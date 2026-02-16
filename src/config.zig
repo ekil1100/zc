@@ -617,28 +617,38 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // 使用 Allocating Writer
-    var response_writer = std.Io.Writer.Allocating.init(allocator);
-    defer response_writer.deinit();
+    const uri = try std.Uri.parse(url);
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .response_writer = &response_writer.writer,
-        .extra_headers = &.{
-            .{ .name = "User-Agent", .value = "clash" },
-            .{ .name = "Accept", .value = "*/*" },
-            .{ .name = "Accept-Language", .value = "en-US,en;q=0.9" },
-        },
-    }) catch |err| {
-        std.debug.print("Failed to download config: {s}\n", .{@errorName(err)});
-        return err;
+    // 准备 headers，覆盖默认的 User-Agent
+    const headers: [2]std.http.Header = .{
+        .{ .name = "User-Agent", .value = "clash" },
+        .{ .name = "Accept", .value = "*/*" },
     };
 
-    if (result.status != .ok) {
-        std.debug.print("Failed to download config: HTTP {d} ({s})\n", .{@intFromEnum(result.status), @tagName(result.status)});
+    var req = try client.request(.GET, uri, .{
+        .extra_headers = &headers,
+    });
+    defer req.deinit();
+
+    try req.sendBodiless();
+    
+    var redirect_buffer: [4096]u8 = undefined;
+    const response = try req.receiveHead(&redirect_buffer);
+    
+    if (response.head.status != .ok) {
+        std.debug.print("Failed to download config: HTTP {d} ({s})\n", .{
+            @intFromEnum(response.head.status),
+            @tagName(response.head.status),
+        });
         return error.DownloadFailed;
     }
+
+    // 读取响应体
+    var response_mut = response;
+    var transfer_buffer: [8192]u8 = undefined;
+    const body_reader = response_mut.reader(&transfer_buffer);
+    const body = try body_reader.readAllAlloc(allocator, 10 * 1024 * 1024);
+    defer allocator.free(body);
 
     // 获取默认配置路径
     const config_dir = try getDefaultConfigDir(allocator) orelse {
@@ -676,7 +686,7 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     // 写入文件
     const file = try std.fs.createFileAbsolute(config_path, .{});
     defer file.close();
-    try file.writeAll(response_writer.written());
+    try file.writeAll(body);
 
     std.debug.print("Config downloaded to: {s}\n", .{config_path});
     std.debug.print("Use 'zc config use {s}' to activate it\n", .{final_filename});
