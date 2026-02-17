@@ -19,35 +19,35 @@ pub const Proxy = struct {
     port: u16,
     // Protocol-specific fields
     password: ?[]const u8 = null,
-    cipher: ?[]const u8 = null, // For Shadowsocks
-    uuid: ?[]const u8 = null, // For VMess/VLESS
-    alter_id: ?u16 = null, // For VMess
+    cipher: ?[]const u8 = null, // SS
+    uuid: ?[]const u8 = null, // VMess/VLESS
+    alter_id: u16 = 0, // VMess
     tls: bool = false,
+    skip_cert_verify: bool = false,
     sni: ?[]const u8 = null,
-    ws_opts: ?WsOptions = null, // WebSocket options
-    obfs: ?[]const u8 = null, // Obfuscation type
+    ws: bool = false, // WebSocket
+    ws_path: ?[]const u8 = null,
+    ws_host: ?[]const u8 = null,
+    // Obfs plugin for Shadowsocks
+    plugin: ?[]const u8 = null,
+    plugin_opts: ?[]const u8 = null,
+    obfs_mode: ?[]const u8 = null, // http or tls
     obfs_host: ?[]const u8 = null, // host header for obfs
 
-    pub const WsOptions = struct {
-        path: ?[]const u8 = null,
-        headers: ?std.StringHashMap([]const u8) = null,
-    };
-};
-
-pub const ProxyGroupType = enum {
-    select,
-    url_test,
-    fallback,
-    load_balance,
-    relay,
-};
-
-pub const ProxyGroup = struct {
-    name: []const u8,
-    group_type: ProxyGroupType,
-    proxies: []const []const u8,
-    url: ?[]const u8 = null, // For url-test/fallback
-    interval: ?u32 = null, // seconds
+    pub fn deinit(self: *Proxy, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.server);
+        if (self.password) |p| allocator.free(p);
+        if (self.cipher) |c| allocator.free(c);
+        if (self.uuid) |u| allocator.free(u);
+        if (self.sni) |s| allocator.free(s);
+        if (self.ws_path) |p| allocator.free(p);
+        if (self.ws_host) |h| allocator.free(h);
+        if (self.plugin) |p| allocator.free(p);
+        if (self.plugin_opts) |p| allocator.free(p);
+        if (self.obfs_mode) |m| allocator.free(m);
+        if (self.obfs_host) |h| allocator.free(h);
+    }
 };
 
 pub const RuleType = enum {
@@ -61,301 +61,551 @@ pub const RuleType = enum {
     dst_port,
     src_port,
     process_name,
-    match, // FINAL
+    final, // MATCH
 };
 
 pub const Rule = struct {
     rule_type: RuleType,
-    value: []const u8,
-    action: []const u8, // Proxy group name or DIRECT/REJECT
+    payload: []const u8,
+    target: []const u8, // Proxy name or DIRECT/REJECT
     no_resolve: bool = false,
+
+    pub fn deinit(self: *Rule, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        allocator.free(self.target);
+    }
+};
+
+pub const ProxyGroupType = enum {
+    select,
+    url_test,
+    fallback,
+    load_balance,
+    relay,
+};
+
+pub const ProxyGroup = struct {
+    name: []const u8,
+    group_type: ProxyGroupType,
+    proxies: std.ArrayList([]const u8),
+    url: ?[]const u8 = null,
+    interval: u32 = 300,
+    tolerance: u16 = 100,
+    lazy: bool = true,
+
+    pub fn deinit(self: *ProxyGroup, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        for (self.proxies.items) |proxy| {
+            allocator.free(proxy);
+        }
+        self.proxies.deinit(allocator);
+        if (self.url) |u| allocator.free(u);
+    }
 };
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    port: u16 = 7890,
+    port: u16 = 7899,
     socks_port: u16 = 7891,
-    mixed_port: ?u16 = null,
+    mixed_port: u16 = 0,
+    redir_port: u16 = 0,
+    tproxy_port: u16 = 0,
     allow_lan: bool = false,
-    bind_address: []const u8 = "127.0.0.1",
+    bind_address: []const u8 = "*",
     mode: []const u8 = "rule",
     log_level: []const u8 = "info",
+    ipv6: bool = true,
     external_controller: ?[]const u8 = null,
+    external_ui: ?[]const u8 = null,
+    secret: ?[]const u8 = null,
+
     proxies: std.ArrayList(Proxy),
     proxy_groups: std.ArrayList(ProxyGroup),
     rules: std.ArrayList(Rule),
 
-    pub fn init(allocator: std.mem.Allocator) Config {
-        return .{
-            .allocator = allocator,
-            .proxies = std.ArrayList(Proxy).init(allocator),
-            .proxy_groups = std.ArrayList(ProxyGroup).init(allocator),
-            .rules = std.ArrayList(Rule).init(allocator),
-        };
-    }
-
     pub fn deinit(self: *Config) void {
-        self.proxies.deinit();
-        self.proxy_groups.deinit();
-        self.rules.deinit();
-    }
-
-    /// 从 YAML 文件解析配置
-    pub fn fromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-        const content = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-        defer allocator.free(content);
-        return try fromYaml(allocator, content);
-    }
-
-    /// 从 YAML 内容解析配置
-    pub fn fromYaml(allocator: std.mem.Allocator, content: []const u8) !Config {
-        var config = Config.init(allocator);
-        errdefer config.deinit();
-
-        // 使用 YAML 解析器
-        var doc = try yaml.parse(allocator, content);
-        defer doc.deinit();
-
-        // 解析基本配置
-        if (doc.get("port")) |port_val| {
-            config.port = @intCast(port_val.asInt() orelse 7890);
+        for (self.proxies.items) |*proxy| {
+            proxy.deinit(self.allocator);
         }
-        if (doc.get("socks-port")) |socks_val| {
-            config.socks_port = @intCast(socks_val.asInt() orelse 7891);
+        self.proxies.deinit(self.allocator);
+
+        for (self.proxy_groups.items) |*group| {
+            group.deinit(self.allocator);
         }
-        if (doc.get("mixed-port")) |mixed_val| {
-            config.mixed_port = @intCast(mixed_val.asInt() orelse 0);
+        self.proxy_groups.deinit(self.allocator);
+
+        for (self.rules.items) |*rule| {
+            rule.deinit(self.allocator);
         }
+        self.rules.deinit(self.allocator);
 
-        // 解析代理节点
-        if (doc.get("proxies")) |proxies_val| {
-            if (proxies_val.asArray()) |arr| {
-                for (arr.items) |proxy_val| {
-                    const proxy = try parseProxy(allocator, proxy_val);
-                    try config.proxies.append(proxy);
-                }
-            }
-        }
-
-        // 解析代理组
-        if (doc.get("proxy-groups")) |groups_val| {
-            if (groups_val.asArray()) |arr| {
-                for (arr.items, 0..) |group_val, i| {
-                    _ = i;
-                    const group = try parseProxyGroup(allocator, group_val);
-                    try config.proxy_groups.append(group);
-                }
-            }
-        }
-
-        // 解析规则
-        if (doc.get("rules")) |rules_val| {
-            if (rules_val.asArray()) |arr| {
-                for (arr.items) |rule_val| {
-                    const rule = try parseRule(allocator, rule_val);
-                    try config.rules.append(rule);
-                }
-            }
-        }
-
-        return config;
-    }
-
-    /// 从文件加载配置
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-        defer allocator.free(content);
-
-        return try Config.fromYaml(allocator, content);
-    }
-
-    /// 加载默认配置
-    pub fn loadDefault(allocator: std.mem.Allocator) !Config {
-        const config_path = try getCurrentConfigPath(allocator) orelse {
-            return error.NoConfigFile;
-        };
-        defer allocator.free(config_path);
-        return try Config.load(allocator, config_path);
-    }
-
-    fn parseProxy(allocator: std.mem.Allocator, val: yaml.Value) !Proxy {
-        var proxy = Proxy{
-            .name = undefined,
-            .proxy_type = .direct,
-            .server = undefined,
-            .port = 0,
-        };
-
-        if (val.get("name")) |name_val| {
-            proxy.name = try allocator.dupe(u8, name_val.asString() orelse "");
-        }
-
-        if (val.get("type")) |type_val| {
-            const type_str = type_val.asString() orelse "";
-            proxy.proxy_type = parseProxyType(type_str);
-        }
-
-        if (val.get("server")) |server_val| {
-            proxy.server = try allocator.dupe(u8, server_val.asString() orelse "");
-        }
-
-        if (val.get("port")) |port_val| {
-            proxy.port = @intCast(port_val.asInt() orelse 0);
-        }
-
-        // 解析协议特定字段
-        if (val.get("password")) |pass_val| {
-            proxy.password = try allocator.dupe(u8, pass_val.asString() orelse "");
-        }
-
-        if (val.get("uuid")) |uuid_val| {
-            proxy.uuid = try allocator.dupe(u8, uuid_val.asString() orelse "");
-        }
-
-        if (val.get("tls")) |tls_val| {
-            proxy.tls = tls_val.asBool() orelse false;
-        }
-
-        return proxy;
-    }
-
-    fn parseProxyType(type_str: []const u8) ProxyType {
-        if (std.mem.eql(u8, type_str, "direct")) return .direct;
-        if (std.mem.eql(u8, type_str, "reject")) return .reject;
-        if (std.mem.eql(u8, type_str, "http")) return .http;
-        if (std.mem.eql(u8, type_str, "socks5")) return .socks5;
-        if (std.mem.eql(u8, type_str, "ss")) return .ss;
-        if (std.mem.eql(u8, type_str, "vmess")) return .vmess;
-        if (std.mem.eql(u8, type_str, "trojan")) return .trojan;
-        if (std.mem.eql(u8, type_str, "vless")) return .vless;
-        return .direct;
-    }
-
-    fn parseProxyGroup(allocator: std.mem.Allocator, val: yaml.Value) !ProxyGroup {
-        var group = ProxyGroup{
-            .name = undefined,
-            .group_type = .select,
-            .proxies = &.{},
-        };
-
-        if (val.get("name")) |name_val| {
-            group.name = try allocator.dupe(u8, name_val.asString() orelse "");
-        }
-
-        if (val.get("type")) |type_val| {
-            const type_str = type_val.asString() orelse "";
-            group.group_type = parseProxyGroupType(type_str);
-        }
-
-        if (val.get("proxies")) |proxies_val| {
-            if (proxies_val.asArray()) |arr| {
-                var proxies = try allocator.alloc([]const u8, arr.items.len);
-                for (arr.items, 0..) |proxy_val, i| {
-                    proxies[i] = try allocator.dupe(u8, proxy_val.asString() orelse "");
-                }
-                group.proxies = proxies;
-            }
-        }
-
-        return group;
-    }
-
-    fn parseProxyGroupType(type_str: []const u8) ProxyGroupType {
-        if (std.mem.eql(u8, type_str, "select")) return .select;
-        if (std.mem.eql(u8, type_str, "url-test")) return .url_test;
-        if (std.mem.eql(u8, type_str, "fallback")) return .fallback;
-        if (std.mem.eql(u8, type_str, "load-balance")) return .load_balance;
-        if (std.mem.eql(u8, type_str, "relay")) return .relay;
-        return .select;
-    }
-
-    fn parseRule(allocator: std.mem.Allocator, val: yaml.Value) !Rule {
-        var rule = Rule{
-            .rule_type = .match,
-            .value = "",
-            .action = "DIRECT",
-        };
-
-        const rule_str = val.asString() orelse "";
-        // 解析规则字符串格式: "TYPE,VALUE,ACTION"
-        var parts = std.mem.split(u8, rule_str, ",");
-        
-        if (parts.next()) |type_str| {
-            rule.rule_type = parseRuleType(type_str);
-        }
-        if (parts.next()) |value_str| {
-            rule.value = try allocator.dupe(u8, value_str);
-        }
-        if (parts.next()) |action_str| {
-            rule.action = try allocator.dupe(u8, action_str);
-        }
-
-        return rule;
-    }
-
-    fn parseRuleType(type_str: []const u8) RuleType {
-        if (std.mem.eql(u8, type_str, "DOMAIN")) return .domain;
-        if (std.mem.eql(u8, type_str, "DOMAIN-SUFFIX")) return .domain_suffix;
-        if (std.mem.eql(u8, type_str, "DOMAIN-KEYWORD")) return .domain_keyword;
-        if (std.mem.eql(u8, type_str, "IP-CIDR")) return .ip_cidr;
-        if (std.mem.eql(u8, type_str, "IP-CIDR6")) return .ip_cidr6;
-        if (std.mem.eql(u8, type_str, "GEOIP")) return .geoip;
-        if (std.mem.eql(u8, type_str, "SRC-IP-CIDR")) return .src_ip_cidr;
-        if (std.mem.eql(u8, type_str, "DST-PORT")) return .dst_port;
-        if (std.mem.eql(u8, type_str, "SRC-PORT")) return .src_port;
-        if (std.mem.eql(u8, type_str, "PROCESS-NAME")) return .process_name;
-        if (std.mem.eql(u8, type_str, "MATCH")) return .match;
-        return .match;
+        self.allocator.free(self.mode);
+        self.allocator.free(self.log_level);
+        self.allocator.free(self.bind_address);
+        if (self.external_controller) |ec| self.allocator.free(ec);
+        if (self.external_ui) |ui| self.allocator.free(ui);
+        if (self.secret) |s| self.allocator.free(s);
     }
 };
 
-/// 获取默认配置目录
-pub fn getDefaultConfigDir(allocator: std.mem.Allocator) !?[]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
-        return null;
+/// 从文件加载配置
+pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    return try parse(allocator, content);
+}
+
+/// 从 YAML 字符串解析配置
+pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
+    var root = try yaml.parse(allocator, content);
+    defer root.deinit(allocator);
+
+    var config = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(ProxyGroup).empty,
+        .rules = std.ArrayList(Rule).empty,
     };
-    defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".config", "zc" });
-}
+    errdefer config.deinit();
 
-/// 获取当前使用的配置文件路径
-pub fn getCurrentConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
-    const config_dir = try getDefaultConfigDir(allocator) orelse return null;
-    defer allocator.free(config_dir);
-    return try std.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
-}
+    if (root != .map) {
+        return error.InvalidConfig;
+    }
 
-/// 验证配置文件格式
-pub fn validateConfig(allocator: std.mem.Allocator, path: []const u8) !bool {
-    _ = allocator;
-    // Check if file exists and is readable
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    // TODO: Parse and validate YAML structure
-    return true;
-}
-
-/// 生成配置文件名从 URL
-fn generateConfigFilenameFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
-    // Extract domain from URL
-    const start = if (std.mem.indexOf(u8, url, "://")) |i| i + 3 else 0;
-    const end = std.mem.indexOf(u8, url[start..], "/") orelse url.len - start;
-    const domain = url[start..start + end];
-    
-    // Clean domain name for filename
-    const clean = try allocator.dupe(u8, domain);
-    for (clean) |*c| {
-        if (c.* == ':' or c.* == '/' or c.* == '?' or c.* == '&' or c.* == '=') {
-            c.* = '_';
+    // 解析基础配置
+    if (root.map.get("port")) |v| {
+        if (v == .integer) {
+            const port = v.integer;
+            if (port > 0 and port <= 65535) {
+                config.port = @intCast(port);
+            }
         }
     }
-    return clean;
+    if (root.map.get("socks-port")) |v| {
+        if (v == .integer) {
+            const port = v.integer;
+            if (port > 0 and port <= 65535) {
+                config.socks_port = @intCast(port);
+            }
+        }
+    }
+    if (root.map.get("mixed-port")) |v| {
+        if (v == .integer) {
+            const port = v.integer;
+            if (port > 0 and port <= 65535) {
+                config.mixed_port = @intCast(port);
+            }
+        }
+    }
+    if (root.map.get("allow-lan")) |v| {
+        if (v == .boolean) config.allow_lan = v.boolean;
+    }
+    if (root.map.get("bind-address")) |v| {
+        if (v == .string) {
+            allocator.free(config.bind_address);
+            config.bind_address = try allocator.dupe(u8, v.string);
+        }
+    }
+    if (root.map.get("mode")) |v| {
+        if (v == .string) {
+            allocator.free(config.mode);
+            config.mode = try allocator.dupe(u8, v.string);
+        }
+    }
+    if (root.map.get("log-level")) |v| {
+        if (v == .string) {
+            allocator.free(config.log_level);
+            config.log_level = try allocator.dupe(u8, v.string);
+        }
+    }
+    if (root.map.get("external-controller")) |v| {
+        if (v == .string) config.external_controller = try allocator.dupe(u8, v.string);
+    }
+
+    // 解析代理列表
+    if (root.map.get("proxies")) |proxies| {
+        if (proxies == .array) {
+            for (proxies.array.items) |*item| {
+                if (item.* == .map) {
+                    // 检查是否是代理组类型（select, url-test等）
+                    if (isProxyGroupType(item.map)) {
+                        const group = try parseProxyGroup(allocator, item.map);
+                        try config.proxy_groups.append(allocator, group);
+                    } else {
+                        const proxy = try parseProxy(allocator, item.map);
+                        try config.proxies.append(allocator, proxy);
+                    }
+                }
+            }
+        }
+    }
+
+    // 解析代理组
+    if (root.map.get("proxy-groups")) |groups| {
+        if (groups == .array) {
+            for (groups.array.items) |*item| {
+                if (item.* == .map) {
+                    const group = try parseProxyGroup(allocator, item.map);
+                    try config.proxy_groups.append(allocator, group);
+                }
+            }
+        }
+    }
+
+    // 解析规则
+    if (root.map.get("rules")) |rules| {
+        if (rules == .array) {
+            for (rules.array.items) |*item| {
+                if (item.* == .string) {
+                    const rule = try parseRule(allocator, item.string);
+                    try config.rules.append(allocator, rule);
+                }
+            }
+        }
+    }
+
+    // 如果没有规则，添加默认 MATCH 规则
+    if (config.rules.items.len == 0) {
+        try config.rules.append(allocator, .{
+            .rule_type = .final,
+            .payload = try allocator.dupe(u8, ""),
+            .target = try allocator.dupe(u8, "DIRECT"),
+        });
+    }
+
+    return config;
 }
 
-/// 从时间戳生成配置文件名
-fn generateConfigFilenameFromTimestamp(allocator: std.mem.Allocator) ![]const u8 {
+fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValue)) !Proxy {
+    const name = map.get("name") orelse return error.MissingProxyName;
+    const proxy_type = map.get("type") orelse return error.MissingProxyType;
+
+    if (name != .string or proxy_type != .string) {
+        return error.InvalidProxyFormat;
+    }
+
+    const ptype = parseProxyType(proxy_type.string) orelse return error.UnknownProxyType;
+
+    // DIRECT 和 REJECT 不需要 server 和 port
+    const needs_server = ptype != .direct and ptype != .reject;
+
+    var proxy = Proxy{
+        .name = try allocator.dupe(u8, name.string),
+        .proxy_type = ptype,
+        .server = if (needs_server) blk: {
+            const server = map.get("server") orelse return error.MissingProxyServer;
+            if (server != .string) return error.InvalidProxyFormat;
+            break :blk try allocator.dupe(u8, server.string);
+        } else "",
+        .port = if (needs_server) blk: {
+            const port = map.get("port") orelse return error.MissingProxyPort;
+            if (port != .integer) return error.InvalidProxyFormat;
+            break :blk @intCast(port.integer);
+        } else 0,
+    };
+
+    // 协议特定字段
+    if (map.get("password")) |v| {
+        if (v == .string) proxy.password = try allocator.dupe(u8, v.string);
+    }
+    if (map.get("cipher")) |v| {
+        if (v == .string) proxy.cipher = try allocator.dupe(u8, v.string);
+    }
+    if (map.get("uuid")) |v| {
+        if (v == .string) proxy.uuid = try allocator.dupe(u8, v.string);
+    }
+    if (map.get("alterId")) |v| {
+        if (v == .integer) proxy.alter_id = @intCast(v.integer);
+    }
+    if (map.get("tls")) |v| {
+        if (v == .boolean) proxy.tls = v.boolean;
+    }
+    if (map.get("skip-cert-verify")) |v| {
+        if (v == .boolean) proxy.skip_cert_verify = v.boolean;
+    }
+    if (map.get("sni")) |v| {
+        if (v == .string) proxy.sni = try allocator.dupe(u8, v.string);
+    }
+    if (map.get("ws-opts")) |v| {
+        if (v == .map) {
+            proxy.ws = true;
+            if (v.map.get("path")) |p| {
+                if (p == .string) proxy.ws_path = try allocator.dupe(u8, p.string);
+            }
+            if (v.map.get("headers")) |h| {
+                if (h == .map) {
+                    if (h.map.get("Host")) |host| {
+                        if (host == .string) proxy.ws_host = try allocator.dupe(u8, host.string);
+                    }
+                }
+            }
+        }
+    }
+
+    // VLESS 必填字段校验
+    if (ptype == .vless and (proxy.uuid == null or proxy.uuid.?.len == 0)) {
+        return error.MissingProxyUuid;
+    }
+
+    // Obfs plugin for Shadowsocks
+    if (map.get("plugin")) |v| {
+        if (v == .string) {
+            proxy.plugin = try allocator.dupe(u8, v.string);
+            // Parse simple-obfs mode
+            if (std.mem.eql(u8, v.string, "obfs")) {
+                // Check for plugin-opts
+                if (map.get("plugin-opts")) |opts| {
+                    if (opts == .map) {
+                        if (opts.map.get("mode")) |mode| {
+                            if (mode == .string) proxy.obfs_mode = try allocator.dupe(u8, mode.string);
+                        }
+                        if (opts.map.get("host")) |host| {
+                            if (host == .string) proxy.obfs_host = try allocator.dupe(u8, host.string);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return proxy;
+}
+
+fn parseProxyGroup(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValue)) !ProxyGroup {
+    const name = map.get("name") orelse return error.MissingGroupName;
+    const gtype = map.get("type") orelse return error.MissingGroupType;
+
+    if (name != .string or gtype != .string) {
+        return error.InvalidGroupFormat;
+    }
+
+    const group_type = parseGroupType(gtype.string) orelse return error.UnknownGroupType;
+
+    var group = ProxyGroup{
+        .name = try allocator.dupe(u8, name.string),
+        .group_type = group_type,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+
+    if (map.get("proxies")) |proxies| {
+        if (proxies == .array) {
+            for (proxies.array.items) |*item| {
+                if (item.* == .string) {
+                    const p = try allocator.dupe(u8, item.string);
+                    try group.proxies.append(allocator, p);
+                }
+            }
+        }
+    }
+
+    if (map.get("url")) |v| {
+        if (v == .string) group.url = try allocator.dupe(u8, v.string);
+    }
+    if (map.get("interval")) |v| {
+        if (v == .integer) group.interval = @intCast(v.integer);
+    }
+    if (map.get("tolerance")) |v| {
+        if (v == .integer) group.tolerance = @intCast(v.integer);
+    }
+    if (map.get("lazy")) |v| {
+        if (v == .boolean) group.lazy = v.boolean;
+    }
+
+    return group;
+}
+
+fn parseRule(allocator: std.mem.Allocator, rule_str: []const u8) !Rule {
+    // Trim whitespace
+    const trimmed = std.mem.trim(u8, rule_str, " \t\r\n");
+
+    // Parse rule format: TYPE,PARAM,TARGET[,no-resolve] or TYPE,TARGET (for MATCH)
+    var parts = std.mem.splitScalar(u8, trimmed, ',');
+
+    const type_str = parts.next() orelse return error.InvalidRule;
+
+    // MATCH rule has no payload: MATCH,TARGET
+    // Other rules have payload: TYPE,PAYLOAD,TARGET
+    const payload: []const u8 = blk: {
+        if (std.mem.eql(u8, type_str, "MATCH")) {
+            break :blk "";
+        } else {
+            break :blk parts.next() orelse return error.InvalidRule;
+        }
+    };
+
+    const target = parts.next() orelse return error.InvalidRule;
+
+    var no_resolve = false;
+    while (parts.next()) |opt| {
+        if (std.mem.eql(u8, std.mem.trim(u8, opt, " \t"), "no-resolve")) {
+            no_resolve = true;
+        }
+    }
+
+    const rule_type = parseRuleType(type_str) orelse return error.UnknownRuleType;
+
+    return Rule{
+        .rule_type = rule_type,
+        .payload = try allocator.dupe(u8, std.mem.trim(u8, payload, " \t")),
+        .target = try allocator.dupe(u8, std.mem.trim(u8, target, " \t")),
+        .no_resolve = no_resolve,
+    };
+}
+
+fn parseProxyType(s: []const u8) ?ProxyType {
+    if (std.mem.eql(u8, s, "direct")) return .direct;
+    if (std.mem.eql(u8, s, "reject")) return .reject;
+    if (std.mem.eql(u8, s, "http")) return .http;
+    if (std.mem.eql(u8, s, "socks5")) return .socks5;
+    if (std.mem.eql(u8, s, "ss")) return .ss;
+    if (std.mem.eql(u8, s, "vmess")) return .vmess;
+    if (std.mem.eql(u8, s, "trojan")) return .trojan;
+    if (std.mem.eql(u8, s, "vless")) return .vless;
+    return null;
+}
+
+fn parseGroupType(s: []const u8) ?ProxyGroupType {
+    if (std.mem.eql(u8, s, "select")) return .select;
+    if (std.mem.eql(u8, s, "url-test")) return .url_test;
+    if (std.mem.eql(u8, s, "fallback")) return .fallback;
+    if (std.mem.eql(u8, s, "load-balance")) return .load_balance;
+    if (std.mem.eql(u8, s, "relay")) return .relay;
+    return null;
+}
+
+/// 检查一个 YAML map 是否是代理组类型
+fn isProxyGroupType(map: std.StringHashMap(yaml.YamlValue)) bool {
+    if (map.get("type")) |type_val| {
+        if (type_val == .string) {
+            return parseGroupType(type_val.string) != null;
+        }
+    }
+    return false;
+}
+
+fn parseRuleType(s: []const u8) ?RuleType {
+    if (std.mem.eql(u8, s, "DOMAIN")) return .domain;
+    if (std.mem.eql(u8, s, "DOMAIN-SUFFIX")) return .domain_suffix;
+    if (std.mem.eql(u8, s, "DOMAIN-KEYWORD")) return .domain_keyword;
+    if (std.mem.eql(u8, s, "IP-CIDR")) return .ip_cidr;
+    if (std.mem.eql(u8, s, "IP-CIDR6")) return .ip_cidr6;
+    if (std.mem.eql(u8, s, "GEOIP")) return .geoip;
+    if (std.mem.eql(u8, s, "SRC-IP-CIDR")) return .src_ip_cidr;
+    if (std.mem.eql(u8, s, "DST-PORT")) return .dst_port;
+    if (std.mem.eql(u8, s, "SRC-PORT")) return .src_port;
+    if (std.mem.eql(u8, s, "PROCESS-NAME")) return .process_name;
+    if (std.mem.eql(u8, s, "MATCH")) return .final;
+    return null;
+}
+
+/// 查找默认配置文件路径
+/// 优先级：~/.config/zc/config.yaml > ~/.zc/config.yaml > ./config.yaml
+fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home);
+
+    const paths = [_][]const u8{
+        "/.config/zc/config.yaml",
+        "/.zc/config.yaml",
+    };
+
+    for (paths) |rel_path| {
+        const full_path = try std.fs.path.join(allocator, &.{ home, rel_path[1..] });
+        std.fs.accessAbsolute(full_path, .{}) catch continue;
+        return full_path;
+    }
+
+    // 检查当前目录的 config.yaml
+    std.fs.cwd().access("config.yaml", .{}) catch return null;
+    return try allocator.dupe(u8, "config.yaml");
+}
+
+/// 默认配置（先尝试从文件读取，失败则用内置配置）
+pub fn loadDefault(allocator: std.mem.Allocator) !Config {
+    // 尝试查找默认配置文件
+    if (try getDefaultConfigPath(allocator)) |path| {
+        defer allocator.free(path);
+        std.debug.print("Loading config from: {s}\n", .{path});
+        return try load(allocator, path);
+    }
+
+    // 使用内置默认配置
+    std.debug.print("No config file found, using built-in defaults\n", .{});
+    const yaml_config =
+        \\port: 7899
+        \\socks-port: 7891
+        \\mode: rule
+        \\log-level: info
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+        \\  - name: REJECT
+        \\    type: reject
+        \\    server: ""
+        \\    port: 0
+        \\rules:
+        \\  - MATCH,DIRECT
+    ;
+    return try parse(allocator, yaml_config);
+}
+
+/// 获取默认配置目录路径 (~/.config/zc)
+pub fn getDefaultConfigDir(allocator: std.mem.Allocator) !?[]const u8 {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home);
+    return try std.fs.path.join(allocator, &.{ home, ".config/zc" });
+}
+
+/// 从 URL 提取域名
+fn extractDomainFromUrl(allocator: std.mem.Allocator, url: []const u8) !?[]const u8 {
+    const uri = std.Uri.parse(url) catch return null;
+
+    const host_component = uri.host orelse return null;
+
+    // 获取 host 字符串
+    const host = switch (host_component) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+
+    if (host.len == 0) return null;
+
+    // 分配内存复制 host
+    var host_copy = try allocator.alloc(u8, host.len);
+    @memcpy(host_copy, host);
+
+    // 移除端口号（如果有）
+    if (std.mem.indexOfScalar(u8, host_copy, ':')) |colon_pos| {
+        host_copy = try allocator.realloc(host_copy, colon_pos);
+        host_copy[colon_pos] = 0;
+        host_copy = host_copy[0..colon_pos];
+    }
+
+    return host_copy;
+}
+
+/// 从 URL 生成配置文件名（使用域名）
+fn generateConfigFilenameFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+    // 尝试提取域名
+    if (try extractDomainFromUrl(allocator, url)) |domain| {
+        return domain;
+    }
+
+    // 如果提取失败，回退到时间戳
+    return try generateConfigFilename(allocator);
+}
+
+/// 生成基于时间戳的配置文件名
+fn generateConfigFilename(allocator: std.mem.Allocator) ![]const u8 {
     const timestamp = std.time.timestamp();
     return std.fmt.allocPrint(allocator, "config_{d}", .{timestamp});
 }
@@ -364,6 +614,30 @@ fn generateConfigFilenameFromTimestamp(allocator: std.mem.Allocator) ![]const u8
 /// name: 可选的自定义文件名，为 null 则从 URL 提取域名作为文件名
 /// 返回: 实际使用的文件名（需要调用者释放内存），出错返回 null
 pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]const u8) !?[]const u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    // 使用 Allocating Writer
+    var response_writer = std.Io.Writer.Allocating.init(allocator);
+    defer response_writer.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &response_writer.writer,
+        .extra_headers = &.{
+            .{ .name = "User-Agent", .value = "clash" },
+        },
+    }) catch |err| {
+        std.debug.print("Failed to download config: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    if (result.status != .ok) {
+        std.debug.print("Failed to download config: HTTP {d}\n", .{@intFromEnum(result.status)});
+        return error.DownloadFailed;
+    }
+
     // 获取默认配置路径
     const config_dir = try getDefaultConfigDir(allocator) orelse {
         std.debug.print("Could not determine config directory\n", .{});
@@ -397,29 +671,10 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     const config_path = try std.fs.path.join(allocator, &.{ config_dir, final_filename });
     defer allocator.free(config_path);
 
-    // 使用 curl 下载配置文件
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{
-            "curl",
-            "-fsSL",
-            "-H", "User-Agent: clash",
-            "-H", "Accept: */*",
-            "-o", config_path,
-            url,
-        },
-    }) catch |err| {
-        std.debug.print("Failed to download config: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.term.Exited != 0) {
-        std.debug.print("Failed to download config: curl exited with code {d}\n", .{result.term.Exited});
-        std.debug.print("Error: {s}\n", .{result.stderr});
-        return error.DownloadFailed;
-    }
+    // 写入文件
+    const file = try std.fs.createFileAbsolute(config_path, .{});
+    defer file.close();
+    try file.writeAll(response_writer.written());
 
     std.debug.print("Config downloaded to: {s}\n", .{config_path});
     std.debug.print("Use 'zc config use {s}' to activate it\n", .{final_filename});
@@ -459,31 +714,47 @@ pub fn listConfigs(allocator: std.mem.Allocator) !void {
 
     std.debug.print("Available configs in {s}:\n\n", .{config_dir});
 
-    var iter = dir.iterate();
+    var it = dir.iterate();
     var count: usize = 0;
-    while (try iter.next()) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".yaml")) continue;
+    while (try it.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".yaml")) {
+            count += 1;
+            const is_active = blk: {
+                if (active_target) |target| {
+                    // 检查 entry.name 是否匹配 target 的文件名
+                    break :blk std.mem.eql(u8, entry.name, std.fs.path.basename(target));
+                }
+                break :blk false;
+            };
 
-        const is_active = if (active_target) |target|
-            std.mem.eql(u8, entry.name, std.fs.path.basename(target))
-        else
-            false;
-
-        if (is_active) {
-            std.debug.print("  * {s} (active)\n", .{entry.name});
-        } else {
-            std.debug.print("    {s}\n", .{entry.name});
+            if (is_active) {
+                std.debug.print("  * {s} (active)\n", .{entry.name});
+            } else {
+                std.debug.print("    {s}\n", .{entry.name});
+            }
         }
-        count += 1;
     }
 
     if (count == 0) {
-        std.debug.print("  (no configs found)\n", .{});
+        std.debug.print("  (no config files found)\n", .{});
+    } else {
+        std.debug.print("\nUse 'zc config use <filename>' to switch config\n", .{});
     }
 }
 
-/// 切换到指定的配置文件
+/// 获取当前激活的配置文件路径
+fn getActiveConfig(allocator: std.mem.Allocator) !?[]const u8 {
+    const config_dir = try getDefaultConfigDir(allocator) orelse return null;
+    defer allocator.free(config_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
+
+    // 检查文件是否存在
+    std.fs.accessAbsolute(config_path, .{}) catch return null;
+    return config_path;
+}
+
+/// 切换配置文件（创建符号链接或复制文件）
 pub fn switchConfig(allocator: std.mem.Allocator, filename: []const u8) !void {
     const config_dir = try getDefaultConfigDir(allocator) orelse {
         std.debug.print("Could not determine config directory\n", .{});
@@ -491,50 +762,57 @@ pub fn switchConfig(allocator: std.mem.Allocator, filename: []const u8) !void {
     };
     defer allocator.free(config_dir);
 
-    // 确保文件名以 .yaml 结尾
-    const target_name = if (std.mem.endsWith(u8, filename, ".yaml"))
-        filename
-    else
-        try std.fmt.allocPrint(allocator, "{s}.yaml", .{filename});
-    defer if (!std.mem.endsWith(u8, filename, ".yaml")) allocator.free(target_name);
+    // 验证源文件存在
+    const source_path = try std.fs.path.join(allocator, &.{ config_dir, filename });
+    defer allocator.free(source_path);
 
-    // 检查目标文件是否存在
-    const target_path = try std.fs.path.join(allocator, &.{ config_dir, target_name });
-    defer allocator.free(target_path);
-
-    std.fs.accessAbsolute(target_path, .{}) catch {
-        std.debug.print("Config not found: {s}\nUse 'zc --list-configs' to see available configs\n", .{target_path});
+    std.fs.accessAbsolute(source_path, .{}) catch {
+        std.debug.print("Config not found: {s}\n", .{source_path});
+        std.debug.print("Use 'zc --list-configs' to see available configs\n", .{});
         return error.ConfigNotFound;
     };
 
-    // 创建符号链接
     const link_path = try std.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
     defer allocator.free(link_path);
 
-    // 如果已存在，删除旧的符号链接
+    // 删除旧的符号链接或文件
     std.fs.deleteFileAbsolute(link_path) catch {};
 
-    // 创建新的符号链接（使用相对路径）
-    try std.fs.symLinkAbsolute(target_path, link_path, .{});
+    // 尝试创建符号链接，如果失败则复制文件
+    std.fs.symLinkAbsolute(source_path, link_path, .{}) catch |err| {
+        // 如果符号链接失败（比如在某些系统上需要权限），则复制文件
+        if (err == error.AccessDenied or err == error.NotSupported or err == error.InvalidArgument) {
+            try std.fs.copyFileAbsolute(source_path, link_path, .{});
+        } else {
+            std.debug.print("Failed to create symlink: {s}, copying file instead\n", .{@errorName(err)});
+            try std.fs.copyFileAbsolute(source_path, link_path, .{});
+        }
+    };
 
-    std.debug.print("Switched to config: {s}\n", .{target_name});
+    std.debug.print("Switched to config: {s}\n", .{filename});
 }
 
-/// 显示当前配置信息
-pub fn showCurrentConfig(allocator: std.mem.Allocator) !void {
-    const config_path = try getCurrentConfigPath(allocator) orelse {
-        std.debug.print("Could not determine config path\n", .{});
-        return error.NoConfigDir;
-    };
-    defer allocator.free(config_path);
+test "config parsing" {
+    const allocator = std.testing.allocator;
 
-    // 检查是否为符号链接
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = std.fs.readLinkAbsolute(config_path, &buf) catch {
-        // 不是符号链接，可能是直接文件
-        std.debug.print("Current config: {s} (direct file)\n", .{config_path});
-        return;
-    };
+    const yaml_config =
+        \\port: 1080
+        \\proxies:
+        \\  - name: Proxy1
+        \\    type: ss
+        \\    server: 127.0.0.1
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: test
+        \\rules:
+        \\  - DOMAIN,google.com,Proxy1
+        \\  - MATCH,DIRECT
+    ;
 
-    std.debug.print("Current config: {s} -> {s}\n", .{ config_path, std.fs.path.basename(target) });
+    var config = try parse(allocator, yaml_config);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(u16, 1080), config.port);
+    try std.testing.expectEqual(@as(usize, 1), config.proxies.items.len);
+    try std.testing.expectEqual(@as(usize, 2), config.rules.items.len);
 }
