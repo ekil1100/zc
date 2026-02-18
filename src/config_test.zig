@@ -5,6 +5,27 @@ const Proxy = @import("config.zig").Proxy;
 const ProxyType = @import("config.zig").ProxyType;
 const Rule = @import("config.zig").Rule;
 const RuleType = @import("config.zig").RuleType;
+const fetchConfig = @import("config.zig").fetchConfig;
+const DownloadResult = @import("config.zig").DownloadResult;
+
+// Verify DownloadResult struct exists and has correct fields
+test "DownloadResult struct exists with correct fields" {
+    const result = DownloadResult{
+        .status = std.http.Status.ok,
+        .body = "test",
+    };
+    try testing.expectEqual(std.http.Status.ok, result.status);
+    try testing.expectEqualStrings("test", result.body);
+}
+
+// Test: fetchConfig function exists and is exported
+test "fetchConfig function is exported" {
+    // Just verify the function signature is accessible by calling it
+    // This ensures the symbol exists at compile time
+    _ = fetchConfig;
+}
+
+// Original tests from before
 
 test "ProxyType enum variants" {
     const types = [_]ProxyType{

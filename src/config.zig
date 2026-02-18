@@ -610,15 +610,19 @@ fn generateConfigFilename(allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "config_{d}", .{timestamp});
 }
 
-/// 下载配置文件从 URL 并保存到默认位置
-/// name: 可选的自定义文件名，为 null 则从 URL 提取域名作为文件名
-/// 返回: 实际使用的文件名（需要调用者释放内存），出错返回 null
-pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]const u8) !?[]const u8 {
+/// 下载结果结构体
+pub const DownloadResult = struct {
+    status: std.http.Status,
+    body: []const u8,
+};
+
+/// fetchConfig 内部函数：执行 HTTP 请求获取配置内容
+/// 可独立测试，验证 User-Agent 等头部设置
+pub fn fetchConfig(allocator: std.mem.Allocator, url: []const u8) !DownloadResult {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // 使用 Allocating Writer
-    var response_writer = std.Io.Writer.Allocating.init(allocator);
+    var response_writer: std.Io.Writer.Allocating = .init(allocator);
     defer response_writer.deinit();
 
     const result = client.fetch(.{
@@ -633,8 +637,23 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
         return err;
     };
 
-    if (result.status != .ok) {
-        std.debug.print("Failed to download config: HTTP {d}\n", .{@intFromEnum(result.status)});
+    const body = try allocator.dupe(u8, response_writer.written());
+
+    return DownloadResult{
+        .status = result.status,
+        .body = body,
+    };
+}
+
+/// 下载配置文件从 URL 并保存到默认位置
+/// name: 可选的自定义文件名，为 null 则从 URL 提取域名作为文件名
+/// 返回: 实际使用的文件名（需要调用者释放内存），出错返回 null
+pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]const u8) !?[]const u8 {
+    const fetch_result = try fetchConfig(allocator, url);
+    defer allocator.free(fetch_result.body);
+
+    if (fetch_result.status != .ok) {
+        std.debug.print("Failed to download config: HTTP {d}\n", .{@intFromEnum(fetch_result.status)});
         return error.DownloadFailed;
     }
 
@@ -674,7 +693,7 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     // 写入文件
     const file = try std.fs.createFileAbsolute(config_path, .{});
     defer file.close();
-    try file.writeAll(response_writer.written());
+    try file.writeAll(fetch_result.body);
 
     std.debug.print("Config downloaded to: {s}\n", .{config_path});
     std.debug.print("Use 'zc config use {s}' to activate it\n", .{final_filename});
