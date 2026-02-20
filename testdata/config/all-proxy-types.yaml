@@ -1,0 +1,209 @@
+# 全代理类型复杂配置样本
+# 用于回归测试覆盖率提升（P20-1B）
+# 包含所有支持的代理类型：direct, reject, http, socks5, ss, vmess, trojan, vless
+
+port: 7890
+socks-port: 7891
+mixed-port: 7892
+allow-lan: true
+bind-address: "0.0.0.0"
+mode: rule
+log-level: debug
+external-controller: "127.0.0.1:9090"
+
+proxies:
+  # 直连与拒绝
+  - name: DIRECT
+    type: direct
+  
+  - name: REJECT
+    type: reject
+  
+  # HTTP 代理
+  - name: http-proxy
+    type: http
+    server: http.example.com
+    port: 8080
+  
+  # SOCKS5 代理
+  - name: socks5-proxy
+    type: socks5
+    server: socks.example.com
+    port: 1080
+  
+  # Shadowsocks (多种加密方式)
+  - name: ss-aes
+    type: ss
+    server: ss1.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: "ss-password-1"
+  
+  - name: ss-chacha
+    type: ss
+    server: ss2.example.com
+    port: 8389
+    cipher: chacha20-ietf-poly1305
+    password: "ss-password-2"
+  
+  # VMess
+  - name: vmess-plain
+    type: vmess
+    server: vmess1.example.com
+    port: 443
+    uuid: "a3482e89-686a-4bd3-8511-5e83c27e6b0a"
+    alterId: 0
+    cipher: auto
+    tls: false
+  
+  - name: vmess-tls
+    type: vmess
+    server: vmess2.example.com
+    port: 443
+    uuid: "b4e33f76-9c21-4f4d-bf3e-8d5a7f9c2e1b"
+    alterId: 0
+    cipher: auto
+    tls: true
+    skip-cert-verify: false
+    sni: "vmess2.example.com"
+  
+  - name: vmess-ws
+    type: vmess
+    server: vmess3.example.com
+    port: 80
+    uuid: "c5f44a87-bd32-5e94-cf4f-9e6b8d0a3f2c"
+    alterId: 0
+    cipher: auto
+    tls: false
+    ws-opts:
+      path: /ws
+      headers:
+        Host: vmess3.example.com
+  
+  # Trojan
+  - name: trojan-simple
+    type: trojan
+    server: trojan1.example.com
+    port: 443
+    password: "trojan-password-1"
+    sni: "trojan1.example.com"
+  
+  - name: trojan-skip-cert
+    type: trojan
+    server: trojan2.example.com
+    port: 443
+    password: "trojan-password-2"
+    sni: "trojan2.example.com"
+    skip-cert-verify: true
+  
+  # VLESS
+  - name: vless-plain
+    type: vless
+    server: vless1.example.com
+    port: 443
+    uuid: "d6f55b98-ce43-6fa5-df5f-0f7c9e1b4a3d"
+    tls: false
+  
+  - name: vless-tls
+    type: vless
+    server: vless2.example.com
+    port: 443
+    uuid: "e7g66c09-df54-7gb6-eg6g-1g8d0f2c5b4e"
+    tls: true
+    sni: "vless2.example.com"
+
+proxy-groups:
+  # 手动选择
+  - name: "首选节点"
+    type: select
+    proxies:
+      - ss-aes
+      - ss-chacha
+      - vmess-tls
+      - trojan-simple
+      - DIRECT
+  
+  # 自动测速
+  - name: "自动选优"
+    type: url-test
+    proxies:
+      - ss-aes
+      - ss-chacha
+      - vmess-tls
+      - trojan-simple
+      - vless-tls
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 100
+  
+  # 故障转移
+  - name: "故障转移"
+    type: fallback
+    proxies:
+      - vmess-tls
+      - trojan-simple
+      - ss-aes
+      - DIRECT
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+  
+  # 负载均衡
+  - name: "负载均衡"
+    type: load_balance
+    proxies:
+      - ss-aes
+      - ss-chacha
+      - vmess-plain
+      - vmess-tls
+  
+  # 代理链
+  - name: "代理链"
+    type: relay
+    proxies:
+      - socks5-proxy
+      - vmess-tls
+
+rules:
+  # 国内直连
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,jd.com,DIRECT
+  
+  # 广告拒绝
+  - DOMAIN-SUFFIX,googleadservices.com,REJECT
+  - DOMAIN-SUFFIX,doubleclick.net,REJECT
+  - DOMAIN-KEYWORD,admarvel,REJECT
+  
+  # 流媒体
+  - DOMAIN-SUFFIX,youtube.com,自动选优
+  - DOMAIN-SUFFIX,netflix.com,自动选优
+  - DOMAIN-SUFFIX,disneyplus.com,自动选优
+  
+  # 社交媒体
+  - DOMAIN-SUFFIX,twitter.com,首选节点
+  - DOMAIN-SUFFIX,facebook.com,首选节点
+  - DOMAIN-SUFFIX,instagram.com,首选节点
+  
+  # 开发者
+  - DOMAIN-SUFFIX,github.com,故障转移
+  - DOMAIN-SUFFIX,stackoverflow.com,故障转移
+  - DOMAIN-SUFFIX,gitlab.com,故障转移
+  
+  # IP 段规则
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  
+  # GEOIP
+  - GEOIP,CN,DIRECT
+  - GEOIP,private,DIRECT,no-resolve
+  
+  # 端口规则
+  - DST-PORT,22,DIRECT
+  - DST-PORT,80,自动选优
+  - DST-PORT,443,自动选优
+  
+  # 默认规则
+  - MATCH,自动选优
