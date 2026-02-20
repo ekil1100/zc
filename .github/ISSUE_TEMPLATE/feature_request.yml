@@ -1,0 +1,34 @@
+name: 功能建议
+description: 提出新的功能想法
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你的需求是什么？
+      description: 描述你遇到的问题或需求场景
+      placeholder: 清晰简洁地描述问题
+    validations:
+      required: true
+  
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望的解决方案
+      description: 你希望发生什么？
+      placeholder: 描述你想要的解决方案
+    validations:
+      required: true
+  
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案
+      description: 你考虑过哪些替代方案？
+  
+  - type: textarea
+    id: context
+    attributes:
+      label: 额外上下文
+      description: 任何其他上下文或截图
