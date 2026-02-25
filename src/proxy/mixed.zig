@@ -1,7 +1,9 @@
 const std = @import("std");
 const net = std.net;
+const outbound = @import("outbound/manager.zig");
+const ProxyStream = outbound.ProxyStream;
 const Engine = @import("../rule/engine.zig").Engine;
-const OutboundManager = @import("outbound/manager.zig").OutboundManager;
+const OutboundManager = outbound.OutboundManager;
 
 /// 混合端口（HTTP + SOCKS5）
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
@@ -109,6 +111,8 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
         .is_domain = atyp == 0x03,
     }) orelse "DIRECT";
 
+    std.debug.print("[Mixed] Rule matched: target={s}:{d} -> proxy={s}\n", .{ target_host, target_port, proxy_name });
+
     var target_stream = manager.connect(proxy_name, target_host, target_port) catch {
         try conn.stream.writeAll(&.{ 0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
         conn.stream.close();
@@ -117,7 +121,7 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
     defer target_stream.close();
 
     try conn.stream.writeAll(&.{ 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
-    try relay(conn.stream, target_stream);
+    try relay(conn.stream, &target_stream);
 }
 
 fn handleHttp(allocator: std.mem.Allocator, conn: net.Server.Connection, first_byte: u8, engine: *Engine, manager: *OutboundManager) !void {
@@ -188,7 +192,7 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
     _ = try conn.stream.write("HTTP/1.1 200 Connection established\r\n\r\n");
 
     // 双向转发
-    try relay(conn.stream, target_stream);
+    try relay(conn.stream, &target_stream);
 }
 
 fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, request: []const u8, engine: *Engine, manager: *OutboundManager) !void {
@@ -212,17 +216,10 @@ fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, 
     defer target_stream.close();
 
     // 转发请求
-    _ = try target_stream.write(request);
+    try target_stream.write(request);
 
-    // 读取响应并返回
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = try target_stream.read(&buf);
-        if (n == 0) break;
-        _ = try conn.stream.write(buf[0..n]);
-    }
-
-    conn.stream.close();
+    // 双向转发（使用 poll 避免阻塞）
+    try relay(conn.stream, &target_stream);
     _ = allocator;
 }
 
@@ -238,10 +235,11 @@ fn extractHost(request: []const u8) ![]const u8 {
     return request[after_host .. after_host + host_end.?];
 }
 
-fn relay(client_stream: net.Stream, target_stream: net.Stream) !void {
+fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
+    std.debug.print("[Relay] Starting relay\n", .{});
     var poll_fds = [_]std.posix.pollfd{
         .{ .fd = client_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = target_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = target_stream.base_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
     };
 
     var buf: [8192]u8 = undefined;
@@ -251,15 +249,14 @@ fn relay(client_stream: net.Stream, target_stream: net.Stream) !void {
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
             const n = try std.posix.read(client_stream.handle, &buf);
+            std.debug.print("[Relay] Client -> Proxy: {} bytes\n", .{n});
             if (n == 0) break;
-            var written: usize = 0;
-            while (written < n) {
-                written += try std.posix.write(target_stream.handle, buf[written..n]);
-            }
+            try target_stream.write(buf[0..n]);
         }
 
         if (poll_fds[1].revents & std.posix.POLL.IN != 0) {
-            const n = try std.posix.read(target_stream.handle, &buf);
+            const n = try target_stream.read(&buf);
+            std.debug.print("[Relay] Proxy -> Client: {} bytes\n", .{n});
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
@@ -270,7 +267,9 @@ fn relay(client_stream: net.Stream, target_stream: net.Stream) !void {
         if ((poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0 or
             (poll_fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0)
         {
+            std.debug.print("[Relay] Poll error/hup\n", .{});
             break;
         }
     }
+    std.debug.print("[Relay] Done\n", .{});
 }

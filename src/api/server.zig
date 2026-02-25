@@ -59,6 +59,12 @@ pub const ApiServer = struct {
         const method = part_iter.next() orelse return;
         const path = part_iter.next() orelse return;
 
+        // 提取 body（\r\n\r\n 之后的部分）
+        const body = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |hdr_end|
+            request[hdr_end + 4 ..]
+        else
+            "";
+
         std.debug.print("[API] {s} {s}\n", .{ method, path });
 
         // 路由
@@ -76,8 +82,8 @@ pub const ApiServer = struct {
             }
         } else if (std.mem.eql(u8, method, "PUT")) {
             if (std.mem.startsWith(u8, path, "/proxies/")) {
-                const proxy_name = path[9..];
-                try self.handleSwitchProxy(conn, proxy_name);
+                const group_name = path[9..];
+                try self.handleSwitchProxy(conn, group_name, body);
             } else {
                 try self.sendError(conn, 404, "Not Found");
             }
@@ -149,9 +155,47 @@ pub const ApiServer = struct {
         try self.sendJsonRaw(conn, json.items);
     }
 
-    fn handleSwitchProxy(self: *ApiServer, conn: net.Server.Connection, proxy_name: []const u8) !void {
-        _ = proxy_name;
-        try self.sendJson(conn, "{\"message\":\"Proxy switched\"}");
+    /// PUT /proxies/<group_name> body: {"name":"proxy_name"}
+    fn handleSwitchProxy(self: *ApiServer, conn: net.Server.Connection, group_name: []const u8, body: []const u8) !void {
+        // 从 body 的 JSON 中提取 "name" 字段
+        const proxy_name = extractJsonString(body, "name") orelse {
+            try self.sendError(conn, 400, "Missing name in body");
+            return;
+        };
+
+        std.debug.print("[API] Switch proxy: group={s}, proxy={s}\n", .{ group_name, proxy_name });
+        self.manager.selectProxy(group_name, proxy_name);
+
+        const resp = std.fmt.allocPrint(self.allocator,
+            "{{\"ok\":true,\"group\":\"{s}\",\"proxy\":\"{s}\"}}", .{ group_name, proxy_name }) catch return;
+        defer self.allocator.free(resp);
+        try self.sendJsonRaw(conn, resp);
+    }
+
+    /// 从 JSON 字符串中提取指定 key 的 string value
+    fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
+        // 查找 "key":"  或  "key": "
+        var i: usize = 0;
+        while (i + key.len + 3 < json.len) : (i += 1) {
+            if (json[i] == '"' and i + 1 + key.len < json.len and
+                std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
+                json[i + 1 + key.len] == '"')
+            {
+                var pos = i + 1 + key.len + 1; // after closing "
+                if (pos < json.len and json[pos] == ':') {
+                    pos += 1;
+                    // skip whitespace
+                    while (pos < json.len and json[pos] == ' ') pos += 1;
+                    if (pos < json.len and json[pos] == '"') {
+                        pos += 1; // opening quote
+                        const val_start = pos;
+                        while (pos < json.len and json[pos] != '"') pos += 1;
+                        if (pos < json.len) return json[val_start..pos];
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     fn sendJson(self: *ApiServer, conn: net.Server.Connection, json_str: []const u8) !void {

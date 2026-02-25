@@ -1,7 +1,9 @@
 const std = @import("std");
 const net = std.net;
 const Engine = @import("../rule/engine.zig").Engine;
-const OutboundManager = @import("outbound/manager.zig").OutboundManager;
+const outbound = @import("outbound/manager.zig");
+const OutboundManager = outbound.OutboundManager;
+const ProxyStream = outbound.ProxyStream;
 
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
     const listen_ip = if (std.mem.eql(u8, bind_address, "*")) "0.0.0.0" else bind_address;
@@ -73,7 +75,7 @@ fn handleConnect(conn: net.Server.Connection, request: []const u8, engine: *Engi
     defer target_stream.close();
 
     try conn.stream.writeAll("HTTP/1.1 200 Connection established\r\n\r\n");
-    try relay(conn.stream.handle, target_stream.handle);
+    try relayHttp(conn.stream, &target_stream);
 }
 
 fn handleHttp(conn: net.Server.Connection, request: []const u8, engine: *Engine, manager: *OutboundManager) !void {
@@ -103,10 +105,10 @@ fn handleHttp(conn: net.Server.Connection, request: []const u8, engine: *Engine,
     defer target_stream.close();
 
     // Forward the request
-    try target_stream.writeAll(request);
+    try target_stream.write(request);
 
     // Relay response back
-    try relay(conn.stream.handle, target_stream.handle);
+    try relayHttp(conn.stream, &target_stream);
 }
 
 fn extractHost(request: []const u8) ![]const u8 {
@@ -126,35 +128,29 @@ fn extractUri(request: []const u8) ![]const u8 {
     return request[first_space + 1 .. first_space + 1 + second_space];
 }
 
-fn relay(client_fd: std.posix.fd_t, target_fd: std.posix.fd_t) !void {
+fn relayHttp(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     var poll_fds = [_]std.posix.pollfd{
-        .{ .fd = client_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = target_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = client_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = target_stream.getHandle(), .events = std.posix.POLL.IN, .revents = 0 },
     };
 
     var buf: [8192]u8 = undefined;
 
     while (true) {
-        const ready = try std.posix.poll(&poll_fds, -1);
-        _ = ready;
+        _ = try std.posix.poll(&poll_fds, -1);
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
-            const n = try std.posix.read(client_fd, &buf);
+            const n = try std.posix.read(client_stream.handle, &buf);
             if (n == 0) break;
-            var written: usize = 0;
-            while (written < n) {
-                const w = try std.posix.write(target_fd, buf[written..n]);
-                written += w;
-            }
+            try target_stream.write(buf[0..n]);
         }
 
         if (poll_fds[1].revents & std.posix.POLL.IN != 0) {
-            const n = try std.posix.read(target_fd, &buf);
+            const n = try target_stream.read(&buf);
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
-                const w = try std.posix.write(client_fd, buf[written..n]);
-                written += w;
+                written += try std.posix.write(client_stream.handle, buf[written..n]);
             }
         }
 

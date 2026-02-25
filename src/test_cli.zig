@@ -6,7 +6,7 @@ const TEST_TARGETS = [_]struct {
     name: []const u8,
     url: []const u8,
 }{
-    .{ .name = "IP/Location", .url = "http://httpbin.org/ip" },
+    .{ .name = "IP/Location", .url = "http://ip-api.com/json" },
     .{ .name = "Google", .url = "http://www.google.com/generate_204" },
     .{ .name = "YouTube", .url = "http://www.youtube.com/generate_204" },
     .{ .name = "Netflix", .url = "http://www.netflix.com" },
@@ -229,7 +229,8 @@ const IpGeoInfo = struct {
 
 /// 获取出口 IP 和地理位置信息
 fn getIpGeoInfo(allocator: std.mem.Allocator, proxy_url: []const u8) !?*IpGeoInfo {
-    const output = runCurl(allocator, proxy_url, "http://ipapi.co/json/", false);
+    // ip-api.com/json 返回 IP + 地理位置
+    const output = runCurl(allocator, proxy_url, "http://ip-api.com/json", false);
     defer switch (output) {
         .ok => |ok| allocator.free(ok),
         .failed => {},
@@ -240,40 +241,31 @@ fn getIpGeoInfo(allocator: std.mem.Allocator, proxy_url: []const u8) !?*IpGeoInf
         .failed => return null,
     };
 
+    // ip-api.com 返回: {"query":"1.2.3.4","country":"XX","regionName":"XX","city":"XX",...}
     var info = try allocator.create(IpGeoInfo);
-    info.city = null;
-    info.region = null;
-    info.country = null;
-
-    if (extractJsonField(allocator, body, "ip")) |ip| {
-        info.ip = ip;
-    } else {
-        allocator.destroy(info);
-        return null;
-    }
-
-    if (extractJsonField(allocator, body, "city")) |city| {
-        info.city = city;
-    }
-    if (extractJsonField(allocator, body, "region")) |region| {
-        info.region = region;
-    }
-    if (extractJsonField(allocator, body, "country_name")) |country| {
-        info.country = country;
-    }
+    info.ip = extractJsonField(allocator, body, "query") orelse try allocator.dupe(u8, "unknown");
+    info.city = extractJsonField(allocator, body, "city");
+    info.region = extractJsonField(allocator, body, "regionName");
+    info.country = extractJsonField(allocator, body, "country");
 
     return info;
 }
 
 fn extractJsonField(allocator: std.mem.Allocator, json: []const u8, field: []const u8) ?[]const u8 {
-    const pattern = std.fmt.allocPrint(allocator, "\"{s}\": \"", .{field}) catch return null;
+    // 搜索 "field": 或 "field":（兼容有无空格的 JSON）
+    const pattern = std.fmt.allocPrint(allocator, "\"{s}\":", .{field}) catch return null;
     defer allocator.free(pattern);
 
     if (std.mem.indexOf(u8, json, pattern)) |start| {
-        const value_start = start + pattern.len;
-        if (std.mem.indexOfScalar(u8, json[value_start..], '"')) |end| {
-            const value = json[value_start .. value_start + end];
-            return allocator.dupe(u8, value) catch return null;
+        var pos = start + pattern.len;
+        // 跳过空格
+        while (pos < json.len and json[pos] == ' ') pos += 1;
+        // 期望引号开始
+        if (pos < json.len and json[pos] == '"') {
+            pos += 1;
+            if (std.mem.indexOfScalar(u8, json[pos..], '"')) |end| {
+                return allocator.dupe(u8, json[pos .. pos + end]) catch return null;
+            }
         }
     }
 
@@ -301,7 +293,7 @@ fn runCurl(allocator: std.mem.Allocator, proxy_url: []const u8, url: []const u8,
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
 
-    args.appendSlice(allocator, &.{ "curl", "--silent", "--show-error", "--max-time", "6", "-x", proxy_url }) catch {
+    args.appendSlice(allocator, &.{ "curl", "--silent", "--show-error", "--max-time", "6", "-x", proxy_url, "-w", "%{http_code}" }) catch {
         return .{ .failed = .unknown };
     };
     if (ignore_body) {
@@ -322,7 +314,15 @@ fn runCurl(allocator: std.mem.Allocator, proxy_url: []const u8, url: []const u8,
     defer allocator.free(result.stderr);
 
     if (result.term == .Exited and result.term.Exited == 0) {
-        return .{ .ok = result.stdout };
+        // 检查 HTTP 状态码
+        const output = result.stdout;
+        if (output.len >= 3) {
+            const status_code = output[output.len - 3 ..];
+            if (std.mem.eql(u8, status_code, "502") or std.mem.eql(u8, status_code, "000")) {
+                return .{ .failed = .tcp_connect };
+            }
+        }
+        return .{ .ok = output };
     }
 
     allocator.free(result.stdout);

@@ -153,119 +153,10 @@ pub fn main() !void {
         return;
     }
 
-    // 处理 profile 子命令
-    if (std.mem.eql(u8, cmd, "profile")) {
-        if (args.len < 3) {
-            if (json_output) {
-                printCliError(json_output, "PROFILE_SUBCOMMAND_MISSING", "profile subcommand is required", "use `zc profile list|use <name>`");
-            } else {
-                std.debug.print("Usage: zc profile list|use <name>\n", .{});
-            }
-            return;
-        }
-
-        const subcmd = args[2];
-
-        if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
-            if (json_output) {
-                try printProfileListJson(allocator);
-            } else {
-                try config.listConfigs(allocator);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "use")) {
-            if (args.len < 4) {
-                printCliError(json_output, "PROFILE_NAME_REQUIRED", "profile name is required", "use `zc profile use <name>`");
-                return;
-            }
-
-            const profile_name = args[3];
-            const exists = try profileExists(allocator, profile_name);
-            if (!exists) {
-                printCliError(json_output, "PROFILE_NOT_FOUND", "profile not found", "run `zc profile list` and confirm the profile name");
-                return;
-            }
-
-            if (json_output) {
-                switchProfileSilent(allocator, profile_name) catch {
-                    printCliError(json_output, "PROFILE_USE_FAILED", "failed to switch profile", "verify config directory permissions and retry");
-                    return;
-                };
-                std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"profile_use\",\"profile\":\"{s}\",\"state\":\"active\"}}}}\n", .{profile_name});
-            } else {
-                config.switchConfig(allocator, profile_name) catch {
-                    printCliError(json_output, "PROFILE_USE_FAILED", "failed to switch profile", "verify config directory permissions and retry");
-                    return;
-                };
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "import")) {
-            if (args.len < 4) {
-                printCliError(json_output, "PROFILE_SOURCE_REQUIRED", "profile import source is required", "use `zc profile import <url_or_path> [-n name]`");
-                return;
-            }
-
-            const source = args[3];
-            var import_name: ?[]const u8 = null;
-            var i: usize = 4;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-n") and i + 1 < args.len) {
-                    import_name = args[i + 1];
-                    i += 1;
-                }
-            }
-
-            var imported_name: ?[]const u8 = null;
-            if (std.mem.startsWith(u8, source, "http://") or std.mem.startsWith(u8, source, "https://")) {
-                imported_name = config.downloadConfig(allocator, source, import_name) catch {
-                    printCliError(json_output, "PROFILE_IMPORT_FAILED", "failed to import profile from url", "check URL/network and retry");
-                    return;
-                };
-            } else {
-                imported_name = importLocalProfile(allocator, source, import_name) catch {
-                    printCliError(json_output, "PROFILE_IMPORT_FAILED", "failed to import profile from local path", "check file path and retry");
-                    return;
-                };
-            }
-            defer if (imported_name) |n| allocator.free(n);
-
-            if (json_output) {
-                std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"profile_import\",\"profile\":\"{s}\",\"source\":\"{s}\"}}}}\n", .{ imported_name orelse "", source });
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "validate")) {
-            const target = if (args.len >= 4) args[3] else null;
-            var cfg = resolveProfileConfig(allocator, target) catch {
-                printCliError(json_output, "PROFILE_VALIDATE_FAILED", "failed to load profile for validation", "run `zc profile list` or pass a valid path");
-                return;
-            };
-            defer cfg.deinit();
-
-            var vr = try validator.validate(allocator, &cfg);
-            defer vr.deinit();
-
-            if (json_output) {
-                try printValidationJson(allocator, &vr);
-            } else {
-                validator.printResult(&vr);
-            }
-            return;
-        }
-
-        printCliError(json_output, "PROFILE_SUBCOMMAND_UNKNOWN", "unknown profile subcommand", "use `zc profile list|use|import|validate`");
-        return;
-    }
-
     // 处理 config 子命令
     if (std.mem.eql(u8, cmd, "config")) {
         if (args.len < 3) {
-            try printConfigHelp();
+            try config.listConfigs(allocator);
             return;
         }
 
@@ -273,15 +164,6 @@ pub fn main() !void {
 
         if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
             try config.listConfigs(allocator);
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "use")) {
-            if (args.len < 4) {
-                std.debug.print("Usage: zc config use <configname>\n", .{});
-                return;
-            }
-            try config.switchConfig(allocator, args[3]);
             return;
         }
 
@@ -316,9 +198,42 @@ pub fn main() !void {
             return;
         }
 
-        // 未知子命令
+        if (std.mem.eql(u8, subcmd, "update")) {
+            var config_name: ?[]const u8 = null;
+
+            if (args.len >= 4) {
+                config_name = args[3];
+            }
+
+            const current_config = config.getCurrentConfigName(allocator) catch null;
+            defer if (current_config) |c| allocator.free(c);
+
+            const target_name = config_name orelse current_config orelse {
+                std.debug.print("Usage: zc config update [<name>]\n", .{});
+                std.debug.print("  <name>  Config name to update (default: current active config)\n", .{});
+                return;
+            };
+
+            const filename = try config.updateConfig(allocator, target_name);
+            defer if (filename) |f| allocator.free(f);
+
+            if (filename) |f| {
+                std.debug.print("Config updated: {s}\n", .{f});
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, subcmd, "use")) {
+            if (args.len < 4) {
+                std.debug.print("Usage: zc config use <name>\n", .{});
+                return;
+            }
+
+            try config.switchConfig(allocator, args[3]);
+            return;
+        }
+
         std.debug.print("Unknown config subcommand: {s}\n", .{subcmd});
-        try printConfigHelp();
         return;
     }
 
@@ -326,6 +241,129 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "proxy")) {
         if (args.len < 3) {
             try printProxyHelp();
+            return;
+        }
+
+        const subcmd = args[2];
+
+        if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
+            // 解析 -c 参数
+            var config_path: ?[]const u8 = null;
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "-c")) {
+                    if (i + 1 < args.len) {
+                        config_path = args[i + 1];
+                        i += 1;
+                    }
+                }
+            }
+
+            // 加载配置
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy list", "check config path and retry with `-c <config>`");
+                return err;
+            };
+            defer cfg.deinit();
+
+            if (json_output) {
+                try proxy_cli.listProxiesJson(allocator, &cfg);
+            } else {
+                try proxy_cli.listProxies(allocator, &cfg);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, subcmd, "select")) {
+            var group_name: ?[]const u8 = null;
+            var proxy_name: ?[]const u8 = null;
+            var config_path: ?[]const u8 = null;
+
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "-g")) {
+                    if (i + 1 < args.len) {
+                        group_name = args[i + 1];
+                        i += 1;
+                    }
+                } else if (std.mem.eql(u8, args[i], "-p")) {
+                    if (i + 1 < args.len) {
+                        proxy_name = args[i + 1];
+                        i += 1;
+                    }
+                } else if (std.mem.eql(u8, args[i], "-c")) {
+                    if (i + 1 < args.len) {
+                        config_path = args[i + 1];
+                        i += 1;
+                    }
+                }
+            }
+
+            // 加载配置（需要可变引用）
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy select", "check config path and retry with `-c <config>`");
+                return err;
+            };
+            defer cfg.deinit();
+
+            if (json_output) {
+                proxy_cli.selectProxyJson(allocator, &cfg, group_name, proxy_name) catch |err| {
+                    switch (err) {
+                        error.GroupNotFound => printCliError(true, "PROXY_GROUP_NOT_FOUND", "proxy group not found", "run `zc proxy list --json` to inspect groups"),
+                        error.ProxyNotFound => printCliError(true, "PROXY_NOT_FOUND", "proxy not found in group", "run `zc proxy select -g <group> --json` to inspect choices"),
+                        error.NoSelectGroup => printCliError(true, "PROXY_SELECT_GROUP_MISSING", "no select-type proxy group found", "check profile proxy-groups config"),
+                        else => printCliError(true, "PROXY_SELECT_FAILED", "failed to select proxy", "retry with valid group/proxy arguments"),
+                    }
+                    return;
+                };
+            } else {
+                try proxy_cli.selectProxy(allocator, &cfg, group_name, proxy_name);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, subcmd, "test")) {
+            var config_path: ?[]const u8 = null;
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "-c") and i + 1 < args.len) {
+                    config_path = args[i + 1];
+                    i += 1;
+                }
+            }
+
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy test", "check config path and retry with `-c <config>`");
+                return err;
+            };
+            defer cfg.deinit();
+
+            if (json_output) {
+                try test_cli.testProxyJson(allocator, &cfg, null);
+            } else {
+                try test_cli.testProxy(allocator, &cfg, null);
+            }
+            return;
+        }
+
+        // 未知子命令
+        if (json_output) {
+            printCliError(json_output, "PROXY_SUBCOMMAND_UNKNOWN", "unknown proxy subcommand", "use `zc proxy --help` or `zc help`");
+        } else {
+            std.debug.print("Unknown proxy subcommand: {s}\n", .{subcmd});
+            try printProxyHelp();
+        }
+        return;
+    }
+
+    // 处理 profile 子命令
+    if (std.mem.eql(u8, cmd, "profile")) {
+        if (args.len < 3) {
+            if (json_output) {
+                printCliError(json_output, "PROFILE_SUBCOMMAND_MISSING", "profile subcommand is required", "use `zc profile list|use <name>`");
+            } else {
+                std.debug.print("Usage: zc profile list|use <name>\n", .{});
+            }
             return;
         }
 
@@ -798,9 +836,9 @@ fn proxyThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine
 
 fn runTui(allocator: std.mem.Allocator, cfg: *const config.Config, engine: *rule_engine.Engine, manager: *outbound.OutboundManager) !void {
     _ = engine;
-    _ = manager;
 
     var tui_manager = try tui.TuiManager.init(allocator, cfg);
+    tui_manager.outbound_manager = manager;
     defer tui_manager.deinit();
 
     // 设置重载回调

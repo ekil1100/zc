@@ -360,8 +360,20 @@ fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValu
             proxy.plugin = try allocator.dupe(u8, v.string);
             // Parse simple-obfs mode
             if (std.mem.eql(u8, v.string, "obfs")) {
-                // Check for plugin-opts
+                // Check for plugin-opts (with hyphen)
                 if (map.get("plugin-opts")) |opts| {
+                    if (opts == .map) {
+                        // Try with hyphen
+                        if (opts.map.get("mode")) |mode| {
+                            if (mode == .string) proxy.obfs_mode = try allocator.dupe(u8, mode.string);
+                        }
+                        // Try with underscore
+                        if (opts.map.get("host")) |host| {
+                            if (host == .string) proxy.obfs_host = try allocator.dupe(u8, host.string);
+                        }
+                    }
+                } else if (map.get("plugin_opts")) |opts| {
+                    // Try with underscore
                     if (opts == .map) {
                         if (opts.map.get("mode")) |mode| {
                             if (mode == .string) proxy.obfs_mode = try allocator.dupe(u8, mode.string);
@@ -532,7 +544,13 @@ pub fn loadDefault(allocator: std.mem.Allocator) !Config {
     // 尝试查找默认配置文件
     if (try getDefaultConfigPath(allocator)) |path| {
         defer allocator.free(path);
-        std.debug.print("Loading config from: {s}\n", .{path});
+        // 如果是符号链接，显示实际目标文件名
+        var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.readLinkAbsolute(path, &target_buf)) |target| {
+            std.debug.print("Loading config from: {s} -> {s}\n", .{ path, std.fs.path.basename(target) });
+        } else |_| {
+            std.debug.print("Loading config from: {s}\n", .{path});
+        }
         return try load(allocator, path);
     }
 
@@ -695,10 +713,93 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     defer file.close();
     try file.writeAll(fetch_result.body);
 
+    // 保存订阅 URL
+    try saveSubscriptionUrl(allocator, final_filename, url);
+
     std.debug.print("Config downloaded to: {s}\n", .{config_path});
     std.debug.print("Use 'zc config use {s}' to activate it\n", .{final_filename});
 
     return final_filename;
+}
+
+/// 保存订阅 URL 到 .url 文件
+fn saveSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8, url: []const u8) !void {
+    const config_dir = try getDefaultConfigDir(allocator) orelse return;
+    defer allocator.free(config_dir);
+
+    // 移除 .yaml 扩展名（如果有）
+    var base_name = config_name;
+    if (std.mem.endsWith(u8, config_name, ".yaml")) {
+        base_name = config_name[0 .. config_name.len - 5];
+    }
+
+    // 生成 .url 文件路径
+    const url_file_path = try std.fs.path.join(allocator, &.{ config_dir, try std.fmt.allocPrint(allocator, "{s}.url", .{base_name}) });
+    defer allocator.free(url_file_path);
+
+    const file = try std.fs.createFileAbsolute(url_file_path, .{});
+    defer file.close();
+    try file.writeAll(url);
+}
+
+/// 获取当前激活的配置名称
+pub fn getCurrentConfigName(allocator: std.mem.Allocator) !?[]const u8 {
+    const config_dir = try getDefaultConfigDir(allocator) orelse return null;
+    defer allocator.free(config_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
+    defer allocator.free(config_path);
+
+    // 尝试读取符号链接目标
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const target = std.fs.readLinkAbsolute(config_path, &buffer) catch {
+        // 不是符号链接，返回默认名称
+        return try allocator.dupe(u8, "config.yaml");
+    };
+
+    const filename = std.fs.path.basename(target);
+    // 移除 .yaml 扩展名
+    if (std.mem.endsWith(u8, filename, ".yaml")) {
+        return try allocator.dupe(u8, filename[0 .. filename.len - 5]);
+    }
+    return try allocator.dupe(u8, filename);
+}
+
+/// 获取订阅 URL
+pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8) !?[]const u8 {
+    const config_dir = try getDefaultConfigDir(allocator) orelse return null;
+    defer allocator.free(config_dir);
+
+    // 移除 .yaml 扩展名（如果有）
+    var base_name = config_name;
+    if (std.mem.endsWith(u8, config_name, ".yaml")) {
+        base_name = config_name[0 .. config_name.len - 5];
+    }
+
+    const url_file_path = try std.fs.path.join(allocator, &.{ config_dir, try std.fmt.allocPrint(allocator, "{s}.url", .{base_name}) });
+    defer allocator.free(url_file_path);
+
+    const file = std.fs.openFileAbsolute(url_file_path, .{}) catch return null;
+    defer file.close();
+
+    const stat = try file.stat();
+    const content = try allocator.alloc(u8, stat.size);
+    _ = try file.read(content);
+    return content;
+}
+
+/// 更新配置文件（从保存的订阅 URL）
+pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8) !?[]const u8 {
+    const url = try getSubscriptionUrl(allocator, config_name) orelse {
+        std.debug.print("No subscription URL found for config: {s}\n", .{config_name});
+        std.debug.print("Use 'zc config download <url>' to download a new config\n", .{});
+        return null;
+    };
+    defer allocator.free(url);
+
+    std.debug.print("Updating from: {s}\n", .{url});
+
+    return try downloadConfig(allocator, url, config_name);
 }
 
 /// 列出所有可用的配置文件

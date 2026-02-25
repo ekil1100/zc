@@ -1,7 +1,9 @@
 const std = @import("std");
 const net = std.net;
 const Engine = @import("../rule/engine.zig").Engine;
-const OutboundManager = @import("outbound/manager.zig").OutboundManager;
+const outbound = @import("outbound/manager.zig");
+const OutboundManager = outbound.OutboundManager;
+const ProxyStream = outbound.ProxyStream;
 
 const Socks5Version = 0x05;
 const AuthMethods = struct {
@@ -161,7 +163,7 @@ fn handleConnection(_allocator: std.mem.Allocator, conn: net.Server.Connection, 
     const addr_bytes = std.mem.asBytes(&bind_addr.in.sa.addr);
     try sendReply(conn.stream, Reply.Success, AddressType.Ipv4, addr_bytes[0..4], bind_port);
 
-    try relay(conn.stream.handle, target_stream.handle);
+    try relaySocks5(conn.stream, &target_stream);
 }
 
 fn sendReply(stream: net.Stream, reply: u8, atyp: u8, addr: *const [4]u8, port: u16) !void {
@@ -179,35 +181,29 @@ fn sendReply(stream: net.Stream, reply: u8, atyp: u8, addr: *const [4]u8, port: 
     try stream.writeAll(&resp);
 }
 
-fn relay(client_fd: std.posix.fd_t, target_fd: std.posix.fd_t) !void {
+fn relaySocks5(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     var poll_fds = [_]std.posix.pollfd{
-        .{ .fd = client_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = target_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = client_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = target_stream.getHandle(), .events = std.posix.POLL.IN, .revents = 0 },
     };
 
     var buf: [8192]u8 = undefined;
 
     while (true) {
-        const ready = try std.posix.poll(&poll_fds, -1);
-        _ = ready;
+        _ = try std.posix.poll(&poll_fds, -1);
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
-            const n = try std.posix.read(client_fd, &buf);
+            const n = try std.posix.read(client_stream.handle, &buf);
             if (n == 0) break;
-            var written: usize = 0;
-            while (written < n) {
-                const w = try std.posix.write(target_fd, buf[written..n]);
-                written += w;
-            }
+            try target_stream.write(buf[0..n]);
         }
 
         if (poll_fds[1].revents & std.posix.POLL.IN != 0) {
-            const n = try std.posix.read(target_fd, &buf);
+            const n = try target_stream.read(&buf);
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
-                const w = try std.posix.write(client_fd, buf[written..n]);
-                written += w;
+                written += try std.posix.write(client_stream.handle, buf[written..n]);
             }
         }
 
