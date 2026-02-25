@@ -1,9 +1,11 @@
 const std = @import("std");
 const testing = std.testing;
+const build_options = @import("build_options");
 
 // Simple HTTP response parsing test
 test "HTTP response parsing" {
-    const response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"version\":\"0.1.0\"}";
+    const ver = build_options.version;
+    const response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" ++ comptime std.fmt.comptimePrint("{{\"version\":\"{s}\"}}", .{ver});
 
     // Check status line
     try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK"));
@@ -12,7 +14,7 @@ test "HTTP response parsing" {
     try testing.expect(std.mem.indexOf(u8, response, "Content-Type: application/json") != null);
 
     // Check body
-    try testing.expect(std.mem.indexOf(u8, response, "{\"version\":\"0.1.0\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "\"version\":\"" ++ ver ++ "\"") != null);
 }
 
 test "JSON response format" {

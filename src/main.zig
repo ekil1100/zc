@@ -12,6 +12,7 @@ const daemon = @import("daemon.zig");
 const proxy_cli = @import("proxy_cli.zig");
 const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
+const build_options = @import("build_options");
 
 // 全局配置路径，用于重载
 var g_config_path: ?[]const u8 = null;
@@ -725,7 +726,7 @@ fn parseConfigPathArg(args: []const []const u8, start_index: usize) ?[]const u8 
 }
 
 fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: bool) !void {
-    std.debug.print("zc v0.1.0\n", .{});
+    std.debug.print("zc v{s}\n", .{build_options.version});
 
     // 保存配置路径用于重载
     if (config_path) |path| {
@@ -961,7 +962,7 @@ fn parseExternalControllerPort(ec: []const u8) !u16 {
 
 fn printHelp() !void {
     std.debug.print("\n", .{});
-    std.debug.print("zc v0.1.0 - A high-performance proxy tool in Zig\n", .{});
+    std.debug.print("zc v{s} - A high-performance proxy tool in Zig\n", .{build_options.version});
     std.debug.print("\n", .{});
     std.debug.print("USAGE:\n", .{});
     std.debug.print("    zc <command> [options]\n", .{});

@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // 从 build.zig.zon 读取版本号，通过 build_options 传入源码
+    const pkg = @import("build.zig.zon");
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", pkg.version);
+
     // Create module for the executable
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -12,6 +17,7 @@ pub fn build(b: *std.Build) void {
     });
 
     exe_mod.link_libc = true;
+    exe_mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "zc",
@@ -34,6 +40,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    test_mod.addOptions("build_options", options);
 
     const exe_unit_tests = b.addTest(.{
         .root_module = test_mod,

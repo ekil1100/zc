@@ -3,6 +3,7 @@ const net = std.net;
 const Config = @import("../config.zig").Config;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = @import("../proxy/outbound/manager.zig").OutboundManager;
+const build_options = @import("build_options");
 
 /// REST API 服务器
 pub const ApiServer = struct {
@@ -70,13 +71,13 @@ pub const ApiServer = struct {
         // 路由
         if (std.mem.eql(u8, method, "GET")) {
             if (std.mem.eql(u8, path, "/")) {
-                try self.sendJson(conn, "{\"version\":\"0.1.0\",\"hello\":\"zc\"}");
+                try self.sendJson(conn, comptime std.fmt.comptimePrint("{{\"version\":\"{s}\",\"hello\":\"zc\"}}", .{build_options.version}));
             } else if (std.mem.eql(u8, path, "/proxies")) {
                 try self.handleGetProxies(conn);
             } else if (std.mem.eql(u8, path, "/rules")) {
                 try self.handleGetRules(conn);
             } else if (std.mem.eql(u8, path, "/version")) {
-                try self.sendJson(conn, "{\"version\":\"0.1.0\"}");
+                try self.sendJson(conn, comptime std.fmt.comptimePrint("{{\"version\":\"{s}\"}}", .{build_options.version}));
             } else {
                 try self.sendError(conn, 404, "Not Found");
             }

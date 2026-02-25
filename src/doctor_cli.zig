@@ -17,7 +17,7 @@ pub const DoctorData = struct {
     daemon_pid: ?i32,
     ports: [3]PortEntry,
     port_count: usize,
-    version: []const u8 = "v0.1.0",
+    version: []const u8 = "zc v" ++ @import("build_options").version,
     network_ok: bool = false,
     proxy_reachable: bool = false,
     config_errors: []const []const u8 = &.{},
