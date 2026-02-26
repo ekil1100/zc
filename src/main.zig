@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
 const http_proxy = @import("proxy/http.zig");
 const socks5_proxy = @import("proxy/socks5.zig");
@@ -737,7 +738,7 @@ fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: boo
     var cfg = try loadAndValidateConfig(allocator, config_path, true);
     defer cfg.deinit();
 
-    // 启动前端口占用预检
+    // 启动前端口占用预检（可能修改 external-controller 端口）
     try preflightPortCheck(&cfg);
 
     // Initialize outbound manager
@@ -783,6 +784,11 @@ fn loadAndValidateConfig(allocator: std.mem.Allocator, config_path: ?[]const u8,
         try config.load(allocator, path)
     else
         try config.loadDefault(allocator);
+
+    // 强制使用 mixed-port 模式，忽略配置文件中的端口设置
+    cfg.mixed_port = constants.MIXED_PORT;
+    cfg.port = 0;
+    cfg.socks_port = 0;
 
     var validation_result = try validator.validate(allocator, &cfg);
     defer validation_result.deinit();
@@ -910,7 +916,7 @@ fn hasInProcessPortConflict(cfg: *const config.Config) !bool {
     return false;
 }
 
-fn preflightPortCheck(cfg: *const config.Config) !void {
+fn preflightPortCheck(cfg: *config.Config) !void {
     const bind_ip = effectiveBindAddress(cfg);
 
     // 进程内端口冲突检查
@@ -927,11 +933,43 @@ fn preflightPortCheck(cfg: *const config.Config) !void {
         if (cfg.socks_port > 0) try checkPortAvailable(bind_ip, cfg.socks_port);
     }
 
+    // external-controller 端口：被占用时自动尝试 port+1..+10
     if (cfg.external_controller) |ec| {
-        const api_port = try parseExternalControllerPort(ec);
-        // API 当前固定监听 127.0.0.1
-        try checkPortAvailable("127.0.0.1", api_port);
+        const original_port = try parseExternalControllerPort(ec);
+        if (isPortAvailable("127.0.0.1", original_port)) return;
+
+        // 原始端口被占用，尝试 fallback
+        var fallback_port: u16 = original_port;
+        var found = false;
+        for (1..11) |offset| {
+            const try_port = original_port +| @as(u16, @intCast(offset));
+            if (try_port <= original_port) break; // overflow
+            if (isPortAvailable("127.0.0.1", try_port)) {
+                fallback_port = try_port;
+                found = true;
+                break;
+            }
+        }
+
+        if (found) {
+            std.debug.print("external-controller: {d} in use, using {d}\n", .{ original_port, fallback_port });
+            // 更新 cfg.external_controller 为新端口
+            const new_ec = std.fmt.allocPrint(cfg.allocator, "127.0.0.1:{d}", .{fallback_port}) catch return;
+            cfg.allocator.free(cfg.external_controller.?);
+            cfg.external_controller = new_ec;
+        } else {
+            std.debug.print("warning: external-controller port {d}-{d} all in use, skipping API server\n", .{ original_port, original_port +| 10 });
+            cfg.allocator.free(cfg.external_controller.?);
+            cfg.external_controller = null;
+        }
     }
+}
+
+fn isPortAvailable(ip: []const u8, port: u16) bool {
+    const address = std.net.Address.parseIp4(ip, port) catch return false;
+    var server = address.listen(.{ .reuse_address = true }) catch return false;
+    server.deinit();
+    return true;
 }
 
 fn checkPortAvailable(ip: []const u8, port: u16) !void {

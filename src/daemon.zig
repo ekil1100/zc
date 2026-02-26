@@ -1,4 +1,6 @@
 const std = @import("std");
+const config = @import("config.zig");
+const constants = @import("constants.zig");
 
 // PID 文件路径
 const PID_FILE = "/tmp/zc.pid";
@@ -81,10 +83,28 @@ pub fn removePidFile(allocator: std.mem.Allocator) void {
 /// 检查进程是否正在运行
 pub fn isRunning(allocator: std.mem.Allocator) !bool {
     const pid = try readPid(allocator) orelse return false;
-    
+
     // 发送信号 0 检查进程是否存在
-    const result = std.posix.kill(pid, 0);
-    _ = result catch return false;
+    std.posix.kill(pid, 0) catch return false;
+
+    // Linux: 读取 /proc/<pid>/comm 验证进程名，防止 PID 回收误判
+    if (comptime @import("builtin").os.tag == .linux) {
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return false;
+        const file = std.fs.openFileAbsolute(path, .{}) catch {
+            removePidFile(allocator);
+            return false;
+        };
+        defer file.close();
+        var buf: [256]u8 = undefined;
+        const n = file.read(&buf) catch return false;
+        const comm = std.mem.trimRight(u8, buf[0..n], "\n");
+        if (!std.mem.eql(u8, comm, "zc")) {
+            removePidFile(allocator);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -143,30 +163,89 @@ fn printCliOk(json_output: bool, action: []const u8, state: []const u8, detail: 
     }
 }
 
+/// 打印启动后的服务信息（mixed-proxy, api-server, mode, proxies, rules）
+fn printStartupInfo(allocator: std.mem.Allocator) void {
+    var cfg = config.loadDefault(allocator) catch return;
+    defer cfg.deinit();
+
+    const bind = if (!cfg.allow_lan)
+        "127.0.0.1"
+    else if (std.mem.eql(u8, cfg.bind_address, "*"))
+        "0.0.0.0"
+    else
+        cfg.bind_address;
+
+    std.debug.print("  mixed-proxy: {s}:{d}\n", .{ bind, constants.MIXED_PORT });
+    if (cfg.external_controller) |ec| {
+        std.debug.print("  api-server:  {s}\n", .{ec});
+    }
+    std.debug.print("  mode:        {s}\n", .{cfg.mode});
+    std.debug.print("  proxies:     {d}\n", .{cfg.proxies.items.len});
+    std.debug.print("  rules:       {d}\n", .{cfg.rules.items.len});
+}
+
 /// 启动守护进程
 pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool) !void {
     // 检查是否已经在运行
     if (try isRunning(allocator)) {
-        printCliOk(json_output, "start", "running", "already_running", null);
+        const existing_pid = try readPid(allocator);
+        if (json_output) {
+            printCliOk(json_output, "start", "running", "already_running", existing_pid);
+        } else {
+            std.debug.print("zc daemon already running (pid: {d})\n", .{existing_pid.?});
+        }
         return;
     }
-    
+
     // Fork 子进程
     const pid = std.posix.fork() catch |err| {
         std.debug.print("Failed to fork: {s}\n", .{@errorName(err)});
         return err;
     };
-    
-    if (pid > 0) {
-        // 父进程：等待子进程至少稳定存活一小段时间，避免假启动
-        std.Thread.sleep(300 * std.time.ns_per_ms);
-        _ = std.posix.kill(pid, 0) catch {
-            printCliError(json_output, "START_FAILED", "failed to start: child exited early", "check logs via `zc log --no-follow` and retry");
-            return error.StartFailed;
-        };
 
+    if (pid > 0) {
+        // 父进程：轮询最多 2s，每 200ms 检查子进程是否存活
+        const log_path = getLogFilePath(allocator) catch null;
+        defer if (log_path) |p| allocator.free(p);
+
+        var i: usize = 0;
+        while (i < 10) : (i += 1) { // 10 × 200ms = 2s
+            std.Thread.sleep(200 * std.time.ns_per_ms);
+
+            // 检查子进程是否还活着
+            std.posix.kill(pid, 0) catch {
+                // 子进程已退出，启动失败
+                if (json_output) {
+                    printCliError(json_output, "START_FAILED", "daemon exited during startup", "check `zc log --no-follow` for details");
+                } else {
+                    std.debug.print("zc daemon failed to start\n", .{});
+                    std.debug.print("  error: daemon exited during startup\n", .{});
+                    if (log_path) |lp| {
+                        std.debug.print("  hint:  check `zc log` or {s}\n", .{lp});
+                    } else {
+                        std.debug.print("  hint:  check `zc log --no-follow`\n", .{});
+                    }
+                }
+                removePidFile(allocator);
+                return error.StartFailed;
+            };
+        }
+
+        // 子进程在 2s 后仍然存活，视为启动成功
         try writePid(allocator, pid);
-        printCliOk(json_output, "start", "running", null, pid);
+
+        if (json_output) {
+            printCliOk(json_output, "start", "running", null, pid);
+        } else {
+            std.debug.print("zc daemon started (pid: {d})\n", .{pid});
+
+            // 加载配置以显示服务信息
+            printStartupInfo(allocator);
+
+            if (log_path) |lp| {
+                std.debug.print("  log:         {s}\n", .{lp});
+            }
+        }
         return;
     }
     

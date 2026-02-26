@@ -105,8 +105,8 @@ pub const ProxyGroup = struct {
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    port: u16 = 7899,
-    socks_port: u16 = 7891,
+    port: u16 = 0,
+    socks_port: u16 = 0,
     mixed_port: u16 = 0,
     redir_port: u16 = 0,
     tproxy_port: u16 = 0,
@@ -557,8 +557,7 @@ pub fn loadDefault(allocator: std.mem.Allocator) !Config {
     // 使用内置默认配置
     std.debug.print("No config file found, using built-in defaults\n", .{});
     const yaml_config =
-        \\port: 7899
-        \\socks-port: 7891
+        \\mixed-port: 7899
         \\mode: rule
         \\log-level: info
         \\proxies:
