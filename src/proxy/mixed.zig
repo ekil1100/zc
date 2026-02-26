@@ -180,8 +180,9 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
 
     // 通过 outbound manager 连接
     const proxy_name = engine.match(host, true) orelse "DIRECT";
+    std.debug.print("[Mixed] CONNECT route: {s}:{d} -> {s}\n", .{ host, port, proxy_name });
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
-        std.debug.print("[Mixed] Connection failed: {}\n", .{err});
+        std.debug.print("[Mixed] Connection failed: target={s}:{d} proxy={s} err={}\n", .{ host, port, proxy_name, err });
         _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         conn.stream.close();
         return;
@@ -207,8 +208,9 @@ fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, 
 
     // 连接目标
     const proxy_name = engine.match(host, true) orelse "DIRECT";
+    std.debug.print("[Mixed] HTTP route: {s}:{d} -> {s}\n", .{ host, port, proxy_name });
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
-        std.debug.print("[Mixed] Connection failed: {}\n", .{err});
+        std.debug.print("[Mixed] Connection failed: target={s}:{d} proxy={s} err={}\n", .{ host, port, proxy_name, err });
         _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         conn.stream.close();
         return;
@@ -236,27 +238,32 @@ fn extractHost(request: []const u8) ![]const u8 {
 }
 
 fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
-    std.debug.print("[Relay] Starting relay\n", .{});
+    relayLog("Starting relay", .{});
     var poll_fds = [_]std.posix.pollfd{
         .{ .fd = client_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
         .{ .fd = target_stream.base_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
     };
 
     var buf: [8192]u8 = undefined;
+    const idle_timeout_ms: i32 = 30_000;
 
     while (true) {
-        _ = try std.posix.poll(&poll_fds, -1);
+        const poll_ret = try std.posix.poll(&poll_fds, idle_timeout_ms);
+        if (poll_ret == 0) {
+            relayLog("Idle timeout reached, closing relay", .{});
+            return error.RelayIdleTimeout;
+        }
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
             const n = try std.posix.read(client_stream.handle, &buf);
-            std.debug.print("[Relay] Client -> Proxy: {} bytes\n", .{n});
+            relayLog("Client -> Proxy: {} bytes", .{n});
             if (n == 0) break;
             try target_stream.write(buf[0..n]);
         }
 
         if (poll_fds[1].revents & std.posix.POLL.IN != 0) {
             const n = try target_stream.read(&buf);
-            std.debug.print("[Relay] Proxy -> Client: {} bytes\n", .{n});
+            relayLog("Proxy -> Client: {} bytes", .{n});
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
@@ -267,9 +274,16 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         if ((poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0 or
             (poll_fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0)
         {
-            std.debug.print("[Relay] Poll error/hup\n", .{});
+            relayLog("Poll error/hup", .{});
             break;
         }
     }
-    std.debug.print("[Relay] Done\n", .{});
+    relayLog("Done", .{});
+}
+
+fn relayLog(comptime format: []const u8, args: anytype) void {
+    const ts = std.time.timestamp();
+    std.debug.print("[{d}] [Relay] ", .{ts});
+    std.debug.print(format, args);
+    std.debug.print("\n", .{});
 }

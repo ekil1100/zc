@@ -7,6 +7,7 @@ const socks5_proxy = @import("proxy/socks5.zig");
 const mixed_proxy = @import("proxy/mixed.zig");
 const rule_engine = @import("rule/engine.zig");
 const outbound = @import("proxy/outbound/manager.zig");
+const meta = @import("meta.zig");
 const api = @import("api/server.zig");
 const tui = @import("tui.zig");
 const daemon = @import("daemon.zig");
@@ -14,6 +15,7 @@ const proxy_cli = @import("proxy_cli.zig");
 const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
 const build_options = @import("build_options");
+const UpdateApplyMode = daemon.ApplyMode;
 
 // 全局配置路径，用于重载
 var g_config_path: ?[]const u8 = null;
@@ -171,13 +173,12 @@ pub fn main() !void {
 
         if (std.mem.eql(u8, subcmd, "download")) {
             if (args.len < 4) {
-                std.debug.print("Usage: zc config download <url> [-n <name>] [-d]\n", .{});
+                std.debug.print("Usage: zc config download <url> [-n <name>]\n", .{});
                 return;
             }
 
             const url = args[3];
             var download_name: ?[]const u8 = null;
-            var set_default = false;
 
             var i: usize = 4;
             while (i < args.len) : (i += 1) {
@@ -186,25 +187,43 @@ pub fn main() !void {
                         download_name = args[i + 1];
                         i += 1;
                     }
-                } else if (std.mem.eql(u8, args[i], "-d")) {
-                    set_default = true;
                 }
             }
 
-            const filename = try config.downloadConfig(allocator, url, download_name);
-            defer if (filename) |f| allocator.free(f);
-
-            if (set_default and filename != null) {
-                try config.switchConfig(allocator, filename.?);
-            }
+            const key = try config.downloadConfig(allocator, url, download_name);
+            defer if (key) |k| allocator.free(k);
             return;
         }
 
         if (std.mem.eql(u8, subcmd, "update")) {
             var config_name: ?[]const u8 = null;
+            var apply_mode: UpdateApplyMode = .auto;
 
-            if (args.len >= 4) {
-                config_name = args[3];
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--apply")) {
+                    if (i + 1 >= args.len) {
+                        std.debug.print("Usage: zc config update [<name>] [--apply <auto|hot|restart>]\n", .{});
+                        return;
+                    }
+                    apply_mode = parseUpdateApplyMode(args[i + 1]) catch {
+                        std.debug.print("Invalid --apply value: {s}\n", .{args[i + 1]});
+                        std.debug.print("Expected one of: auto, hot, restart\n", .{});
+                        return;
+                    };
+                    i += 1;
+                } else if (std.mem.startsWith(u8, args[i], "--apply=")) {
+                    const value = args[i]["--apply=".len..];
+                    apply_mode = parseUpdateApplyMode(value) catch {
+                        std.debug.print("Invalid --apply value: {s}\n", .{value});
+                        std.debug.print("Expected one of: auto, hot, restart\n", .{});
+                        return;
+                    };
+                } else if (args[i].len > 0 and args[i][0] != '-') {
+                    if (config_name == null) {
+                        config_name = args[i];
+                    }
+                }
             }
 
             const current_config = config.getCurrentConfigName(allocator) catch null;
@@ -219,8 +238,20 @@ pub fn main() !void {
             const filename = try config.updateConfig(allocator, target_name);
             defer if (filename) |f| allocator.free(f);
 
-            if (filename) |f| {
-                std.debug.print("Config updated: {s}\n", .{f});
+            if (filename != null) {
+                // 应用策略：auto(默认)/hot/restart
+                if (try daemon.isRunning(allocator)) {
+                    const result = daemon.reloadOrRestart(allocator, null, json_output, apply_mode) catch |err| {
+                        std.debug.print("Failed to apply updated config: {s}\n", .{@errorName(err)});
+                        return err;
+                    };
+
+                    switch (result) {
+                        .hot_applied => std.debug.print("Config applied via hot reload\n", .{}),
+                        .restart_applied => std.debug.print("Config applied via restart\n", .{}),
+                        .restart_fallback => std.debug.print("Config hot reload unavailable, fell back to restart\n", .{}),
+                    }
+                }
             }
             return;
         }
@@ -726,6 +757,13 @@ fn parseConfigPathArg(args: []const []const u8, start_index: usize) ?[]const u8 
     return null;
 }
 
+fn parseUpdateApplyMode(s: []const u8) !UpdateApplyMode {
+    if (std.mem.eql(u8, s, "auto")) return .auto;
+    if (std.mem.eql(u8, s, "hot")) return .hot;
+    if (std.mem.eql(u8, s, "restart")) return .restart;
+    return error.InvalidApplyMode;
+}
+
 fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: bool) !void {
     std.debug.print("zc v{s}\n", .{build_options.version});
 
@@ -741,9 +779,16 @@ fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: boo
     // 启动前端口占用预检（可能修改 external-controller 端口）
     try preflightPortCheck(&cfg);
 
-    // Initialize outbound manager
-    var manager = try outbound.OutboundManager.init(allocator, &cfg);
+    // 获取当前配置 key
+    const config_key = config.getCurrentConfigName(allocator) catch null;
+    defer if (config_key) |k| allocator.free(k);
+
+    // Initialize outbound manager with config key
+    var manager = try outbound.OutboundManager.initWithKey(allocator, &cfg, config_key);
     defer manager.deinit();
+
+    // 从 meta.json 恢复持久化的节点选择
+    manager.loadPersistedSelections();
 
     // Initialize rule engine
     var engine = try rule_engine.Engine.init(allocator, &cfg.rules);
@@ -1160,4 +1205,13 @@ test "hasInProcessPortConflict detects conflicts" {
     cfg.mixed_port = 7892;
     cfg.external_controller = try allocator.dupe(u8, "127.0.0.1:7892");
     try testing.expect(try hasInProcessPortConflict(&cfg));
+}
+
+test "parseUpdateApplyMode supports auto hot restart" {
+    const testing = std.testing;
+
+    try testing.expectEqual(UpdateApplyMode.auto, try parseUpdateApplyMode("auto"));
+    try testing.expectEqual(UpdateApplyMode.hot, try parseUpdateApplyMode("hot"));
+    try testing.expectEqual(UpdateApplyMode.restart, try parseUpdateApplyMode("restart"));
+    try testing.expectError(error.InvalidApplyMode, parseUpdateApplyMode("noop"));
 }

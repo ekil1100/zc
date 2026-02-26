@@ -31,6 +31,9 @@ pub const ShadowsocksClient = struct {
     // Leftover data after stripping HTTP headers / server salt
     read_leftover: ?[]u8 = null,
 
+    // Decrypted payload leftover when a chunk exceeds caller's buffer
+    read_payload_leftover: ?[]u8 = null,
+
     pub fn init(allocator: std.mem.Allocator, server: []const u8, port: u16, password: []const u8, cipher: []const u8) !ShadowsocksClient {
         const cipher_type = aead.parseCipherType(cipher) orelse return error.UnsupportedCipher;
         return ShadowsocksClient{
@@ -59,6 +62,7 @@ pub const ShadowsocksClient = struct {
             self.allocator.free(o.host);
         }
         if (self.read_leftover) |lo| self.allocator.free(lo);
+        if (self.read_payload_leftover) |lo| self.allocator.free(lo);
         if (self.stream) |s| s.close();
     }
 
@@ -74,6 +78,7 @@ pub const ShadowsocksClient = struct {
         // 2. TCP connect
         var stream = try net.tcpConnectToAddress(addr_list.addrs[0]);
         std.debug.print("[SS] TCP connected\n", .{});
+        try setSocketTimeouts(stream.handle, 15_000);
 
         // 3. Generate client salt (size = key length per SS AEAD spec)
         const salt_len = self.cipher_type.saltLen();
@@ -118,6 +123,15 @@ pub const ShadowsocksClient = struct {
         self.dec_ctx = null;
         self.read_leftover = null;
         return stream;
+    }
+
+    fn setSocketTimeouts(fd: std.posix.fd_t, timeout_ms: u32) !void {
+        const tv = std.posix.timeval{
+            .sec = @intCast(timeout_ms / 1000),
+            .usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
     }
 
     /// Send initial SS data wrapped in HTTP obfs request
@@ -170,6 +184,21 @@ pub const ShadowsocksClient = struct {
 
     /// 接收并解密数据
     pub fn read(self: *ShadowsocksClient, buf: []u8) !usize {
+        // First, drain any leftover decrypted payload from a previous oversized chunk
+        if (self.read_payload_leftover) |leftover| {
+            const copy_len = @min(leftover.len, buf.len);
+            @memcpy(buf[0..copy_len], leftover[0..copy_len]);
+            if (copy_len < leftover.len) {
+                const remaining = try self.allocator.dupe(u8, leftover[copy_len..]);
+                self.allocator.free(leftover);
+                self.read_payload_leftover = remaining;
+            } else {
+                self.allocator.free(leftover);
+                self.read_payload_leftover = null;
+            }
+            return copy_len;
+        }
+
         const stream = self.stream orelse return error.NotConnected;
 
         // Lazy init: on first read, strip obfs headers + read server salt → init dec_ctx
@@ -185,7 +214,6 @@ pub const ShadowsocksClient = struct {
         try self.readExactBuffered(stream, &len_hdr);
 
         const payload_len = try ctx.decryptLen(&len_hdr);
-        if (payload_len > buf.len) return error.BufferTooSmall;
 
         // Read encrypted payload + tag
         const enc_payload_len = payload_len + tag_len;
@@ -194,8 +222,21 @@ pub const ShadowsocksClient = struct {
 
         try self.readExactBuffered(stream, enc_payload);
 
-        try ctx.decryptPayload(enc_payload, buf);
-        return payload_len;
+        if (payload_len <= buf.len) {
+            // Fast path: caller buffer is large enough
+            try ctx.decryptPayload(enc_payload, buf[0..payload_len]);
+            return payload_len;
+        } else {
+            // Oversized chunk: decrypt into temp buffer, return partial, save rest
+            const tmp = try self.allocator.alloc(u8, payload_len);
+            defer self.allocator.free(tmp);
+
+            try ctx.decryptPayload(enc_payload, tmp);
+
+            @memcpy(buf, tmp[0..buf.len]);
+            self.read_payload_leftover = try self.allocator.dupe(u8, tmp[buf.len..]);
+            return buf.len;
+        }
     }
 
     /// Initialize decryption context: strip obfs HTTP response + read server salt

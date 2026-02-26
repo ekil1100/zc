@@ -1167,4 +1167,25 @@ R1 PORT_TYPE_INT | R2 LOG_LEVEL_ENUM | R3 PROXY_GROUP_TYPE_CHECK | R4 DNS_FIELD_
   - DoD：创建贡献指南；添加 issue 模板
   - 预估：1h
 
+- [ ] P20-1F [1.2] 修复 brew update 卡住（zc mixed + outbound）
+  - 范围：`src/proxy/outbound/manager.zig`、`src/proxy/mixed.zig`、相关测试
+  - DoD：`brew update` 经 zc 代理不再卡住；日志不再出现循环 `error.BufferTooSmall`；新增并发回归测试通过
+  - 状态：DONE（2026-02-26 23:37:23 +0800）
+  - 备注：已改为全协议按连接实例化客户端；补充 mixed 路由/失败上下文日志；`zig build test` 通过
+  - 预估：2h
+
+- [ ] P20-1G [1.2] config update 热加载与 meta 稳定化（TDD）
+  - 范围：`src/main.zig`、`src/daemon.zig`、`src/meta.zig`、`src/proxy/outbound/manager.zig`、相关测试
+  - DoD：先写失败测试；`config update --apply=<auto|hot|restart>` 可用；默认 auto（热加载优先，必要时回退重启）；meta 改用 std.json 解析；`loadPersistedSelections` 不触发写盘；`generateKey` 去除 modulo bias
+  - 状态：DONE（2026-02-26 23:55:59 +0800）
+  - 备注：已按 TDD 先加失败测试（apply mode / unicode escape），实现后 `zig build test` 通过；按确认不做 sidecar 迁移、不改 TOML
+  - 预估：4h
+
+- [ ] P20-1H [1.2] 修复 relay 卡死（brew/cask 大文件下载场景）
+  - 范围：`src/proxy/mixed.zig`、`src/proxy/outbound/shadowsocks.zig`
+  - DoD：relay 增加时间戳日志；无数据超时可退出并重试而非无限挂起；`zig build test` 通过
+  - 状态：DONE（2026-02-27 00:09:09 +0800）
+  - 备注：已为 relay 日志加时间戳、poll 空闲超时（30s）、SS socket 收发超时（15s）；`zig build test` 通过
+  - 预估：1.5h
+
 - NEXT（唯一）：P20-1A（安装指南整合，文档收尾）

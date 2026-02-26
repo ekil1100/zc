@@ -6,6 +6,18 @@ const constants = @import("constants.zig");
 const PID_FILE = "/tmp/zc.pid";
 const LOG_FILE = "/tmp/zc.log";
 
+pub const ApplyMode = enum {
+    auto,
+    hot,
+    restart,
+};
+
+pub const ApplyResult = enum {
+    hot_applied,
+    restart_applied,
+    restart_fallback,
+};
+
 /// 获取 PID 文件路径
 pub fn getPidFilePath(allocator: std.mem.Allocator) ![]const u8 {
     // 优先使用 XDG_RUNTIME_DIR，否则使用 /tmp
@@ -375,6 +387,34 @@ pub fn restartDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, jso
 
     try startDaemon(allocator, config_path, json_output);
     printCliOk(json_output, "restart", "running", null, null);
+}
+
+pub fn reloadDaemon(_: std.mem.Allocator, _: ?[]const u8, _: bool) !void {
+    return error.HotReloadUnsupported;
+}
+
+pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool, apply_mode: ApplyMode) !ApplyResult {
+    if (!try isRunning(allocator)) {
+        return .hot_applied;
+    }
+
+    switch (apply_mode) {
+        .restart => {
+            try restartDaemon(allocator, config_path, json_output);
+            return .restart_applied;
+        },
+        .hot => {
+            try reloadDaemon(allocator, config_path, json_output);
+            return .hot_applied;
+        },
+        .auto => {
+            reloadDaemon(allocator, config_path, json_output) catch {
+                try restartDaemon(allocator, config_path, json_output);
+                return .restart_fallback;
+            };
+            return .hot_applied;
+        },
+    }
 }
 
 /// 获取状态

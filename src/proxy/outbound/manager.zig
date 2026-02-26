@@ -3,6 +3,7 @@ const net = std.net;
 const Config = @import("../../config.zig").Config;
 const Proxy = @import("../../config.zig").Proxy;
 const ProxyType = @import("../../config.zig").ProxyType;
+const meta = @import("../../meta.zig");
 const ss = @import("shadowsocks.zig");
 const vmess = @import("../../protocol/vmess.zig");
 const trojan = @import("../../protocol/trojan.zig");
@@ -11,8 +12,10 @@ const vless = @import("../../protocol/vless.zig");
 /// 代理流包装器
 pub const ProxyStream = struct {
     base_stream: net.Stream,
-    ss_client: ?*ss.ShadowsocksClient = null,
+    allocator: ?std.mem.Allocator = null,
+    owned_ss_client: ?*ss.ShadowsocksClient = null,
     is_encrypted: bool = false,
+    is_closed: bool = false,
 
     pub fn initDirect(stream: net.Stream) ProxyStream {
         return .{
@@ -21,17 +24,18 @@ pub const ProxyStream = struct {
         };
     }
 
-    pub fn initShadowsocks(stream: net.Stream, client: *ss.ShadowsocksClient) ProxyStream {
+    pub fn initShadowsocks(allocator: std.mem.Allocator, stream: net.Stream, client: *ss.ShadowsocksClient) ProxyStream {
         return .{
             .base_stream = stream,
-            .ss_client = client,
+            .allocator = allocator,
+            .owned_ss_client = client,
             .is_encrypted = true,
         };
     }
 
     pub fn write(self: *ProxyStream, data: []const u8) !void {
         if (self.is_encrypted) {
-            try self.ss_client.?.write(data);
+            try self.owned_ss_client.?.write(data);
         } else {
             try self.base_stream.writeAll(data);
         }
@@ -39,14 +43,21 @@ pub const ProxyStream = struct {
 
     pub fn read(self: *ProxyStream, buf: []u8) !usize {
         if (self.is_encrypted) {
-            return try self.ss_client.?.read(buf);
+            return try self.owned_ss_client.?.read(buf);
         } else {
             return try self.base_stream.read(buf);
         }
     }
 
     pub fn close(self: *ProxyStream) void {
+        if (self.is_closed) return;
+        self.is_closed = true;
         self.base_stream.close();
+        if (self.owned_ss_client) |client| {
+            client.deinit();
+            self.allocator.?.destroy(client);
+            self.owned_ss_client = null;
+        }
     }
 
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
@@ -58,132 +69,52 @@ pub const ProxyStream = struct {
 pub const OutboundManager = struct {
     allocator: std.mem.Allocator,
     config: *const Config,
-    ss_clients: std.StringHashMap(*ss.ShadowsocksClient),
-    vmess_clients: std.StringHashMap(*vmess.Client),
-    trojan_clients: std.StringHashMap(*trojan.Client),
-    vless_clients: std.StringHashMap(*vless.Client),
 
     /// 每个代理组的当前选择（group_name → proxy_name）
     group_selections: std.StringHashMap([]const u8),
 
-    pub fn init(allocator: std.mem.Allocator, config: *const Config) !OutboundManager {
-        var manager = OutboundManager{
-            .allocator = allocator,
-            .config = config,
-            .ss_clients = std.StringHashMap(*ss.ShadowsocksClient).init(allocator),
-            .vmess_clients = std.StringHashMap(*vmess.Client).init(allocator),
-            .trojan_clients = std.StringHashMap(*trojan.Client).init(allocator),
-            .vless_clients = std.StringHashMap(*vless.Client).init(allocator),
-            .group_selections = std.StringHashMap([]const u8).init(allocator),
-        };
+    /// 当前配置 key（用于持久化 selections 到 meta.json）
+    config_key: ?[]const u8 = null,
+    persist_invocations: usize = 0,
 
-        // 预初始化代理客户端
-        for (config.proxies.items) |*proxy| {
-            if (proxy.proxy_type == .ss) {
-                std.debug.print("[Manager] SS proxy: {s}, obfs_mode={s}, obfs_host={s}, plugin={s}\n", .{ proxy.name, proxy.obfs_mode orelse "null", proxy.obfs_host orelse "null", proxy.plugin orelse "null" });
-            }
-            switch (proxy.proxy_type) {
-                .ss => {
-                    const client = try allocator.create(ss.ShadowsocksClient);
-                    // 启用 obfs
-                    const use_obfs = true;
-                    if (use_obfs and proxy.obfs_mode != null) {
-                        const obfs_mode = proxy.obfs_mode.?;
-                        const obfs_host = proxy.obfs_host orelse proxy.server;
-                        client.* = try ss.ShadowsocksClient.initWithObfs(
-                            allocator,
-                            proxy.server,
-                            proxy.port,
-                            proxy.password orelse "",
-                            proxy.cipher orelse "aes-128-gcm",
-                            obfs_mode,
-                            obfs_host,
-                        );
-                    } else {
-                        client.* = try ss.ShadowsocksClient.init(
-                            allocator,
-                            proxy.server,
-                            proxy.port,
-                            proxy.password orelse "",
-                            proxy.cipher orelse "aes-128-gcm",
-                        );
-                    }
-                    try manager.ss_clients.put(proxy.name, client);
-                },
-                .vmess => {
-                    const client = try allocator.create(vmess.Client);
-                    client.* = try vmess.Client.init(allocator, .{
-                        .id = proxy.uuid orelse return error.MissingUuid,
-                        .address = proxy.server,
-                        .port = proxy.port,
-                        .alter_id = proxy.alter_id,
-                    });
-                    try manager.vmess_clients.put(proxy.name, client);
-                },
-                .trojan => {
-                    const client = try allocator.create(trojan.Client);
-                    client.* = try trojan.Client.init(allocator, .{
-                        .password = proxy.password orelse return error.MissingPassword,
-                        .address = proxy.server,
-                        .port = proxy.port,
-                        .sni = proxy.sni,
-                        .skip_cert_verify = proxy.skip_cert_verify,
-                    });
-                    try manager.trojan_clients.put(proxy.name, client);
-                },
-                .vless => {
-                    const client = try allocator.create(vless.Client);
-                    client.* = try vless.Client.init(allocator, .{
-                        .id = proxy.uuid orelse return error.MissingUuid,
-                        .address = proxy.server,
-                        .port = proxy.port,
-                    });
-                    try manager.vless_clients.put(proxy.name, client);
-                },
-                else => {},
-            }
-        }
+    pub fn init(allocator: std.mem.Allocator, config_arg: *const Config) !OutboundManager {
+        return try initWithKey(allocator, config_arg, null);
+    }
+
+    pub fn initWithKey(allocator: std.mem.Allocator, config_arg: *const Config, config_key: ?[]const u8) !OutboundManager {
+        const manager = OutboundManager{
+            .allocator = allocator,
+            .config = config_arg,
+            .group_selections = std.StringHashMap([]const u8).init(allocator),
+            .config_key = if (config_key) |k| allocator.dupe(u8, k) catch null else null,
+        };
 
         return manager;
     }
 
     pub fn deinit(self: *OutboundManager) void {
-        var iter = self.ss_clients.valueIterator();
-        while (iter.next()) |client| {
-            client.*.deinit();
-            self.allocator.destroy(client.*);
-        }
-        self.ss_clients.deinit();
-
-        var vmess_iter = self.vmess_clients.valueIterator();
-        while (vmess_iter.next()) |client| {
-            self.allocator.destroy(client.*);
-        }
-        self.vmess_clients.deinit();
-
-        var trojan_iter = self.trojan_clients.valueIterator();
-        while (trojan_iter.next()) |client| {
-            self.allocator.destroy(client.*);
-        }
-        self.trojan_clients.deinit();
-
-        var vless_iter = self.vless_clients.valueIterator();
-        while (vless_iter.next()) |client| {
-            self.allocator.destroy(client.*);
-        }
-        self.vless_clients.deinit();
         self.group_selections.deinit();
+        if (self.config_key) |k| self.allocator.free(k);
     }
 
     /// 设置代理组的选择（由 TUI/API 调用）
     /// 注意：存储 config 中的稳定字符串引用，而非调用者的临时切片
     pub fn selectProxy(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8) void {
+        self.selectProxyInternal(group_name, proxy_name, true);
+    }
+
+    fn selectProxyInternal(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8, persist: bool) void {
         for (self.config.proxy_groups.items) |grp| {
             if (std.mem.eql(u8, grp.name, group_name)) {
                 for (grp.proxies.items) |pname| {
                     if (std.mem.eql(u8, pname, proxy_name)) {
                         self.group_selections.put(grp.name, pname) catch {};
                         std.debug.print("[Manager] Group '{s}' selected: {s}\n", .{ grp.name, pname });
+
+                        if (persist) {
+                            // 持久化到 meta.json
+                            self.persistSelections();
+                        }
                         return;
                     }
                 }
@@ -192,6 +123,59 @@ pub const OutboundManager = struct {
             }
         }
         std.debug.print("[Manager] Group '{s}' not found\n", .{group_name});
+    }
+
+    /// 持久化当前 selections 到 meta.json
+    fn persistSelections(self: *OutboundManager) void {
+        const key = self.config_key orelse return;
+        self.persist_invocations += 1;
+
+        var meta_data = meta.load(self.allocator) catch return;
+        defer meta_data.deinit();
+
+        const entry = meta_data.configs.getPtr(key) orelse return;
+
+        // 清除旧的 selections
+        {
+            var it = entry.selections.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                self.allocator.free(e.value_ptr.*);
+            }
+            entry.selections.clearRetainingCapacity();
+        }
+
+        // 写入当前 selections
+        var sel_it = self.group_selections.iterator();
+        while (sel_it.next()) |e| {
+            const gn = self.allocator.dupe(u8, e.key_ptr.*) catch continue;
+            const pn = self.allocator.dupe(u8, e.value_ptr.*) catch {
+                self.allocator.free(gn);
+                continue;
+            };
+            entry.selections.put(gn, pn) catch {
+                self.allocator.free(gn);
+                self.allocator.free(pn);
+                continue;
+            };
+        }
+
+        meta.save(self.allocator, &meta_data) catch {};
+    }
+
+    /// 从 meta.json 加载持久化的 selections
+    pub fn loadPersistedSelections(self: *OutboundManager) void {
+        const key = self.config_key orelse return;
+
+        var meta_data = meta.load(self.allocator) catch return;
+        defer meta_data.deinit();
+
+        const cm = meta_data.configs.get(key) orelse return;
+
+        var it = cm.selections.iterator();
+        while (it.next()) |entry| {
+            self.selectProxyInternal(entry.key_ptr.*, entry.value_ptr.*, false);
+        }
     }
 
     /// 根据代理名称建立连接（返回加密的代理流）
@@ -247,26 +231,45 @@ pub const OutboundManager = struct {
                 return error.ConnectionRejected;
             },
             .ss => {
-                const client = self.ss_clients.get(proxy.name) orelse return error.ClientNotFound;
+                const client = try self.makeShadowsocksClient(proxy);
+                errdefer {
+                    client.deinit();
+                    self.allocator.destroy(client);
+                }
                 const addr = ss.Address{
                     .host = target,
                     .port = port,
                 };
                 const stream = try client.connect(addr);
-                return ProxyStream.initShadowsocks(stream, client);
+                return ProxyStream.initShadowsocks(self.allocator, stream, client);
             },
             .vmess => {
-                const client = self.vmess_clients.get(proxy.name) orelse return error.ClientNotFound;
+                var client = try vmess.Client.init(self.allocator, .{
+                    .id = proxy.uuid orelse return error.MissingUuid,
+                    .address = proxy.server,
+                    .port = proxy.port,
+                    .alter_id = proxy.alter_id,
+                });
                 const stream = try client.connect(target, port);
                 return ProxyStream.initDirect(stream);
             },
             .trojan => {
-                const client = self.trojan_clients.get(proxy.name) orelse return error.ClientNotFound;
+                var client = try trojan.Client.init(self.allocator, .{
+                    .password = proxy.password orelse return error.MissingPassword,
+                    .address = proxy.server,
+                    .port = proxy.port,
+                    .sni = proxy.sni,
+                    .skip_cert_verify = proxy.skip_cert_verify,
+                });
                 const stream = try client.connect(target, port);
                 return ProxyStream.initDirect(stream);
             },
             .vless => {
-                const client = self.vless_clients.get(proxy.name) orelse return error.ClientNotFound;
+                var client = try vless.Client.init(self.allocator, .{
+                    .id = proxy.uuid orelse return error.MissingUuid,
+                    .address = proxy.server,
+                    .port = proxy.port,
+                });
                 const stream = try client.connect(target, port);
                 return ProxyStream.initDirect(stream);
             },
@@ -275,6 +278,34 @@ pub const OutboundManager = struct {
                 return error.NotImplemented;
             },
         }
+    }
+
+    fn makeShadowsocksClient(self: *OutboundManager, proxy: *const Proxy) !*ss.ShadowsocksClient {
+        const client = try self.allocator.create(ss.ShadowsocksClient);
+        errdefer self.allocator.destroy(client);
+
+        if (proxy.obfs_mode) |obfs_mode| {
+            const obfs_host = proxy.obfs_host orelse proxy.server;
+            client.* = try ss.ShadowsocksClient.initWithObfs(
+                self.allocator,
+                proxy.server,
+                proxy.port,
+                proxy.password orelse "",
+                proxy.cipher orelse "aes-128-gcm",
+                obfs_mode,
+                obfs_host,
+            );
+        } else {
+            client.* = try ss.ShadowsocksClient.init(
+                self.allocator,
+                proxy.server,
+                proxy.port,
+                proxy.password orelse "",
+                proxy.cipher orelse "aes-128-gcm",
+            );
+        }
+
+        return client;
     }
 
     /// 解析代理组为实际代理名称
@@ -306,3 +337,76 @@ pub const OutboundManager = struct {
         return null;
     }
 };
+
+test "makeShadowsocksClient returns isolated instances" {
+    const allocator = std.testing.allocator;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    const proxy = Proxy{
+        .name = "ss-test",
+        .proxy_type = .ss,
+        .server = "127.0.0.1",
+        .port = 8388,
+        .password = "password",
+        .cipher = "aes-128-gcm",
+        .obfs_mode = "http",
+        .obfs_host = "example.com",
+    };
+
+    const c1 = try manager.makeShadowsocksClient(&proxy);
+    defer {
+        c1.deinit();
+        allocator.destroy(c1);
+    }
+    const c2 = try manager.makeShadowsocksClient(&proxy);
+    defer {
+        c2.deinit();
+        allocator.destroy(c2);
+    }
+
+    try std.testing.expect(c1 != c2);
+    try std.testing.expect(c1.stream == null);
+    try std.testing.expect(c2.stream == null);
+}
+
+test "selectProxyInternal with persist=false skips persist" {
+    const allocator = std.testing.allocator;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var gp = @import("../../config.zig").ProxyGroup{
+        .name = try allocator.dupe(u8, "G1"),
+        .group_type = .select,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+    try gp.proxies.append(allocator, try allocator.dupe(u8, "P1"));
+    try cfg.proxy_groups.append(allocator, gp);
+
+    var mgr = try OutboundManager.init(allocator, &cfg);
+    defer mgr.deinit();
+
+    mgr.selectProxyInternal("G1", "P1", false);
+    try std.testing.expectEqual(@as(usize, 0), mgr.persist_invocations);
+}
