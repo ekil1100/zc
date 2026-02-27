@@ -4,6 +4,7 @@ const outbound = @import("outbound/manager.zig");
 const ProxyStream = outbound.ProxyStream;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = outbound.OutboundManager;
+const ss = @import("outbound/shadowsocks.zig");
 
 /// 混合端口（HTTP + SOCKS5）
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
@@ -18,14 +19,37 @@ pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, 
 
     while (true) {
         const conn = try server.accept();
-
-        // 为每个连接创建独立任务
-        const conn_allocator = allocator;
-        handleConnection(conn_allocator, conn, engine, manager) catch |err| {
-            std.debug.print("Mixed connection error: {}\n", .{err});
-            conn.stream.close();
-        };
+        try spawnConnectionTask(allocator, conn, engine, manager);
     }
+}
+
+const ConnTask = struct {
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    engine: *Engine,
+    manager: *OutboundManager,
+};
+
+fn spawnConnectionTask(allocator: std.mem.Allocator, conn: net.Server.Connection, engine: *Engine, manager: *OutboundManager) !void {
+    const task = try allocator.create(ConnTask);
+    errdefer allocator.destroy(task);
+    task.* = .{
+        .allocator = allocator,
+        .conn = conn,
+        .engine = engine,
+        .manager = manager,
+    };
+
+    const thread = try std.Thread.spawn(.{}, connectionTaskMain, .{task});
+    thread.detach();
+}
+
+fn connectionTaskMain(task: *ConnTask) void {
+    defer task.allocator.destroy(task);
+    handleConnection(task.allocator, task.conn, task.engine, task.manager) catch |err| {
+        std.debug.print("Mixed connection error: {}\n", .{err});
+        task.conn.stream.close();
+    };
 }
 
 fn handleConnection(allocator: std.mem.Allocator, conn: net.Server.Connection, engine: *Engine, manager: *OutboundManager) !void {
@@ -246,39 +270,156 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
 
     var buf: [8192]u8 = undefined;
     const idle_timeout_ms: i32 = 30_000;
+    var up_bytes: usize = 0;
+    var down_bytes: usize = 0;
+    var last_report_ms = std.time.milliTimestamp();
 
     while (true) {
+        // Important: encrypted upstream may still have decrypted leftover bytes in memory
+        // even when socket has no new readable event.
+        try drainTargetPending(client_stream, target_stream, &buf, &down_bytes);
+
         const poll_ret = try std.posix.poll(&poll_fds, idle_timeout_ms);
         if (poll_ret == 0) {
+            relayFlushStats(&up_bytes, &down_bytes, true);
             relayLog("Idle timeout reached, closing relay", .{});
             return error.RelayIdleTimeout;
         }
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
             const n = try std.posix.read(client_stream.handle, &buf);
-            relayLog("Client -> Proxy: {} bytes", .{n});
             if (n == 0) break;
             try target_stream.write(buf[0..n]);
+            up_bytes += n;
         }
 
         if (poll_fds[1].revents & std.posix.POLL.IN != 0) {
             const n = try target_stream.read(&buf);
-            relayLog("Proxy -> Client: {} bytes", .{n});
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
                 written += try std.posix.write(client_stream.handle, buf[written..n]);
             }
+            down_bytes += n;
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - last_report_ms >= 1000) {
+            relayFlushStats(&up_bytes, &down_bytes, false);
+            last_report_ms = now_ms;
         }
 
         if ((poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0 or
             (poll_fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0)
         {
+            relayFlushStats(&up_bytes, &down_bytes, true);
             relayLog("Poll error/hup", .{});
             break;
         }
     }
+    relayFlushStats(&up_bytes, &down_bytes, true);
     relayLog("Done", .{});
+}
+
+fn drainTargetPending(client_stream: net.Stream, target_stream: *ProxyStream, buf: []u8, down_bytes: *usize) !void {
+    while (target_stream.hasPendingRead()) {
+        const n = try target_stream.read(buf);
+        if (n == 0) break;
+        var written: usize = 0;
+        while (written < n) {
+            written += try std.posix.write(client_stream.handle, buf[written..n]);
+        }
+        down_bytes.* += n;
+    }
+}
+
+fn relayFlushStats(up_bytes: *usize, down_bytes: *usize, force: bool) void {
+    if (up_bytes.* == 0 and down_bytes.* == 0 and !force) return;
+    relayLog("window traffic: up={}B down={}B", .{ up_bytes.*, down_bytes.* });
+    up_bytes.* = 0;
+    down_bytes.* = 0;
+}
+
+test "relay drains SS pending leftover without poll event" {
+    const allocator = std.testing.allocator;
+
+    var client_fds: [2]std.posix.fd_t = undefined;
+    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &client_fds);
+    defer std.posix.close(client_fds[0]);
+    defer std.posix.close(client_fds[1]);
+
+    var target_fds: [2]std.posix.fd_t = undefined;
+    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &target_fds);
+    defer std.posix.close(target_fds[0]);
+    defer std.posix.close(target_fds[1]);
+
+    const client_stream = net.Stream{ .handle = client_fds[0] };
+    const peer_stream = net.Stream{ .handle = client_fds[1] };
+    const target_base = net.Stream{ .handle = target_fds[0] };
+
+    const ss_client = try allocator.create(ss.ShadowsocksClient);
+    errdefer allocator.destroy(ss_client);
+    ss_client.* = try ss.ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    ss_client.read_payload_leftover = try allocator.dupe(u8, "hello");
+
+    var target_stream = ProxyStream.initShadowsocks(allocator, target_base, ss_client);
+    defer target_stream.close();
+
+    var relay_thread = try std.Thread.spawn(.{}, struct {
+        fn run(cs: net.Stream, ts: *ProxyStream) void {
+            _ = relay(cs, ts) catch {};
+        }
+    }.run, .{ client_stream, &target_stream });
+
+    var out: [5]u8 = undefined;
+    const n = try std.posix.read(peer_stream.handle, &out);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("hello", out[0..n]);
+
+    peer_stream.close();
+    relay_thread.join();
+}
+
+test "relay forwards traffic in both directions (direct stream)" {
+    var client_fds: [2]std.posix.fd_t = undefined;
+    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &client_fds);
+    defer std.posix.close(client_fds[0]);
+    defer std.posix.close(client_fds[1]);
+
+    var target_fds: [2]std.posix.fd_t = undefined;
+    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &target_fds);
+    defer std.posix.close(target_fds[0]);
+    defer std.posix.close(target_fds[1]);
+
+    const client_stream = net.Stream{ .handle = client_fds[0] };
+    const client_peer = net.Stream{ .handle = client_fds[1] };
+    const target_stream = net.Stream{ .handle = target_fds[0] };
+    const target_peer = net.Stream{ .handle = target_fds[1] };
+
+    var proxy_stream = ProxyStream.initDirect(target_stream);
+    defer proxy_stream.close();
+
+    var relay_thread = try std.Thread.spawn(.{}, struct {
+        fn run(cs: net.Stream, ts: *ProxyStream) void {
+            _ = relay(cs, ts) catch {};
+        }
+    }.run, .{ client_stream, &proxy_stream });
+
+    try std.posix.writeAll(client_peer.handle, "ping");
+    var buf: [4]u8 = undefined;
+    const n1 = try std.posix.read(target_peer.handle, &buf);
+    try std.testing.expectEqual(@as(usize, 4), n1);
+    try std.testing.expectEqualStrings("ping", buf[0..n1]);
+
+    try std.posix.writeAll(target_peer.handle, "pong");
+    var buf2: [4]u8 = undefined;
+    const n2 = try std.posix.read(client_peer.handle, &buf2);
+    try std.testing.expectEqual(@as(usize, 4), n2);
+    try std.testing.expectEqualStrings("pong", buf2[0..n2]);
+
+    client_peer.close();
+    target_peer.close();
+    relay_thread.join();
 }
 
 fn relayLog(comptime format: []const u8, args: anytype) void {

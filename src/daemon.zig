@@ -449,11 +449,13 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
 
     // 首先显示最后 N 行
     const n = lines orelse 50;
-    try printLastNLines(file, n);
+    try printLastNLines(allocator, file, n);
 
     // 如果需要持续刷新
     if (follow) {
         std.debug.print("\n--- Following log (Ctrl+C to exit) ---\n", .{});
+        var carry = std.ArrayList(u8).empty;
+        defer carry.deinit(allocator);
 
         // 获取当前文件位置
         const stat = try file.stat();
@@ -474,12 +476,16 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
                 while (true) {
                     const bytes_read = try file.read(&buffer);
                     if (bytes_read == 0) break;
-                    std.debug.print("{s}", .{buffer[0..bytes_read]});
+                    try printTimestampedChunk(allocator, buffer[0..bytes_read], &carry);
                 }
 
                 last_pos = new_size;
             } else if (new_size < last_pos) {
                 // 文件被截断或轮转，从头开始
+                if (carry.items.len > 0) {
+                    printTimestampedLine(carry.items);
+                    carry.clearRetainingCapacity();
+                }
                 std.debug.print("\n--- Log file rotated, restarting from beginning ---\n", .{});
                 try file.seekTo(0);
                 last_pos = 0;
@@ -489,7 +495,7 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
 }
 
 /// 打印文件最后 N 行
-fn printLastNLines(file: std.fs.File, n: usize) !void {
+fn printLastNLines(allocator: std.mem.Allocator, file: std.fs.File, n: usize) !void {
     const file_size = (try file.stat()).size;
     const max_size = 1024 * 1024 * 10; // 10MB max
     const read_size = @min(file_size, max_size);
@@ -497,11 +503,6 @@ fn printLastNLines(file: std.fs.File, n: usize) !void {
     if (read_size == 0) {
         return;
     }
-
-    // 分配缓冲区
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
     const content = try allocator.alloc(u8, read_size);
     defer allocator.free(content);
@@ -524,6 +525,34 @@ fn printLastNLines(file: std.fs.File, n: usize) !void {
         }
     }
 
-    // 输出内容
-    std.debug.print("{s}", .{content[start_pos..]});
+    try printTimestampedSlice(allocator, content[start_pos..]);
+}
+
+fn printTimestampedSlice(allocator: std.mem.Allocator, content: []const u8) !void {
+    var carry = std.ArrayList(u8).empty;
+    defer carry.deinit(allocator);
+    try printTimestampedChunk(allocator, content, &carry);
+    if (carry.items.len > 0) {
+        printTimestampedLine(carry.items);
+    }
+}
+
+fn printTimestampedChunk(allocator: std.mem.Allocator, chunk: []const u8, carry: *std.ArrayList(u8)) !void {
+    try carry.appendSlice(allocator, chunk);
+
+    while (std.mem.indexOfScalar(u8, carry.items, '\n')) |idx| {
+        const line = carry.items[0..idx];
+        printTimestampedLine(line);
+
+        const remaining = carry.items.len - (idx + 1);
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, carry.items[0..remaining], carry.items[idx + 1 ..]);
+        }
+        carry.shrinkRetainingCapacity(remaining);
+    }
+}
+
+fn printTimestampedLine(line: []const u8) void {
+    const ts = std.time.timestamp();
+    std.debug.print("[{d}] {s}\n", .{ ts, line });
 }

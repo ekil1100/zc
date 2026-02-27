@@ -1188,4 +1188,25 @@ R1 PORT_TYPE_INT | R2 LOG_LEVEL_ENUM | R3 PROXY_GROUP_TYPE_CHECK | R4 DNS_FIELD_
   - 备注：已为 relay 日志加时间戳、poll 空闲超时（30s）、SS socket 收发超时（15s）；`zig build test` 通过
   - 预估：1.5h
 
+- [ ] P20-1I [1.2] relay 日志降采样 + zc log 时间戳
+  - 范围：`src/proxy/mixed.zig`、`src/daemon.zig`
+  - DoD：relay 不再逐包刷日志（按窗口聚合输出）；`zc log` 显示带时间戳行；`zig build test` 通过
+  - 状态：DONE（2026-02-27 00:17:54 +0800）
+  - 备注：relay 改为 1s 窗口流量聚合日志；`zc log` 历史与 follow 输出按行加时间戳；`zig build test` 通过
+  - 预估：1h
+
+- [ ] P20-1J [1.2] 修复 relay 对 SS leftover 的阻塞等待（含 e2e）
+  - 范围：`src/proxy/mixed.zig`、`src/proxy/outbound/manager.zig`、`src/proxy/outbound/shadowsocks.zig`
+  - DoD：relay 在 target 有 pending 解密数据时无需 poll 即可转发；新增 e2e 用例覆盖“leftover 存在但 fd 无可读事件”场景；`zig build test` 通过
+  - 状态：DONE（2026-02-27 00:36:41 +0800）
+  - 备注：已实现 pending leftover 直排转发，新增 e2e（socketpair）复现与验证；`zig build test` 通过
+  - 预估：1h
+
+- [ ] P20-1K [1.2] 修复 mixed 连接串行阻塞（含并发/双向 e2e）
+  - 范围：`src/proxy/mixed.zig`
+  - DoD：accept 后每连接独立线程处理；新增 relay 双向转发 e2e；`zig build test` 通过
+  - 状态：DONE（2026-02-27 00:40:43 +0800）
+  - 备注：mixed 改为每连接独立线程；新增 relay 双向 e2e；`zig build test` 通过
+  - 预估：1h
+
 - NEXT（唯一）：P20-1A（安装指南整合，文档收尾）

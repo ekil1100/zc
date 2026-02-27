@@ -239,6 +239,10 @@ pub const ShadowsocksClient = struct {
         }
     }
 
+    pub fn hasPendingRead(self: *const ShadowsocksClient) bool {
+        return self.read_payload_leftover != null or self.read_leftover != null;
+    }
+
     /// Initialize decryption context: strip obfs HTTP response + read server salt
     fn initDecryptContext(self: *ShadowsocksClient, stream: net.Stream) !void {
         const salt_len = self.cipher_type.saltLen();

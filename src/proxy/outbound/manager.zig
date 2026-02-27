@@ -60,6 +60,11 @@ pub const ProxyStream = struct {
         }
     }
 
+    pub fn hasPendingRead(self: *const ProxyStream) bool {
+        if (!self.is_encrypted) return false;
+        return self.owned_ss_client.?.hasPendingRead();
+    }
+
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
         return self.base_stream.handle;
     }
