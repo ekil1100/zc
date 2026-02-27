@@ -190,11 +190,7 @@ pub const OutboundManager = struct {
         // 处理 DIRECT 和 REJECT 特殊代理
         if (std.mem.eql(u8, proxy_name, "DIRECT")) {
             std.debug.print("[Manager] Using DIRECT\n", .{});
-            var addr_list = try net.getAddressList(self.allocator, target, port);
-            defer addr_list.deinit();
-            if (addr_list.addrs.len == 0) return error.HostNotFound;
-            const stream = try net.tcpConnectToAddress(addr_list.addrs[0]);
-            return ProxyStream.initDirect(stream);
+            return try self.connectDirectTarget(target, port);
         }
         if (std.mem.eql(u8, proxy_name, "REJECT")) {
             return error.ConnectionRejected;
@@ -226,11 +222,7 @@ pub const OutboundManager = struct {
     fn connectToProxy(self: *OutboundManager, proxy: *const Proxy, target: []const u8, port: u16) !ProxyStream {
         switch (proxy.proxy_type) {
             .direct => {
-                var addr_list = try net.getAddressList(self.allocator, target, port);
-                defer addr_list.deinit();
-                if (addr_list.addrs.len == 0) return error.HostNotFound;
-                const stream = try net.tcpConnectToAddress(addr_list.addrs[0]);
-                return ProxyStream.initDirect(stream);
+                return try self.connectDirectTarget(target, port);
             },
             .reject => {
                 return error.ConnectionRejected;
@@ -311,6 +303,25 @@ pub const OutboundManager = struct {
         }
 
         return client;
+    }
+
+    fn connectDirectTarget(self: *OutboundManager, target: []const u8, port: u16) !ProxyStream {
+        var addr_list = net.getAddressList(self.allocator, target, port) catch |err| {
+            std.debug.print("[Manager] Target DNS resolve failed: target={s}:{d} err={}\n", .{ target, port, err });
+            return error.TargetDnsResolveFailed;
+        };
+        defer addr_list.deinit();
+
+        if (addr_list.addrs.len == 0) {
+            std.debug.print("[Manager] Target DNS resolve returned no address: target={s}:{d}\n", .{ target, port });
+            return error.TargetDnsResolveFailed;
+        }
+
+        const stream = net.tcpConnectToAddress(addr_list.addrs[0]) catch |err| {
+            std.debug.print("[Manager] Target TCP connect failed: target={s}:{d} err={}\n", .{ target, port, err });
+            return error.TargetTcpConnectFailed;
+        };
+        return ProxyStream.initDirect(stream);
     }
 
     /// 解析代理组为实际代理名称

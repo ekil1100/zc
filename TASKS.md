@@ -6,6 +6,22 @@
 
 ---
 
+## 临时任务：DNS 断连可观测与重试加固（2026-02-27）
+
+### HOTFIX-DNS-RETRY-OBS
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/proxy/outbound/shadowsocks.zig`, `src/proxy/mixed.zig`, `src/proxy/outbound/shadowsocks_test.zig`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 日志可区分“上游代理域名解析失败（SS server DNS）”与“目标域名解析失败（target DNS）”
+  - [x] DNS 解析失败与 TCP 连接失败均具备 3 次重试，退避时间为 200/500/1000ms
+  - [x] 失败日志包含 attempt 次数与最终失败原因
+  - [x] 新增/更新测试覆盖重试策略关键逻辑
+- 备注：2026-02-27 15:29 +0800 进入 DOING（因现场断连复盘触发）；2026-02-27 15:31 +0800 完成实现与测试（`zig build test` 通过）；2026-02-27 15:47 +0800 补充 SOCKS5 错误映射回归测试并再次通过 `zig build test`。
+
+---
+
 ## 当前冲刺：Phase 0（基线与差距分析）
 
 ### P0-1 能力矩阵对比（mihomo/c vs zc）

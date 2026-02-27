@@ -62,3 +62,11 @@ test "Shadowsocks tag size" {
     const tag_size: usize = 16;
     try testing.expectEqual(@as(usize, 16), tag_size);
 }
+
+test "Shadowsocks retry policy uses 3 attempts and exponential backoff" {
+    try testing.expectEqual(@as(usize, 3), shadowsocks.connect_retry_attempts);
+    try testing.expectEqual(@as(u64, 200), ShadowsocksClient.retryBackoffMs(0));
+    try testing.expectEqual(@as(u64, 500), ShadowsocksClient.retryBackoffMs(1));
+    try testing.expectEqual(@as(u64, 1000), ShadowsocksClient.retryBackoffMs(2));
+    try testing.expectEqual(@as(u64, 1000), ShadowsocksClient.retryBackoffMs(99));
+}

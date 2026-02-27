@@ -148,11 +148,7 @@ fn handleConnection(_allocator: std.mem.Allocator, conn: net.Server.Connection, 
 
     var target_stream = manager.connect(proxy_name, target_host, target_port) catch |err| {
         std.debug.print("[SOCKS5] Connection failed: {}\n", .{err});
-        const reply_code = switch (err) {
-            error.ConnectionRejected => Reply.ConnectionRefused,
-            error.HostNotFound, error.ProxyNotFound => Reply.HostUnreachable,
-            else => Reply.GeneralFailure,
-        };
+        const reply_code = mapConnectErrorToReply(err);
         try sendReply(conn.stream, reply_code, 0, &[_]u8{0} ** 4, 0);
         return;
     };
@@ -213,4 +209,32 @@ fn relaySocks5(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             break;
         }
     }
+}
+
+fn mapConnectErrorToReply(err: anyerror) u8 {
+    return switch (err) {
+        error.ConnectionRejected => Reply.ConnectionRefused,
+        error.ProxyNotFound,
+        error.TargetDnsResolveFailed,
+        error.UpstreamDnsResolveFailed,
+        => Reply.HostUnreachable,
+        error.TargetTcpConnectFailed,
+        error.UpstreamTcpConnectFailed,
+        => Reply.ConnectionRefused,
+        else => Reply.GeneralFailure,
+    };
+}
+
+test "mapConnectErrorToReply maps DNS errors to host unreachable" {
+    try std.testing.expectEqual(@as(u8, Reply.HostUnreachable), mapConnectErrorToReply(error.TargetDnsResolveFailed));
+    try std.testing.expectEqual(@as(u8, Reply.HostUnreachable), mapConnectErrorToReply(error.UpstreamDnsResolveFailed));
+}
+
+test "mapConnectErrorToReply maps connect errors to connection refused" {
+    try std.testing.expectEqual(@as(u8, Reply.ConnectionRefused), mapConnectErrorToReply(error.TargetTcpConnectFailed));
+    try std.testing.expectEqual(@as(u8, Reply.ConnectionRefused), mapConnectErrorToReply(error.UpstreamTcpConnectFailed));
+}
+
+test "mapConnectErrorToReply maps unknown errors to general failure" {
+    try std.testing.expectEqual(@as(u8, Reply.GeneralFailure), mapConnectErrorToReply(error.NotImplemented));
 }

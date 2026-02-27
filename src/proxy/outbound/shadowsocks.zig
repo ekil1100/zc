@@ -2,6 +2,8 @@ const std = @import("std");
 const net = std.net;
 const aead = @import("../../crypto/aead.zig");
 pub const Address = aead.Address;
+pub const connect_retry_attempts: usize = 3;
+const retry_backoff_ms = [_]u64{ 200, 500, 1000 };
 
 /// Shadowsocks Obfs configuration
 pub const ObfsConfig = struct {
@@ -70,15 +72,12 @@ pub const ShadowsocksClient = struct {
     pub fn connect(self: *ShadowsocksClient, target: Address) !net.Stream {
         std.debug.print("[SS] Connecting to {s}:{d} via SS\n", .{ self.server, self.port });
 
-        // 1. DNS resolve
-        var addr_list = try net.getAddressList(self.allocator, self.server, self.port);
-        defer addr_list.deinit();
-        if (addr_list.addrs.len == 0) return error.HostNotFound;
+        // 1. DNS resolve (with retry/backoff)
+        const upstream_addr = try self.resolveUpstreamAddressWithRetry();
 
-        // 2. TCP connect
-        var stream = try net.tcpConnectToAddress(addr_list.addrs[0]);
+        // 2. TCP connect (with retry/backoff)
+        var stream = try self.connectUpstreamWithRetry(upstream_addr);
         std.debug.print("[SS] TCP connected\n", .{});
-        try setSocketTimeouts(stream.handle, 15_000);
 
         // 3. Generate client salt (size = key length per SS AEAD spec)
         const salt_len = self.cipher_type.saltLen();
@@ -123,6 +122,70 @@ pub const ShadowsocksClient = struct {
         self.dec_ctx = null;
         self.read_leftover = null;
         return stream;
+    }
+
+    pub fn retryBackoffMs(attempt_index: usize) u64 {
+        if (attempt_index >= retry_backoff_ms.len) return retry_backoff_ms[retry_backoff_ms.len - 1];
+        return retry_backoff_ms[attempt_index];
+    }
+
+    fn resolveUpstreamAddressWithRetry(self: *ShadowsocksClient) !net.Address {
+        var last_err: anyerror = error.UpstreamDnsResolveFailed;
+
+        var attempt: usize = 0;
+        while (attempt < connect_retry_attempts) : (attempt += 1) {
+            var addr_list = net.getAddressList(self.allocator, self.server, self.port) catch |err| {
+                last_err = err;
+                std.debug.print("[SS] Upstream DNS resolve failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
+                sleepBeforeRetry(attempt, connect_retry_attempts);
+                continue;
+            };
+            defer addr_list.deinit();
+
+            if (addr_list.addrs.len == 0) {
+                last_err = error.HostNotFound;
+                std.debug.print("[SS] Upstream DNS resolve returned no address: server={s}:{d} attempt={d}/{d}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts });
+                sleepBeforeRetry(attempt, connect_retry_attempts);
+                continue;
+            }
+            if (attempt > 0) {
+                std.debug.print("[SS] Upstream DNS resolve recovered: server={s}:{d} attempt={d}/{d}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts });
+            }
+            return addr_list.addrs[0];
+        }
+
+        std.debug.print("[SS] Upstream DNS resolve failed after retries: server={s}:{d} attempts={d} last_err={}\n", .{ self.server, self.port, connect_retry_attempts, last_err });
+        return error.UpstreamDnsResolveFailed;
+    }
+
+    fn connectUpstreamWithRetry(self: *ShadowsocksClient, addr: net.Address) !net.Stream {
+        var last_err: anyerror = error.UpstreamTcpConnectFailed;
+
+        var attempt: usize = 0;
+        while (attempt < connect_retry_attempts) : (attempt += 1) {
+            var stream = net.tcpConnectToAddress(addr) catch |err| {
+                last_err = err;
+                std.debug.print("[SS] Upstream TCP connect failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
+                sleepBeforeRetry(attempt, connect_retry_attempts);
+                continue;
+            };
+
+            setSocketTimeouts(stream.handle, 15_000) catch |err| {
+                stream.close();
+                last_err = err;
+                std.debug.print("[SS] Upstream socket timeout setup failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
+                sleepBeforeRetry(attempt, connect_retry_attempts);
+                continue;
+            };
+
+            if (attempt > 0) {
+                std.debug.print("[SS] Upstream TCP connect recovered: server={s}:{d} attempt={d}/{d}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts });
+            }
+            return stream;
+        }
+
+        std.debug.print("[SS] Upstream TCP connect failed after retries: server={s}:{d} attempts={d} last_err={}\n", .{ self.server, self.port, connect_retry_attempts, last_err });
+        return error.UpstreamTcpConnectFailed;
     }
 
     fn setSocketTimeouts(fd: std.posix.fd_t, timeout_ms: u32) !void {
@@ -330,6 +393,11 @@ pub const ShadowsocksClient = struct {
         }
     }
 };
+
+fn sleepBeforeRetry(attempt_index: usize, max_attempts: usize) void {
+    if (attempt_index + 1 >= max_attempts) return;
+    std.Thread.sleep(ShadowsocksClient.retryBackoffMs(attempt_index) * std.time.ns_per_ms);
+}
 
 test "Shadowsocks client init" {
     const allocator = std.testing.allocator;

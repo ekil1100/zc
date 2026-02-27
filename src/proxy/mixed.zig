@@ -137,7 +137,8 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
 
     std.debug.print("[Mixed] Rule matched: target={s}:{d} -> proxy={s}\n", .{ target_host, target_port, proxy_name });
 
-    var target_stream = manager.connect(proxy_name, target_host, target_port) catch {
+    var target_stream = manager.connect(proxy_name, target_host, target_port) catch |err| {
+        logConnectionFailure(target_host, target_port, proxy_name, err);
         try conn.stream.writeAll(&.{ 0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
         conn.stream.close();
         return;
@@ -206,7 +207,7 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
     const proxy_name = engine.match(host, true) orelse "DIRECT";
     std.debug.print("[Mixed] CONNECT route: {s}:{d} -> {s}\n", .{ host, port, proxy_name });
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
-        std.debug.print("[Mixed] Connection failed: target={s}:{d} proxy={s} err={}\n", .{ host, port, proxy_name, err });
+        logConnectionFailure(host, port, proxy_name, err);
         _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         conn.stream.close();
         return;
@@ -234,7 +235,7 @@ fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, 
     const proxy_name = engine.match(host, true) orelse "DIRECT";
     std.debug.print("[Mixed] HTTP route: {s}:{d} -> {s}\n", .{ host, port, proxy_name });
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
-        std.debug.print("[Mixed] Connection failed: target={s}:{d} proxy={s} err={}\n", .{ host, port, proxy_name, err });
+        logConnectionFailure(host, port, proxy_name, err);
         _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         conn.stream.close();
         return;
@@ -247,6 +248,16 @@ fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, 
     // 双向转发（使用 poll 避免阻塞）
     try relay(conn.stream, &target_stream);
     _ = allocator;
+}
+
+fn logConnectionFailure(target: []const u8, port: u16, proxy_name: []const u8, err: anyerror) void {
+    switch (err) {
+        error.UpstreamDnsResolveFailed => std.debug.print("[Mixed] Connection failed: kind=upstream_dns target={s}:{d} proxy={s} err={}\n", .{ target, port, proxy_name, err }),
+        error.UpstreamTcpConnectFailed => std.debug.print("[Mixed] Connection failed: kind=upstream_connect target={s}:{d} proxy={s} err={}\n", .{ target, port, proxy_name, err }),
+        error.TargetDnsResolveFailed => std.debug.print("[Mixed] Connection failed: kind=target_dns target={s}:{d} proxy={s} err={}\n", .{ target, port, proxy_name, err }),
+        error.TargetTcpConnectFailed => std.debug.print("[Mixed] Connection failed: kind=target_connect target={s}:{d} proxy={s} err={}\n", .{ target, port, proxy_name, err }),
+        else => std.debug.print("[Mixed] Connection failed: kind=other target={s}:{d} proxy={s} err={}\n", .{ target, port, proxy_name, err }),
+    }
 }
 
 fn extractHost(request: []const u8) ![]const u8 {
