@@ -6,6 +6,36 @@
 
 ---
 
+## 临时任务：Code Review 问题复现测试（2026-02-27）
+
+### HOTFIX-REVIEW-REPRO-TESTS
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `src/proxy/outbound/shadowsocks.zig`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 新增测试可复现 mixed 连接生命周期问题（连接处理返回后客户端侧未观察到关闭）
+  - [x] 新增测试可复现 Shadowsocks pending-read 语义问题（仅 `read_leftover` 不应视为可无阻塞读取）
+  - [x] 运行 `zig build test` 可看到新增复现测试失败，证明问题可触达
+- 备注：2026-02-27 16:08 +0800 进入 DOING（按 code review 结论先做复现测试）；2026-02-27 16:11 +0800 完成复现测试并执行 `zig build test --summary all`，结果 `14/17 passed, 3 failed`（两类问题均可复现）。
+
+---
+
+## 临时任务：Code Review 问题修复（2026-02-27）
+
+### HOTFIX-REVIEW-FIXES
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `src/proxy/outbound/shadowsocks.zig`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] `mixed` 连接处理成功路径结束后明确关闭客户端连接
+  - [x] `hasPendingRead` 不再将仅 `read_leftover` 视为可无阻塞读取
+  - [x] `zig build test --summary all` 全部通过
+- 备注：2026-02-27 16:12 +0800 进入 DOING（根据复现失败开始修复实现）；2026-02-27 16:13 +0800 完成修复并通过 `zig build test --summary all`（`17/17 tests passed`）。
+
+---
+
 ## 临时任务：DNS 断连可观测与重试加固（2026-02-27）
 
 ### HOTFIX-DNS-RETRY-OBS

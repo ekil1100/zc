@@ -16,6 +16,7 @@ const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
 const build_options = @import("build_options");
 const UpdateApplyMode = daemon.ApplyMode;
+const shadowsocks = @import("proxy/outbound/shadowsocks.zig");
 
 // 全局配置路径，用于重载
 var g_config_path: ?[]const u8 = null;
@@ -1214,4 +1215,27 @@ test "parseUpdateApplyMode supports auto hot restart" {
     try testing.expectEqual(UpdateApplyMode.hot, try parseUpdateApplyMode("hot"));
     try testing.expectEqual(UpdateApplyMode.restart, try parseUpdateApplyMode("restart"));
     try testing.expectError(error.InvalidApplyMode, parseUpdateApplyMode("noop"));
+}
+
+test "mixed handler should explicitly close client stream on success path" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try std.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    const fn_pos = std.mem.indexOf(u8, content, "fn handleConnection(") orelse return error.TestUnexpectedResult;
+    const next_fn_pos = std.mem.indexOfPos(u8, content, fn_pos, "fn handleSocks5(") orelse return error.TestUnexpectedResult;
+    const fn_body = content[fn_pos..next_fn_pos];
+    try testing.expect(std.mem.indexOf(u8, fn_body, "defer conn.stream.close();") != null);
+}
+
+test "shadowsocks hasPendingRead should ignore encrypted leftover-only state" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var client = try shadowsocks.ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    defer client.deinit();
+
+    client.read_leftover = try allocator.dupe(u8, "partial");
+    try testing.expect(!client.hasPendingRead());
 }

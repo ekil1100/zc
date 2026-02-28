@@ -48,18 +48,16 @@ fn connectionTaskMain(task: *ConnTask) void {
     defer task.allocator.destroy(task);
     handleConnection(task.allocator, task.conn, task.engine, task.manager) catch |err| {
         std.debug.print("Mixed connection error: {}\n", .{err});
-        task.conn.stream.close();
     };
 }
 
 fn handleConnection(allocator: std.mem.Allocator, conn: net.Server.Connection, engine: *Engine, manager: *OutboundManager) !void {
+    defer conn.stream.close();
+
     // 读取第一个字节来判断协议类型
     var first_byte: [1]u8 = undefined;
     const n = try conn.stream.read(&first_byte);
-    if (n == 0) {
-        conn.stream.close();
-        return;
-    }
+    if (n == 0) return;
 
     // 判断协议类型
     if (first_byte[0] == 0x05) {
@@ -69,7 +67,7 @@ fn handleConnection(allocator: std.mem.Allocator, conn: net.Server.Connection, e
     } else if (first_byte[0] == 0x04) {
         // SOCKS4 协议（暂不支持，按 SOCKS5 处理）
         std.debug.print("[Mixed] Detected SOCKS4 connection (not supported)\n", .{});
-        conn.stream.close();
+        return;
     } else {
         // HTTP/HTTPS 代理（第一个字节是可打印字符如 'C', 'G', 'P', 'H' 等）
         std.debug.print("[Mixed] Detected HTTP connection\n", .{});
@@ -96,7 +94,6 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
     }
     if (!found_no_auth) {
         try conn.stream.writeAll(&.{ first_byte, 0xFF });
-        conn.stream.close();
         return;
     }
 
@@ -124,7 +121,6 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
         },
         else => {
             try conn.stream.writeAll(&.{ 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
-            conn.stream.close();
             return;
         },
     };
@@ -140,7 +136,6 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
     var target_stream = manager.connect(proxy_name, target_host, target_port) catch |err| {
         logConnectionFailure(target_host, target_port, proxy_name, err);
         try conn.stream.writeAll(&.{ 0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
-        conn.stream.close();
         return;
     };
     defer target_stream.close();
@@ -154,18 +149,12 @@ fn handleHttp(allocator: std.mem.Allocator, conn: net.Server.Connection, first_b
     var buf: [4096]u8 = undefined;
     buf[0] = first_byte;
     const n = try conn.stream.read(buf[1..]);
-    if (n == 0) {
-        conn.stream.close();
-        return;
-    }
+    if (n == 0) return;
     const request = buf[0 .. n + 1];
 
     // 查找 HTTP 方法
     const method_end = std.mem.indexOf(u8, request, " ");
-    if (method_end == null) {
-        conn.stream.close();
-        return;
-    }
+    if (method_end == null) return;
     const method = request[0..method_end.?];
 
     if (std.mem.eql(u8, method, "CONNECT")) {
@@ -182,22 +171,15 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
     _ = part_iter.next(); // "CONNECT"
     const target = part_iter.next();
 
-    if (target == null) {
-        conn.stream.close();
-        return;
-    }
+    if (target == null) return;
 
     const host_port = target.?;
     const colon_pos = std.mem.lastIndexOf(u8, host_port, ":");
-    if (colon_pos == null) {
-        conn.stream.close();
-        return;
-    }
+    if (colon_pos == null) return;
 
     const host = host_port[0..colon_pos.?];
     const port_str = host_port[colon_pos.? + 1 ..];
     const port = std.fmt.parseInt(u16, port_str, 10) catch {
-        conn.stream.close();
         return;
     };
 
@@ -209,7 +191,6 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
         logConnectionFailure(host, port, proxy_name, err);
         _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-        conn.stream.close();
         return;
     };
     defer target_stream.close();
@@ -224,7 +205,6 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
 fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, request: []const u8, engine: *Engine, manager: *OutboundManager) !void {
     // 解析目标 host
     const host = extractHost(request) catch {
-        conn.stream.close();
         return;
     };
     const port: u16 = 80;
@@ -237,7 +217,6 @@ fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, 
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
         logConnectionFailure(host, port, proxy_name, err);
         _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-        conn.stream.close();
         return;
     };
     defer target_stream.close();
@@ -354,19 +333,15 @@ fn relayFlushStats(up_bytes: *usize, down_bytes: *usize, force: bool) void {
 test "relay drains SS pending leftover without poll event" {
     const allocator = std.testing.allocator;
 
-    var client_fds: [2]std.posix.fd_t = undefined;
-    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &client_fds);
-    defer std.posix.close(client_fds[0]);
-    defer std.posix.close(client_fds[1]);
+    const client_pair = try makeTcpStreamPair();
+    defer client_pair.left.close();
+    defer client_pair.right.close();
+    const target_pair = try makeTcpStreamPair();
+    defer target_pair.right.close();
 
-    var target_fds: [2]std.posix.fd_t = undefined;
-    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &target_fds);
-    defer std.posix.close(target_fds[0]);
-    defer std.posix.close(target_fds[1]);
-
-    const client_stream = net.Stream{ .handle = client_fds[0] };
-    const peer_stream = net.Stream{ .handle = client_fds[1] };
-    const target_base = net.Stream{ .handle = target_fds[0] };
+    const client_stream = client_pair.left;
+    const peer_stream = client_pair.right;
+    const target_base = target_pair.left;
 
     const ss_client = try allocator.create(ss.ShadowsocksClient);
     errdefer allocator.destroy(ss_client);
@@ -392,20 +367,16 @@ test "relay drains SS pending leftover without poll event" {
 }
 
 test "relay forwards traffic in both directions (direct stream)" {
-    var client_fds: [2]std.posix.fd_t = undefined;
-    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &client_fds);
-    defer std.posix.close(client_fds[0]);
-    defer std.posix.close(client_fds[1]);
+    const client_pair = try makeTcpStreamPair();
+    defer client_pair.left.close();
+    defer client_pair.right.close();
+    const target_pair = try makeTcpStreamPair();
+    defer target_pair.right.close();
 
-    var target_fds: [2]std.posix.fd_t = undefined;
-    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &target_fds);
-    defer std.posix.close(target_fds[0]);
-    defer std.posix.close(target_fds[1]);
-
-    const client_stream = net.Stream{ .handle = client_fds[0] };
-    const client_peer = net.Stream{ .handle = client_fds[1] };
-    const target_stream = net.Stream{ .handle = target_fds[0] };
-    const target_peer = net.Stream{ .handle = target_fds[1] };
+    const client_stream = client_pair.left;
+    const client_peer = client_pair.right;
+    const target_stream = target_pair.left;
+    const target_peer = target_pair.right;
 
     var proxy_stream = ProxyStream.initDirect(target_stream);
     defer proxy_stream.close();
@@ -431,6 +402,97 @@ test "relay forwards traffic in both directions (direct stream)" {
     client_peer.close();
     target_peer.close();
     relay_thread.join();
+}
+
+test "handleConnection should close client stream after successful HTTP relay" {
+    const allocator = std.testing.allocator;
+
+    var cfg = @import("../config.zig").Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(@import("../config.zig").Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var manager = try outbound.OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    const upstream_addr = try net.Address.parseIp4("127.0.0.1", 0);
+    var upstream_server = try upstream_addr.listen(.{ .reuse_address = true });
+    defer upstream_server.deinit();
+
+    const upstream_thread = try std.Thread.spawn(.{}, struct {
+        fn run(server: *net.Server) void {
+            const conn = server.accept() catch return;
+            defer conn.stream.close();
+
+            var buf: [1024]u8 = undefined;
+            _ = conn.stream.read(&buf) catch return;
+            _ = conn.stream.write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n") catch return;
+        }
+    }.run, .{&upstream_server});
+    defer upstream_thread.join();
+
+    const target_port = upstream_server.listen_address.getPort();
+    const req = try std.fmt.allocPrint(allocator, "GET / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{target_port});
+    defer allocator.free(req);
+
+    const mixed_pair = try makeTcpStreamPair();
+    defer mixed_pair.left.close();
+    defer mixed_pair.right.close();
+
+    const mixed_conn = net.Server.Connection{
+        .stream = mixed_pair.left,
+        .address = try net.Address.parseIp4("127.0.0.1", 12345),
+    };
+    const mixed_client = mixed_pair.right;
+
+    try mixed_client.writeAll(req);
+    try handleConnection(allocator, mixed_conn, &engine, &manager);
+
+    var resp_buf: [1024]u8 = undefined;
+    _ = mixed_client.read(&resp_buf) catch 0;
+
+    try setReadTimeoutMs(mixed_client.handle, 100);
+    var one: [1]u8 = undefined;
+    const n = mixed_client.read(&one) catch |err| switch (err) {
+        error.WouldBlock => @as(usize, 1),
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+fn setReadTimeoutMs(fd: std.posix.fd_t, timeout_ms: u32) !void {
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+}
+
+const StreamPair = struct {
+    left: net.Stream,
+    right: net.Stream,
+};
+
+fn makeTcpStreamPair() !StreamPair {
+    const addr = try net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const client = try net.tcpConnectToAddress(server.listen_address);
+    const accepted = try server.accept();
+    return .{
+        .left = accepted.stream,
+        .right = client,
+    };
 }
 
 fn relayLog(comptime format: []const u8, args: anytype) void {

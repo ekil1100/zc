@@ -303,7 +303,7 @@ pub const ShadowsocksClient = struct {
     }
 
     pub fn hasPendingRead(self: *const ShadowsocksClient) bool {
-        return self.read_payload_leftover != null or self.read_leftover != null;
+        return self.read_payload_leftover != null;
     }
 
     /// Initialize decryption context: strip obfs HTTP response + read server salt
@@ -403,4 +403,13 @@ test "Shadowsocks client init" {
     const allocator = std.testing.allocator;
     var client = try ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
     defer client.deinit();
+}
+
+test "hasPendingRead should be false when only encrypted leftover exists" {
+    const allocator = std.testing.allocator;
+    var client = try ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    defer client.deinit();
+
+    client.read_leftover = try allocator.dupe(u8, "x");
+    try std.testing.expect(!client.hasPendingRead());
 }
