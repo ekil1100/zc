@@ -6,6 +6,22 @@
 
 ---
 
+## 临时任务：手动复制配置后 proxy select 持久化修复（2026-03-02）
+
+### HOTFIX-CONFIG-KEY-RESOLVE
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/config.zig`, `src/main.zig`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 当通过 `-c ~/.config/zc/configs/<name>.yaml` 启动时可正确推导 `config_key`
+  - [x] 无 `meta.active` 但可解析默认配置路径时，仍可推导 `config_key`
+  - [x] 新增测试覆盖 key 推导逻辑（`config.test.resolveRuntimeConfigKey infers key from explicit configs path`）
+  - [x] 非 `zc config download` 场景（如 `~/.config/zc/config.yaml` 符号链接到 `configs/<name>.yaml`）可正确推导 `<name>` 并持久化 selection
+- 备注：2026-03-02 15:42 +0800 进入 DOING（修复手动复制 configs 场景下 selection 不持久化）；2026-03-02 15:44 +0800 完成首版修复。2026-03-02 15:46 +0800 根据需求澄清重开：补齐“非 download + 符号链接路径”场景。2026-03-02 15:47 +0800 完成二次修复并新增 symlink 场景测试（`config.test.inferConfigKeyFromPath resolves symlinked config path for non-download config` 通过）。
+
+---
+
 ## 临时任务：Code Review 问题复现测试（2026-02-27）
 
 ### HOTFIX-REVIEW-REPRO-TESTS

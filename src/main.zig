@@ -780,8 +780,8 @@ fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: boo
     // 启动前端口占用预检（可能修改 external-controller 端口）
     try preflightPortCheck(&cfg);
 
-    // 获取当前配置 key
-    const config_key = config.getCurrentConfigName(allocator) catch null;
+    // 获取运行时配置 key（优先显式 -c 路径，其次 active/default）
+    const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
     defer if (config_key) |k| allocator.free(k);
 
     // Initialize outbound manager with config key

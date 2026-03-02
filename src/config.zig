@@ -730,6 +730,76 @@ pub fn getCurrentConfigName(allocator: std.mem.Allocator) !?[]const u8 {
     return null;
 }
 
+/// 解析运行时配置 key：
+/// 1) 优先从显式配置路径推导（仅当位于 ~/.config/zc/configs 且为 *.yaml）
+/// 2) 回退到 meta.active
+/// 3) 回退到默认配置路径推导
+pub fn resolveRuntimeConfigKey(allocator: std.mem.Allocator, explicit_config_path: ?[]const u8) !?[]const u8 {
+    if (explicit_config_path) |path| {
+        if (try inferConfigKeyFromPath(allocator, path)) |k| return k;
+    }
+
+    if (try getCurrentConfigName(allocator)) |active| {
+        return active;
+    }
+
+    if (try getDefaultConfigPath(allocator)) |default_path| {
+        defer allocator.free(default_path);
+        return try inferConfigKeyFromPath(allocator, default_path);
+    }
+
+    return null;
+}
+
+fn inferConfigKeyFromPath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    const configs_dir = try meta.getConfigsDir(allocator) orelse return null;
+    defer allocator.free(configs_dir);
+
+    return try inferConfigKeyFromPathWithConfigsDir(allocator, path, configs_dir);
+}
+
+fn inferConfigKeyFromPathWithConfigsDir(allocator: std.mem.Allocator, path: []const u8, configs_dir: []const u8) !?[]const u8 {
+    const resolved_path = try toResolvedPathForKey(allocator, path);
+    defer allocator.free(resolved_path);
+
+    const resolved_configs_dir = try toResolvedPathForKey(allocator, configs_dir);
+    defer allocator.free(resolved_configs_dir);
+
+    if (!isPathWithinDir(resolved_path, resolved_configs_dir)) return null;
+
+    const basename = std.fs.path.basename(resolved_path);
+    if (!std.mem.endsWith(u8, basename, ".yaml")) return null;
+    if (basename.len <= ".yaml".len) return null;
+
+    return try allocator.dupe(u8, basename[0 .. basename.len - ".yaml".len]);
+}
+
+fn isPathWithinDir(path: []const u8, dir: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    if (path.len == dir.len) return true;
+    return path[dir.len] == std.fs.path.sep;
+}
+
+fn toAbsoluteNormalizedPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, path });
+}
+
+fn toResolvedPathForKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const abs_path = try toAbsoluteNormalizedPath(allocator, path);
+    defer allocator.free(abs_path);
+
+    return std.fs.realpathAlloc(allocator, abs_path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => try allocator.dupe(u8, abs_path),
+    };
+}
+
 /// 获取订阅 URL（从 meta.json）
 pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8) !?[]const u8 {
     var meta_data = meta.load(allocator) catch return null;
@@ -921,4 +991,50 @@ test "config parsing" {
     try std.testing.expectEqual(@as(u16, 1080), config.port);
     try std.testing.expectEqual(@as(usize, 1), config.proxies.items.len);
     try std.testing.expectEqual(@as(usize, 2), config.rules.items.len);
+}
+
+test "resolveRuntimeConfigKey infers key from explicit configs path" {
+    const allocator = std.testing.allocator;
+
+    try meta.ensureConfigsDir(allocator);
+    const configs_dir = (try meta.getConfigsDir(allocator)).?;
+    defer allocator.free(configs_dir);
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ configs_dir, "manual.yaml" });
+    defer allocator.free(cfg_path);
+
+    const key = (try resolveRuntimeConfigKey(allocator, cfg_path)).?;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("manual", key);
+}
+
+test "inferConfigKeyFromPath resolves symlinked config path for non-download config" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var configs = try tmp.dir.makeOpenPath("configs", .{});
+    defer configs.close();
+
+    {
+        const f = try configs.createFile("manual.yaml", .{});
+        f.close();
+    }
+
+    tmp.dir.symLink("configs/manual.yaml", "config.yaml", .{}) catch return error.SkipZigTest;
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+
+    const tmp_abs = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(tmp_abs);
+    const configs_abs = try std.fs.path.join(allocator, &.{ tmp_abs, "configs" });
+    defer allocator.free(configs_abs);
+    const link_abs = try std.fs.path.join(allocator, &.{ tmp_abs, "config.yaml" });
+    defer allocator.free(link_abs);
+
+    const key = (try inferConfigKeyFromPathWithConfigsDir(allocator, link_abs, configs_abs)).?;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("manual", key);
 }
