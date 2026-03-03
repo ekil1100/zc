@@ -1,6 +1,8 @@
 const std = @import("std");
 const net = std.net;
 const crypto = std.crypto;
+const tls = std.crypto.tls;
+const Certificate = std.crypto.Certificate;
 
 /// Trojan 命令类型
 pub const Command = enum(u8) {
@@ -22,6 +24,19 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
     password_hash: [56]u8,   // SHA-224 hex string (28 bytes * 2)
+    tls_conn: ?*TlsConnection = null,
+
+    const TlsConnection = struct {
+        stream: net.Stream,
+        stream_reader: net.Stream.Reader,
+        stream_writer: net.Stream.Writer,
+        tls_client: tls.Client,
+        ca_bundle: ?Certificate.Bundle = null,
+        socket_read_buffer: [tls.Client.min_buffer_len]u8,
+        socket_write_buffer: [tls.Client.min_buffer_len]u8,
+        tls_read_buffer: [tls.Client.min_buffer_len]u8,
+        tls_write_buffer: [tls.Client.min_buffer_len]u8,
+    };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         // 计算密码的 SHA-224 哈希
@@ -45,21 +60,118 @@ pub const Client = struct {
         };
     }
 
+    pub fn deinit(self: *Client) void {
+        if (self.tls_conn) |conn| {
+            _ = conn.tls_client.end() catch {};
+            conn.stream.close();
+            if (conn.ca_bundle) |*ca_bundle| {
+                ca_bundle.deinit(self.allocator);
+            }
+            self.allocator.destroy(conn);
+            self.tls_conn = null;
+        }
+    }
+
     /// 连接到 Trojan 服务器
     pub fn connect(self: *Client, target_host: []const u8, target_port: u16) !net.Stream {
+        if (self.tls_conn != null) return error.AlreadyConnected;
+
         // 1. 建立 TCP 连接
-        var stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
-        errdefer stream.close();
+        const stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
 
-        // 2. 发送 Trojan 握手
-        try self.handshake(&stream, target_host, target_port);
+        // 2. 在 TCP 之上建立 TLS 会话
+        const conn = self.initTlsConnection(stream) catch |err| {
+            stream.close();
+            return err;
+        };
+        errdefer self.deinitTlsConnection(conn);
 
-        return stream;
+        // 3. 在 TLS 通道中发送 Trojan 握手
+        try self.handshake(conn, target_host, target_port);
+
+        self.tls_conn = conn;
+        return conn.stream;
+    }
+
+    pub fn write(self: *Client, data: []const u8) !void {
+        const conn = self.tls_conn orelse return error.NotConnected;
+        try conn.tls_client.writer.writeAll(data);
+        try conn.tls_client.writer.flush();
+    }
+
+    pub fn read(self: *Client, buf: []u8) !usize {
+        const conn = self.tls_conn orelse return error.NotConnected;
+        return try conn.tls_client.reader.readSliceShort(buf);
+    }
+
+    pub fn hasPendingRead(self: *const Client) bool {
+        if (self.tls_conn) |conn| {
+            return conn.tls_client.reader.bufferedLen() > 0;
+        }
+        return false;
+    }
+
+    fn initTlsConnection(self: *Client, stream: net.Stream) !*TlsConnection {
+        const conn = try self.allocator.create(TlsConnection);
+        errdefer self.allocator.destroy(conn);
+
+        conn.stream = stream;
+        conn.ca_bundle = null;
+        conn.socket_read_buffer = undefined;
+        conn.socket_write_buffer = undefined;
+        conn.tls_read_buffer = undefined;
+        conn.tls_write_buffer = undefined;
+        conn.stream_reader = conn.stream.reader(&conn.socket_read_buffer);
+        conn.stream_writer = conn.stream.writer(&conn.socket_write_buffer);
+        conn.tls_client = undefined;
+
+        var options = tls.Client.Options{
+            .host = .{ .explicit = self.tlsHost() },
+            .ca = .{ .no_verification = {} },
+            .allow_truncation_attacks = true,
+            .read_buffer = &conn.tls_read_buffer,
+            .write_buffer = &conn.tls_write_buffer,
+        };
+
+        if (!self.config.skip_cert_verify) {
+            conn.ca_bundle = Certificate.Bundle{};
+            if (conn.ca_bundle) |*ca_bundle| {
+                try ca_bundle.rescan(self.allocator);
+                options.ca = .{ .bundle = ca_bundle.* };
+            }
+        }
+
+        conn.tls_client = tls.Client.init(
+            conn.stream_reader.interface(),
+            &conn.stream_writer.interface,
+            options,
+        ) catch |err| {
+            if (conn.ca_bundle) |*ca_bundle| {
+                ca_bundle.deinit(self.allocator);
+                conn.ca_bundle = null;
+            }
+            return err;
+        };
+
+        return conn;
+    }
+
+    fn tlsHost(self: *const Client) []const u8 {
+        return self.config.sni orelse self.config.address;
+    }
+
+    fn deinitTlsConnection(self: *Client, conn: *TlsConnection) void {
+        _ = conn.tls_client.end() catch {};
+        conn.stream.close();
+        if (conn.ca_bundle) |*ca_bundle| {
+            ca_bundle.deinit(self.allocator);
+        }
+        self.allocator.destroy(conn);
     }
 
     /// Trojan 握手协议
     /// 格式: [密码哈希(56)]\r\n [命令(1)] [地址类型(1)] [地址] [端口(2)]\r\n
-    fn handshake(self: *Client, stream: *net.Stream, target_host: []const u8, target_port: u16) !void {
+    fn handshake(self: *Client, conn: *TlsConnection, target_host: []const u8, target_port: u16) !void {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -81,7 +193,8 @@ pub const Client = struct {
         try buf.appendSlice(self.allocator, "\r\n");
 
         // 发送握手
-        try stream.writeAll(buf.items);
+        try conn.tls_client.writer.writeAll(buf.items);
+        try conn.tls_client.writer.flush();
     }
 
     /// 编码目标地址
@@ -233,7 +346,7 @@ test "Trojan password hash" {
 test "Trojan encodeAddress IPv4" {
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client = try Client.init(allocator, .{
         .password = "test",
         .address = "127.0.0.1",
         .port = 443,
@@ -276,4 +389,41 @@ test "Trojan parseIpv6 ipv4-mapped" {
     try testing.expectEqual(@as(u8, 168), out[13]);
     try testing.expectEqual(@as(u8, 1), out[14]);
     try testing.expectEqual(@as(u8, 1), out[15]);
+}
+
+test "Trojan TLS host prefers configured sni" {
+    const allocator = testing.allocator;
+
+    const client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+        .sni = "m.ctrip.com",
+    });
+
+    try testing.expectEqualStrings("m.ctrip.com", client.tlsHost());
+}
+
+test "Trojan TLS host falls back to server address when sni is absent" {
+    const allocator = testing.allocator;
+
+    const client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+    });
+
+    try testing.expectEqualStrings("server.example.com", client.tlsHost());
+}
+
+test "Trojan hasPendingRead returns false when not connected" {
+    const allocator = testing.allocator;
+
+    const client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+    });
+
+    try testing.expect(!client.hasPendingRead());
 }

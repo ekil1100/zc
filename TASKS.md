@@ -6,6 +6,23 @@
 
 ---
 
+## 临时任务：Trojan TLS 链路修复（2026-03-02）
+
+### HOTFIX-TROJAN-TLS
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/protocol/trojan.zig`, `src/proxy/outbound/manager.zig`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] Trojan 出站连接流程为 `TCP -> TLS Handshake -> Trojan Handshake`
+  - [x] `sni` 配置在 TLS 握手中生效（默认回退到 server）
+  - [x] `skip_cert_verify` 控制证书校验策略（false=系统 CA 校验；true=跳过校验）
+  - [x] 代理转发读写走 TLS 明文接口而非裸 TCP
+  - [x] 新增/更新测试覆盖关键行为，且相关测试通过
+- 备注：2026-03-02 16:05 +0800 进入 DOING（根据诊断结果修复 Trojan 明文握手问题）；2026-03-02 16:12 +0800 完成修复。验证：`zig test src/protocol/trojan.zig` 通过（8/8）；`zig build test` 仍受既有失败 `meta.test.parseMetaJson decodes unicode escape sequences` 影响（与本改动无关）。
+
+---
+
 ## 临时任务：手动复制配置后 proxy select 持久化修复（2026-03-02）
 
 ### HOTFIX-CONFIG-KEY-RESOLVE

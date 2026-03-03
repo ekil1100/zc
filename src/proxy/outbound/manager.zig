@@ -14,13 +14,12 @@ pub const ProxyStream = struct {
     base_stream: net.Stream,
     allocator: ?std.mem.Allocator = null,
     owned_ss_client: ?*ss.ShadowsocksClient = null,
-    is_encrypted: bool = false,
+    owned_trojan_client: ?*trojan.Client = null,
     is_closed: bool = false,
 
     pub fn initDirect(stream: net.Stream) ProxyStream {
         return .{
             .base_stream = stream,
-            .is_encrypted = false,
         };
     }
 
@@ -29,21 +28,32 @@ pub const ProxyStream = struct {
             .base_stream = stream,
             .allocator = allocator,
             .owned_ss_client = client,
-            .is_encrypted = true,
+        };
+    }
+
+    pub fn initTrojan(allocator: std.mem.Allocator, stream: net.Stream, client: *trojan.Client) ProxyStream {
+        return .{
+            .base_stream = stream,
+            .allocator = allocator,
+            .owned_trojan_client = client,
         };
     }
 
     pub fn write(self: *ProxyStream, data: []const u8) !void {
-        if (self.is_encrypted) {
-            try self.owned_ss_client.?.write(data);
+        if (self.owned_ss_client) |client| {
+            try client.write(data);
+        } else if (self.owned_trojan_client) |client| {
+            try client.write(data);
         } else {
             try self.base_stream.writeAll(data);
         }
     }
 
     pub fn read(self: *ProxyStream, buf: []u8) !usize {
-        if (self.is_encrypted) {
-            return try self.owned_ss_client.?.read(buf);
+        if (self.owned_ss_client) |client| {
+            return try client.read(buf);
+        } else if (self.owned_trojan_client) |client| {
+            return try client.read(buf);
         } else {
             return try self.base_stream.read(buf);
         }
@@ -52,17 +62,30 @@ pub const ProxyStream = struct {
     pub fn close(self: *ProxyStream) void {
         if (self.is_closed) return;
         self.is_closed = true;
-        self.base_stream.close();
+
         if (self.owned_ss_client) |client| {
             client.deinit();
             self.allocator.?.destroy(client);
             self.owned_ss_client = null;
+            return;
         }
+        if (self.owned_trojan_client) |client| {
+            client.deinit();
+            self.allocator.?.destroy(client);
+            self.owned_trojan_client = null;
+            return;
+        }
+        self.base_stream.close();
     }
 
     pub fn hasPendingRead(self: *const ProxyStream) bool {
-        if (!self.is_encrypted) return false;
-        return self.owned_ss_client.?.hasPendingRead();
+        if (self.owned_ss_client) |client| {
+            return client.hasPendingRead();
+        }
+        if (self.owned_trojan_client) |client| {
+            return client.hasPendingRead();
+        }
+        return false;
     }
 
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
@@ -251,15 +274,18 @@ pub const OutboundManager = struct {
                 return ProxyStream.initDirect(stream);
             },
             .trojan => {
-                var client = try trojan.Client.init(self.allocator, .{
+                const client = try self.allocator.create(trojan.Client);
+                errdefer self.allocator.destroy(client);
+                client.* = try trojan.Client.init(self.allocator, .{
                     .password = proxy.password orelse return error.MissingPassword,
                     .address = proxy.server,
                     .port = proxy.port,
                     .sni = proxy.sni,
                     .skip_cert_verify = proxy.skip_cert_verify,
                 });
+                errdefer client.deinit();
                 const stream = try client.connect(target, port);
-                return ProxyStream.initDirect(stream);
+                return ProxyStream.initTrojan(self.allocator, stream, client);
             },
             .vless => {
                 var client = try vless.Client.init(self.allocator, .{
