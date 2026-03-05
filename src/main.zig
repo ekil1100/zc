@@ -14,9 +14,16 @@ const daemon = @import("daemon.zig");
 const proxy_cli = @import("proxy_cli.zig");
 const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
+const override = @import("override.zig");
 const build_options = @import("build_options");
 const UpdateApplyMode = daemon.ApplyMode;
 const shadowsocks = @import("proxy/outbound/shadowsocks.zig");
+
+const ConfigOverrideAction = union(enum) {
+    show,
+    clear,
+    set: []const u8,
+};
 
 // 全局配置路径，用于重载
 var g_config_path: ?[]const u8 = null;
@@ -47,6 +54,12 @@ pub fn main() !void {
     const cmd = args[1];
     const json_output = hasFlag(args, "--json");
 
+    var override_opts = override.parseCliOptions(allocator, args) catch |err| {
+        printOverrideOptionError(json_output, err);
+        return err;
+    };
+    defer override_opts.deinit(allocator);
+
     // 处理 daemon 运行模式（内部使用）
     if (std.mem.eql(u8, cmd, "--daemon-run")) {
         var config_path: ?[]const u8 = null;
@@ -60,7 +73,7 @@ pub fn main() !void {
             }
         }
         // 在 daemon 模式下运行代理（无 TUI）
-        try runProxy(allocator, config_path, false);
+        try runProxy(allocator, config_path, false, &override_opts, "daemon-run");
         return;
     }
 
@@ -72,7 +85,7 @@ pub fn main() !void {
 
     // 处理 tui 命令
     if (std.mem.eql(u8, cmd, "tui")) {
-        try runProxy(allocator, null, true);
+        try runProxy(allocator, null, true, &override_opts, "tui");
         return;
     }
 
@@ -89,7 +102,14 @@ pub fn main() !void {
             }
         }
         // 后台启动
-        daemon.startDaemon(allocator, config_path, json_output) catch |err| {
+        var forward_args = std.ArrayList([]const u8).empty;
+        defer {
+            for (forward_args.items) |item| allocator.free(item);
+            forward_args.deinit(allocator);
+        }
+        try override_opts.appendForwardArgs(allocator, &forward_args);
+
+        daemon.startDaemon(allocator, config_path, json_output, forward_args.items) catch |err| {
             printCliError(json_output, "START_FAILED", "failed to start daemon", "check config path and logs via `zc log --no-follow`");
             return err;
         };
@@ -117,7 +137,14 @@ pub fn main() !void {
                 }
             }
         }
-        daemon.restartDaemon(allocator, config_path, json_output) catch |err| {
+        var forward_args = std.ArrayList([]const u8).empty;
+        defer {
+            for (forward_args.items) |item| allocator.free(item);
+            forward_args.deinit(allocator);
+        }
+        try override_opts.appendForwardArgs(allocator, &forward_args);
+
+        daemon.restartDaemon(allocator, config_path, json_output, forward_args.items) catch |err| {
             printCliError(json_output, "RESTART_FAILED", "failed to restart daemon", "check logs and retry `zc restart -c <config>`");
             return err;
         };
@@ -267,6 +294,151 @@ pub fn main() !void {
             return;
         }
 
+        if (std.mem.eql(u8, subcmd, "dump")) {
+            const config_path = parseConfigPathArg(args, 3);
+            const no_override = hasFlag(args, "--no-override");
+            var cfg = if (config_path) |path|
+                try config.load(allocator, path)
+            else
+                try config.loadDefault(allocator);
+            defer cfg.deinit();
+
+            if (!no_override) {
+                var persisted_script: ?[]u8 = null;
+                defer if (persisted_script) |p| allocator.free(p);
+                var effective_override = resolveEffectiveOverrideOptions(
+                    allocator,
+                    &override_opts,
+                    config_path,
+                    &persisted_script,
+                ) catch |err| {
+                    if (printOverrideRuntimeError(json_output, err)) return err;
+                    printConfigDumpError(json_output, err);
+                    return err;
+                };
+
+                override.apply(allocator, &cfg, &effective_override, "config.dump", config_path) catch |err| {
+                    if (printOverrideRuntimeError(json_output, err)) return err;
+                    printConfigDumpError(json_output, err);
+                    return err;
+                };
+            }
+
+            const dumped = if (json_output)
+                override.dumpConfigJson(allocator, &cfg)
+            else
+                override.dumpConfigYaml(allocator, &cfg);
+            const dumped_text = dumped catch |err| {
+                printConfigDumpError(json_output, err);
+                return err;
+            };
+            defer allocator.free(dumped_text);
+
+            std.debug.print("{s}\n", .{dumped_text});
+            return;
+        }
+
+        if (std.mem.eql(u8, subcmd, "override")) {
+            const action = parseConfigOverrideAction(args, 3) catch {
+                if (json_output) {
+                    printCliError(true, "CONFIG_OVERRIDE_ARGUMENT_INVALID", "invalid config override arguments", "use `zc config override <script.lua>` / `zc config override --clear` / `zc config override`");
+                } else {
+                    std.debug.print("Usage: zc config override [<script.lua>|--clear]\n", .{});
+                }
+                return;
+            };
+
+            const runtime_key = config.resolveRuntimeConfigKey(allocator, null) catch null;
+            defer if (runtime_key) |k| allocator.free(k);
+            const profile_name = runtime_key orelse "(none)";
+
+            switch (action) {
+                .set => |script| {
+                    const managed_path = config.copyOverrideScriptForCurrentConfig(allocator, script) catch |err| {
+                        printConfigOverrideError(json_output, err);
+                        return err;
+                    };
+                    defer allocator.free(managed_path);
+
+                    validateOverrideAndPrepareRuleProviders(allocator, managed_path) catch |err| {
+                        std.fs.deleteFileAbsolute(managed_path) catch {};
+                        if (printOverrideRuntimeError(json_output, err)) return err;
+                        printConfigOverridePrepareError(json_output, err);
+                        return err;
+                    };
+
+                    config.persistOverrideScriptPathForCurrentConfig(allocator, managed_path) catch |err| {
+                        std.fs.deleteFileAbsolute(managed_path) catch {};
+                        printConfigOverrideError(json_output, err);
+                        return err;
+                    };
+
+                    applyConfigOverrideToRunningDaemon(allocator, json_output) catch |err| {
+                        printConfigOverrideApplyError(json_output, err);
+                        return err;
+                    };
+
+                    if (json_output) {
+                        std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_set\",\"profile\":\"{s}\",\"enabled\":true,\"script\":\"{s}\"}}}}\n", .{
+                            profile_name,
+                            managed_path,
+                        });
+                    } else {
+                        std.debug.print("Persisted override set for config {s}: {s}\n", .{ profile_name, managed_path });
+                    }
+                    return;
+                },
+                .clear => {
+                    const had_override = config.clearPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
+                        printConfigOverrideError(json_output, err);
+                        return err;
+                    };
+
+                    if (had_override) {
+                        applyConfigOverrideToRunningDaemon(allocator, json_output) catch |err| {
+                            printConfigOverrideApplyError(json_output, err);
+                            return err;
+                        };
+                    }
+
+                    if (json_output) {
+                        std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_clear\",\"profile\":\"{s}\",\"enabled\":false,\"cleared\":{s}}}}}\n", .{
+                            profile_name,
+                            if (had_override) "true" else "false",
+                        });
+                    } else if (had_override) {
+                        std.debug.print("Cleared persisted override for config {s}\n", .{profile_name});
+                    } else {
+                        std.debug.print("No persisted override set for config {s}\n", .{profile_name});
+                    }
+                    return;
+                },
+                .show => {
+                    const current_script = config.getPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
+                        printConfigOverrideError(json_output, err);
+                        return err;
+                    };
+                    defer if (current_script) |s| allocator.free(s);
+
+                    if (json_output) {
+                        if (current_script) |s| {
+                            std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_get\",\"profile\":\"{s}\",\"enabled\":true,\"script\":\"{s}\"}}}}\n", .{
+                                profile_name,
+                                s,
+                            });
+                        } else {
+                            std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_get\",\"profile\":\"{s}\",\"enabled\":false,\"script\":null}}}}\n", .{profile_name});
+                        }
+                    } else if (current_script) |s| {
+                        std.debug.print("Config {s} persisted override: {s}\n", .{ profile_name, s });
+                    } else {
+                        std.debug.print("Config {s} persisted override: (none)\n", .{profile_name});
+                    }
+                    return;
+                },
+            }
+        }
+
         std.debug.print("Unknown config subcommand: {s}\n", .{subcmd});
         return;
     }
@@ -294,7 +466,8 @@ pub fn main() !void {
             }
 
             // 加载配置
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "proxy.list") catch |err| {
+                if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy list", "check config path and retry with `-c <config>`");
                 return err;
             };
@@ -334,7 +507,8 @@ pub fn main() !void {
             }
 
             // 加载配置（需要可变引用）
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "proxy.select") catch |err| {
+                if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy select", "check config path and retry with `-c <config>`");
                 return err;
             };
@@ -366,7 +540,8 @@ pub fn main() !void {
                 }
             }
 
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "proxy.test") catch |err| {
+                if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy test", "check config path and retry with `-c <config>`");
                 return err;
             };
@@ -417,7 +592,8 @@ pub fn main() !void {
             }
 
             // 加载配置
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "profile.list") catch |err| {
+                if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy list", "check config path and retry with `-c <config>`");
                 return err;
             };
@@ -457,7 +633,8 @@ pub fn main() !void {
             }
 
             // 加载配置（需要可变引用）
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "profile.select") catch |err| {
+                if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy select", "check config path and retry with `-c <config>`");
                 return err;
             };
@@ -489,7 +666,8 @@ pub fn main() !void {
                 }
             }
 
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output) catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "profile.test") catch |err| {
+                if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy test", "check config path and retry with `-c <config>`");
                 return err;
             };
@@ -517,7 +695,10 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "test")) {
         const config_path = parseConfigPathArg(args, 2);
 
-        var cfg = try loadAndValidateConfig(allocator, config_path, !json_output);
+        var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "test") catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            return err;
+        };
         defer cfg.deinit();
 
         try test_cli.testProxy(allocator, &cfg, null);
@@ -527,13 +708,45 @@ pub fn main() !void {
     // 处理 doctor 命令
     if (std.mem.eql(u8, cmd, "doctor")) {
         const config_path = parseConfigPathArg(args, 2);
+        var cfg_check = loadRawConfigForDoctor(allocator, config_path) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            if (json_output) {
+                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
+            }
+            return err;
+        };
+        defer cfg_check.deinit();
+
+        var persisted_script: ?[]u8 = null;
+        defer if (persisted_script) |p| allocator.free(p);
+        var effective_override = resolveEffectiveOverrideOptions(
+            allocator,
+            &override_opts,
+            config_path,
+            &persisted_script,
+        ) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            if (json_output) {
+                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
+            }
+            return err;
+        };
+
+        override.apply(allocator, &cfg_check, &effective_override, "doctor", config_path) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            if (json_output) {
+                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
+            }
+            return err;
+        };
+
         if (json_output) {
-            doctor_cli.runDoctorJson(allocator, config_path) catch |err| {
+            doctor_cli.runDoctorJsonWithConfig(allocator, &cfg_check, config_path) catch |err| {
                 printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
                 return err;
             };
         } else {
-            try doctor_cli.runDoctor(allocator, config_path);
+            try doctor_cli.runDoctorWithConfig(allocator, &cfg_check, config_path);
         }
         return;
     }
@@ -545,13 +758,45 @@ pub fn main() !void {
             return;
         }
         const config_path = parseConfigPathArg(args, 3);
+        var cfg_check = loadRawConfigForDoctor(allocator, config_path) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            if (json_output) {
+                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
+            }
+            return err;
+        };
+        defer cfg_check.deinit();
+
+        var persisted_script: ?[]u8 = null;
+        defer if (persisted_script) |p| allocator.free(p);
+        var effective_override = resolveEffectiveOverrideOptions(
+            allocator,
+            &override_opts,
+            config_path,
+            &persisted_script,
+        ) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            if (json_output) {
+                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
+            }
+            return err;
+        };
+
+        override.apply(allocator, &cfg_check, &effective_override, "diag.doctor", config_path) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            if (json_output) {
+                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
+            }
+            return err;
+        };
+
         if (json_output) {
-            doctor_cli.runDoctorJson(allocator, config_path) catch |err| {
+            doctor_cli.runDoctorJsonWithConfig(allocator, &cfg_check, config_path) catch |err| {
                 printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
                 return err;
             };
         } else {
-            try doctor_cli.runDoctor(allocator, config_path);
+            try doctor_cli.runDoctorWithConfig(allocator, &cfg_check, config_path);
         }
         return;
     }
@@ -727,6 +972,13 @@ fn printProfileListJson(allocator: std.mem.Allocator) !void {
     std.debug.print("{s}", .{out.items});
 }
 
+fn loadRawConfigForDoctor(allocator: std.mem.Allocator, config_path: ?[]const u8) !config.Config {
+    if (config_path) |path| {
+        return config.load(allocator, path);
+    }
+    return config.loadDefault(allocator);
+}
+
 fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {
     if (json_output) {
         std.debug.print(
@@ -739,6 +991,91 @@ fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint:
     std.debug.print("error.code={s}\n", .{code});
     std.debug.print("error.message={s}\n", .{message});
     std.debug.print("error.hint={s}\n", .{hint});
+}
+
+fn printOverrideOptionError(json_output: bool, err: anyerror) void {
+    switch (err) {
+        error.MissingOverrideScriptPath => printCliError(json_output, "OVERRIDE_SCRIPT_NOT_FOUND", "missing --override-script path", "use `--override-script <path>`"),
+        error.InvalidOverrideTimeout => printCliError(json_output, "OVERRIDE_SCRIPT_TIMEOUT", "invalid --override-timeout-ms value", "use a positive integer, e.g. `--override-timeout-ms 500`"),
+        error.MissingOverrideArg => printCliError(json_output, "OVERRIDE_OUTPUT_INVALID", "missing --override-arg value", "use `--override-arg key=value`"),
+        error.InvalidOverrideArg => printCliError(json_output, "OVERRIDE_OUTPUT_INVALID", "invalid --override-arg value", "use `--override-arg key=value`"),
+        error.DeprecatedOverrideDumpOption => printCliError(json_output, "OVERRIDE_OPTION_DEPRECATED", "--override-dump-yaml/json has been removed", "use `zc config dump [-c <config>]`"),
+        else => printCliError(json_output, "OVERRIDE_SCRIPT_EXEC_FAILED", "failed to parse override options", "check override flags and retry"),
+    }
+}
+
+fn printOverrideRuntimeError(json_output: bool, err: anyerror) bool {
+    switch (err) {
+        error.OverrideScriptNotFound => {
+            printCliError(json_output, "OVERRIDE_SCRIPT_NOT_FOUND", "override script or lua runtime not found", "verify `--override-script` path and lua runtime availability");
+            return true;
+        },
+        error.OverrideScriptExecFailed => {
+            printCliError(json_output, "OVERRIDE_SCRIPT_EXEC_FAILED", "override script execution failed", "ensure script exits 0 and prints valid yaml patch");
+            return true;
+        },
+        error.OverrideScriptTimeout => {
+            printCliError(json_output, "OVERRIDE_SCRIPT_TIMEOUT", "override script timed out", "increase `--override-timeout-ms` or optimize script");
+            return true;
+        },
+        error.OverrideOutputInvalid => {
+            printCliError(json_output, "OVERRIDE_OUTPUT_INVALID", "override script output is invalid", "return/print a yaml object with known config keys");
+            return true;
+        },
+        error.OverrideMergeFailed => {
+            printCliError(json_output, "OVERRIDE_MERGE_FAILED", "failed to merge override output", "check script output structure, or run `zc config override --clear` / `zc config dump --no-override`");
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn printConfigOverrideError(json_output: bool, err: anyerror) void {
+    switch (err) {
+        error.NoActiveConfig => printCliError(json_output, "CONFIG_OVERRIDE_NO_ACTIVE", "no active config found for override", "run `zc config use <name>` first"),
+        error.FileNotFound => printCliError(json_output, "CONFIG_OVERRIDE_SCRIPT_NOT_FOUND", "override script file not found", "check script path and retry"),
+        error.RuleProviderDownloadFailed => printCliError(json_output, "RULE_PROVIDER_DOWNLOAD_FAILED", "failed to download rule-provider files", "check provider url/network and retry"),
+        error.RuleProviderFileNotFound => printCliError(json_output, "RULE_PROVIDER_FILE_NOT_FOUND", "rule-provider file not found", "check `rule-providers.<name>.path` or provider url"),
+        else => printCliError(json_output, "CONFIG_OVERRIDE_FAILED", "failed to update persisted config override", "check config state and retry"),
+    }
+}
+
+fn printConfigOverridePrepareError(json_output: bool, err: anyerror) void {
+    switch (err) {
+        error.RuleProviderDownloadFailed => printCliError(json_output, "RULE_PROVIDER_DOWNLOAD_FAILED", "failed to download rule-provider files", "check provider url/network and retry"),
+        error.RuleProviderFileNotFound => printCliError(json_output, "RULE_PROVIDER_FILE_NOT_FOUND", "rule-provider file not found", "check `rule-providers.<name>.path` or provider url"),
+        else => printCliError(json_output, "CONFIG_OVERRIDE_FAILED", "failed to prepare merged config after override", "check script output and provider paths"),
+    }
+}
+
+fn printConfigOverrideApplyError(json_output: bool, _: anyerror) void {
+    printCliError(
+        json_output,
+        "CONFIG_OVERRIDE_APPLY_FAILED",
+        "override persisted but failed to apply to running daemon",
+        "check `zc log --no-follow`, then run `zc restart`",
+    );
+}
+
+fn printConfigDumpError(json_output: bool, _: anyerror) void {
+    printCliError(json_output, "CONFIG_DUMP_FAILED", "failed to dump merged config", "check config path/override script and retry");
+}
+
+fn validateOverrideAndPrepareRuleProviders(allocator: std.mem.Allocator, script_path: []const u8) !void {
+    var cfg = try config.loadDefault(allocator);
+    defer cfg.deinit();
+
+    var opts = override.CliOptions{};
+    opts.script_path = try allocator.dupe(u8, script_path);
+    defer opts.deinit(allocator);
+
+    try override.apply(allocator, &cfg, &opts, "config.override.set", null);
+    try config.prepareRuleProvidersForRuntime(allocator, &cfg, null);
+}
+
+fn applyConfigOverrideToRunningDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
+    if (!try daemon.isRunning(allocator)) return;
+    _ = try daemon.reloadOrRestart(allocator, null, json_output, .auto);
 }
 
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
@@ -758,6 +1095,32 @@ fn parseConfigPathArg(args: []const []const u8, start_index: usize) ?[]const u8 
     return null;
 }
 
+fn parseConfigOverrideAction(args: []const []const u8, start_index: usize) !ConfigOverrideAction {
+    var clear = false;
+    var script_path: ?[]const u8 = null;
+
+    var i: usize = start_index;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json")) continue;
+        if (std.mem.eql(u8, arg, "--clear")) {
+            clear = true;
+            continue;
+        }
+        if (arg.len > 0 and arg[0] == '-') return error.InvalidConfigOverrideArgs;
+        if (script_path == null) {
+            script_path = arg;
+        } else {
+            return error.InvalidConfigOverrideArgs;
+        }
+    }
+
+    if (clear and script_path != null) return error.InvalidConfigOverrideArgs;
+    if (clear) return .clear;
+    if (script_path) |script| return .{ .set = script };
+    return .show;
+}
+
 fn parseUpdateApplyMode(s: []const u8) !UpdateApplyMode {
     if (std.mem.eql(u8, s, "auto")) return .auto;
     if (std.mem.eql(u8, s, "hot")) return .hot;
@@ -765,7 +1128,13 @@ fn parseUpdateApplyMode(s: []const u8) !UpdateApplyMode {
     return error.InvalidApplyMode;
 }
 
-fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: bool) !void {
+fn runProxy(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    use_tui: bool,
+    override_opts: *const override.CliOptions,
+    command_name: []const u8,
+) !void {
     std.debug.print("zc v{s}\n", .{build_options.version});
 
     // 保存配置路径用于重载
@@ -774,7 +1143,7 @@ fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: boo
     }
 
     // 加载并验证配置
-    var cfg = try loadAndValidateConfig(allocator, config_path, true);
+    var cfg = try loadAndValidateConfig(allocator, config_path, true, override_opts, command_name);
     defer cfg.deinit();
 
     // 启动前端口占用预检（可能修改 external-controller 端口）
@@ -825,16 +1194,35 @@ fn runProxy(allocator: std.mem.Allocator, config_path: ?[]const u8, use_tui: boo
     }
 }
 
-fn loadAndValidateConfig(allocator: std.mem.Allocator, config_path: ?[]const u8, print_validation: bool) !config.Config {
+fn loadAndValidateConfig(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    print_validation: bool,
+    override_opts: *const override.CliOptions,
+    command_name: []const u8,
+) !config.Config {
     var cfg = if (config_path) |path|
         try config.load(allocator, path)
     else
         try config.loadDefault(allocator);
+    errdefer cfg.deinit();
 
     // 强制使用 mixed-port 模式，忽略配置文件中的端口设置
     cfg.mixed_port = constants.MIXED_PORT;
     cfg.port = 0;
     cfg.socks_port = 0;
+
+    var persisted_script: ?[]u8 = null;
+    defer if (persisted_script) |p| allocator.free(p);
+    var effective_override = try resolveEffectiveOverrideOptions(
+        allocator,
+        override_opts,
+        config_path,
+        &persisted_script,
+    );
+
+    try override.apply(allocator, &cfg, &effective_override, command_name, config_path);
+    try config.prepareRuleProvidersForRuntime(allocator, &cfg, config_path);
 
     var validation_result = try validator.validate(allocator, &cfg);
     defer validation_result.deinit();
@@ -848,6 +1236,23 @@ fn loadAndValidateConfig(allocator: std.mem.Allocator, config_path: ?[]const u8,
     }
 
     return cfg;
+}
+
+fn resolveEffectiveOverrideOptions(
+    allocator: std.mem.Allocator,
+    base_opts: *const override.CliOptions,
+    config_path: ?[]const u8,
+    persisted_script: *?[]u8,
+) !override.CliOptions {
+    var effective = base_opts.*;
+    persisted_script.* = null;
+
+    if (effective.script_path == null) {
+        persisted_script.* = try config.getPersistedOverrideScriptForRuntime(allocator, config_path);
+        if (persisted_script.*) |p| effective.script_path = p;
+    }
+
+    return effective;
 }
 
 fn proxyThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine: *rule_engine.Engine, manager: *outbound.OutboundManager) void {
@@ -1064,6 +1469,11 @@ fn printHelp() !void {
     std.debug.print("    test [-c <config>]      Test network connectivity\n", .{});
     std.debug.print("    doctor [-c <config>]    Diagnose config/service/ports\n", .{});
     std.debug.print("\n", .{});
+    std.debug.print("OVERRIDE OPTIONS (for config-loading commands):\n", .{});
+    std.debug.print("    --override-script <path>       Run override script (lua returns table, or executable prints YAML)\n", .{});
+    std.debug.print("    --override-arg <k=v>           Pass key/value to override script (repeatable)\n", .{});
+    std.debug.print("    --override-timeout-ms <n>      Override script timeout in milliseconds (default: 500)\n", .{});
+    std.debug.print("\n", .{});
     std.debug.print("CONFIG COMMANDS:\n", .{});
     std.debug.print("    zc config list                  List all available configs\n", .{});
     std.debug.print("    zc config ls                    Alias for list\n", .{});
@@ -1071,6 +1481,10 @@ fn printHelp() !void {
     std.debug.print("                            -n <name>   Config filename (default: timestamp)\n", .{});
     std.debug.print("                            -d          Set as default after download\n", .{});
     std.debug.print("    zc config use <configname>     Switch to specified config\n", .{});
+    std.debug.print("    zc config dump [-c <config>] [--no-override]\n", .{});
+    std.debug.print("                               Print merged config (YAML default, JSON with --json)\n", .{});
+    std.debug.print("    zc config override [script|--clear]\n", .{});
+    std.debug.print("                               Bind/clear persisted override for current config\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("PROXY COMMANDS:\n", .{});
     std.debug.print("    zc proxy list                   List all proxy groups and nodes\n", .{});
@@ -1109,6 +1523,13 @@ fn printHelp() !void {
     std.debug.print("    # Switch config\n", .{});
     std.debug.print("    zc config use myconfig.yaml\n", .{});
     std.debug.print("\n", .{});
+    std.debug.print("    # Bind persisted override to current config\n", .{});
+    std.debug.print("    zc config override ./override.lua\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("    # Dump merged config as YAML\n", .{});
+    std.debug.print("    zc config dump\n", .{});
+    std.debug.print("    zc config dump --no-override\n", .{});
+    std.debug.print("\n", .{});
 }
 
 fn printConfigHelp() !void {
@@ -1122,12 +1543,18 @@ fn printConfigHelp() !void {
     std.debug.print("                            -n <name>   Config filename (default: timestamp)\n", .{});
     std.debug.print("                            -d          Set as default after download\n", .{});
     std.debug.print("    zc config use <configname>     Switch to specified config\n", .{});
+    std.debug.print("    zc config dump [-c <config>] [--no-override]\n", .{});
+    std.debug.print("    zc config override [script|--clear]\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("EXAMPLES:\n", .{});
     std.debug.print("    zc config download https://example.com/config.yaml\n", .{});
     std.debug.print("    zc config download https://example.com/config.yaml -n myconfig -d\n", .{});
     std.debug.print("    zc config list\n", .{});
     std.debug.print("    zc config use myconfig.yaml\n", .{});
+    std.debug.print("    zc config dump\n", .{});
+    std.debug.print("    zc config dump --no-override\n", .{});
+    std.debug.print("    zc config override ./override.lua\n", .{});
+    std.debug.print("    zc config override --clear\n", .{});
     std.debug.print("\n", .{});
 }
 
@@ -1169,9 +1596,42 @@ test "parseConfigPathArg handles -c" {
     try testing.expect(parseConfigPathArg(args2[0..], 2) == null);
 }
 
+test "parseConfigOverrideAction supports show set clear" {
+    const testing = std.testing;
+
+    const show_args = [_][]const u8{ "zc", "config", "override" };
+    const a1 = try parseConfigOverrideAction(show_args[0..], 3);
+    try testing.expect(a1 == .show);
+
+    const set_args = [_][]const u8{ "zc", "config", "override", "./override.lua" };
+    const a2 = try parseConfigOverrideAction(set_args[0..], 3);
+    try testing.expect(a2 == .set);
+    try testing.expectEqualStrings("./override.lua", a2.set);
+
+    const clear_args = [_][]const u8{ "zc", "config", "override", "--clear" };
+    const a3 = try parseConfigOverrideAction(clear_args[0..], 3);
+    try testing.expect(a3 == .clear);
+
+    const set_json_args = [_][]const u8{ "zc", "config", "override", "./override.lua", "--json" };
+    const a4 = try parseConfigOverrideAction(set_json_args[0..], 3);
+    try testing.expect(a4 == .set);
+    try testing.expectEqualStrings("./override.lua", a4.set);
+}
+
+test "parseConfigOverrideAction rejects invalid args" {
+    const testing = std.testing;
+
+    const both_args = [_][]const u8{ "zc", "config", "override", "--clear", "./override.lua" };
+    try testing.expectError(error.InvalidConfigOverrideArgs, parseConfigOverrideAction(both_args[0..], 3));
+
+    const unknown_flag_args = [_][]const u8{ "zc", "config", "override", "--bad" };
+    try testing.expectError(error.InvalidConfigOverrideArgs, parseConfigOverrideAction(unknown_flag_args[0..], 3));
+}
+
 test "include auxiliary cli tests" {
     _ = @import("test_cli.zig");
     _ = @import("doctor_cli.zig");
+    _ = @import("override.zig");
 }
 
 test "hasInProcessPortConflict detects conflicts" {

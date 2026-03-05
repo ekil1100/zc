@@ -58,6 +58,7 @@ pub const RuleType = enum {
     ip_cidr,
     ip_cidr6,
     geoip,
+    rule_set,
     src_ip_cidr,
     dst_port,
     src_port,
@@ -74,6 +75,36 @@ pub const Rule = struct {
     pub fn deinit(self: *Rule, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
         allocator.free(self.target);
+    }
+};
+
+pub const RuleProviderBehavior = enum {
+    domain,
+    ipcidr,
+    classical,
+};
+
+pub const RuleProvider = struct {
+    name: []const u8,
+    provider_type: []const u8,
+    behavior: RuleProviderBehavior,
+    url: ?[]const u8 = null,
+    path: []const u8,
+    interval: u32 = 86400,
+    entries: std.ArrayList([]const u8),
+
+    pub fn deinit(self: *RuleProvider, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.provider_type);
+        if (self.url) |u| allocator.free(u);
+        allocator.free(self.path);
+        self.clearEntries(allocator);
+        self.entries.deinit(allocator);
+    }
+
+    pub fn clearEntries(self: *RuleProvider, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |item| allocator.free(item);
+        self.entries.clearRetainingCapacity();
     }
 };
 
@@ -122,6 +153,7 @@ pub const Config = struct {
 
     proxies: std.ArrayList(Proxy),
     proxy_groups: std.ArrayList(ProxyGroup),
+    rule_providers: std.ArrayList(RuleProvider) = .empty,
     rules: std.ArrayList(Rule),
 
     pub fn deinit(self: *Config) void {
@@ -134,6 +166,11 @@ pub const Config = struct {
             group.deinit(self.allocator);
         }
         self.proxy_groups.deinit(self.allocator);
+
+        for (self.rule_providers.items) |*provider| {
+            provider.deinit(self.allocator);
+        }
+        self.rule_providers.deinit(self.allocator);
 
         for (self.rules.items) |*rule| {
             rule.deinit(self.allocator);
@@ -172,6 +209,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
         .bind_address = try allocator.dupe(u8, "*"),
         .proxies = std.ArrayList(Proxy).empty,
         .proxy_groups = std.ArrayList(ProxyGroup).empty,
+        .rule_providers = std.ArrayList(RuleProvider).empty,
         .rules = std.ArrayList(Rule).empty,
     };
     errdefer config.deinit();
@@ -256,6 +294,17 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
                     const group = try parseProxyGroup(allocator, item.map);
                     try config.proxy_groups.append(allocator, group);
                 }
+            }
+        }
+    }
+
+    if (root.map.get("rule-providers")) |providers| {
+        if (providers == .map) {
+            var it = providers.map.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .map) return error.InvalidConfig;
+                const provider = try parseRuleProvider(allocator, entry.key_ptr.*, entry.value_ptr.*.map);
+                try config.rule_providers.append(allocator, provider);
             }
         }
     }
@@ -434,6 +483,41 @@ fn parseProxyGroup(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.Yam
     return group;
 }
 
+fn parseRuleProvider(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    map: std.StringHashMap(yaml.YamlValue),
+) !RuleProvider {
+    const type_val = map.get("type") orelse return error.MissingRuleProviderType;
+    const behavior_val = map.get("behavior") orelse return error.MissingRuleProviderBehavior;
+    const path_val = map.get("path") orelse return error.MissingRuleProviderPath;
+
+    if (type_val != .string or behavior_val != .string or path_val != .string) {
+        return error.InvalidRuleProviderFormat;
+    }
+
+    var provider = RuleProvider{
+        .name = try allocator.dupe(u8, name),
+        .provider_type = try allocator.dupe(u8, type_val.string),
+        .behavior = parseRuleProviderBehavior(behavior_val.string) orelse return error.InvalidRuleProviderBehavior,
+        .path = try allocator.dupe(u8, path_val.string),
+        .entries = std.ArrayList([]const u8).empty,
+    };
+    errdefer provider.deinit(allocator);
+
+    if (map.get("url")) |v| {
+        if (v != .string) return error.InvalidRuleProviderFormat;
+        provider.url = try allocator.dupe(u8, v.string);
+    }
+    if (map.get("interval")) |v| {
+        if (v != .integer) return error.InvalidRuleProviderFormat;
+        if (v.integer <= 0) return error.InvalidRuleProviderFormat;
+        provider.interval = @intCast(v.integer);
+    }
+
+    return provider;
+}
+
 fn parseRule(allocator: std.mem.Allocator, rule_str: []const u8) !Rule {
     // Trim whitespace
     const trimmed = std.mem.trim(u8, rule_str, " \t\r\n");
@@ -510,11 +594,19 @@ fn parseRuleType(s: []const u8) ?RuleType {
     if (std.mem.eql(u8, s, "IP-CIDR")) return .ip_cidr;
     if (std.mem.eql(u8, s, "IP-CIDR6")) return .ip_cidr6;
     if (std.mem.eql(u8, s, "GEOIP")) return .geoip;
+    if (std.mem.eql(u8, s, "RULE-SET")) return .rule_set;
     if (std.mem.eql(u8, s, "SRC-IP-CIDR")) return .src_ip_cidr;
     if (std.mem.eql(u8, s, "DST-PORT")) return .dst_port;
     if (std.mem.eql(u8, s, "SRC-PORT")) return .src_port;
     if (std.mem.eql(u8, s, "PROCESS-NAME")) return .process_name;
     if (std.mem.eql(u8, s, "MATCH")) return .final;
+    return null;
+}
+
+fn parseRuleProviderBehavior(s: []const u8) ?RuleProviderBehavior {
+    if (std.mem.eql(u8, s, "domain")) return .domain;
+    if (std.mem.eql(u8, s, "ipcidr")) return .ipcidr;
+    if (std.mem.eql(u8, s, "classical")) return .classical;
     return null;
 }
 
@@ -573,7 +665,6 @@ fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
     return try allocator.dupe(u8, "config.yaml");
 }
 
-
 /// 默认配置（先尝试从文件读取，失败则用内置配置）
 pub fn loadDefault(allocator: std.mem.Allocator) !Config {
     // 尝试查找默认配置文件
@@ -604,13 +695,360 @@ pub fn loadDefault(allocator: std.mem.Allocator) !Config {
     return try parse(allocator, yaml_config);
 }
 
+pub fn prepareRuleProvidersForRuntime(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    config_path: ?[]const u8,
+) !void {
+    try syncRuleProviderFilesIfNeeded(allocator, cfg, config_path);
+    try loadRuleProviderEntries(allocator, cfg, config_path);
+    try expandRuleSetRules(allocator, cfg);
+}
+
+fn syncRuleProviderFilesIfNeeded(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    config_path: ?[]const u8,
+) !void {
+    for (cfg.rule_providers.items) |*provider| {
+        const resolved_path = try resolveRuleProviderPath(allocator, provider.path, config_path);
+        defer allocator.free(resolved_path);
+
+        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (provider.url) |url| {
+                    try downloadRuleProviderFile(allocator, provider.name, url, resolved_path, true);
+                    continue;
+                }
+                return error.RuleProviderFileNotFound;
+            },
+            else => return err,
+        };
+        defer file.close();
+        const stat = try file.stat();
+
+        if (provider.url) |url| {
+            if (isRuleProviderRefreshDue(stat.mtime, provider.interval)) {
+                downloadRuleProviderFile(allocator, provider.name, url, resolved_path, false) catch |err| {
+                    std.debug.print(
+                        "rule-provider refresh failed (using cached file): name={s} url={s} path={s} error={s}\n",
+                        .{ provider.name, url, resolved_path, @errorName(err) },
+                    );
+                };
+            }
+        }
+    }
+}
+
+fn downloadRuleProviderFile(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    url: []const u8,
+    resolved_path: []const u8,
+    required: bool,
+) !void {
+    const result = fetchConfig(allocator, url) catch |err| {
+        std.debug.print(
+            "rule-provider download failed: name={s} url={s} path={s} error={s}\n",
+            .{ provider_name, url, resolved_path, @errorName(err) },
+        );
+        return error.RuleProviderDownloadFailed;
+    };
+    defer allocator.free(result.body);
+
+    if (result.status != .ok) {
+        std.debug.print(
+            "rule-provider download failed: name={s} url={s} path={s} status={d}\n",
+            .{ provider_name, url, resolved_path, @intFromEnum(result.status) },
+        );
+        return error.RuleProviderDownloadFailed;
+    }
+
+    const parent = std.fs.path.dirname(resolved_path) orelse return error.RuleProviderDownloadFailed;
+    std.fs.cwd().makePath(parent) catch |err| {
+        std.debug.print(
+            "rule-provider download failed: name={s} url={s} path={s} mkdir_error={s}\n",
+            .{ provider_name, url, resolved_path, @errorName(err) },
+        );
+        return error.RuleProviderDownloadFailed;
+    };
+
+    const file = std.fs.createFileAbsolute(resolved_path, .{}) catch |err| {
+        std.debug.print(
+            "rule-provider download failed: name={s} url={s} path={s} file_error={s}\n",
+            .{ provider_name, url, resolved_path, @errorName(err) },
+        );
+        return error.RuleProviderDownloadFailed;
+    };
+    defer file.close();
+    file.writeAll(result.body) catch |err| {
+        std.debug.print(
+            "rule-provider download failed: name={s} url={s} path={s} write_error={s}\n",
+            .{ provider_name, url, resolved_path, @errorName(err) },
+        );
+        return error.RuleProviderDownloadFailed;
+    };
+
+    if (required) {
+        std.debug.print("rule-provider downloaded: name={s} path={s}\n", .{ provider_name, resolved_path });
+    } else {
+        std.debug.print("rule-provider refreshed: name={s} path={s}\n", .{ provider_name, resolved_path });
+    }
+}
+
+fn isRuleProviderRefreshDue(mtime: i128, interval_seconds: u32) bool {
+    if (interval_seconds == 0) return true;
+    const now_sec = std.time.timestamp();
+    const mtime_sec = statTimestampToSeconds(mtime);
+    if (mtime_sec <= 0) return true;
+    return now_sec - mtime_sec >= @as(i64, @intCast(interval_seconds));
+}
+
+fn statTimestampToSeconds(raw: i128) i64 {
+    const sec_threshold: i128 = 10_000_000_000;
+    if (raw >= sec_threshold or raw <= -sec_threshold) {
+        return @intCast(@divTrunc(raw, std.time.ns_per_s));
+    }
+    return @intCast(raw);
+}
+
+fn loadRuleProviderEntries(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    config_path: ?[]const u8,
+) !void {
+    for (cfg.rule_providers.items) |*provider| {
+        provider.clearEntries(allocator);
+        const resolved_path = try resolveRuleProviderPath(allocator, provider.path, config_path);
+        defer allocator.free(resolved_path);
+
+        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch |err| {
+            switch (err) {
+                error.FileNotFound => return error.RuleProviderFileNotFound,
+                else => return err,
+            }
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(allocator, 8 * 1024 * 1024);
+        defer allocator.free(content);
+
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |raw_line| {
+            const normalized = normalizeRuleProviderLine(raw_line) orelse continue;
+            try provider.entries.append(allocator, try allocator.dupe(u8, normalized));
+        }
+    }
+}
+
+fn normalizeRuleProviderLine(raw_line: []const u8) ?[]const u8 {
+    var line = std.mem.trim(u8, raw_line, " \t\r");
+    if (line.len == 0) return null;
+    if (line[0] == '#') return null;
+
+    // Support Clash rule-provider YAML wrapper format:
+    // payload:
+    //   - RULE,...
+    if (std.mem.eql(u8, line, "payload:")) return null;
+    if (line[0] == '-') {
+        line = std.mem.trim(u8, line[1..], " \t");
+        if (line.len == 0) return null;
+    }
+
+    // Some providers use YAML string literals in payload arrays:
+    //   - '1.1.1.0/24'
+    //   - "DOMAIN-SUFFIX,example.com"
+    line = stripMatchingQuotes(line);
+
+    return line;
+}
+
+fn stripMatchingQuotes(s: []const u8) []const u8 {
+    if (s.len < 2) return s;
+    const first = s[0];
+    const last = s[s.len - 1];
+    if ((first == '\'' and last == '\'') or (first == '"' and last == '"')) {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
+fn expandRuleSetRules(allocator: std.mem.Allocator, cfg: *Config) !void {
+    var expanded = std.ArrayList(Rule).empty;
+    errdefer {
+        for (expanded.items) |*r| r.deinit(allocator);
+        expanded.deinit(allocator);
+    }
+
+    for (cfg.rules.items) |rule| {
+        if (rule.rule_type != .rule_set) {
+            try expanded.append(allocator, try cloneRule(allocator, rule));
+            continue;
+        }
+
+        const provider = findRuleProvider(cfg, rule.payload) orelse return error.RuleProviderNotFound;
+        try appendRulesFromProvider(allocator, &expanded, provider, rule.target, rule.no_resolve);
+    }
+
+    for (cfg.rules.items) |*r| r.deinit(allocator);
+    cfg.rules.deinit(allocator);
+    cfg.rules = expanded;
+}
+
+fn appendRulesFromProvider(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Rule),
+    provider: *const RuleProvider,
+    target: []const u8,
+    inherit_no_resolve: bool,
+) !void {
+    switch (provider.behavior) {
+        .domain => {
+            for (provider.entries.items) |entry| {
+                const payload = normalizeDomainProviderEntry(entry) orelse continue;
+                var rule = Rule{
+                    .rule_type = .domain_suffix,
+                    .payload = try allocator.dupe(u8, payload),
+                    .target = try allocator.dupe(u8, target),
+                    .no_resolve = inherit_no_resolve,
+                };
+                errdefer rule.deinit(allocator);
+                try out.append(allocator, rule);
+            }
+        },
+        .ipcidr => {
+            for (provider.entries.items) |entry| {
+                const payload = normalizeIpCidrProviderEntry(entry) orelse continue;
+                const rule_type: RuleType = if (std.mem.indexOfScalar(u8, payload, ':') != null) .ip_cidr6 else .ip_cidr;
+                var rule = Rule{
+                    .rule_type = rule_type,
+                    .payload = try allocator.dupe(u8, payload),
+                    .target = try allocator.dupe(u8, target),
+                    .no_resolve = inherit_no_resolve,
+                };
+                errdefer rule.deinit(allocator);
+                try out.append(allocator, rule);
+            }
+        },
+        .classical => {
+            for (provider.entries.items) |entry| {
+                var rule = try parseClassicalProviderEntry(allocator, entry, target);
+                if (inherit_no_resolve) rule.no_resolve = true;
+                errdefer rule.deinit(allocator);
+                try out.append(allocator, rule);
+            }
+        },
+    }
+}
+
+fn parseClassicalProviderEntry(
+    allocator: std.mem.Allocator,
+    entry: []const u8,
+    default_target: []const u8,
+) !Rule {
+    const trimmed = std.mem.trim(u8, entry, " \t\r");
+    if (trimmed.len == 0) return error.InvalidRuleProviderEntry;
+
+    var parts_it = std.mem.splitScalar(u8, trimmed, ',');
+    const type_raw = parts_it.next() orelse return error.InvalidRuleProviderEntry;
+    const type_str = std.mem.trim(u8, type_raw, " \t");
+    const rule_type = parseRuleType(type_str) orelse return error.UnknownRuleType;
+
+    var payload: []const u8 = "";
+    if (rule_type != .final) {
+        const payload_raw = parts_it.next() orelse return error.InvalidRuleProviderEntry;
+        payload = std.mem.trim(u8, payload_raw, " \t");
+        if (payload.len == 0) return error.InvalidRuleProviderEntry;
+    }
+
+    var target: []const u8 = default_target;
+    var no_resolve = false;
+    while (parts_it.next()) |opt_raw| {
+        const opt = std.mem.trim(u8, opt_raw, " \t");
+        if (opt.len == 0) continue;
+        if (std.mem.eql(u8, opt, "no-resolve")) {
+            no_resolve = true;
+            continue;
+        }
+        target = opt;
+    }
+
+    return .{
+        .rule_type = rule_type,
+        .payload = try allocator.dupe(u8, payload),
+        .target = try allocator.dupe(u8, target),
+        .no_resolve = no_resolve,
+    };
+}
+
+fn normalizeDomainProviderEntry(entry: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, entry, " \t\r");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "DOMAIN-SUFFIX,")) {
+        return std.mem.trim(u8, trimmed["DOMAIN-SUFFIX,".len..], " \t");
+    }
+    if (std.mem.startsWith(u8, trimmed, "DOMAIN,")) {
+        return std.mem.trim(u8, trimmed["DOMAIN,".len..], " \t");
+    }
+    if (std.mem.startsWith(u8, trimmed, "+.")) return trimmed[2..];
+    if (trimmed[0] == '.') return trimmed[1..];
+    return trimmed;
+}
+
+fn normalizeIpCidrProviderEntry(entry: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, entry, " \t\r");
+    if (trimmed.len == 0) return null;
+    if (std.mem.startsWith(u8, trimmed, "IP-CIDR,")) {
+        return std.mem.trim(u8, trimmed["IP-CIDR,".len..], " \t");
+    }
+    if (std.mem.startsWith(u8, trimmed, "IP-CIDR6,")) {
+        return std.mem.trim(u8, trimmed["IP-CIDR6,".len..], " \t");
+    }
+    return trimmed;
+}
+
+fn resolveRuleProviderPath(
+    allocator: std.mem.Allocator,
+    provider_path: []const u8,
+    config_path: ?[]const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(provider_path)) {
+        return try std.fs.path.resolve(allocator, &.{provider_path});
+    }
+
+    if (config_path) |cfg_path| {
+        const dir = std.fs.path.dirname(cfg_path) orelse ".";
+        return try std.fs.path.resolve(allocator, &.{ dir, provider_path });
+    }
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    return try std.fs.path.resolve(allocator, &.{ cwd, provider_path });
+}
+
+fn findRuleProvider(cfg: *const Config, name: []const u8) ?*const RuleProvider {
+    for (cfg.rule_providers.items) |*provider| {
+        if (std.mem.eql(u8, provider.name, name)) return provider;
+    }
+    return null;
+}
+
+fn cloneRule(allocator: std.mem.Allocator, rule: Rule) !Rule {
+    return .{
+        .rule_type = rule.rule_type,
+        .payload = try allocator.dupe(u8, rule.payload),
+        .target = try allocator.dupe(u8, rule.target),
+        .no_resolve = rule.no_resolve,
+    };
+}
+
 /// 获取默认配置目录路径 (~/.config/zc)
 pub fn getDefaultConfigDir(allocator: std.mem.Allocator) !?[]const u8 {
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
     defer allocator.free(home);
     return try std.fs.path.join(allocator, &.{ home, ".config/zc" });
 }
-
 
 /// 下载结果结构体
 pub const DownloadResult = struct {
@@ -718,7 +1156,6 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     return key;
 }
 
-
 /// 获取当前激活的配置 key（从 meta.json）
 pub fn getCurrentConfigName(allocator: std.mem.Allocator) !?[]const u8 {
     var meta_data = meta.load(allocator) catch return null;
@@ -749,6 +1186,178 @@ pub fn resolveRuntimeConfigKey(allocator: std.mem.Allocator, explicit_config_pat
     }
 
     return null;
+}
+
+/// 获取运行时可用的持久化 override 脚本（按配置 key）
+pub fn getPersistedOverrideScriptForRuntime(allocator: std.mem.Allocator, explicit_config_path: ?[]const u8) !?[]u8 {
+    const key = if (explicit_config_path) |path|
+        (try inferConfigKeyFromPath(allocator, path)) orelse return null
+    else
+        (try resolveRuntimeConfigKey(allocator, null)) orelse return null;
+    defer allocator.free(key);
+
+    var meta_data = try meta.load(allocator);
+    defer meta_data.deinit();
+
+    const cm = meta_data.configs.get(key) orelse return null;
+    const script_path = cm.override_script orelse return null;
+    return try allocator.dupe(u8, script_path);
+}
+
+/// 获取“当前配置”绑定的持久化 override 脚本
+pub fn getPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator) !?[]u8 {
+    return getPersistedOverrideScriptForRuntime(allocator, null);
+}
+
+/// 获取 override 脚本托管目录（~/.config/zc/override）
+pub fn getOverrideScriptsDir(allocator: std.mem.Allocator) !?[]const u8 {
+    const config_dir = try getDefaultConfigDir(allocator) orelse return null;
+    defer allocator.free(config_dir);
+    return try std.fs.path.join(allocator, &.{ config_dir, "override" });
+}
+
+/// 为当前配置复制 override 脚本到托管目录，返回托管脚本绝对路径
+pub fn copyOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) ![]u8 {
+    const key = (try resolveRuntimeConfigKey(allocator, null)) orelse return error.NoActiveConfig;
+    defer allocator.free(key);
+
+    const abs_script = try toAbsoluteNormalizedPath(allocator, script_path);
+    defer allocator.free(abs_script);
+
+    var file = std.fs.openFileAbsolute(abs_script, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    file.close();
+
+    const overrides_dir = (try getOverrideScriptsDir(allocator)) orelse return error.NoConfigDir;
+    defer allocator.free(overrides_dir);
+
+    std.fs.cwd().makePath(overrides_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const managed_path = try makeManagedOverrideScriptPathForKey(allocator, key, abs_script, overrides_dir);
+    errdefer allocator.free(managed_path);
+
+    try std.fs.copyFileAbsolute(abs_script, managed_path, .{});
+    return managed_path;
+}
+
+/// 将已存在的脚本路径绑定为当前配置持久化 override
+pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) !void {
+    const key = (try resolveRuntimeConfigKey(allocator, null)) orelse return error.NoActiveConfig;
+    defer allocator.free(key);
+
+    const abs_script = try toAbsoluteNormalizedPath(allocator, script_path);
+    defer allocator.free(abs_script);
+
+    var file = std.fs.openFileAbsolute(abs_script, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    file.close();
+
+    const overrides_dir = (try getOverrideScriptsDir(allocator)) orelse return error.NoConfigDir;
+    defer allocator.free(overrides_dir);
+
+    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    defer meta_data.deinit();
+
+    const cm = try ensureConfigMetaEntry(allocator, &meta_data, key);
+    if (cm.override_script) |old| {
+        const should_delete = isManagedOverrideScriptPath(allocator, old, overrides_dir) catch false;
+        if (should_delete and !std.mem.eql(u8, old, abs_script)) {
+            std.fs.deleteFileAbsolute(old) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+    }
+    if (cm.override_script) |old| allocator.free(old);
+    cm.override_script = try allocator.dupe(u8, abs_script);
+
+    try meta.save(allocator, &meta_data);
+}
+
+/// 为“当前配置”设置持久化 override 脚本，返回托管脚本路径
+pub fn setPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) ![]u8 {
+    const managed_path = try copyOverrideScriptForCurrentConfig(allocator, script_path);
+    errdefer {
+        std.fs.deleteFileAbsolute(managed_path) catch {};
+        allocator.free(managed_path);
+    }
+
+    try persistOverrideScriptPathForCurrentConfig(allocator, managed_path);
+    return managed_path;
+}
+
+/// 清除“当前配置”的持久化 override 脚本
+pub fn clearPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator) !bool {
+    const key = (try resolveRuntimeConfigKey(allocator, null)) orelse return error.NoActiveConfig;
+    defer allocator.free(key);
+
+    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    defer meta_data.deinit();
+
+    const cm = meta_data.configs.getPtr(key) orelse return false;
+
+    const overrides_dir = (try getOverrideScriptsDir(allocator)) orelse return error.NoConfigDir;
+    defer allocator.free(overrides_dir);
+
+    if (cm.override_script) |old| {
+        const should_delete = isManagedOverrideScriptPath(allocator, old, overrides_dir) catch false;
+        if (should_delete) {
+            std.fs.deleteFileAbsolute(old) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+        allocator.free(old);
+        cm.override_script = null;
+        try meta.save(allocator, &meta_data);
+        return true;
+    }
+    return false;
+}
+
+fn ensureConfigMetaEntry(allocator: std.mem.Allocator, meta_data: *meta.MetaData, key: []const u8) !*meta.ConfigMeta {
+    if (!meta_data.configs.contains(key)) {
+        const key_owned = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_owned);
+
+        var cm = meta.ConfigMeta.init(allocator);
+        errdefer cm.deinit(allocator);
+
+        try meta_data.configs.put(key_owned, cm);
+    }
+    return meta_data.configs.getPtr(key).?;
+}
+
+fn makeManagedOverrideScriptPathForKey(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    source_abs_path: []const u8,
+    overrides_dir: []const u8,
+) ![]u8 {
+    const ext = std.fs.path.extension(source_abs_path);
+    const ts = std.time.nanoTimestamp();
+    const filename = try std.fmt.allocPrint(allocator, "{s}-{d}{s}", .{ key, ts, ext });
+    defer allocator.free(filename);
+    return try std.fs.path.join(allocator, &.{ overrides_dir, filename });
+}
+
+fn isManagedOverrideScriptPath(
+    allocator: std.mem.Allocator,
+    script_path: []const u8,
+    overrides_dir: []const u8,
+) !bool {
+    const resolved_script = try std.fs.path.resolve(allocator, &.{script_path});
+    defer allocator.free(resolved_script);
+    const resolved_overrides = try std.fs.path.resolve(allocator, &.{overrides_dir});
+    defer allocator.free(resolved_overrides);
+    return isPathWithinDir(resolved_script, resolved_overrides);
 }
 
 fn inferConfigKeyFromPath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
@@ -915,7 +1524,6 @@ pub fn listConfigs(allocator: std.mem.Allocator) !void {
     }
 }
 
-
 /// 切换配置文件（更新 meta.json 的 active 字段）
 pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8) !void {
     var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
@@ -993,6 +1601,144 @@ test "config parsing" {
     try std.testing.expectEqual(@as(usize, 2), config.rules.items.len);
 }
 
+test "config parsing supports rule-providers and rule-set" {
+    const allocator = std.testing.allocator;
+
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+        \\rule-providers:
+        \\  directset:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: /tmp/directset.txt
+        \\    interval: 3600
+        \\rules:
+        \\  - RULE-SET,directset,DIRECT
+        \\  - MATCH,DIRECT
+    ;
+
+    var cfg = try parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.rule_providers.items.len);
+    try std.testing.expectEqualStrings("directset", cfg.rule_providers.items[0].name);
+    try std.testing.expectEqual(@as(RuleType, .rule_set), cfg.rules.items[0].rule_type);
+    try std.testing.expectEqualStrings("directset", cfg.rules.items[0].payload);
+}
+
+test "prepareRuleProvidersForRuntime expands rule-set rules" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("direct.txt", .{});
+        defer f.close();
+        try f.writeAll("example.com\n");
+    }
+
+    const provider_abs = try tmp.dir.realpathAlloc(allocator, "direct.txt");
+    defer allocator.free(provider_abs);
+
+    const yaml_config = try std.fmt.allocPrint(allocator,
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+        \\rule-providers:
+        \\  directset:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: {s}
+        \\    interval: 3600
+        \\rules:
+        \\  - RULE-SET,directset,DIRECT
+        \\  - MATCH,DIRECT
+    , .{provider_abs});
+    defer allocator.free(yaml_config);
+
+    var cfg = try parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    try prepareRuleProvidersForRuntime(allocator, &cfg, null);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.rules.items.len);
+    try std.testing.expectEqual(@as(RuleType, .domain_suffix), cfg.rules.items[0].rule_type);
+    try std.testing.expectEqualStrings("example.com", cfg.rules.items[0].payload);
+    try std.testing.expectEqualStrings("DIRECT", cfg.rules.items[0].target);
+    try std.testing.expectEqual(@as(RuleType, .final), cfg.rules.items[1].rule_type);
+}
+
+test "prepareRuleProvidersForRuntime supports yaml payload style classical provider" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("applications.txt", .{});
+        defer f.close();
+        try f.writeAll(
+            \\payload:
+            \\  - PROCESS-NAME,tailscale
+            \\  - PROCESS-NAME,tailscaled
+            \\
+        );
+    }
+
+    const provider_abs = try tmp.dir.realpathAlloc(allocator, "applications.txt");
+    defer allocator.free(provider_abs);
+
+    const yaml_config = try std.fmt.allocPrint(allocator,
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+        \\rule-providers:
+        \\  applications:
+        \\    type: file
+        \\    behavior: classical
+        \\    path: {s}
+        \\    interval: 3600
+        \\rules:
+        \\  - RULE-SET,applications,DIRECT
+        \\  - MATCH,DIRECT
+    , .{provider_abs});
+    defer allocator.free(yaml_config);
+
+    var cfg = try parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    try prepareRuleProvidersForRuntime(allocator, &cfg, null);
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.rules.items.len);
+    try std.testing.expectEqual(@as(RuleType, .process_name), cfg.rules.items[0].rule_type);
+    try std.testing.expectEqualStrings("tailscale", cfg.rules.items[0].payload);
+    try std.testing.expectEqual(@as(RuleType, .process_name), cfg.rules.items[1].rule_type);
+    try std.testing.expectEqualStrings("tailscaled", cfg.rules.items[1].payload);
+    try std.testing.expectEqual(@as(RuleType, .final), cfg.rules.items[2].rule_type);
+}
+
+test "normalizeRuleProviderLine strips payload dash and quotes" {
+    const a = normalizeRuleProviderLine("  - '1.2.3.0/24'  ").?;
+    try std.testing.expectEqualStrings("1.2.3.0/24", a);
+
+    const b = normalizeRuleProviderLine("  - \"DOMAIN-SUFFIX,example.com\"  ").?;
+    try std.testing.expectEqualStrings("DOMAIN-SUFFIX,example.com", b);
+
+    try std.testing.expect(normalizeRuleProviderLine("payload:") == null);
+}
+
 test "resolveRuntimeConfigKey infers key from explicit configs path" {
     const allocator = std.testing.allocator;
 
@@ -1037,4 +1783,31 @@ test "inferConfigKeyFromPath resolves symlinked config path for non-download con
     const key = (try inferConfigKeyFromPathWithConfigsDir(allocator, link_abs, configs_abs)).?;
     defer allocator.free(key);
     try std.testing.expectEqualStrings("manual", key);
+}
+
+test "isRuleProviderRefreshDue supports second and nanosecond timestamps" {
+    const now = std.time.timestamp();
+
+    const stale_sec = @as(i128, @intCast(now - 1000));
+    try std.testing.expect(isRuleProviderRefreshDue(stale_sec, 300));
+
+    const fresh_sec = @as(i128, @intCast(now - 10));
+    try std.testing.expect(!isRuleProviderRefreshDue(fresh_sec, 300));
+
+    const stale_ns = @as(i128, @intCast(now - 1000)) * std.time.ns_per_s;
+    try std.testing.expect(isRuleProviderRefreshDue(stale_ns, 300));
+}
+
+test "makeManagedOverrideScriptPathForKey keeps source extension" {
+    const allocator = std.testing.allocator;
+    const path = try makeManagedOverrideScriptPathForKey(
+        allocator,
+        "abc123",
+        "/tmp/source.lua",
+        "/tmp/zc-override",
+    );
+    defer allocator.free(path);
+
+    try std.testing.expect(std.mem.startsWith(u8, path, "/tmp/zc-override/abc123-"));
+    try std.testing.expect(std.mem.endsWith(u8, path, ".lua"));
 }

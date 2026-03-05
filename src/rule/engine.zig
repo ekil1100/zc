@@ -112,6 +112,7 @@ pub const Engine = struct {
                     // payload 是国家代码，需要在运行时查询
                     engine.geoip_enabled = true;
                 },
+                .rule_set => {},
                 .dst_port => {
                     const range = try parsePortRange(rule.payload, rule.target);
                     try engine.dst_port_ranges.append(allocator, range);
@@ -353,6 +354,7 @@ pub const Engine = struct {
                 .geoip => {
                     // no-resolve 的 GEOIP 规则不匹配（因为没有 IP）
                 },
+                .rule_set => {},
                 else => {},
             }
         }

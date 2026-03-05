@@ -311,6 +311,11 @@ fn validateRules(allocator: std.mem.Allocator, config: *const Config, result: *V
                     try result.addError("Rule #{d}: invalid port range '{s}'", .{ i + 1, rule.payload });
                 }
             },
+            .rule_set => {
+                if (rule.payload.len == 0) {
+                    try result.addError("Rule #{d}: RULE-SET provider name cannot be empty", .{i + 1});
+                }
+            },
             else => {},
         }
     }
@@ -334,6 +339,14 @@ fn validateReferences(allocator: std.mem.Allocator, config: *const Config, resul
         try group_names.put(group.name, {});
     }
 
+    // 收集 rule-provider 名称
+    var provider_names = std.StringHashMap(void).init(allocator);
+    defer provider_names.deinit();
+
+    for (config.rule_providers.items) |provider| {
+        try provider_names.put(provider.name, {});
+    }
+
     // 检查代理组中的引用（代理组可以引用其他代理组）
     for (config.proxy_groups.items) |group| {
         for (group.proxies.items) |proxy_name| {
@@ -352,6 +365,20 @@ fn validateReferences(allocator: std.mem.Allocator, config: *const Config, resul
 
     // 检查规则中的引用（规则可以引用代理或代理组）
     for (config.rules.items, 0..) |rule, i| {
+        if (rule.rule_type == .rule_set) {
+            if (!provider_names.contains(rule.payload)) {
+                try result.addError("Rule #{d}: references undefined rule-provider '{s}'", .{ i + 1, rule.payload });
+            }
+            if (!std.mem.eql(u8, rule.target, "DIRECT") and
+                !std.mem.eql(u8, rule.target, "REJECT") and
+                !proxy_names.contains(rule.target) and
+                !group_names.contains(rule.target))
+            {
+                try result.addError("Rule #{d}: references undefined target '{s}'", .{ i + 1, rule.target });
+            }
+            continue;
+        }
+
         const target = rule.target;
         if (!std.mem.eql(u8, target, "DIRECT") and
             !std.mem.eql(u8, target, "REJECT") and

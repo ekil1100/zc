@@ -24,11 +24,52 @@ pub const DoctorData = struct {
     config_warnings: []const []const u8 = &.{},
     migration_hints: []const []const u8 = &.{},
     daemon_uptime_seconds: ?i64 = null,
+
+    pub fn deinit(self: *DoctorData, allocator: std.mem.Allocator) void {
+        if (self.config_errors.len > 0) {
+            for (self.config_errors) |msg| allocator.free(msg);
+            allocator.free(self.config_errors);
+        }
+        if (self.config_warnings.len > 0) {
+            for (self.config_warnings) |msg| allocator.free(msg);
+            allocator.free(self.config_warnings);
+        }
+        if (self.migration_hints.len > 0) {
+            for (self.migration_hints) |hint| allocator.free(hint);
+            allocator.free(self.migration_hints);
+        }
+    }
 };
 
 pub fn runDoctorJson(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
-    const data = try collectDoctorData(allocator, config_path);
+    var data = try collectDoctorData(allocator, config_path, null);
+    defer data.deinit(allocator);
+    try emitDoctorJson(allocator, &data);
+}
 
+pub fn runDoctorJsonWithConfig(allocator: std.mem.Allocator, cfg: *config.Config, config_path: ?[]const u8) !void {
+    var data = try collectDoctorData(allocator, config_path, cfg);
+    defer data.deinit(allocator);
+    try emitDoctorJson(allocator, &data);
+}
+
+pub fn runDoctor(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
+    var data = try collectDoctorData(allocator, config_path, null);
+    defer data.deinit(allocator);
+    const report = try formatDoctorReport(allocator, &data);
+    defer allocator.free(report);
+    std.debug.print("{s}", .{report});
+}
+
+pub fn runDoctorWithConfig(allocator: std.mem.Allocator, cfg: *config.Config, config_path: ?[]const u8) !void {
+    var data = try collectDoctorData(allocator, config_path, cfg);
+    defer data.deinit(allocator);
+    const report = try formatDoctorReport(allocator, &data);
+    defer allocator.free(report);
+    std.debug.print("{s}", .{report});
+}
+
+fn emitDoctorJson(allocator: std.mem.Allocator, data: *const DoctorData) !void {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
@@ -72,14 +113,6 @@ pub fn runDoctorJson(allocator: std.mem.Allocator, config_path: ?[]const u8) !vo
         try out.appendSlice(allocator, w);
         try out.appendSlice(allocator, "\"");
     }
-    // config_warnings array
-    try out.appendSlice(allocator, ",\"config_warnings\":[");
-    for (data.config_warnings, 0..) |w, idx| {
-        if (idx > 0) try out.appendSlice(allocator, ",");
-        try out.appendSlice(allocator, "\"");
-        try out.appendSlice(allocator, w);
-        try out.appendSlice(allocator, "\"");
-    }
     try out.appendSlice(allocator, "],\"migration_hints\":[");
     for (data.migration_hints, 0..) |h, idx| {
         if (idx > 0) try out.appendSlice(allocator, ",");
@@ -97,14 +130,7 @@ pub fn runDoctorJson(allocator: std.mem.Allocator, config_path: ?[]const u8) !vo
     std.debug.print("{s}", .{out.items});
 }
 
-pub fn runDoctor(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
-    const data = try collectDoctorData(allocator, config_path);
-    const report = try formatDoctorReport(allocator, &data);
-    defer allocator.free(report);
-    std.debug.print("{s}", .{report});
-}
-
-fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8) !DoctorData {
+fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8, provided_cfg: ?*config.Config) !DoctorData {
     var data = DoctorData{
         .config_ok = false,
         .config_source = if (config_path != null) "custom" else "default",
@@ -115,44 +141,20 @@ fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8) !Do
         .port_count = 0,
     };
 
-    var cfg: ?config.Config = null;
-    if (config_path) |path| {
-        cfg = config.load(allocator, path) catch null;
+    if (provided_cfg) |loaded_cfg| {
+        if (try populateConfigData(allocator, loaded_cfg, config_path, &data)) return data;
     } else {
-        cfg = config.loadDefault(allocator) catch null;
-    }
-
-    if (cfg) |*loaded_cfg| {
-        defer loaded_cfg.deinit();
-
-        var vr = validator.validate(allocator, loaded_cfg) catch {
-            data.config_ok = false;
-            data.config_source = if (config_path != null) "custom (parse ok, validation failed)" else "default (parse ok, validation failed)";
-            try fillEffectivePorts(allocator, loaded_cfg, &data);
-            try fillDaemonStatus(allocator, &data);
-            return data;
-        };
-        defer vr.deinit();
-
-        data.config_ok = vr.isValid();
-
-        // Capture config errors and warnings
-        if (vr.errors.items.len > 0) {
-            const errs = try allocator.alloc([]const u8, vr.errors.items.len);
-            for (vr.errors.items, 0..) |e, idx| {
-                errs[idx] = try allocator.dupe(u8, e.message);
-            }
-            data.config_errors = errs;
-        }
-        if (vr.warnings.items.len > 0) {
-            const warns = try allocator.alloc([]const u8, vr.warnings.items.len);
-            for (vr.warnings.items, 0..) |w, idx| {
-                warns[idx] = try allocator.dupe(u8, w.message);
-            }
-            data.config_warnings = warns;
+        var cfg: ?config.Config = null;
+        if (config_path) |path| {
+            cfg = config.load(allocator, path) catch null;
+        } else {
+            cfg = config.loadDefault(allocator) catch null;
         }
 
-        try fillEffectivePorts(allocator, loaded_cfg, &data);
+        if (cfg) |*loaded_cfg| {
+            defer loaded_cfg.deinit();
+            if (try populateConfigData(allocator, loaded_cfg, config_path, &data)) return data;
+        }
     }
 
     data.daemon_pid = try daemon.readPid(allocator);
@@ -172,6 +174,55 @@ fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8) !Do
     return data;
 }
 
+fn populateConfigData(
+    allocator: std.mem.Allocator,
+    loaded_cfg: *config.Config,
+    config_path: ?[]const u8,
+    data: *DoctorData,
+) !bool {
+    config.prepareRuleProvidersForRuntime(allocator, loaded_cfg, config_path) catch |err| {
+        data.config_ok = false;
+        data.config_source = if (config_path != null) "custom (parse ok, provider prepare failed)" else "default (parse ok, provider prepare failed)";
+
+        const errs = try allocator.alloc([]const u8, 1);
+        errs[0] = try std.fmt.allocPrint(allocator, "rule-providers preparation failed: {s}", .{@errorName(err)});
+        data.config_errors = errs;
+
+        try fillEffectivePorts(allocator, loaded_cfg, data);
+        try fillDaemonStatus(allocator, data);
+        return true;
+    };
+
+    var vr = validator.validate(allocator, loaded_cfg) catch {
+        data.config_ok = false;
+        data.config_source = if (config_path != null) "custom (parse ok, validation failed)" else "default (parse ok, validation failed)";
+        try fillEffectivePorts(allocator, loaded_cfg, data);
+        try fillDaemonStatus(allocator, data);
+        return true;
+    };
+    defer vr.deinit();
+
+    data.config_ok = vr.isValid();
+
+    if (vr.errors.items.len > 0) {
+        const errs = try allocator.alloc([]const u8, vr.errors.items.len);
+        for (vr.errors.items, 0..) |e, idx| {
+            errs[idx] = try allocator.dupe(u8, e.message);
+        }
+        data.config_errors = errs;
+    }
+    if (vr.warnings.items.len > 0) {
+        const warns = try allocator.alloc([]const u8, vr.warnings.items.len);
+        for (vr.warnings.items, 0..) |w, idx| {
+            warns[idx] = try allocator.dupe(u8, w.message);
+        }
+        data.config_warnings = warns;
+    }
+
+    try fillEffectivePorts(allocator, loaded_cfg, data);
+    return false;
+}
+
 fn checkNetworkConnectivity() bool {
     const stream = std.net.tcpConnectToHost(std.heap.page_allocator, "1.1.1.1", 53) catch return false;
     stream.close();
@@ -185,7 +236,7 @@ fn getDaemonUptime(pid: ?i32) !?i64 {
     const cmd = try std.fmt.bufPrint(&buf, "ps -o etimes= -p {d}", .{p});
     const result = std.process.Child.run(.{
         .allocator = std.heap.page_allocator,
-        .argv = &.{"sh", "-c", cmd},
+        .argv = &.{ "sh", "-c", cmd },
     }) catch return null;
     defer {
         std.heap.page_allocator.free(result.stdout);
@@ -220,7 +271,7 @@ fn collectMigrationHints(allocator: std.mem.Allocator, config_path: ?[]const u8)
         try hints.append(allocator, try allocator.dupe(u8, "proxy-providers is not supported; declare proxies statically in the config"));
     }
 
-    return hints.items;
+    return try hints.toOwnedSlice(allocator);
 }
 
 fn fillDaemonStatus(allocator: std.mem.Allocator, data: *DoctorData) !void {

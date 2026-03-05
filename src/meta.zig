@@ -5,6 +5,8 @@ const config_mod = @import("config.zig");
 pub const ConfigMeta = struct {
     url: ?[]const u8 = null,
     filename: ?[]const u8 = null,
+    /// 配置级持久化 override 脚本路径
+    override_script: ?[]const u8 = null,
     /// URL 中的其他参数（target, emoji 等）
     params: std.StringHashMap([]const u8),
     /// 节点选择持久化（group_name → proxy_name）
@@ -20,6 +22,7 @@ pub const ConfigMeta = struct {
     pub fn deinit(self: *ConfigMeta, allocator: std.mem.Allocator) void {
         if (self.url) |u| allocator.free(u);
         if (self.filename) |f| allocator.free(f);
+        if (self.override_script) |s| allocator.free(s);
         {
             var it = self.params.iterator();
             while (it.next()) |entry| {
@@ -178,6 +181,13 @@ pub fn save(allocator: std.mem.Allocator, meta: *const MetaData) !void {
             field_first = false;
             try buf.appendSlice(allocator, "      \"filename\": ");
             try writeJsonString(allocator, &buf, fname);
+        }
+
+        if (cm.override_script) |script_path| {
+            if (!field_first) try buf.appendSlice(allocator, ",\n");
+            field_first = false;
+            try buf.appendSlice(allocator, "      \"override_script\": ");
+            try writeJsonString(allocator, &buf, script_path);
         }
 
         // params
@@ -386,6 +396,14 @@ fn parseMetaJson(allocator: std.mem.Allocator, content: []const u8, meta: *MetaD
             switch (filename_val) {
                 .null => {},
                 .string => |s| cm.filename = try allocator.dupe(u8, s),
+                else => return error.InvalidMetaJson,
+            }
+        }
+
+        if (obj.get("override_script")) |override_val| {
+            switch (override_val) {
+                .null => {},
+                .string => |s| cm.override_script = try allocator.dupe(u8, s),
                 else => return error.InvalidMetaJson,
             }
         }
@@ -606,6 +624,12 @@ const JsonParser = struct {
                 } else {
                     cm.filename = try self.parseString();
                 }
+            } else if (std.mem.eql(u8, field_name, "override_script")) {
+                if (self.peek() == 'n') {
+                    try self.parseNull();
+                } else {
+                    cm.override_script = try self.parseString();
+                }
             } else if (std.mem.eql(u8, field_name, "params")) {
                 var old_params = cm.params;
                 cm.params = try self.parseStringMap();
@@ -798,7 +822,7 @@ test "parseMetaJson decodes unicode escape sequences" {
         \\  "active": "abc12345",
         \\  "configs": {
         \\    "abc12345": {
-        \\      "filename": "A\\u003cB.yaml"
+        \\      "filename": "A\u003cB.yaml"
         \\    }
         \\  }
         \\}

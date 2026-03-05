@@ -100,6 +100,20 @@
 | `PROXY_SUBCOMMAND_UNKNOWN` | unknown proxy subcommand | use `zclash proxy list|select|test` |
 | `DIAG_DOCTOR_FAILED` | failed to run doctor diagnostics | retry with valid config and inspect logs |
 | `DIAG_SUBCOMMAND_UNKNOWN` | unknown diag subcommand | use `zclash diag doctor [-c <config>] [--json]` |
+| `OVERRIDE_SCRIPT_NOT_FOUND` | override script or runtime not found | check `--override-script` path and lua availability |
+| `OVERRIDE_SCRIPT_EXEC_FAILED` | override script execution failed | ensure script exits 0 and outputs valid override |
+| `OVERRIDE_SCRIPT_TIMEOUT` | override script timed out | increase `--override-timeout-ms` or simplify script |
+| `OVERRIDE_OUTPUT_INVALID` | override output is invalid | output yaml object with known config keys |
+| `OVERRIDE_MERGE_FAILED` | failed to merge override result | check override field types and structure |
+| `OVERRIDE_OPTION_DEPRECATED` | `--override-dump-yaml/json` has been removed | use `zc config dump [-c <config>]` |
+| `RULE_PROVIDER_DOWNLOAD_FAILED` | failed to download rule-provider files | check provider url/network and retry |
+| `RULE_PROVIDER_FILE_NOT_FOUND` | rule-provider file not found | check `rule-providers.<name>.path` or provider url |
+| `CONFIG_OVERRIDE_ARGUMENT_INVALID` | invalid config override arguments | use `zc config override <script.lua>` / `--clear` |
+| `CONFIG_OVERRIDE_NO_ACTIVE` | no active config found for override | run `zc config use <name>` first |
+| `CONFIG_OVERRIDE_SCRIPT_NOT_FOUND` | override script file not found | check script path and retry |
+| `CONFIG_OVERRIDE_FAILED` | failed to update persisted config override | check config state and retry |
+| `CONFIG_OVERRIDE_APPLY_FAILED` | override persisted but failed to apply running daemon | check logs and run `zc restart` |
+| `CONFIG_DUMP_FAILED` | failed to dump merged config | check config path/override script and retry |
 
 ---
 

@@ -101,7 +101,7 @@ pub const ApiServer = struct {
 
         for (self.config.proxies.items, 0..) |proxy, i| {
             if (i > 0) try json.appendSlice(self.allocator, ",");
-            
+
             const type_str = switch (proxy.proxy_type) {
                 .direct => "Direct",
                 .reject => "Reject",
@@ -113,10 +113,7 @@ pub const ApiServer = struct {
                 .vless => "Vless",
             };
 
-            try json.writer(self.allocator).print(
-                "{{\"name\":\"{s}\",\"type\":\"{s}\",\"server\":\"{s}\",\"port\":{d}}}",
-                .{ proxy.name, type_str, proxy.server, proxy.port }
-            );
+            try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\",\"server\":\"{s}\",\"port\":{d}}}", .{ proxy.name, type_str, proxy.server, proxy.port });
         }
 
         try json.appendSlice(self.allocator, "]}");
@@ -131,7 +128,7 @@ pub const ApiServer = struct {
 
         for (self.config.rules.items, 0..) |rule, i| {
             if (i > 0) try json.appendSlice(self.allocator, ",");
-            
+
             const type_str = switch (rule.rule_type) {
                 .domain => "DOMAIN",
                 .domain_suffix => "DOMAIN-SUFFIX",
@@ -139,6 +136,7 @@ pub const ApiServer = struct {
                 .ip_cidr => "IP-CIDR",
                 .ip_cidr6 => "IP-CIDR6",
                 .geoip => "GEOIP",
+                .rule_set => "RULE-SET",
                 .src_ip_cidr => "SRC-IP-CIDR",
                 .dst_port => "DST-PORT",
                 .src_port => "SRC-PORT",
@@ -146,10 +144,7 @@ pub const ApiServer = struct {
                 .final => "MATCH",
             };
 
-            try json.writer(self.allocator).print(
-                "{{\"type\":\"{s}\",\"payload\":\"{s}\",\"target\":\"{s}\"}}",
-                .{ type_str, rule.payload, rule.target }
-            );
+            try json.writer(self.allocator).print("{{\"type\":\"{s}\",\"payload\":\"{s}\",\"target\":\"{s}\"}}", .{ type_str, rule.payload, rule.target });
         }
 
         try json.appendSlice(self.allocator, "]}");
@@ -167,8 +162,7 @@ pub const ApiServer = struct {
         std.debug.print("[API] Switch proxy: group={s}, proxy={s}\n", .{ group_name, proxy_name });
         self.manager.selectProxy(group_name, proxy_name);
 
-        const resp = std.fmt.allocPrint(self.allocator,
-            "{{\"ok\":true,\"group\":\"{s}\",\"proxy\":\"{s}\"}}", .{ group_name, proxy_name }) catch return;
+        const resp = std.fmt.allocPrint(self.allocator, "{{\"ok\":true,\"group\":\"{s}\",\"proxy\":\"{s}\"}}", .{ group_name, proxy_name }) catch return;
         defer self.allocator.free(resp);
         try self.sendJsonRaw(conn, resp);
     }
@@ -204,34 +198,25 @@ pub const ApiServer = struct {
     }
 
     fn sendJsonRaw(self: *ApiServer, conn: net.Server.Connection, body: []const u8) !void {
-        const response = try std.fmt.allocPrint(self.allocator,
-            "HTTP/1.1 200 OK\r\n" ++
+        const response = try std.fmt.allocPrint(self.allocator, "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: application/json\r\n" ++
             "Content-Length: {d}\r\n" ++
             "\r\n" ++
-            "{s}",
-            .{ body.len, body }
-        );
+            "{s}", .{ body.len, body });
         defer self.allocator.free(response);
 
         try conn.stream.writeAll(response);
     }
 
     fn sendError(self: *ApiServer, conn: net.Server.Connection, code: u16, message: []const u8) !void {
-        const body = try std.fmt.allocPrint(self.allocator,
-            "{{\"error\":\"{s}\"}}",
-            .{message}
-        );
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{message});
         defer self.allocator.free(body);
 
-        const response = try std.fmt.allocPrint(self.allocator,
-            "HTTP/1.1 {d} {s}\r\n" ++
+        const response = try std.fmt.allocPrint(self.allocator, "HTTP/1.1 {d} {s}\r\n" ++
             "Content-Type: application/json\r\n" ++
             "Content-Length: {d}\r\n" ++
             "\r\n" ++
-            "{s}",
-            .{ code, message, body.len, body }
-        );
+            "{s}", .{ code, message, body.len, body });
         defer self.allocator.free(response);
 
         try conn.stream.writeAll(response);

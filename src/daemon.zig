@@ -36,11 +36,11 @@ pub fn getLogFilePath(allocator: std.mem.Allocator) ![]const u8 {
         return try allocator.dupe(u8, LOG_FILE);
     };
     defer allocator.free(home);
-    
+
     // 使用 ~/.local/share/zc/zc.log
     const log_dir = try std.fs.path.join(allocator, &.{ home, ".local/share/zc" });
     defer allocator.free(log_dir);
-    
+
     // 创建目录
     std.fs.makeDirAbsolute(log_dir) catch |err| {
         if (err != error.PathAlreadyExists) {
@@ -48,7 +48,7 @@ pub fn getLogFilePath(allocator: std.mem.Allocator) ![]const u8 {
             return try allocator.dupe(u8, LOG_FILE);
         }
     };
-    
+
     return try std.fs.path.join(allocator, &.{ log_dir, "zc.log" });
 }
 
@@ -75,13 +75,13 @@ pub fn readPid(allocator: std.mem.Allocator) !?i32 {
 pub fn writePid(allocator: std.mem.Allocator, pid: i32) !void {
     const pid_file = try getPidFilePath(allocator);
     defer allocator.free(pid_file);
-    
+
     const file = try std.fs.createFileAbsolute(pid_file, .{});
     defer file.close();
-    
+
     const pid_str = try std.fmt.allocPrint(allocator, "{d}\n", .{pid});
     defer allocator.free(pid_str);
-    
+
     try file.writeAll(pid_str);
 }
 
@@ -197,7 +197,7 @@ fn printStartupInfo(allocator: std.mem.Allocator) void {
 }
 
 /// 启动守护进程
-pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool) !void {
+pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool, extra_args: []const []const u8) !void {
     // 检查是否已经在运行
     if (try isRunning(allocator)) {
         const existing_pid = try readPid(allocator);
@@ -260,39 +260,39 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
         }
         return;
     }
-    
+
     // 子进程：成为守护进程
     // 创建新会话
     _ = std.posix.setsid() catch {};
-    
+
     // 重定向标准输出/错误到日志文件
     const log_path = try getLogFilePath(allocator);
     defer allocator.free(log_path);
-    
+
     const log_fd = std.posix.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch |err| {
         std.debug.print("Failed to open log file: {s}\n", .{@errorName(err)});
         return err;
     };
-    
+
     // 重定向 stdout 和 stderr
     std.posix.dup2(log_fd, std.posix.STDOUT_FILENO) catch {};
     std.posix.dup2(log_fd, std.posix.STDERR_FILENO) catch {};
     std.posix.close(log_fd);
-    
+
     // 关闭 stdin
     const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0) catch null;
     if (dev_null) |fd| {
         std.posix.dup2(fd, std.posix.STDIN_FILENO) catch {};
         std.posix.close(fd);
     }
-    
+
     // 获取当前可执行文件路径
     const exe_path = std.fs.selfExePathAlloc(allocator) catch |err| {
         std.debug.print("Failed to get exe path: {s}\n", .{@errorName(err)});
         return err;
     };
     defer allocator.free(exe_path);
-    
+
     // 构建参数
     var argv_list = std.ArrayList([]const u8).empty;
     defer {
@@ -301,15 +301,18 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
         }
         argv_list.deinit(allocator);
     }
-    
+
     try argv_list.append(allocator, try allocator.dupe(u8, exe_path));
     try argv_list.append(allocator, try allocator.dupe(u8, "--daemon-run"));
-    
+
     if (config_path) |path| {
         try argv_list.append(allocator, try allocator.dupe(u8, "-c"));
         try argv_list.append(allocator, try allocator.dupe(u8, path));
     }
-    
+    for (extra_args) |arg| {
+        try argv_list.append(allocator, try allocator.dupe(u8, arg));
+    }
+
     // 转换为 null 终止的数组
     const argv = try allocator.alloc(?[*:0]const u8, argv_list.items.len + 1);
     defer allocator.free(argv);
@@ -322,14 +325,14 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
         argv[i] = sentinel_arg.ptr;
     }
     argv[argv_list.items.len] = null;
-    
+
     // 执行新的进程
     const err = std.posix.execvpeZ(
         argv[0].?,
         @ptrCast(argv.ptr),
         @ptrCast(std.c.environ),
     );
-    
+
     // execve 不应该返回，如果返回说明出错了
     std.debug.print("Failed to exec: {s}\n", .{@errorName(err)});
     return err;
@@ -341,7 +344,7 @@ pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
         printCliOk(json_output, "stop", "stopped", "already_stopped", null);
         return;
     };
-    
+
     // 发送 SIGTERM 信号
     std.posix.kill(pid, std.posix.SIG.TERM) catch |err| {
         if (err == error.ProcessNotFound) {
@@ -352,7 +355,7 @@ pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
         printCliError(json_output, "STOP_FAILED", "failed to send terminate signal", "verify process permissions and retry `zc stop`");
         return err;
     };
-    
+
     // 等待优雅退出
     var stopped = false;
     var i: usize = 0;
@@ -376,7 +379,7 @@ pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
 }
 
 /// 重启守护进程
-pub fn restartDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool) !void {
+pub fn restartDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool, extra_args: []const []const u8) !void {
     const was_running = try isRunning(allocator);
 
     if (was_running) {
@@ -385,7 +388,7 @@ pub fn restartDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, jso
         printCliOk(json_output, "restart", "stopped", "service_was_stopped", null);
     }
 
-    try startDaemon(allocator, config_path, json_output);
+    try startDaemon(allocator, config_path, json_output, extra_args);
     printCliOk(json_output, "restart", "running", null, null);
 }
 
@@ -400,7 +403,7 @@ pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, j
 
     switch (apply_mode) {
         .restart => {
-            try restartDaemon(allocator, config_path, json_output);
+            try restartDaemon(allocator, config_path, json_output, &.{});
             return .restart_applied;
         },
         .hot => {
@@ -409,7 +412,7 @@ pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, j
         },
         .auto => {
             reloadDaemon(allocator, config_path, json_output) catch {
-                try restartDaemon(allocator, config_path, json_output);
+                try restartDaemon(allocator, config_path, json_output, &.{});
                 return .restart_fallback;
             };
             return .hot_applied;

@@ -261,3 +261,44 @@
 1. 先实现：`profile list/use`（基础读写闭环）
 2. 再实现：`profile import/validate`（导入与质量门禁）
 3. 每步都先补 `--json` + `code/message/hint`
+
+---
+
+## 12. Runtime Override（v1）
+
+适用命令：所有会加载配置的命令路径（如 `start/tui/test/doctor/proxy ...`）。
+
+### 12.0 config 级持久化绑定
+
+- `zc config override <script.lua>`：给当前配置绑定持久化 override 脚本。
+- `zc config override --clear`：清除当前配置绑定。
+- `zc config override`：查看当前配置绑定状态。
+- 绑定粒度是 `meta.configs.<key>`，仅作用该配置。
+- `set` 会将脚本复制到 `~/.config/zc/override/` 托管目录。
+- `set/clear` 后若 daemon 正在运行，会自动尝试应用配置（`auto`，当前会 fallback restart）。
+
+### 12.1 flags
+
+- `--override-script <path>`
+- `--override-arg <k=v>`（可重复）
+- `--override-timeout-ms <n>`（默认 `500`）
+- merged 配置查看统一使用 `zc config dump`（`--json` 输出 JSON，`--no-override` 忽略覆盖脚本）
+
+### 12.2 行为
+
+- 覆盖仅在当前命令进程内生效，不写回 profile 文件。
+- 运行时优先级：`--override-script` > `zc config override` 持久化绑定 > 无覆盖。
+- 合并策略：标量字段替换；`rule-providers` / `proxies` / `proxy-groups` / `rules` 使用整体替换。
+- `rules` 中支持 `RULE-SET`；运行时会按 `rule-providers.<name>.path` 加载本地规则文件。
+- provider 文件自动同步策略：
+  - 缺失且有 `url`：必须下载成功，否则报错
+  - 已存在且到达 `interval`：尝试刷新，失败保留本地缓存
+  - 缺失且无 `url`：报错
+- 未知或暂不支持的键直接报错（`OVERRIDE_OUTPUT_INVALID`）。
+
+### 12.3 脚本契约
+
+- `*.lua`：脚本返回 Lua table（或 `nil`）。
+- 非 lua 可执行脚本：stdout 输出 YAML 覆盖对象。
+- 可通过 `input.command / input.config_path / input.args` 获取上下文（lua 模式）。
+- `*.lua` 需要运行环境存在 `luajit` 或 `lua` 可执行文件。

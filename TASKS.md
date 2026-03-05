@@ -6,6 +6,123 @@
 
 ---
 
+## 临时任务：override 持久化复制与自动同步（2026-03-05）
+
+### FEATURE-OVERRIDE-MANAGED-SYNC-APPLY
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/config.zig`, `src/main.zig`, `src/meta.zig`, `docs/config/override.md`, `docs/cli/spec.md`, `docs/api/error-codes.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] `zc config override <script>` 会将脚本复制到 `~/.config/zc/override/` 后再持久化绑定
+  - [x] `override` 生效后自动同步 `rule-providers` 资源（缺失必下，过期尝试更新）
+  - [x] `zc config override --clear` 会清除绑定并删除受管脚本副本（仅脚本，不删 ruleset 缓存）
+  - [x] `set` 阶段下载失败会回滚绑定并输出具体失败项
+  - [x] `set/clear` 后 daemon 运行中自动应用（auto；失败报错但不回滚持久化态）
+  - [x] 测试与文档同步更新
+- 备注：2026-03-05 15:32 +0800 进入 DOING（实现 override 受管复制、provider 自动下载、自动应用与回滚策略）；2026-03-05 15:38 +0800 完成实现。实现要点：`config override set` 改为“先复制脚本到托管目录，再校验并同步 provider，最后持久化绑定”；`prepareRuleProvidersForRuntime` 新增自动下载/刷新；`clear` 删除受管脚本副本；daemon 运行中会自动 apply（失败报错不回滚）。验证：`zig build`、`zig build test` 通过。2026-03-05 15:47 +0800 追加修复：兼容 `payload:` YAML 样式 rule-provider 文件（如 Loyalsoldier `applications.txt`），修复 `UnknownRuleType`；并修复 `config_path=null` 时相对 provider 路径解析为绝对路径，避免 debug 断言崩溃。回归：`zig build test` 通过，隔离 HOME 执行 `zc config override docs/config/examples/override-loyalsoldier-rules.lua` 成功。2026-03-05 15:54 +0800 追加修复：兼容 `payload` 条目中的引号字符串（如 `'1.1.1.0/24'`），避免 `zc test` 出现大规模 `invalid CIDR format` 误报；复测 `zig build run -- test` 通过，并更新 `~/.local/bin/zc` 后 `zc test` 配置校验通过。
+
+---
+
+## 临时任务：config dump 与 override 选项收敛（2026-03-05）
+
+### FEATURE-CONFIG-DUMP-OVERRIDE-CLEANUP
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/main.zig`, `src/override.zig`, `docs/config/override.md`, `docs/cli/spec.md`, `docs/api/error-codes.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 新增 `zc config dump` 命令，默认输出 merge 后 YAML
+  - [x] `config dump` 支持 `-c` 指定配置，并应用持久化/临时 override（支持 `--no-override` 跳过覆盖）
+  - [x] 移除 `--override-dump-yaml` / `--override-dump-json` 选项
+  - [x] 文档与帮助输出同步更新
+  - [x] 构建与测试通过
+- 备注：2026-03-05 11:37 +0800 进入 DOING（实现直觉化 dump 命令并收敛 override 选项）；2026-03-05 11:48 +0800 完成实现。验证：`zig build`、`zig build test` 通过；手工验证 `zc config dump -c testdata/config/minimal.yaml` YAML 输出正常，`zc config dump --no-override` 可在覆盖脚本异常时输出原配置；旧参数 `--override-dump-yaml` 返回 `OVERRIDE_OPTION_DEPRECATED` 并提示使用 `zc config dump`。2026-03-05 11:56 +0800 追加修复 Lua wrapper 的嵌套 YAML 缩进问题（此前会导致 `rule-providers` 覆盖时 `OVERRIDE_MERGE_FAILED`）；回归验证 `zc config dump` 在持久化脚本开启时可正常输出。
+
+---
+
+## 临时任务：meta unicode 解析回归测试修复（2026-03-05）
+
+### HOTFIX-META-UNICODE-TEST
+- 状态：DONE
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/meta.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 修复 `meta.test.parseMetaJson decodes unicode escape sequences` 失败
+  - [x] `zig build test` 全量通过
+- 备注：2026-03-05 08:36 +0800 完成修复。调整用例中的 JSON unicode 转义输入为单反斜杠（有效 `\uXXXX`），验证 `zig build test` 通过。
+
+---
+
+## 临时任务：按当前配置持久化 Override（2026-03-05）
+
+### FEATURE-CONFIG-OVERRIDE-PERSIST
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/main.zig`, `src/config.zig`, `src/meta.zig`, `docs/config/override.md`, `docs/cli/spec.md`, `docs/api/error-codes.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 新增 `zc config override <script>` 命令，为当前配置绑定持久化 override 脚本
+  - [x] 新增 `zc config override --clear` 与 `zc config override`（查看）能力
+  - [x] 持久化只作用于当前配置（`meta.configs.<key>` 维度），切换配置互不影响
+  - [x] 运行时优先级：CLI `--override-script` > 持久化 override
+  - [x] 重启后仍生效，且文档同步
+- 备注：2026-03-05 08:15 +0800 进入 DOING（实现“当前配置专属 + 持久化 + 直觉命令”）；2026-03-05 08:28 +0800 完成实现与文档同步。验证：`zig build` 通过；`zig build test` 结果 `30/31`（既有失败 `meta.test.parseMetaJson decodes unicode escape sequences`，与本改动无关）；隔离 HOME 手工回归 `config override set/get/clear` 与“无 `--override-script` 自动应用持久化脚本”通过。
+
+---
+
+## 临时任务：rule-providers 运行时支持（2026-03-04）
+
+### FEATURE-RULE-PROVIDERS-RUNTIME
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/config.zig`, `src/override.zig`, `src/main.zig`, `src/config_validator.zig`, `src/rule/engine.zig`, `src/api/server.zig`, `src/doctor_cli.zig`, `docs/config/override.md`, `docs/cli/spec.md`, `docs/config/examples/override-loyalsoldier-rules.lua`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 新增 `rule-providers` 配置解析模型（含 `domain/ipcidr/classical` behavior）
+  - [x] 新增 `RULE-SET` 规则类型解析，并可引用 `rule-providers`
+  - [x] 配置加载链路支持从 `rule-providers.<name>.path` 读取本地规则文件并展开 `RULE-SET`
+  - [x] override 支持覆盖 `rule-providers` 字段
+  - [x] 增加测试覆盖 `rule-providers + RULE-SET` 解析和展开
+  - [x] 更新示例脚本与文档说明
+- 备注：2026-03-04 10:57 +0800 完成实现与文档同步。验证：`zig build` 通过；`zig build test` 结果 `28/29`（既有失败 `meta.test.parseMetaJson decodes unicode escape sequences`，与本改动无关）；手工验证 `rule-providers + RULE-SET` 基础链路与 override 覆盖链路通过。
+
+---
+
+## 临时任务：Lua 覆盖脚本示例（2026-03-04）
+
+### DOC-OVERRIDE-LUA-EXAMPLE
+- 状态：DONE
+- 优先级：P2
+- 负责人：Codex
+- 输出：`docs/config/examples/override-loyalsoldier-rules.lua`, `docs/config/override.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 提供可直接用于 `--override-script` 的 Lua 示例脚本
+  - [x] 覆盖你提供的规则集逻辑（`rules`）
+  - [x] 明确标注当前 override 对 `rule-providers` 的限制
+- 备注：2026-03-04 10:31 +0800 完成脚本与文档补充；2026-03-05 08:06 +0800 更新 `override-loyalsoldier-rules.lua` 支持 `ruleset_dir/proxy_group/interval` 参数，并改为默认本地 `file` provider 路径布局（`<ruleset_dir>/<name>.txt`），手工验证通过。
+
+---
+
+## 临时任务：配置覆盖功能（2026-03-03）
+
+### FEATURE-CONFIG-OVERRIDE-LUA
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/override.zig`, `src/main.zig`, `src/daemon.zig`, `src/doctor_cli.zig`, `README.md`, `docs/config/override.md`, `docs/cli/spec.md`, `docs/api/error-codes.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 新增 `--override-script / --override-arg / --override-timeout-ms / --override-dump-yaml / --override-dump-json` 参数
+  - [x] 覆盖逻辑接入统一配置加载链路，覆盖规则为“标量替换 + `proxies/proxy-groups/rules` 整体替换”
+  - [x] `start/restart` 场景通过 daemon 转发保留 override 参数
+  - [x] `--override-dump-yaml` 和 `--override-dump-json` 输出合并后配置且脱敏敏感字段
+  - [x] 文档同步更新（README + CLI spec + error codes + 新增 override 文档）
+  - [x] 新增测试覆盖 override 选项解析与覆盖合并基础行为
+- 备注：2026-03-03 17:08 +0800 进入 DOING（实现运行时配置覆盖与 dump 能力）；2026-03-03 17:52 +0800 完成实现并更新文档；2026-03-03 18:03 +0800 修正 doctor 覆盖链路为“内存配置直传”（移除临时文件序列化副作用），并补充 doctor 数据释放避免内存泄漏。验证：`zig build test` 结果 `26/27`（既有失败 `meta.test.parseMetaJson decodes unicode escape sequences`，与本改动无关）；手工验证 `zig build run -- test -c testdata/config/minimal.yaml --override-dump-yaml` 与 lua 覆盖脚本场景通过。
+
+---
+
 ## 临时任务：Trojan TLS 链路修复（2026-03-02）
 
 ### HOTFIX-TROJAN-TLS

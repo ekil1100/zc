@@ -31,23 +31,23 @@ test "ProxyType enum variants" {
     const types = [_]ProxyType{
         .direct, .reject, .http, .socks5, .ss, .vmess, .trojan,
     };
-    
+
     try testing.expectEqual(@as(usize, 7), types.len);
 }
 
 test "RuleType enum variants" {
     const types = [_]RuleType{
-        .domain, .domain_suffix, .domain_keyword, .ip_cidr,
-        .ip_cidr6, .geoip, .src_ip_cidr, .dst_port,
-        .src_port, .process_name, .final,
+        .domain,   .domain_suffix, .domain_keyword, .ip_cidr,
+        .ip_cidr6, .geoip,         .rule_set,       .src_ip_cidr,
+        .dst_port, .src_port,      .process_name,   .final,
     };
-    
-    try testing.expectEqual(@as(usize, 11), types.len);
+
+    try testing.expectEqual(@as(usize, 12), types.len);
 }
 
 test "Proxy struct default values" {
     const allocator = testing.allocator;
-    
+
     var proxy = Proxy{
         .name = try allocator.dupe(u8, "TestProxy"),
         .proxy_type = .ss,
@@ -55,7 +55,7 @@ test "Proxy struct default values" {
         .port = 8388,
     };
     defer proxy.deinit(allocator);
-    
+
     try testing.expectEqualStrings("TestProxy", proxy.name);
     try testing.expectEqualStrings("127.0.0.1", proxy.server);
     try testing.expectEqual(@as(u16, 8388), proxy.port);
@@ -66,7 +66,7 @@ test "Proxy struct default values" {
 
 test "Proxy with all fields" {
     const allocator = testing.allocator;
-    
+
     var proxy = Proxy{
         .name = try allocator.dupe(u8, "FullProxy"),
         .proxy_type = .vmess,
@@ -81,7 +81,7 @@ test "Proxy with all fields" {
         .ws_path = try allocator.dupe(u8, "/ws"),
     };
     defer proxy.deinit(allocator);
-    
+
     try testing.expect(proxy.tls);
     try testing.expect(proxy.ws);
     try testing.expectEqualStrings("/ws", proxy.ws_path.?);
@@ -89,7 +89,7 @@ test "Proxy with all fields" {
 
 test "Rule struct" {
     const allocator = testing.allocator;
-    
+
     var rule = Rule{
         .rule_type = .domain_suffix,
         .payload = try allocator.dupe(u8, "google.com"),
@@ -97,7 +97,7 @@ test "Rule struct" {
         .no_resolve = false,
     };
     defer rule.deinit(allocator);
-    
+
     try testing.expectEqual(RuleType.domain_suffix, rule.rule_type);
     try testing.expectEqualStrings("google.com", rule.payload);
     try testing.expectEqualStrings("PROXY", rule.target);
@@ -106,7 +106,7 @@ test "Rule struct" {
 
 test "Rule with no_resolve" {
     const allocator = testing.allocator;
-    
+
     var rule = Rule{
         .rule_type = .ip_cidr,
         .payload = try allocator.dupe(u8, "192.168.0.0/16"),
@@ -114,13 +114,13 @@ test "Rule with no_resolve" {
         .no_resolve = true,
     };
     defer rule.deinit(allocator);
-    
+
     try testing.expect(rule.no_resolve);
 }
 
 test "Config defaults" {
     const allocator = testing.allocator;
-    
+
     var config = Config{
         .allocator = allocator,
         .port = 7890,
@@ -134,7 +134,7 @@ test "Config defaults" {
         .rules = std.ArrayList(Rule).empty,
     };
     defer config.deinit();
-    
+
     try testing.expectEqual(@as(u16, 7890), config.port);
     try testing.expectEqual(@as(u16, 7891), config.socks_port);
     try testing.expectEqualStrings("rule", config.mode);
@@ -143,7 +143,7 @@ test "Config defaults" {
 
 test "Config with external controller" {
     const allocator = testing.allocator;
-    
+
     var config = Config{
         .allocator = allocator,
         .mode = try allocator.dupe(u8, "rule"),
@@ -155,6 +155,6 @@ test "Config with external controller" {
         .rules = std.ArrayList(Rule).empty,
     };
     defer config.deinit();
-    
+
     try testing.expectEqualStrings("127.0.0.1:9090", config.external_controller.?);
 }
