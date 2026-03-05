@@ -57,6 +57,7 @@ Global input available in script:
 ```lua
 input.command      -- string, e.g. "test" / "proxy.list"
 input.config_path  -- base config path or ""
+input.script_path  -- resolved override script path
 input.args         -- key/value map from --override-arg
 ```
 

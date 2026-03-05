@@ -7,12 +7,29 @@
 --
 -- Optional args via --override-arg:
 --   proxy_group=<name>   default: Proxies
---   ruleset_dir=<path>   default: ./ruleset
+--   ruleset_dir=<path>   default: <script_dir>/ruleset
 --   interval=<seconds>   default: 86400
 
 local proxy_group = "Proxies"
 local ruleset_dir = "./ruleset"
 local interval = 86400
+
+local function script_dir()
+  if not input or not input.script_path or input.script_path == "" then
+    return nil
+  end
+  local p = input.script_path
+  local slash = string.match(p, "^(.*)[/\\].-$")
+  if slash and slash ~= "" then
+    return slash
+  end
+  return nil
+end
+
+local base = script_dir()
+if base then
+  ruleset_dir = base .. "/ruleset"
+end
 
 if input and input.args and input.args.proxy_group and input.args.proxy_group ~= "" then
   proxy_group = input.args.proxy_group

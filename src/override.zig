@@ -158,6 +158,7 @@ fn executeOverrideScript(
     } else {
         try env_map.put("ZC_OVERRIDE_CONFIG_PATH", "");
     }
+    try env_map.put("ZC_OVERRIDE_SCRIPT_PATH", script_path);
     const timeout_text = try std.fmt.allocPrint(allocator, "{d}", .{opts.timeout_ms});
     defer allocator.free(timeout_text);
     try env_map.put("ZC_OVERRIDE_TIMEOUT_MS", timeout_text);
@@ -313,6 +314,7 @@ fn luaWrapper() []const u8 {
     \\input = {
     \\  command = os.getenv("ZC_OVERRIDE_COMMAND"),
     \\  config_path = os.getenv("ZC_OVERRIDE_CONFIG_PATH"),
+    \\  script_path = os.getenv("ZC_OVERRIDE_SCRIPT_PATH"),
     \\  args = parse_args(os.getenv("ZC_OVERRIDE_ARGS")),
     \\}
     \\

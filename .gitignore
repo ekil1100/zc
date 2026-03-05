@@ -1,6 +1,10 @@
 # Zig build artifacts
 .zig-cache/
+.zig-cache-global/
 zig-out/
+
+# Runtime generated artifacts
+ruleset/
 
 # Build artifacts
 *.o
