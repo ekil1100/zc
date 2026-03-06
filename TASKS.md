@@ -6,6 +6,38 @@
 
 ---
 
+## 临时任务：mixed-port(7899) 下载中断排查与修复（2026-03-05）
+
+### HOTFIX-MIXED-DOWNLOAD-RESET
+- 状态：DOING
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [ ] 在同机对照复现：`7899 (zc)` 可稳定触发下载中断，`7897 (Clash Verge)` 同目标可成功
+  - [x] 明确根因到具体代码路径（不是环境层面的模糊结论）
+  - [ ] 完成修复后，`7899 (zc)` 对同类大响应下载不再异常断开
+  - [x] 新增回归测试覆盖根因场景并通过
+- 备注：2026-03-05 20:07 +0800 进入 DOING（按“先复现、再根因、后修复”执行）；2026-03-05 20:09 +0800 复现到同类错误（`ECONNRESET` / `server closed connection`），并在同时段观察到 `zc` 侧 `RelayIdleTimeout`；2026-03-05 20:18 +0800 定位根因为 `src/proxy/mixed.zig` 中 relay 写死 30s idle 超时并主动断开隧道；2026-03-05 20:21 +0800 完成修复（默认禁用 mixed relay 空闲超时）并补回归测试；2026-03-05 20:22 +0800 验证 `zig build test --summary all`（36/36 passed）。因本机存在既有 daemon 端口占用与进程切换限制，端到端“新二进制接管 7899”回归仍待补做。
+
+---
+
+## 临时任务：daemon 单实例保护修复（2026-03-06）
+
+### HOTFIX-DAEMON-SINGLETON-GUARD
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/daemon.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 先补失败测试，覆盖“已有 lock/pid 被占用时不得再次启动 daemon”
+  - [x] `zc start` / `zc restart` 不再因并发或历史 pid 文件状态产生多个 `zc --daemon-run`
+  - [x] `zc stop` 后可重新启动，且不会遗留 lock 状态
+  - [x] `zig build test` 通过
+- 备注：2026-03-06 14:58 +0800 进入 DOING（先补测试，再为 daemon 增加单实例锁与更稳健的 pid 生命周期管理）；2026-03-06 15:08 +0800 完成修复。实现要点：新增 daemon lock 文件并在 `startDaemon` 启动前原子获取独占锁，锁 fd 通过 `dup` 保留到 `exec` 后的 `--daemon-run` 生命周期；已有锁时返回 `already_running` 而不是再 fork 新实例；补充锁重入回归测试。验证：`zig build test --summary all`（37/37 passed）。
+
+---
+
 ## 临时任务：override 持久化复制与自动同步（2026-03-05）
 
 ### FEATURE-OVERRIDE-MANAGED-SYNC-APPLY

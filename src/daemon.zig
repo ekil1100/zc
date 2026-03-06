@@ -4,7 +4,10 @@ const constants = @import("constants.zig");
 
 // PID 文件路径
 const PID_FILE = "/tmp/zc.pid";
+const LOCK_FILE = "/tmp/zc.lock";
 const LOG_FILE = "/tmp/zc.log";
+const startup_poll_interval_ms: u64 = 200;
+const startup_poll_attempts: usize = 10;
 
 pub const ApplyMode = enum {
     auto,
@@ -20,13 +23,22 @@ pub const ApplyResult = enum {
 
 /// 获取 PID 文件路径
 pub fn getPidFilePath(allocator: std.mem.Allocator) ![]const u8 {
+    return getRuntimeFilePath(allocator, "zc.pid", PID_FILE);
+}
+
+/// 获取 lock 文件路径
+fn getLockFilePath(allocator: std.mem.Allocator) ![]const u8 {
+    return getRuntimeFilePath(allocator, "zc.lock", LOCK_FILE);
+}
+
+fn getRuntimeFilePath(allocator: std.mem.Allocator, basename: []const u8, fallback: []const u8) ![]const u8 {
     // 优先使用 XDG_RUNTIME_DIR，否则使用 /tmp
     if (std.process.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR")) |runtime_dir| {
-        const path = try std.fs.path.join(allocator, &.{ runtime_dir, "zc.pid" });
+        const path = try std.fs.path.join(allocator, &.{ runtime_dir, basename });
         allocator.free(runtime_dir);
         return path;
     } else |_| {
-        return try allocator.dupe(u8, PID_FILE);
+        return try allocator.dupe(u8, fallback);
     }
 }
 
@@ -92,32 +104,87 @@ pub fn removePidFile(allocator: std.mem.Allocator) void {
     std.fs.deleteFileAbsolute(pid_file) catch {};
 }
 
-/// 检查进程是否正在运行
-pub fn isRunning(allocator: std.mem.Allocator) !bool {
-    const pid = try readPid(allocator) orelse return false;
-
-    // 发送信号 0 检查进程是否存在
+fn isPidRunning(allocator: std.mem.Allocator, pid: i32) !bool {
     std.posix.kill(pid, 0) catch return false;
 
     // Linux: 读取 /proc/<pid>/comm 验证进程名，防止 PID 回收误判
     if (comptime @import("builtin").os.tag == .linux) {
         var path_buf: [64]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return false;
-        const file = std.fs.openFileAbsolute(path, .{}) catch {
-            removePidFile(allocator);
-            return false;
-        };
+        const file = std.fs.openFileAbsolute(path, .{}) catch return false;
         defer file.close();
         var buf: [256]u8 = undefined;
         const n = file.read(&buf) catch return false;
         const comm = std.mem.trimRight(u8, buf[0..n], "\n");
         if (!std.mem.eql(u8, comm, "zc")) {
-            removePidFile(allocator);
             return false;
         }
     }
 
+    _ = allocator;
     return true;
+}
+
+fn waitForTrackedRunningPid(allocator: std.mem.Allocator) !?i32 {
+    var attempt: usize = 0;
+    while (attempt < startup_poll_attempts) : (attempt += 1) {
+        if (try readPid(allocator)) |pid| {
+            if (try isPidRunning(allocator, pid)) return pid;
+        }
+        std.Thread.sleep(startup_poll_interval_ms * std.time.ns_per_ms);
+    }
+    return null;
+}
+
+fn duplicateWithoutCloexec(file: std.fs.File) !std.fs.File {
+    const dup_fd = try std.posix.dup(file.handle);
+    file.close();
+    return .{ .handle = dup_fd };
+}
+
+fn acquireDaemonLockFileAtPath(lock_file_path: []const u8) !std.fs.File {
+    const lock_file = std.fs.createFileAbsolute(lock_file_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => return error.DaemonAlreadyRunning,
+        else => return err,
+    };
+    errdefer lock_file.close();
+    return try duplicateWithoutCloexec(lock_file);
+}
+
+fn acquireDaemonLockFile(allocator: std.mem.Allocator) !std.fs.File {
+    const lock_file_path = try getLockFilePath(allocator);
+    defer allocator.free(lock_file_path);
+    return try acquireDaemonLockFileAtPath(lock_file_path);
+}
+
+fn printAlreadyRunning(json_output: bool, pid: ?i32) void {
+    if (json_output) {
+        printCliOk(json_output, "start", "running", "already_running", pid);
+        return;
+    }
+
+    if (pid) |p| {
+        std.debug.print("zc daemon already running (pid: {d})\n", .{p});
+    } else {
+        std.debug.print("zc daemon already running or startup is in progress\n", .{});
+    }
+}
+
+/// 检查进程是否正在运行
+pub fn isRunning(allocator: std.mem.Allocator) !bool {
+    const pid = try readPid(allocator) orelse return false;
+
+    if (try isPidRunning(allocator, pid)) {
+        return true;
+    }
+
+    removePidFile(allocator);
+    return false;
 }
 
 fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {
@@ -198,14 +265,20 @@ fn printStartupInfo(allocator: std.mem.Allocator) void {
 
 /// 启动守护进程
 pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool, extra_args: []const []const u8) !void {
-    // 检查是否已经在运行
+    var lock_file = acquireDaemonLockFile(allocator) catch |err| switch (err) {
+        error.DaemonAlreadyRunning => {
+            const existing_pid = try waitForTrackedRunningPid(allocator);
+            printAlreadyRunning(json_output, existing_pid);
+            return;
+        },
+        else => return err,
+    };
+    errdefer lock_file.close();
+
+    // 兼容旧版本 daemon：即使没有 lock，也不要在已有 pid 存活时再启动一个实例
     if (try isRunning(allocator)) {
         const existing_pid = try readPid(allocator);
-        if (json_output) {
-            printCliOk(json_output, "start", "running", "already_running", existing_pid);
-        } else {
-            std.debug.print("zc daemon already running (pid: {d})\n", .{existing_pid.?});
-        }
+        printAlreadyRunning(json_output, existing_pid);
         return;
     }
 
@@ -221,8 +294,8 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
         defer if (log_path) |p| allocator.free(p);
 
         var i: usize = 0;
-        while (i < 10) : (i += 1) { // 10 × 200ms = 2s
-            std.Thread.sleep(200 * std.time.ns_per_ms);
+        while (i < startup_poll_attempts) : (i += 1) { // 10 × 200ms = 2s
+            std.Thread.sleep(startup_poll_interval_ms * std.time.ns_per_ms);
 
             // 检查子进程是否还活着
             std.posix.kill(pid, 0) catch {
@@ -245,6 +318,7 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
 
         // 子进程在 2s 后仍然存活，视为启动成功
         try writePid(allocator, pid);
+        lock_file.close();
 
         if (json_output) {
             printCliOk(json_output, "start", "running", null, pid);
@@ -558,4 +632,27 @@ fn printTimestampedChunk(allocator: std.mem.Allocator, chunk: []const u8, carry:
 fn printTimestampedLine(line: []const u8) void {
     const ts = std.time.timestamp();
     std.debug.print("[{d}] {s}\n", .{ ts, line });
+}
+
+test "daemon lock prevents duplicate acquisition and can be reacquired after close" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+
+    const lock_path = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    defer allocator.free(lock_path);
+
+    var first_lock: ?std.fs.File = try acquireDaemonLockFileAtPath(lock_path);
+    defer if (first_lock) |file| file.close();
+
+    try std.testing.expectError(error.DaemonAlreadyRunning, acquireDaemonLockFileAtPath(lock_path));
+
+    first_lock.?.close();
+    first_lock = null;
+
+    var second_lock = try acquireDaemonLockFileAtPath(lock_path);
+    defer second_lock.close();
 }
