@@ -5,6 +5,7 @@ const ProxyStream = outbound.ProxyStream;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = outbound.OutboundManager;
 const ss = @import("outbound/shadowsocks.zig");
+const relay_poll_timeout_ms: i32 = -1;
 
 /// 混合端口（HTTP + SOCKS5）
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
@@ -259,7 +260,6 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     };
 
     var buf: [8192]u8 = undefined;
-    const idle_timeout_ms: i32 = 30_000;
     var up_bytes: usize = 0;
     var down_bytes: usize = 0;
     var last_report_ms = std.time.milliTimestamp();
@@ -269,12 +269,7 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         // even when socket has no new readable event.
         try drainTargetPending(client_stream, target_stream, &buf, &down_bytes);
 
-        const poll_ret = try std.posix.poll(&poll_fds, idle_timeout_ms);
-        if (poll_ret == 0) {
-            relayFlushStats(&up_bytes, &down_bytes, true);
-            relayLog("Idle timeout reached, closing relay", .{});
-            return error.RelayIdleTimeout;
-        }
+        _ = try std.posix.poll(&poll_fds, relay_poll_timeout_ms);
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
             const n = try std.posix.read(client_stream.handle, &buf);
@@ -364,6 +359,10 @@ test "relay drains SS pending leftover without poll event" {
 
     peer_stream.close();
     relay_thread.join();
+}
+
+test "mixed relay keeps idle tunnels open by default" {
+    try std.testing.expectEqual(@as(i32, -1), relay_poll_timeout_ms);
 }
 
 test "relay forwards traffic in both directions (direct stream)" {
