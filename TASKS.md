@@ -92,6 +92,18 @@
   - [x] 保留并通过针对该路径的最小回归测试或可复现脚本
 - 备注：2026-03-08 19:28 +0800 进入 DOING（按“先复现三组对照，再缩小到 mixed 实现差异，最后补回归”执行）。当前已知现象：`openclaw` 飞书扩展的 HTTP 登录/token 路径走 Lark SDK 默认 `axios + 环境代理`，在 `http_proxy/https_proxy/all_proxy -> 127.0.0.1:7899` 下仍稳定报 `AxiosError: socket hang up` / `ECONNRESET`；但显式 `HttpsProxyAgent("http://127.0.0.1:7899")` 可通，同机将 env-proxy 改到 `7897` 也可通。2026-03-08 20:17 +0800 完成同机复现与协议级抓包。实测：1) 使用 openclaw 飞书扩展同版 axios + 显式 `HttpsProxyAgent("http://127.0.0.1:7899")` 请求 `tenant_access_token/internal`，`7899` 返回 HTTP 200 + `code=0`；2) 仅设置 `http_proxy/https_proxy/all_proxy=http://127.0.0.1:7899` 时，同一 axios 请求稳定 `ECONNRESET/socket hang up`；3) 同样 env-proxy 改到 `7897` 时可返回 HTTP 200 + `code=0`。进一步通过本地临时 capture proxy 抓到两条路径的原始代理首包：显式 agent 发的是 `CONNECT open.feishu.cn:443 HTTP/1.1`，而 axios env-proxy 发的是明文 `POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal HTTP/1.1`（absolute-form request-target）。这说明当前 `zc mixed` 仍只支持 `CONNECT` 隧道和普通 HTTP 转发，不支持 HTTPS forward-proxy 的 absolute-form 语义；现有 `handleHttpRequest()` 会把非 CONNECT 请求统一按明文 HTTP 处理，默认连 `host:80` 并原样转发请求，因此遇到 `POST https://...` 时属于能力缺口，不再是单纯的 half-close/reset 关闭语义 bug。2026-03-08 20:48 +0800 完成修复并做同机 live 验证。最终实现：1) `handleHttpRequest()` 识别 absolute-form `https://...` 请求，按 HTTPS forward-proxy 语义处理；2) DIRECT 路径不再走自定义 `Io.Reader/Writer` 包装，而是对 `net.Stream.reader()/writer()` 直接挂 `std.crypto.tls.Client`，避免自定义包装在响应读取阶段触发 `ReadFailed` 和清理期 panic；3) 修正 DIRECT TLS 缓冲布局，按 Zig 标准库 `std.http.Client` 的模式区分 `tls_write_buffer`（底层 socket writer，大缓冲）和 `socket_write_buffer`（TLS 明文 writer，小缓冲），消除 `request_flush` 阶段的 `MessageTooBig`；4) 在 `tls_client.writer.flush()` 后补上底层 `socket_writer.interface.flush()`，修复“请求已加密但未真正发出，客户端 30s 超时”的问题。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（46/46 passed）；`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast` 通过；安装到 `~/.local/bin/zc` 后，用 `/Users/like/.local/bin/zc --daemon-run` 做单 shell e2e 复现，`http_proxy/https_proxy/all_proxy -> 127.0.0.1:7899` 的 axios env-proxy Feishu token 请求返回 `HTTP 200` + `code=0`，不再出现 `ECONNRESET/socket hang up`。
 
+## 临时任务：同步 README 与 AGENTS 文档（2026-03-08）
+
+### DOC-README-AGENTS-SYNC
+- 状态：DONE
+- 优先级：P2
+- 负责人：Codex
+- 输出：`README.md`, `AGENTS.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] `README.md` 补充这次用户可感知的运行行为变化
+  - [x] `AGENTS.md` 补充对应的文档同步约束
+- 备注：2026-03-08 20:51 +0800 完成小幅同步；README 仅补 daemon 状态探测与 mixed HTTPS forward-proxy 支持的简短说明，AGENTS 仅补“运行行为变化需同步 README”约束，不展开排障细节。2026-03-08 20:53 +0800 按补充要求微调 README，把 `just install` 放到更显眼的位置，并补一句说明其会安装到 `~/.local/bin/zc`。2026-03-08 20:54 +0800 按最新要求再次收敛 README，删除实现/行为细节，只保留面向用户的安装与常用命令用法。2026-03-08 20:55 +0800 继续收窄 README，删除 `Runtime Override` 整段，仅保留最基础的安装、启动与状态检查入口。2026-03-08 20:56 +0800 按最新要求移除 `zc tui`，因为当前还不是可直接给用户承诺的入口。2026-03-08 20:57 +0800 重构 `AGENTS.md`，删除角色分工、重复解释与冗长方法学描述，收敛为目标、技术约束、工程规则、任务维护和 Git 规范几个必要部分。
+
 ## 临时任务：daemon 单实例保护修复（2026-03-06）
 
 ### HOTFIX-DAEMON-SINGLETON-GUARD
