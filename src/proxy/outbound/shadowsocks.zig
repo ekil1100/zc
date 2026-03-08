@@ -1,6 +1,7 @@
 const std = @import("std");
 const net = std.net;
 const aead = @import("../../crypto/aead.zig");
+const socket_options = @import("../../socket_options.zig");
 pub const Address = aead.Address;
 pub const connect_retry_attempts: usize = 3;
 const retry_backoff_ms = [_]u64{ 200, 500, 1000 };
@@ -166,6 +167,14 @@ pub const ShadowsocksClient = struct {
             var stream = net.tcpConnectToAddress(addr) catch |err| {
                 last_err = err;
                 std.debug.print("[SS] Upstream TCP connect failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
+                sleepBeforeRetry(attempt, connect_retry_attempts);
+                continue;
+            };
+
+            socket_options.configureConnectedStream(stream) catch |err| {
+                stream.close();
+                last_err = err;
+                std.debug.print("[SS] Upstream socket sigpipe setup failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
                 sleepBeforeRetry(attempt, connect_retry_attempts);
                 continue;
             };

@@ -4,6 +4,7 @@ const Config = @import("../config.zig").Config;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = @import("../proxy/outbound/manager.zig").OutboundManager;
 const build_options = @import("build_options");
+const socket_options = @import("../socket_options.zig");
 
 /// REST API 服务器
 pub const ApiServer = struct {
@@ -34,6 +35,11 @@ pub const ApiServer = struct {
 
         while (true) {
             const conn = try server.accept();
+            socket_options.configureConnectedStream(conn.stream) catch |err| {
+                std.debug.print("API accepted socket setup error: {}\n", .{err});
+                conn.stream.close();
+                continue;
+            };
             self.handleConnection(conn) catch |err| {
                 std.debug.print("API connection error: {}\n", .{err});
                 conn.stream.close();

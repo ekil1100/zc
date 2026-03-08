@@ -1,4 +1,5 @@
 const std = @import("std");
+const socket_options = @import("../socket_options.zig");
 const net = std.net;
 const crypto = std.crypto;
 const base64 = std.base64;
@@ -240,6 +241,7 @@ pub const WebSocket = struct {
 pub fn connectWs(allocator: std.mem.Allocator, host: []const u8, port: u16, path: []const u8, use_tls: bool, ws_host: ?[]const u8) !WebSocket {
     const stream = try net.tcpConnectToHost(allocator, host, port);
     errdefer stream.close();
+    try socket_options.configureConnectedStream(stream);
 
     var ws: WebSocket = undefined;
 

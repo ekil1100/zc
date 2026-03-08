@@ -4,6 +4,7 @@ const Engine = @import("../rule/engine.zig").Engine;
 const outbound = @import("outbound/manager.zig");
 const OutboundManager = outbound.OutboundManager;
 const ProxyStream = outbound.ProxyStream;
+const socket_options = @import("../socket_options.zig");
 
 const Socks5Version = 0x05;
 const AuthMethods = struct {
@@ -42,6 +43,11 @@ pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, 
 
     while (true) {
         const conn = try server.accept();
+        socket_options.configureConnectedStream(conn.stream) catch |err| {
+            std.debug.print("SOCKS5 accepted socket setup error: {}\n", .{err});
+            conn.stream.close();
+            continue;
+        };
 
         // Pass engine and manager to each connection handler
         const ctx = try allocator.create(ConnectionContext);

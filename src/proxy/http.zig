@@ -4,6 +4,7 @@ const Engine = @import("../rule/engine.zig").Engine;
 const outbound = @import("outbound/manager.zig");
 const OutboundManager = outbound.OutboundManager;
 const ProxyStream = outbound.ProxyStream;
+const socket_options = @import("../socket_options.zig");
 
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
     const listen_ip = if (std.mem.eql(u8, bind_address, "*")) "0.0.0.0" else bind_address;
@@ -17,6 +18,11 @@ pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, 
 
     while (true) {
         const conn = try server.accept();
+        socket_options.configureConnectedStream(conn.stream) catch |err| {
+            std.debug.print("HTTP accepted socket setup error: {}\n", .{err});
+            conn.stream.close();
+            continue;
+        };
 
         handleConnection(allocator, conn, engine, manager) catch |err| {
             std.debug.print("Connection error: {}\n", .{err});

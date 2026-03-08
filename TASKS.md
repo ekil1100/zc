@@ -6,6 +6,22 @@
 
 ---
 
+## 临时任务：修复 zc daemon 处理本地 HTTP 代理流量时自退出（2026-03-08）
+
+### HOTFIX-DAEMON-LOCAL-PROXY-EXIT
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `src/socket_options.zig`, `src/proxy/outbound/manager.zig`, `src/proxy/outbound/shadowsocks.zig`, `src/protocol/trojan.zig`, `src/protocol/vless.zig`, `src/protocol/vmess.zig`, `src/proxy/websocket.zig`, `src/proxy/http.zig`, `src/proxy/socks5.zig`, `src/api/server.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 稳定复现并明确根因到具体代码路径，而不是停留在“daemon 自停”现象描述
+  - [x] 修复后，`zc start` 后通过 `http_proxy=http://127.0.0.1:7899` 访问 `http://127.0.0.1:8082/info/version` 不再导致 daemon 退出
+  - [x] 新增/更新测试覆盖本次根因对应的内存生命周期与 socket 保护逻辑并通过
+  - [x] `zig test src/socket_options.zig` 与 `zig build test --summary all` 通过
+- 备注：2026-03-08 21:02 +0800 进入 DOING。当前已实机复现：`zc start` 后 daemon 正常运行；一旦通过 `7899` 发起 `GET http://127.0.0.1:8082/info/version`，curl 侧报 `Empty reply from server`，随后 `zc status` 变为 `state: stopped detail: stale_pid_file`，`ps` 中 daemon 进程消失。`zc.log` 最后可见该请求被 mixed 识别为 `absolute_form=true` 并路由到 `Proxies`，随后 Shadowsocks 握手与 relay 完成后进程直接消失，无 panic / fatal error 日志。初步怀疑是 macOS socket 写入路径未屏蔽 `SIGPIPE`，因此先补了 Darwin `SO_NOSIGPIPE` 保护到出站连接和 accept 后 socket，作为 runtime 加固。2026-03-08 21:11 +0800 继续实机追查后拿到新的 DiagnosticReport：`zc-2026-03-08-210409.ips` 明确显示 `EXC_BAD_ACCESS/SIGSEGV`，faulting frame 为 `proxy.mixed.handleHttp -> DebugAllocator.free`，排除“被信号直接打死”的假设。最终根因定位为 `src/proxy/mixed.zig` 的 absolute-form URI 解析：`std.Uri.getHostAlloc()` 可能直接返回借用的原始 host 切片，而 `ForwardRequest.deinit()` 误把它当堆内存无条件 `free`，导致处理 `POST/GET https://...` 一类请求后在退出 `handleHttp` 时段错误。修复方式：改为 `uri.getHost()` 后显式 `allocator.dupe()`，保证 `forward.host` 始终由 `ForwardRequest` 自己持有；同时新增“absolute-form host memory ownership” 回归测试。验证：`zig test src/socket_options.zig` 通过，`zig build test --summary all`（46/46 passed），`zig build -Doptimize=ReleaseFast` 通过；安装到 `~/.local/bin/zc` 后实机回归 `zc start` -> openclaw 自动发起 Feishu/Telegram/Discord 流量 -> `zc status` 仍保持 `state: running pid: 95061`；随后重放此前 100% 触发自退的 `env http_proxy=http://127.0.0.1:7899 curl http://127.0.0.1:8082/info/version`，curl 仍返回 `Empty reply from server`，但 daemon 不再退出，`ps -fp 95061` 仍可见 `/Users/like/.local/bin/zc --daemon-run`。
+
+---
+
 ## 临时任务：mixed-port(7899) 下载中断排查与修复（2026-03-05）
 
 ### HOTFIX-MIXED-DOWNLOAD-RESET

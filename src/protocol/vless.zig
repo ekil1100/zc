@@ -1,5 +1,6 @@
 const std = @import("std");
 const net = std.net;
+const socket_options = @import("../socket_options.zig");
 
 /// VLESS 命令类型
 pub const Command = enum(u8) {
@@ -35,6 +36,7 @@ pub const Client = struct {
     pub fn connect(self: *Client, target_host: []const u8, target_port: u16) !net.Stream {
         var stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
         errdefer stream.close();
+        try socket_options.configureConnectedStream(stream);
 
         try self.handshake(&stream, target_host, target_port);
         return stream;

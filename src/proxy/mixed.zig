@@ -6,6 +6,7 @@ const ProxyStream = outbound.ProxyStream;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = outbound.OutboundManager;
 const ss = @import("outbound/shadowsocks.zig");
+const socket_options = @import("../socket_options.zig");
 const relay_poll_timeout_ms: i32 = -1;
 
 /// 混合端口（HTTP + SOCKS5）
@@ -21,6 +22,11 @@ pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, 
 
     while (true) {
         const conn = try server.accept();
+        socket_options.configureConnectedStream(conn.stream) catch |err| {
+            std.debug.print("Mixed accepted socket setup error: {}\n", .{err});
+            conn.stream.close();
+            continue;
+        };
         try spawnConnectionTask(allocator, conn, engine, manager);
     }
 }
@@ -352,7 +358,8 @@ fn parseForwardRequest(allocator: std.mem.Allocator, request: []const u8) !Forwa
 
     if (std.mem.indexOf(u8, target_text, "://")) |_| {
         const uri = try std.Uri.parse(target_text);
-        const host = try uri.getHostAlloc(allocator);
+        var host_buf: [std.Uri.host_name_max]u8 = undefined;
+        const host = try allocator.dupe(u8, try uri.getHost(&host_buf));
         const scheme: ForwardScheme = if (std.mem.eql(u8, uri.scheme, "https"))
             .https
         else if (std.mem.eql(u8, uri.scheme, "http"))
@@ -1390,6 +1397,26 @@ test "parseForwardRequest accepts lowercase host and absolute https target" {
     try std.testing.expectEqual(@as(usize, 81), parsed.content_length);
     try std.testing.expect(parsed.absolute_form);
     try std.testing.expectEqualStrings("/open-apis/auth/v3/tenant_access_token/internal", parsed.origin_target);
+}
+
+test "parseForwardRequest owns absolute-form host memory" {
+    const allocator = std.testing.allocator;
+    const request = try allocator.dupe(
+        u8,
+        "POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal HTTP/1.1\r\n" ++
+            "host: open.feishu.cn\r\n" ++
+            "Content-Length: 81\r\n" ++
+            "\r\n",
+    );
+    defer allocator.free(request);
+
+    var parsed = try parseForwardRequest(allocator, request);
+    defer parsed.deinit(allocator);
+
+    const req_start = @intFromPtr(request.ptr);
+    const req_end = req_start + request.len;
+    const host_ptr = @intFromPtr(parsed.host.ptr);
+    try std.testing.expect(host_ptr < req_start or host_ptr >= req_end);
 }
 
 test "buildForwardRequestHead rewrites absolute-form request line and forces connection close" {

@@ -8,6 +8,7 @@ const ss = @import("shadowsocks.zig");
 const vmess = @import("../../protocol/vmess.zig");
 const trojan = @import("../../protocol/trojan.zig");
 const vless = @import("../../protocol/vless.zig");
+const socket_options = @import("../../socket_options.zig");
 
 /// 代理流包装器
 pub const ProxyStream = struct {
@@ -346,6 +347,11 @@ pub const OutboundManager = struct {
         const stream = net.tcpConnectToAddress(addr_list.addrs[0]) catch |err| {
             std.debug.print("[Manager] Target TCP connect failed: target={s}:{d} err={}\n", .{ target, port, err });
             return error.TargetTcpConnectFailed;
+        };
+        socket_options.configureConnectedStream(stream) catch |err| {
+            stream.close();
+            std.debug.print("[Manager] Target socket setup failed: target={s}:{d} err={}\n", .{ target, port, err });
+            return error.TargetSocketSetupFailed;
         };
         return ProxyStream.initDirect(stream);
     }

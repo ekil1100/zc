@@ -3,6 +3,7 @@ const net = std.net;
 const crypto = std.crypto;
 const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
+const socket_options = @import("../socket_options.zig");
 
 /// Trojan 命令类型
 pub const Command = enum(u8) {
@@ -78,6 +79,7 @@ pub const Client = struct {
 
         // 1. 建立 TCP 连接
         const stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
+        try socket_options.configureConnectedStream(stream);
 
         // 2. 在 TCP 之上建立 TLS 会话
         const conn = self.initTlsConnection(stream) catch |err| {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const net = std.net;
 const crypto = std.crypto;
+const socket_options = @import("../socket_options.zig");
 
 /// VMess 协议版本
 pub const Version = enum(u8) {
@@ -72,6 +73,7 @@ pub const Client = struct {
         // 1. 建立 TCP 连接
         var stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
         errdefer stream.close();
+        try socket_options.configureConnectedStream(stream);
 
         // 2. 发送 VMess 握手
         try self.handshake(&stream, target_host, target_port);
