@@ -6,6 +6,21 @@
 
 ---
 
+## 临时任务：本地/私网目标旁路远端代理（2026-03-08）
+
+### HOTFIX-LOCAL-TARGET-DIRECT-BYPASS
+- 状态：BLOCKED
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/proxy/outbound/manager.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 目标为 `localhost` / `127.0.0.0/8` / `::1` / 常见私网地址时，不再被代理组错误送往远端节点
+  - [x] 回归测试覆盖 loopback/private 地址旁路判断
+  - [ ] 安装新二进制后，`http_proxy=http://127.0.0.1:7899 curl http://127.0.0.1:8082/info/version` 不再返回 `Empty reply from server`
+- 备注：2026-03-08 21:20 +0800 进入 DOING。当前 daemon 崩溃问题已修复，但同一条复现命令仍返回 `Empty reply from server`。日志显示 `127.0.0.1:8082` 被 mixed 识别后继续匹配到 `MATCH -> Proxies`，随后交给 Shadowsocks 远端处理；由于远端节点不可能访问本机 loopback 地址，请求自然无法返回。准备在 `OutboundManager.connect` 增加对 loopback / 私网目标的统一直连旁路，避免这类目标被错误送往远端代理。2026-03-08 21:31 +0800 完成代码修复：`OutboundManager.connect` 现在会对 `localhost`、IPv4 loopback / RFC1918 / link-local，以及 IPv6 `::1` / `fc00::/7` / `fe80::/10` 统一旁路代理并直连本地目标；新增单测覆盖基础判断和“即使规则命中代理组，连接 `127.0.0.1` 仍必须直接命中本地 listener”。验证：`zig build test --summary all`（46/46 passed）、`zig build -Doptimize=ReleaseFast` 通过。当前 live 验证受外部环境阻塞：本机 `127.0.0.1:7899` 仍被未知占用者持有，`zc --daemon-run` 启动即报 `Port precheck failed: 127.0.0.1:7899 is already in use`，因此无法在同端口完成最终 `curl` 回归。
+
+---
+
 ## 临时任务：修复 zc daemon 处理本地 HTTP 代理流量时自退出（2026-03-08）
 
 ### HOTFIX-DAEMON-LOCAL-PROXY-EXIT

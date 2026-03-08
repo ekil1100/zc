@@ -211,6 +211,11 @@ pub const OutboundManager = struct {
     pub fn connect(self: *OutboundManager, proxy_name: []const u8, target: []const u8, port: u16) !ProxyStream {
         std.debug.print("[Manager] connect: proxy={s}, target={s}:{d}\n", .{ proxy_name, target, port });
 
+        if (shouldBypassProxyForTarget(target)) {
+            std.debug.print("[Manager] Bypassing proxy for local/private target: {s}:{d}\n", .{ target, port });
+            return try self.connectDirectTarget(target, port);
+        }
+
         // 处理 DIRECT 和 REJECT 特殊代理
         if (std.mem.eql(u8, proxy_name, "DIRECT")) {
             std.debug.print("[Manager] Using DIRECT\n", .{});
@@ -386,6 +391,41 @@ pub const OutboundManager = struct {
     }
 };
 
+fn shouldBypassProxyForTarget(target: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(target, "localhost")) return true;
+
+    if (std.net.Address.parseIp4(target, 0)) |addr| {
+        const ip = addr.in.sa.addr;
+        const a = @as(u8, @truncate(ip >> 0));
+        const b = @as(u8, @truncate(ip >> 8));
+
+        if (a == 127) return true;
+        if (a == 10) return true;
+        if (a == 172 and b >= 16 and b <= 31) return true;
+        if (a == 192 and b == 168) return true;
+        if (a == 169 and b == 254) return true;
+        return false;
+    } else |_| {}
+
+    if (std.net.Address.parseIp6(target, 0)) |addr6| {
+        const ip = addr6.in6.sa.addr;
+        if (isIpv6Loopback(ip)) return true;
+        if ((ip[0] & 0xfe) == 0xfc) return true; // fc00::/7
+        if (ip[0] == 0xfe and (ip[1] & 0xc0) == 0x80) return true; // fe80::/10
+        return false;
+    } else |_| {}
+
+    return false;
+}
+
+fn isIpv6Loopback(ip: [16]u8) bool {
+    var i: usize = 0;
+    while (i < 15) : (i += 1) {
+        if (ip[i] != 0) return false;
+    }
+    return ip[15] == 1;
+}
+
 test "makeShadowsocksClient returns isolated instances" {
     const allocator = std.testing.allocator;
 
@@ -457,4 +497,76 @@ test "selectProxyInternal with persist=false skips persist" {
 
     mgr.selectProxyInternal("G1", "P1", false);
     try std.testing.expectEqual(@as(usize, 0), mgr.persist_invocations);
+}
+
+test "shouldBypassProxyForTarget detects loopback and private targets" {
+    try std.testing.expect(shouldBypassProxyForTarget("localhost"));
+    try std.testing.expect(shouldBypassProxyForTarget("127.0.0.1"));
+    try std.testing.expect(shouldBypassProxyForTarget("10.0.0.8"));
+    try std.testing.expect(shouldBypassProxyForTarget("172.16.5.4"));
+    try std.testing.expect(shouldBypassProxyForTarget("192.168.1.20"));
+    try std.testing.expect(shouldBypassProxyForTarget("169.254.1.9"));
+    try std.testing.expect(shouldBypassProxyForTarget("::1"));
+    try std.testing.expect(shouldBypassProxyForTarget("fc00::1"));
+    try std.testing.expect(shouldBypassProxyForTarget("fe80::1"));
+    try std.testing.expect(!shouldBypassProxyForTarget("8.8.8.8"));
+    try std.testing.expect(!shouldBypassProxyForTarget("1.1.1.1"));
+    try std.testing.expect(!shouldBypassProxyForTarget("open.feishu.cn"));
+}
+
+test "connect bypasses proxy groups for loopback targets" {
+    const allocator = std.testing.allocator;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "remote-ss"),
+        .proxy_type = .ss,
+        .server = try allocator.dupe(u8, "203.0.113.10"),
+        .port = 8388,
+        .password = try allocator.dupe(u8, "password"),
+        .cipher = try allocator.dupe(u8, "aes-128-gcm"),
+    });
+
+    var group = @import("../../config.zig").ProxyGroup{
+        .name = try allocator.dupe(u8, "Proxies"),
+        .group_type = .select,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+    try group.proxies.append(allocator, try allocator.dupe(u8, "remote-ss"));
+    try cfg.proxy_groups.append(allocator, group);
+
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    const listen_addr = try net.Address.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(server_arg: *net.Server) void {
+            const conn = server_arg.accept() catch return;
+            defer conn.stream.close();
+            _ = conn.stream.writeAll("ok") catch {};
+        }
+    }.run, .{&server});
+    defer accept_thread.join();
+
+    var stream = try manager.connect("Proxies", "127.0.0.1", server.listen_address.getPort());
+    defer stream.close();
+
+    var buf: [2]u8 = undefined;
+    const n = try stream.read(&buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("ok", buf[0..n]);
+    try std.testing.expect(stream.owned_ss_client == null);
 }
