@@ -12,6 +12,8 @@ cd zc
 just install
 ```
 
+`just install` builds `zig-out/bin/zc` and atomically replaces `~/.local/bin/zc`, so an existing local daemon can keep running while the new CLI binary is staged.
+
 ## Quick Start
 
 ```bash

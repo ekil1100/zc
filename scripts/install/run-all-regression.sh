@@ -6,6 +6,7 @@ steps=(
   "verify-install-flow.sh:flow"
   "verify-install-env.sh:env"
   "verify-install-path-matrix.sh:path"
+  "verify-local-dev-install.sh:dev-install"
   "verify-rollback-flow.sh:rollback"
   "run-3step-smoke.sh:smoke"
   "run-beta-checklist.sh:evidence"
