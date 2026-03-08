@@ -17,7 +17,8 @@
   - [x] `AGENTS.md` 明确要求 feature / bugfix / hotfix 先通过 git worktree 开始，并指定 `.worktrees/` 为默认目录
   - [x] `AGENTS.md` 明确规定本地开发不要占用 `7899`，并要求启动链路优先提供 `zc start --port <port>` 这类显式入口；端口冲突时只报错、不自动切换端口
   - [x] `AGENTS.md` 明确要求完成实现后先 review，再 commit 并合并回 `main`
-- 备注：2026-03-08 22:01 +0800 按最新协作要求更新开发流程，仅调整协作文档，不涉及产品代码与运行行为。2026-03-08 22:09 +0800 根据进一步确认，将默认 worktree 目录修正为 `.worktrees/`，并把端口策略从“自动探测 fallback”收敛为“显式 `zc start --port <port>`，冲突时报错拒绝启动”。
+  - [x] `AGENTS.md` 明确要求合并回 `main` 后清理对应 worktree 和本地分支
+- 备注：2026-03-08 22:01 +0800 按最新协作要求更新开发流程，仅调整协作文档，不涉及产品代码与运行行为。2026-03-08 22:09 +0800 根据进一步确认，将默认 worktree 目录修正为 `.worktrees/`，并把端口策略从“自动探测 fallback”收敛为“显式 `zc start --port <port>`，冲突时报错拒绝启动”。2026-03-09 00:00 +0800 继续收紧流程要求：worktree 分支合并回 `main` 后，必须清理对应 worktree 和本地分支，避免遗留漂移工作区。
 
 ### FEATURE-START-EXPLICIT-PORT
 - 状态：DONE

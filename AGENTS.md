@@ -49,7 +49,7 @@ zc 以 mihomo/c 为基线，优先做好这几件事：
 - 开始 feature / bugfix / hotfix 前，先使用 git worktree 创建隔离工作区，统一放在仓库根目录的 `.worktrees/`
 - 本地开发启动 `zc` 时不要使用 `7899`，该端口保留给生产环境；优先提供 `zc start --port <port>` 这类显式入口，端口冲突时只报错并拒绝启动，避免误启动到其他端口
 - 实现完成后先做一次 review，再整理结论与风险
-- 完成验证后提交 commit，并合并回 `main`
+- 完成验证后提交 commit，并合并回 `main`；合并完成后清理对应 worktree 和本地分支
 
 ## Git 规范
 
