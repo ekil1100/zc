@@ -9,7 +9,7 @@
 ## 临时任务：本地/私网目标旁路远端代理（2026-03-08）
 
 ### HOTFIX-STATUS-AFTER-KILL-RECOVERY
-- 状态：DOING
+- 状态：DONE
 - 优先级：P0
 - 负责人：Codex
 - 输出：`Justfile`, `scripts/install/local-dev-install.sh`, `scripts/install/verify-local-dev-install.sh`, `scripts/install/run-all-regression.sh`, `README.md`, `TASKS.md`
@@ -18,7 +18,7 @@
   - [x] 修复后，daemon 被 kill / 崩溃后，`zc status` 返回可解释的停止态，而不是进程被系统直接杀掉
   - [x] 修复后，不再需要执行 `just install` 才能恢复 `zc status`
   - [x] 新增/更新测试覆盖本次根因对应的状态探测或进程恢复路径
-- 备注：2026-03-09 00:09 +0800 进入 DOING。当前用户回报是：在现网环境中 `kill zc` 之后，直接执行 `zc status` 会出现 `zsh: killed     zc status`，而重新 `just install` 后才恢复。下一步按“先复现、再根因、后修复”执行，并优先用非 `7899` 端口和隔离 worktree 避免污染生产环境。2026-03-09 00:47 +0800 在隔离环境里复现不到 `status` 逻辑异常：`kill -9` 掉 `--daemon-run` 后，`zc status` 已能稳定返回 `state: stopped detail: stale_pid_file`。继续排查现网崩溃报告后，命中多份 macOS DiagnosticReport：`SIGKILL (Code Signature Invalid)` / `Taskgated Invalid Signature`，说明被系统直接杀掉的是新启动的 CLI 进程本身，而不是 status 探测代码 panic。进一步对照当前 `just install` 发现它会先 `rm ~/.local/bin/zc` 再直接 `cp` 覆盖，存在把正在使用/即将执行的 Mach-O 暴露在“删除或半写入”窗口里的风险；当前修复方向改为本地安装原子替换，并为切换前“旧目标仍可执行”补回归脚本。2026-03-09 01:00 +0800 完成实现：`Justfile` 改为先构建，再调用 `scripts/install/local-dev-install.sh`，通过“目标目录内临时文件 + 原子 `mv`”替换 `~/.local/bin/zc`；在 Darwin 上如果 staged 文件是 Mach-O，再先做一次 `codesign --verify --strict`，避免把坏签名二进制换上去；新增 `scripts/install/verify-local-dev-install.sh` 回归，覆盖“切换前旧目标仍可执行”和“安装失败不污染旧目标”两条关键路径，并接入 `scripts/install/run-all-regression.sh`。验证：`bash scripts/install/verify-local-dev-install.sh` 通过；`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（51/51 passed）通过；真实 `zig-out/bin/zc` 连续 10 次原子安装到 `/tmp/zc-real-loop/zc` 后均可通过 `codesign --verify --strict` 并成功执行隔离态 `zc status`。另：现有 `bash scripts/install/run-all-regression.sh` 仍因未改动的 `verify-install-path-matrix.sh` 中 `case_linux_user_local_bin` 失败而整体返回 FAIL，本次未扩散该问题。
+- 备注：2026-03-09 00:09 +0800 进入 DOING。当前用户回报是：在现网环境中 `kill zc` 之后，直接执行 `zc status` 会出现 `zsh: killed     zc status`，而重新 `just install` 后才恢复。下一步按“先复现、再根因、后修复”执行，并优先用非 `7899` 端口和隔离 worktree 避免污染生产环境。2026-03-09 00:47 +0800 在隔离环境里复现不到 `status` 逻辑异常：`kill -9` 掉 `--daemon-run` 后，`zc status` 已能稳定返回 `state: stopped detail: stale_pid_file`。继续排查现网崩溃报告后，命中多份 macOS DiagnosticReport：`SIGKILL (Code Signature Invalid)` / `Taskgated Invalid Signature`，说明被系统直接杀掉的是新启动的 CLI 进程本身，而不是 status 探测代码 panic。进一步对照当前 `just install` 发现它会先 `rm ~/.local/bin/zc` 再直接 `cp` 覆盖，存在把正在使用/即将执行的 Mach-O 暴露在“删除或半写入”窗口里的风险；当前修复方向改为本地安装原子替换，并为切换前“旧目标仍可执行”补回归脚本。2026-03-09 01:00 +0800 完成实现：`Justfile` 改为先构建，再调用 `scripts/install/local-dev-install.sh`，通过“目标目录内临时文件 + 原子 `mv`”替换 `~/.local/bin/zc`；在 Darwin 上如果 staged 文件是 Mach-O，再先做一次 `codesign --verify --strict`，避免把坏签名二进制换上去；新增 `scripts/install/verify-local-dev-install.sh` 回归，覆盖“切换前旧目标仍可执行”和“安装失败不污染旧目标”两条关键路径，并接入 `scripts/install/run-all-regression.sh`。验证：`bash scripts/install/verify-local-dev-install.sh` 通过；`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（51/51 passed）通过；真实 `zig-out/bin/zc` 连续 10 次原子安装到 `/tmp/zc-real-loop/zc` 后均可通过 `codesign --verify --strict` 并成功执行隔离态 `zc status`。另：现有 `bash scripts/install/run-all-regression.sh` 仍因未改动的 `verify-install-path-matrix.sh` 中 `case_linux_user_local_bin` 失败而整体返回 FAIL，本次未扩散该问题。2026-03-09 01:07 +0800 合并前自审完成，未发现新的阻塞问题；本任务按当前根因与验证链路收口为 DONE，后续若要补做“Code Signature Invalid” 的完全同形复现，可另开独立任务，不继续阻塞当前 hotfix 合并。
 
 ### DOC-AGENTS-DEVELOPMENT-WORKFLOW
 - 状态：DONE
