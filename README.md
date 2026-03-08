@@ -21,6 +21,9 @@ just install
 # Start service
 zc start
 
+# Start service on an explicit local-dev port
+zc start --port 7901
+
 # Check status
 zc status
 ```

@@ -27,7 +27,7 @@ pub const ApiServer = struct {
     pub fn start(self: *ApiServer) !void {
         const address = try net.Address.parseIp4("127.0.0.1", self.port);
         var server = try address.listen(.{
-            .reuse_address = true,
+            .reuse_address = false,
         });
         defer server.deinit();
 

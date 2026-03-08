@@ -25,6 +25,11 @@ const ConfigOverrideAction = union(enum) {
     set: []const u8,
 };
 
+const StartCommandOptions = struct {
+    config_path: ?[]const u8 = null,
+    port: ?u16 = null,
+};
+
 // 全局配置路径，用于重载
 var g_config_path: ?[]const u8 = null;
 var gpa_holder: ?*std.heap.GeneralPurposeAllocator(.{}) = null;
@@ -62,19 +67,13 @@ pub fn main() !void {
 
     // 处理 daemon 运行模式（内部使用）
     if (std.mem.eql(u8, cmd, "--daemon-run")) {
-        var config_path: ?[]const u8 = null;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "-c")) {
-                if (i + 1 < args.len) {
-                    config_path = args[i + 1];
-                    i += 1;
-                }
-            }
-        }
+        const start_opts = parseStartCommandOptions(args, 2) catch |err| {
+            printStartCommandOptionError(json_output, err);
+            return err;
+        };
         daemon.writePid(allocator, std.c.getpid()) catch {};
         // 在 daemon 模式下运行代理（无 TUI）
-        try runProxy(allocator, config_path, false, &override_opts, "daemon-run");
+        try runProxy(allocator, start_opts.config_path, start_opts.port, false, &override_opts, "daemon-run");
         return;
     }
 
@@ -86,31 +85,32 @@ pub fn main() !void {
 
     // 处理 tui 命令
     if (std.mem.eql(u8, cmd, "tui")) {
-        try runProxy(allocator, null, true, &override_opts, "tui");
+        try runProxy(allocator, null, null, true, &override_opts, "tui");
         return;
     }
 
     // 处理 start 命令
     if (std.mem.eql(u8, cmd, "start")) {
-        var config_path: ?[]const u8 = null;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "-c")) {
-                if (i + 1 < args.len) {
-                    config_path = args[i + 1];
-                    i += 1;
-                }
-            }
-        }
+        const start_opts = parseStartCommandOptions(args, 2) catch |err| {
+            printStartCommandOptionError(json_output, err);
+            return err;
+        };
+        preflightStartCommand(allocator, start_opts, &override_opts) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            printStartPreflightError(json_output, err);
+            return err;
+        };
+
         // 后台启动
         var forward_args = std.ArrayList([]const u8).empty;
         defer {
             for (forward_args.items) |item| allocator.free(item);
             forward_args.deinit(allocator);
         }
+        try appendStartForwardArgs(allocator, &forward_args, start_opts);
         try override_opts.appendForwardArgs(allocator, &forward_args);
 
-        daemon.startDaemon(allocator, config_path, json_output, forward_args.items) catch |err| {
+        daemon.startDaemon(allocator, start_opts.config_path, json_output, forward_args.items) catch |err| {
             printCliError(json_output, "START_FAILED", "failed to start daemon", "check config path and logs via `zc log --no-follow`");
             return err;
         };
@@ -467,7 +467,7 @@ pub fn main() !void {
             }
 
             // 加载配置
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "proxy.list") catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "proxy.list") catch |err| {
                 if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy list", "check config path and retry with `-c <config>`");
                 return err;
@@ -508,7 +508,7 @@ pub fn main() !void {
             }
 
             // 加载配置（需要可变引用）
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "proxy.select") catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "proxy.select") catch |err| {
                 if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy select", "check config path and retry with `-c <config>`");
                 return err;
@@ -541,7 +541,7 @@ pub fn main() !void {
                 }
             }
 
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "proxy.test") catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "proxy.test") catch |err| {
                 if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy test", "check config path and retry with `-c <config>`");
                 return err;
@@ -593,7 +593,7 @@ pub fn main() !void {
             }
 
             // 加载配置
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "profile.list") catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "profile.list") catch |err| {
                 if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy list", "check config path and retry with `-c <config>`");
                 return err;
@@ -634,7 +634,7 @@ pub fn main() !void {
             }
 
             // 加载配置（需要可变引用）
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "profile.select") catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "profile.select") catch |err| {
                 if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy select", "check config path and retry with `-c <config>`");
                 return err;
@@ -667,7 +667,7 @@ pub fn main() !void {
                 }
             }
 
-            var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "profile.test") catch |err| {
+            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "profile.test") catch |err| {
                 if (printOverrideRuntimeError(json_output, err)) return err;
                 printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy test", "check config path and retry with `-c <config>`");
                 return err;
@@ -696,7 +696,7 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "test")) {
         const config_path = parseConfigPathArg(args, 2);
 
-        var cfg = loadAndValidateConfig(allocator, config_path, !json_output, &override_opts, "test") catch |err| {
+        var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "test") catch |err| {
             if (printOverrideRuntimeError(json_output, err)) return err;
             return err;
         };
@@ -1132,6 +1132,7 @@ fn parseUpdateApplyMode(s: []const u8) !UpdateApplyMode {
 fn runProxy(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
+    mixed_port_override: ?u16,
     use_tui: bool,
     override_opts: *const override.CliOptions,
     command_name: []const u8,
@@ -1144,11 +1145,11 @@ fn runProxy(
     }
 
     // 加载并验证配置
-    var cfg = try loadAndValidateConfig(allocator, config_path, true, override_opts, command_name);
+    var cfg = try loadAndValidateConfig(allocator, config_path, mixed_port_override, true, override_opts, command_name);
     defer cfg.deinit();
 
     // 启动前端口占用预检（可能修改 external-controller 端口）
-    try preflightPortCheck(&cfg);
+    try preflightPortCheck(&cfg, true);
 
     // 获取运行时配置 key（优先显式 -c 路径，其次 active/default）
     const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
@@ -1195,12 +1196,93 @@ fn runProxy(
     }
 }
 
-fn loadAndValidateConfig(
+fn parseStartPortValue(text: []const u8) !u16 {
+    const port = std.fmt.parseInt(u16, text, 10) catch return error.InvalidStartPort;
+    if (port == 0) return error.InvalidStartPort;
+    return port;
+}
+
+fn parseStartCommandOptions(args: []const []const u8, start_index: usize) !StartCommandOptions {
+    var opts = StartCommandOptions{};
+    var i = start_index;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-c")) {
+            if (i + 1 >= args.len) return error.MissingConfigPath;
+            opts.config_path = args[i + 1];
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, args[i], "--port")) {
+            if (i + 1 >= args.len) return error.MissingPortValue;
+            opts.port = try parseStartPortValue(args[i + 1]);
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, args[i], "--port=")) {
+            opts.port = try parseStartPortValue(args[i]["--port=".len..]);
+            continue;
+        }
+    }
+
+    return opts;
+}
+
+fn appendStartForwardArgs(
+    allocator: std.mem.Allocator,
+    forward_args: *std.ArrayList([]const u8),
+    opts: StartCommandOptions,
+) !void {
+    if (opts.port) |port| {
+        try forward_args.append(allocator, try std.fmt.allocPrint(allocator, "--port={d}", .{port}));
+    }
+}
+
+fn printStartCommandOptionError(json_output: bool, err: anyerror) void {
+    switch (err) {
+        error.MissingConfigPath => printCliError(json_output, "START_CONFIG_PATH_REQUIRED", "missing value for `-c`", "use `zc start -c <config>`"),
+        error.MissingPortValue => printCliError(json_output, "START_PORT_REQUIRED", "missing value for `--port`", "use `zc start --port <1-65535>`"),
+        error.InvalidStartPort => printCliError(json_output, "START_PORT_INVALID", "invalid `--port` value", "use an integer between 1 and 65535"),
+        else => printCliError(json_output, "START_ARGS_INVALID", "invalid start arguments", "check `zc help`"),
+    }
+}
+
+fn printStartPreflightError(json_output: bool, err: anyerror) void {
+    switch (err) {
+        error.PortAlreadyInUse => printCliError(json_output, "START_PORT_IN_USE", "requested start port is already in use", "retry with `zc start --port <free-port>`"),
+        error.PortConflict => printCliError(json_output, "START_PORT_CONFLICT", "requested start port conflicts with another runtime listener", "change the port or fix the conflicting runtime config"),
+        error.InvalidBindAddress => printCliError(json_output, "START_BIND_ADDRESS_INVALID", "invalid bind address for start preflight", "fix `bind-address` in config and retry"),
+        error.InvalidExternalController => printCliError(json_output, "START_EXTERNAL_CONTROLLER_INVALID", "invalid `external-controller` address in config", "fix `external-controller` to `host:port` format"),
+        else => printCliError(json_output, "START_PREFLIGHT_FAILED", "failed to validate daemon start ports", "check config and retry"),
+    }
+}
+
+fn preflightStartCommand(
+    allocator: std.mem.Allocator,
+    start_opts: StartCommandOptions,
+    override_opts: *const override.CliOptions,
+) !void {
+    var cfg = try loadRuntimeConfig(allocator, start_opts.config_path, start_opts.port, override_opts, "start", false);
+    defer cfg.deinit();
+    try preflightPortCheck(&cfg, false);
+}
+
+fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) void {
+    if (mixed_port_override) |port| {
+        cfg.mixed_port = port;
+    } else if (cfg.mixed_port == 0) {
+        cfg.mixed_port = constants.MIXED_PORT;
+    }
+    cfg.port = 0;
+    cfg.socks_port = 0;
+}
+
+fn loadRuntimeConfig(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
-    print_validation: bool,
+    mixed_port_override: ?u16,
     override_opts: *const override.CliOptions,
     command_name: []const u8,
+    prepare_runtime_artifacts: bool,
 ) !config.Config {
     var cfg = if (config_path) |path|
         try config.load(allocator, path)
@@ -1208,7 +1290,7 @@ fn loadAndValidateConfig(
         try config.loadDefault(allocator);
     errdefer cfg.deinit();
 
-    // 强制使用 mixed-port 模式，忽略配置文件中的端口设置
+    // 默认统一走 mixed-port，必要时允许 `zc start --port <n>` 覆盖本次 daemon 端口。
     cfg.mixed_port = constants.MIXED_PORT;
     cfg.port = 0;
     cfg.socks_port = 0;
@@ -1223,7 +1305,23 @@ fn loadAndValidateConfig(
     );
 
     try override.apply(allocator, &cfg, &effective_override, command_name, config_path);
-    try config.prepareRuleProvidersForRuntime(allocator, &cfg, config_path);
+    applyRuntimePortSelection(&cfg, mixed_port_override);
+    if (prepare_runtime_artifacts) {
+        try config.prepareRuleProvidersForRuntime(allocator, &cfg, config_path);
+    }
+    return cfg;
+}
+
+fn loadAndValidateConfig(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    mixed_port_override: ?u16,
+    print_validation: bool,
+    override_opts: *const override.CliOptions,
+    command_name: []const u8,
+) !config.Config {
+    var cfg = try loadRuntimeConfig(allocator, config_path, mixed_port_override, override_opts, command_name, true);
+    errdefer cfg.deinit();
 
     var validation_result = try validator.validate(allocator, &cfg);
     defer validation_result.deinit();
@@ -1232,8 +1330,7 @@ fn loadAndValidateConfig(
     }
 
     if (!validation_result.isValid()) {
-        cfg.deinit();
-        std.process.exit(1);
+        return error.InvalidConfig;
     }
 
     return cfg;
@@ -1368,21 +1465,21 @@ fn hasInProcessPortConflict(cfg: *const config.Config) !bool {
     return false;
 }
 
-fn preflightPortCheck(cfg: *config.Config) !void {
+fn preflightPortCheck(cfg: *config.Config, emit_errors: bool) !void {
     const bind_ip = effectiveBindAddress(cfg);
 
     // 进程内端口冲突检查
     if (try hasInProcessPortConflict(cfg)) {
-        std.debug.print("Port precheck failed: in-process port conflict detected\n", .{});
+        if (emit_errors) std.debug.print("Port precheck failed: in-process port conflict detected\n", .{});
         return error.PortConflict;
     }
 
     // 系统端口占用检查
     if (cfg.mixed_port > 0) {
-        try checkPortAvailable(bind_ip, cfg.mixed_port);
+        try checkPortAvailable(bind_ip, cfg.mixed_port, emit_errors);
     } else {
-        if (cfg.port > 0) try checkPortAvailable(bind_ip, cfg.port);
-        if (cfg.socks_port > 0) try checkPortAvailable(bind_ip, cfg.socks_port);
+        if (cfg.port > 0) try checkPortAvailable(bind_ip, cfg.port, emit_errors);
+        if (cfg.socks_port > 0) try checkPortAvailable(bind_ip, cfg.socks_port, emit_errors);
     }
 
     // external-controller 端口：被占用时自动尝试 port+1..+10
@@ -1419,19 +1516,19 @@ fn preflightPortCheck(cfg: *config.Config) !void {
 
 fn isPortAvailable(ip: []const u8, port: u16) bool {
     const address = std.net.Address.parseIp4(ip, port) catch return false;
-    var server = address.listen(.{ .reuse_address = true }) catch return false;
+    var server = address.listen(.{ .reuse_address = false }) catch return false;
     server.deinit();
     return true;
 }
 
-fn checkPortAvailable(ip: []const u8, port: u16) !void {
+fn checkPortAvailable(ip: []const u8, port: u16, emit_errors: bool) !void {
     const address = std.net.Address.parseIp4(ip, port) catch {
-        std.debug.print("Invalid bind-address '{s}'\n", .{ip});
+        if (emit_errors) std.debug.print("Invalid bind-address '{s}'\n", .{ip});
         return error.InvalidBindAddress;
     };
 
-    var server = address.listen(.{ .reuse_address = true }) catch {
-        std.debug.print("Port precheck failed: {s}:{d} is already in use\n", .{ ip, port });
+    var server = address.listen(.{ .reuse_address = false }) catch {
+        if (emit_errors) std.debug.print("Port precheck failed: {s}:{d} is already in use\n", .{ ip, port });
         return error.PortAlreadyInUse;
     };
     server.deinit();
@@ -1460,7 +1557,8 @@ fn printHelp() !void {
     std.debug.print("COMMANDS:\n", .{});
     std.debug.print("    help                    Show this help message\n", .{});
     std.debug.print("    tui                     Start TUI dashboard\n", .{});
-    std.debug.print("    start [-c <config>]     Start proxy in background\n", .{});
+    std.debug.print("    start [-c <config>] [--port <port>]\n", .{});
+    std.debug.print("                            Start proxy in background\n", .{});
     std.debug.print("    stop                    Stop proxy\n", .{});
     std.debug.print("    restart [-c <config>]   Restart proxy\n", .{});
     std.debug.print("    status                  Show proxy status\n", .{});
@@ -1500,6 +1598,9 @@ fn printHelp() !void {
     std.debug.print("\n", .{});
     std.debug.print("    # Start with specific config\n", .{});
     std.debug.print("    zc start -c /path/to/config.yaml\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("    # Start with an explicit mixed port for local development\n", .{});
+    std.debug.print("    zc start --port 7901\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("    # Start TUI\n", .{});
     std.debug.print("    zc tui\n", .{});
@@ -1676,6 +1777,94 @@ test "parseUpdateApplyMode supports auto hot restart" {
     try testing.expectEqual(UpdateApplyMode.hot, try parseUpdateApplyMode("hot"));
     try testing.expectEqual(UpdateApplyMode.restart, try parseUpdateApplyMode("restart"));
     try testing.expectError(error.InvalidApplyMode, parseUpdateApplyMode("noop"));
+}
+
+test "parseStartCommandOptions supports config path and explicit port" {
+    const testing = std.testing;
+
+    const args = [_][]const u8{ "zc", "start", "-c", "./x.yaml", "--port", "7901", "--json" };
+    const opts = try parseStartCommandOptions(args[0..], 2);
+    try testing.expectEqualStrings("./x.yaml", opts.config_path.?);
+    try testing.expectEqual(@as(?u16, 7901), opts.port);
+
+    const args2 = [_][]const u8{ "zc", "start", "--port=7902" };
+    const opts2 = try parseStartCommandOptions(args2[0..], 2);
+    try testing.expect(opts2.config_path == null);
+    try testing.expectEqual(@as(?u16, 7902), opts2.port);
+}
+
+test "parseStartCommandOptions rejects missing or invalid port values" {
+    const testing = std.testing;
+
+    const missing_port = [_][]const u8{ "zc", "start", "--port" };
+    try testing.expectError(error.MissingPortValue, parseStartCommandOptions(missing_port[0..], 2));
+
+    const invalid_port = [_][]const u8{ "zc", "start", "--port", "abc" };
+    try testing.expectError(error.InvalidStartPort, parseStartCommandOptions(invalid_port[0..], 2));
+
+    const zero_port = [_][]const u8{ "zc", "start", "--port=0" };
+    try testing.expectError(error.InvalidStartPort, parseStartCommandOptions(zero_port[0..], 2));
+}
+
+test "appendStartForwardArgs forwards explicit port override" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var args = std.ArrayList([]const u8).empty;
+    defer {
+        for (args.items) |item| allocator.free(item);
+        args.deinit(allocator);
+    }
+
+    try appendStartForwardArgs(allocator, &args, .{ .port = 7901 });
+    try testing.expectEqual(@as(usize, 1), args.items.len);
+    try testing.expectEqualStrings("--port=7901", args.items[0]);
+}
+
+test "applyRuntimePortSelection prefers explicit port and keeps mixed mode" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var cfg = config.Config{
+        .allocator = allocator,
+        .port = 7890,
+        .socks_port = 7891,
+        .mixed_port = constants.MIXED_PORT,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "127.0.0.1"),
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+    defer cfg.deinit();
+
+    applyRuntimePortSelection(&cfg, 7901);
+    try testing.expectEqual(@as(u16, 7901), cfg.mixed_port);
+    try testing.expectEqual(@as(u16, 0), cfg.port);
+    try testing.expectEqual(@as(u16, 0), cfg.socks_port);
+}
+
+test "preflightPortCheck rejects mixed-port conflicts without fallback" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var cfg = config.Config{
+        .allocator = allocator,
+        .mixed_port = 7901,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "127.0.0.1"),
+        .external_controller = try allocator.dupe(u8, "127.0.0.1:7901"),
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+    defer cfg.deinit();
+
+    try testing.expectError(error.PortConflict, preflightPortCheck(&cfg, false));
+    try testing.expectEqual(@as(u16, 7901), cfg.mixed_port);
+    try testing.expectEqualStrings("127.0.0.1:7901", cfg.external_controller.?);
 }
 
 test "mixed handler should explicitly close client stream on success path" {

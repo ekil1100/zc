@@ -20,16 +20,16 @@
 - 备注：2026-03-08 22:01 +0800 按最新协作要求更新开发流程，仅调整协作文档，不涉及产品代码与运行行为。2026-03-08 22:09 +0800 根据进一步确认，将默认 worktree 目录修正为 `.worktrees/`，并把端口策略从“自动探测 fallback”收敛为“显式 `zc start --port <port>`，冲突时报错拒绝启动”。
 
 ### FEATURE-START-EXPLICIT-PORT
-- 状态：DOING
+- 状态：DONE
 - 优先级：P1
 - 负责人：Codex
 - 输出：`src/main.zig`, `src/daemon.zig`, `README.md`, `docs/cli/spec.md`, `TASKS.md`
 - 验收标准（Acceptance Criteria / DoD）：
-  - [ ] `zc start --port <port>` 支持显式覆盖本次 daemon 启动使用的 mixed port
-  - [ ] 未显式传入 `--port` 时，默认行为仍保持 `7899`
-  - [ ] 当请求端口已被占用时，`zc start --port <port>` 明确报错且 daemon 不启动到其他端口
-  - [ ] 新增/更新测试覆盖 CLI 解析与端口冲突关键路径，并同步 README / CLI 文档
-- 备注：2026-03-08 22:09 +0800 进入 DOING。目标是把“开发时不要占用 7899”收敛成显式 CLI 能力，而不是自动 fallback 到未知端口，避免误启动后用户不知道服务实际监听在哪个端口。
+  - [x] `zc start --port <port>` 支持显式覆盖本次 daemon 启动使用的 mixed port
+  - [x] 未显式传入 `--port` 时，默认行为仍保持 `7899`
+  - [x] 当请求端口已被占用时，`zc start --port <port>` 明确报错且 daemon 不启动到其他端口
+  - [x] 新增/更新测试覆盖 CLI 解析与端口冲突关键路径，并同步 README / CLI 文档
+- 备注：2026-03-08 22:09 +0800 进入 DOING。目标是把“开发时不要占用 7899”收敛成显式 CLI 能力，而不是自动 fallback 到未知端口，避免误启动后用户不知道服务实际监听在哪个端口。2026-03-08 22:54 +0800 完成实现。实现要点：新增 `zc start --port <port>` 参数解析、前置端口预检与 daemon-run 参数透传；运行时仍保持 mixed-only 模式，默认端口继续是 `7899`；为避免 macOS 上 `SO_REUSEADDR` 导致同端口重复监听，mixed/http/socks5/API listener 与端口探测全部改为独占绑定。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（51/51 passed）、`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast` 通过；隔离二进制 `/tmp/zc-devtest --daemon-run --port 17921 -c testdata/config/minimal.yaml` 实机成功监听 `127.0.0.1:17921`，第二个隔离环境重放同命令时明确返回 `Port precheck failed: 127.0.0.1:17921 is already in use` 且退出。受现有机器上已有生产 `zc --daemon-run` 进程影响，`zc start --port ...` 的整条 daemon 管理链 live 验证不适合直接在同机复现；本次通过单测覆盖 `start` 参数解析/透传与冲突路径，并用 `--daemon-run` 实机验证实际绑定行为。
 
 ### HOTFIX-LOCAL-TARGET-DIRECT-BYPASS
 - 状态：BLOCKED

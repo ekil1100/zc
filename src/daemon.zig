@@ -592,8 +592,27 @@ fn emitStatusText(snapshot: *const StatusSnapshot) void {
 }
 
 /// 打印启动后的服务信息（mixed-proxy, api-server, mode, proxies, rules）
-fn printStartupInfo(allocator: std.mem.Allocator) void {
-    var cfg = config.loadDefault(allocator) catch return;
+fn parseStartPortOverride(extra_args: []const []const u8) ?u16 {
+    var i: usize = 0;
+    while (i < extra_args.len) : (i += 1) {
+        if (std.mem.eql(u8, extra_args[i], "--port")) {
+            if (i + 1 >= extra_args.len) return null;
+            return std.fmt.parseInt(u16, extra_args[i + 1], 10) catch null;
+        }
+        if (std.mem.startsWith(u8, extra_args[i], "--port=")) {
+            return std.fmt.parseInt(u16, extra_args[i]["--port=".len..], 10) catch null;
+        }
+    }
+    return null;
+}
+
+fn printStartupInfo(allocator: std.mem.Allocator, config_path: ?[]const u8, extra_args: []const []const u8) void {
+    var cfg = blk: {
+        if (config_path) |path| {
+            break :blk config.load(allocator, path) catch return;
+        }
+        break :blk config.loadDefault(allocator) catch return;
+    };
     defer cfg.deinit();
 
     const bind = if (!cfg.allow_lan)
@@ -603,7 +622,8 @@ fn printStartupInfo(allocator: std.mem.Allocator) void {
     else
         cfg.bind_address;
 
-    std.debug.print("  mixed-proxy: {s}:{d}\n", .{ bind, constants.MIXED_PORT });
+    const mixed_port = parseStartPortOverride(extra_args) orelse constants.MIXED_PORT;
+    std.debug.print("  mixed-proxy: {s}:{d}\n", .{ bind, mixed_port });
     if (cfg.external_controller) |ec| {
         std.debug.print("  api-server:  {s}\n", .{ec});
     }
@@ -675,7 +695,7 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
             std.debug.print("zc daemon started (pid: {d})\n", .{pid});
 
             // 加载配置以显示服务信息
-            printStartupInfo(allocator);
+            printStartupInfo(allocator, config_path, extra_args);
 
             if (log_path) |lp| {
                 std.debug.print("  log:         {s}\n", .{lp});

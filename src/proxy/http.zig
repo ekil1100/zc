@@ -10,7 +10,7 @@ pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, 
     const listen_ip = if (std.mem.eql(u8, bind_address, "*")) "0.0.0.0" else bind_address;
     const address = try net.Address.parseIp4(listen_ip, port);
     var server = try address.listen(.{
-        .reuse_address = true,
+        .reuse_address = false,
     });
     defer server.deinit();
 

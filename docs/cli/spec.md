@@ -35,7 +35,7 @@
 ## 3. 命令层级
 
 ## 3.1 L0（全局控制）
-- `zclash start [-c <config>]`
+- `zclash start [-c <config>] [--port <port>]`
 - `zclash stop`
 - `zclash restart [-c <config>]`
 - `zclash status`
@@ -58,6 +58,8 @@
 
 ### `start`
 - 语义：启动服务（若已启动则返回已运行状态，不重复拉起）
+- `--port <port>`：显式覆盖本次 daemon 启动使用的 mixed port，便于本地开发避开生产占用端口
+- 若请求端口已被占用：直接报错并拒绝启动，不自动切换到其他端口
 - 成功：返回运行中状态 + 关键端口/配置摘要
 
 ### `stop`
