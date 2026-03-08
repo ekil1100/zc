@@ -70,7 +70,7 @@
 
 ### `status`
 - 语义：只读查询，不改变状态
-- 成功：返回运行状态、PID、端口、配置来源、最近错误（若有）
+- 成功：返回运行状态、PID、daemon uptime、当前激活配置，以及 pid/lock/log 运行时路径
 
 ---
 
@@ -168,7 +168,7 @@
 - [x] 原子任务 C（首批）：扩展 `--json` 到资源命令 `proxy list`，并补齐 `proxy` 路径部分错误结构
 
 验证记录（关键场景）：
-- `zig run src/main.zig -- status --json` 输出：`{"ok":true,"data":{"action":"status","state":"stopped"}}`
+- `zig run src/main.zig -- status --json` 输出：`{"ok":true,"data":{"action":"status","state":"stopped","uptime_seconds":null,"active_config":"<config-key>|null","paths":{"pid_file":"...","lock_file":"...","log_file":"..."}}}`
 - `zig run src/main.zig -- stop --json` 输出：`{"ok":true,"data":{"action":"stop","state":"stopped","detail":"already_stopped"}}`
 - `zig run src/main.zig -- proxy list -c testdata/config/minimal.yaml --json` 输出：`{"ok":true,"data":{"groups":[...]}}`
 - `zig run src/main.zig -- proxy select -g PROXY --json -c testdata/config/minimal.yaml` 输出：`{"ok":true,"data":{"action":"proxy_select",...}}`
@@ -183,6 +183,13 @@
 - `network_ok`：网络连通性（DNS 53 端口可达）
 - `daemon_pid`：守护进程 PID
 - `ports`：有效端口列表
+
+#### status 输出字段（v1.1+）
+- 文本态固定输出：`state`、`pid`、`uptime_seconds`、`active_config`、`pid_file`、`lock_file`、`log_file`
+- `detail`：仅在存在补充说明时输出（如 `stale_pid_file`、`lock_held_pid_untracked`）
+- 当 `detail=lock_held_pid_untracked` 时，表示 runtime lock 明确仍被 daemon 持有，但当前 pid 文件/进程扫描未恢复出 PID；此时 `state` 仍应视为 `running`
+- JSON 兼容保留：`action`、`state`、`detail`、`pid`
+- JSON 新增：`uptime_seconds`、`active_config`、`paths.pid_file`、`paths.lock_file`、`paths.log_file`
 
 ---
 

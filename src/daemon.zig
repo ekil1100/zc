@@ -8,6 +8,7 @@ const LOCK_FILE = "/tmp/zc.lock";
 const LOG_FILE = "/tmp/zc.log";
 const startup_poll_interval_ms: u64 = 200;
 const startup_poll_attempts: usize = 10;
+const process_scan_max_output_bytes: usize = 16 * 1024 * 1024;
 
 pub const ApplyMode = enum {
     auto,
@@ -19,6 +20,36 @@ pub const ApplyResult = enum {
     hot_applied,
     restart_applied,
     restart_fallback,
+};
+
+const StatusSnapshot = struct {
+    action: []const u8 = "status",
+    state: []const u8,
+    detail: ?[]const u8 = null,
+    pid: ?i32 = null,
+    uptime_seconds: ?i64 = null,
+    active_config: ?[]const u8 = null,
+    pid_file: []const u8,
+    lock_file: []const u8,
+    log_file: []const u8,
+
+    fn deinit(self: *StatusSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.pid_file);
+        allocator.free(self.lock_file);
+        allocator.free(self.log_file);
+        if (self.active_config) |active_config| allocator.free(active_config);
+    }
+};
+
+const RuntimeState = struct {
+    pid: ?i32 = null,
+    detail: ?[]const u8 = null,
+    lock_held: bool = false,
+    stale_pid: ?i32 = null,
+
+    fn isRunning(self: RuntimeState) bool {
+        return self.pid != null or self.lock_held;
+    }
 };
 
 /// 获取 PID 文件路径
@@ -69,6 +100,10 @@ pub fn readPid(allocator: std.mem.Allocator) !?i32 {
     const pid_file = try getPidFilePath(allocator);
     defer allocator.free(pid_file);
 
+    return readPidAtPath(pid_file);
+}
+
+fn readPidAtPath(pid_file: []const u8) !?i32 {
     const file = std.fs.openFileAbsolute(pid_file, .{}) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
@@ -88,12 +123,15 @@ pub fn writePid(allocator: std.mem.Allocator, pid: i32) !void {
     const pid_file = try getPidFilePath(allocator);
     defer allocator.free(pid_file);
 
+    try writePidAtPath(pid_file, pid);
+}
+
+fn writePidAtPath(pid_file: []const u8, pid: i32) !void {
     const file = try std.fs.createFileAbsolute(pid_file, .{});
     defer file.close();
 
-    const pid_str = try std.fmt.allocPrint(allocator, "{d}\n", .{pid});
-    defer allocator.free(pid_str);
-
+    var buf: [32]u8 = undefined;
+    const pid_str = try std.fmt.bufPrint(&buf, "{d}\n", .{pid});
     try file.writeAll(pid_str);
 }
 
@@ -101,6 +139,10 @@ pub fn writePid(allocator: std.mem.Allocator, pid: i32) !void {
 pub fn removePidFile(allocator: std.mem.Allocator) void {
     const pid_file = getPidFilePath(allocator) catch return;
     defer allocator.free(pid_file);
+    removePidFileAtPath(pid_file);
+}
+
+fn removePidFileAtPath(pid_file: []const u8) void {
     std.fs.deleteFileAbsolute(pid_file) catch {};
 }
 
@@ -125,12 +167,130 @@ fn isPidRunning(allocator: std.mem.Allocator, pid: i32) !bool {
     return true;
 }
 
+fn discoverDaemonPid(allocator: std.mem.Allocator) !?i32 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "ps", "-ww", "-axo", "pid=,comm=,args=" },
+        .max_output_bytes = process_scan_max_output_bytes,
+    }) catch return null;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    if (result.term.Exited != 0) return null;
+
+    if (parseDaemonPidCandidateFromPsOutput(result.stdout)) |pid| {
+        if (try isPidRunning(allocator, pid)) return pid;
+    }
+
+    const pgrep_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "pgrep", "-f", "--", "--daemon-run" },
+        .max_output_bytes = process_scan_max_output_bytes,
+    }) catch return null;
+    defer {
+        allocator.free(pgrep_result.stdout);
+        allocator.free(pgrep_result.stderr);
+    }
+    if (pgrep_result.term.Exited != 0) return null;
+
+    var lines = std.mem.tokenizeScalar(u8, pgrep_result.stdout, '\n');
+    while (lines.next()) |line| {
+        const pid = parsePidFirstToken(line) orelse continue;
+        if (pid == std.c.getpid()) continue;
+        if (try isPidRunning(allocator, pid)) return pid;
+    }
+
+    return null;
+}
+
+fn parseDaemonPidCandidateFromPsOutput(output: []const u8) ?i32 {
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+
+        var parts = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const pid_text = parts.next() orelse continue;
+        const pid = std.fmt.parseInt(i32, pid_text, 10) catch continue;
+        if (pid == std.c.getpid()) continue;
+
+        const after_pid = std.mem.trimLeft(u8, trimmed[pid_text.len..], " \t");
+        var after_pid_parts = std.mem.tokenizeAny(u8, after_pid, " \t");
+        const _comm_text = after_pid_parts.next() orelse continue;
+        const args = std.mem.trimLeft(u8, after_pid[_comm_text.len..], " \t");
+        var arg_parts = std.mem.tokenizeAny(u8, args, " \t");
+        const argv0 = arg_parts.next() orelse continue;
+
+        if (!std.mem.eql(u8, std.fs.path.basename(argv0), "zc")) continue;
+        if (std.mem.indexOf(u8, args, "--daemon-run") == null) continue;
+        return pid;
+    }
+
+    return null;
+}
+
+fn parsePidFirstToken(line: []const u8) ?i32 {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return null;
+
+    var parts = std.mem.tokenizeAny(u8, trimmed, " \t");
+    const pid_text = parts.next() orelse return null;
+    return std.fmt.parseInt(i32, pid_text, 10) catch null;
+}
+
+fn inspectRuntimeAtPaths(allocator: std.mem.Allocator, pid_file: []const u8, lock_file: []const u8) !RuntimeState {
+    var stale_pid: ?i32 = null;
+
+    if (try readPidAtPath(pid_file)) |pid| {
+        if (try isPidRunning(allocator, pid)) {
+            return .{
+                .pid = pid,
+                .lock_held = true,
+            };
+        }
+        stale_pid = pid;
+        removePidFileAtPath(pid_file);
+    }
+
+    if (try discoverDaemonPid(allocator)) |pid| {
+        writePidAtPath(pid_file, pid) catch {};
+        return .{
+            .pid = pid,
+            .lock_held = true,
+        };
+    }
+
+    if (try isDaemonLockHeldAtPath(lock_file)) {
+        return .{
+            .detail = "lock_held_pid_untracked",
+            .lock_held = true,
+            .stale_pid = stale_pid,
+        };
+    }
+
+    return .{
+        .detail = if (stale_pid != null) "stale_pid_file" else null,
+        .stale_pid = stale_pid,
+    };
+}
+
+fn inspectRuntime(allocator: std.mem.Allocator) !RuntimeState {
+    const pid_file = try getPidFilePath(allocator);
+    defer allocator.free(pid_file);
+    const lock_file = try getLockFilePath(allocator);
+    defer allocator.free(lock_file);
+    return try inspectRuntimeAtPaths(allocator, pid_file, lock_file);
+}
+
+fn readTrackedPid(allocator: std.mem.Allocator) !?i32 {
+    return (try inspectRuntime(allocator)).pid;
+}
+
 fn waitForTrackedRunningPid(allocator: std.mem.Allocator) !?i32 {
     var attempt: usize = 0;
     while (attempt < startup_poll_attempts) : (attempt += 1) {
-        if (try readPid(allocator)) |pid| {
-            if (try isPidRunning(allocator, pid)) return pid;
-        }
+        if (try readTrackedPid(allocator)) |pid| return pid;
         std.Thread.sleep(startup_poll_interval_ms * std.time.ns_per_ms);
     }
     return null;
@@ -162,6 +322,15 @@ fn acquireDaemonLockFile(allocator: std.mem.Allocator) !std.fs.File {
     return try acquireDaemonLockFileAtPath(lock_file_path);
 }
 
+fn isDaemonLockHeldAtPath(lock_file_path: []const u8) !bool {
+    var lock_file = acquireDaemonLockFileAtPath(lock_file_path) catch |err| switch (err) {
+        error.DaemonAlreadyRunning => return true,
+        else => return err,
+    };
+    lock_file.close();
+    return false;
+}
+
 fn printAlreadyRunning(json_output: bool, pid: ?i32) void {
     if (json_output) {
         printCliOk(json_output, "start", "running", "already_running", pid);
@@ -177,14 +346,7 @@ fn printAlreadyRunning(json_output: bool, pid: ?i32) void {
 
 /// 检查进程是否正在运行
 pub fn isRunning(allocator: std.mem.Allocator) !bool {
-    const pid = try readPid(allocator) orelse return false;
-
-    if (try isPidRunning(allocator, pid)) {
-        return true;
-    }
-
-    removePidFile(allocator);
-    return false;
+    return (try inspectRuntime(allocator)).isRunning();
 }
 
 fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {
@@ -242,6 +404,193 @@ fn printCliOk(json_output: bool, action: []const u8, state: []const u8, detail: 
     }
 }
 
+fn getDaemonUptime(pid: ?i32) !?i64 {
+    const p = pid orelse return null;
+    var buf: [256]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&buf, "ps -o etimes= -p {d}", .{p});
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &.{ "sh", "-c", cmd },
+    }) catch return null;
+    defer {
+        std.heap.page_allocator.free(result.stdout);
+        std.heap.page_allocator.free(result.stderr);
+    }
+    if (result.term.Exited != 0) return null;
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\n\r");
+    return std.fmt.parseInt(i64, trimmed, 10) catch null;
+}
+
+fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
+    const pid_file = try getPidFilePath(allocator);
+    errdefer allocator.free(pid_file);
+    const lock_file = try getLockFilePath(allocator);
+    errdefer allocator.free(lock_file);
+    const log_file = try getLogFilePath(allocator);
+    errdefer allocator.free(log_file);
+    const active_config = try config.resolveRuntimeConfigKey(allocator, null);
+    errdefer if (active_config) |value| allocator.free(value);
+
+    const runtime = try inspectRuntimeAtPaths(allocator, pid_file, lock_file);
+    if (runtime.pid) |p| {
+        return .{
+            .state = "running",
+            .detail = runtime.detail,
+            .pid = p,
+            .uptime_seconds = try getDaemonUptime(p),
+            .active_config = active_config,
+            .pid_file = pid_file,
+            .lock_file = lock_file,
+            .log_file = log_file,
+        };
+    }
+
+    if (runtime.lock_held) {
+        return .{
+            .state = "running",
+            .detail = runtime.detail,
+            .active_config = active_config,
+            .pid_file = pid_file,
+            .lock_file = lock_file,
+            .log_file = log_file,
+        };
+    }
+
+    return .{
+        .state = "stopped",
+        .detail = runtime.detail,
+        .pid = runtime.stale_pid,
+        .active_config = active_config,
+        .pid_file = pid_file,
+        .lock_file = lock_file,
+        .log_file = log_file,
+    };
+}
+
+fn collectStatusSnapshotAtPaths(
+    allocator: std.mem.Allocator,
+    pid_file: []const u8,
+    lock_file: []const u8,
+    log_file: []const u8,
+    active_config: ?[]const u8,
+) !StatusSnapshot {
+    const runtime = try inspectRuntimeAtPaths(allocator, pid_file, lock_file);
+    if (runtime.pid) |p| {
+        return .{
+            .state = "running",
+            .detail = runtime.detail,
+            .pid = p,
+            .uptime_seconds = try getDaemonUptime(p),
+            .active_config = active_config,
+            .pid_file = pid_file,
+            .lock_file = lock_file,
+            .log_file = log_file,
+        };
+    }
+
+    if (runtime.lock_held) {
+        return .{
+            .state = "running",
+            .detail = runtime.detail,
+            .active_config = active_config,
+            .pid_file = pid_file,
+            .lock_file = lock_file,
+            .log_file = log_file,
+        };
+    }
+
+    return .{
+        .state = "stopped",
+        .detail = runtime.detail,
+        .pid = runtime.stale_pid,
+        .active_config = active_config,
+        .pid_file = pid_file,
+        .lock_file = lock_file,
+        .log_file = log_file,
+    };
+}
+
+fn appendJsonStringEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try out.append(allocator, '"');
+    for (value) |ch| switch (ch) {
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        '\r' => try out.appendSlice(allocator, "\\r"),
+        '\t' => try out.appendSlice(allocator, "\\t"),
+        else => try out.append(allocator, ch),
+    };
+    try out.append(allocator, '"');
+}
+
+fn formatStatusJson(allocator: std.mem.Allocator, snapshot: *const StatusSnapshot) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{");
+    try out.appendSlice(allocator, "\"action\":\"status\"");
+    try out.writer(allocator).print(",\"state\":\"{s}\"", .{snapshot.state});
+    if (snapshot.detail) |detail| {
+        try out.writer(allocator).print(",\"detail\":\"{s}\"", .{detail});
+    }
+    if (snapshot.pid) |pid| {
+        try out.writer(allocator).print(",\"pid\":{d}", .{pid});
+    }
+    if (snapshot.uptime_seconds) |uptime_seconds| {
+        try out.writer(allocator).print(",\"uptime_seconds\":{d}", .{uptime_seconds});
+    } else {
+        try out.appendSlice(allocator, ",\"uptime_seconds\":null");
+    }
+    try out.appendSlice(allocator, ",\"active_config\":");
+    if (snapshot.active_config) |active_config| {
+        try appendJsonStringEscaped(&out, allocator, active_config);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    try out.appendSlice(allocator, ",\"paths\":{");
+    try out.appendSlice(allocator, "\"pid_file\":");
+    try appendJsonStringEscaped(&out, allocator, snapshot.pid_file);
+    try out.appendSlice(allocator, ",\"lock_file\":");
+    try appendJsonStringEscaped(&out, allocator, snapshot.lock_file);
+    try out.appendSlice(allocator, ",\"log_file\":");
+    try appendJsonStringEscaped(&out, allocator, snapshot.log_file);
+    try out.appendSlice(allocator, "}}}\n");
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn emitStatusJson(allocator: std.mem.Allocator, snapshot: *const StatusSnapshot) !void {
+    const text = try formatStatusJson(allocator, snapshot);
+    defer allocator.free(text);
+    std.debug.print("{s}", .{text});
+}
+
+fn emitStatusText(snapshot: *const StatusSnapshot) void {
+    std.debug.print("zc status\n", .{});
+    std.debug.print("state: {s}\n", .{snapshot.state});
+    if (snapshot.detail) |detail| {
+        std.debug.print("detail: {s}\n", .{detail});
+    }
+    if (snapshot.pid) |pid| {
+        std.debug.print("pid: {d}\n", .{pid});
+    } else {
+        std.debug.print("pid: (none)\n", .{});
+    }
+    if (snapshot.uptime_seconds) |uptime_seconds| {
+        std.debug.print("uptime_seconds: {d}\n", .{uptime_seconds});
+    } else {
+        std.debug.print("uptime_seconds: (unknown)\n", .{});
+    }
+    if (snapshot.active_config) |active_config| {
+        std.debug.print("active_config: {s}\n", .{active_config});
+    } else {
+        std.debug.print("active_config: (none)\n", .{});
+    }
+    std.debug.print("pid_file: {s}\n", .{snapshot.pid_file});
+    std.debug.print("lock_file: {s}\n", .{snapshot.lock_file});
+    std.debug.print("log_file: {s}\n", .{snapshot.log_file});
+}
+
 /// 打印启动后的服务信息（mixed-proxy, api-server, mode, proxies, rules）
 fn printStartupInfo(allocator: std.mem.Allocator) void {
     var cfg = config.loadDefault(allocator) catch return;
@@ -275,9 +624,9 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
     };
     errdefer lock_file.close();
 
-    // 兼容旧版本 daemon：即使没有 lock，也不要在已有 pid 存活时再启动一个实例
-    if (try isRunning(allocator)) {
-        const existing_pid = try readPid(allocator);
+    // 兼容旧版本 daemon：即使没有 lock，也不要在已有可追踪 pid 存活时再启动一个实例。
+    // 这里不能用 isRunning()，因为当前 start 进程自己已经拿到了 lock。
+    if (try readTrackedPid(allocator)) |existing_pid| {
         printAlreadyRunning(json_output, existing_pid);
         return;
     }
@@ -414,7 +763,12 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
 
 /// 停止守护进程
 pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
-    const pid = try readPid(allocator) orelse {
+    const runtime = try inspectRuntime(allocator);
+    const pid = runtime.pid orelse {
+        if (runtime.lock_held) {
+            printCliError(json_output, "STOP_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc stop`");
+            return error.DaemonPidUntracked;
+        }
         printCliOk(json_output, "stop", "stopped", "already_stopped", null);
         return;
     };
@@ -463,7 +817,11 @@ pub fn restartDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, jso
     }
 
     try startDaemon(allocator, config_path, json_output, extra_args);
-    printCliOk(json_output, "restart", "running", null, null);
+    const pid = try readTrackedPid(allocator) orelse {
+        printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details");
+        return error.StartFailed;
+    };
+    printCliOk(json_output, "restart", "running", null, pid);
 }
 
 pub fn reloadDaemon(_: std.mem.Allocator, _: ?[]const u8, _: bool) !void {
@@ -496,18 +854,15 @@ pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, j
 
 /// 获取状态
 pub fn getStatus(allocator: std.mem.Allocator, json_output: bool) !void {
-    const pid = try readPid(allocator);
+    var snapshot = try collectStatusSnapshot(allocator);
+    defer snapshot.deinit(allocator);
 
-    if (pid) |p| {
-        if (try isRunning(allocator)) {
-            printCliOk(json_output, "status", "running", null, p);
-        } else {
-            printCliOk(json_output, "status", "stopped", "stale_pid_file", p);
-            removePidFile(allocator);
-        }
-    } else {
-        printCliOk(json_output, "status", "stopped", null, null);
+    if (json_output) {
+        try emitStatusJson(allocator, &snapshot);
+        return;
     }
+
+    emitStatusText(&snapshot);
 }
 
 /// 查看日志（默认显示最后 50 行，持续刷新）
@@ -655,4 +1010,179 @@ test "daemon lock prevents duplicate acquisition and can be reacquired after clo
 
     var second_lock = try acquireDaemonLockFileAtPath(lock_path);
     defer second_lock.close();
+}
+
+test "collectStatusSnapshot reports stopped state without pid file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+
+    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    defer allocator.free(pid_file);
+    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    defer allocator.free(lock_file);
+    const log_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
+    defer allocator.free(log_file);
+
+    var snapshot = try collectStatusSnapshotAtPaths(
+        allocator,
+        try allocator.dupe(u8, pid_file),
+        try allocator.dupe(u8, lock_file),
+        try allocator.dupe(u8, log_file),
+        null,
+    );
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqualStrings("stopped", snapshot.state);
+    try std.testing.expect(snapshot.detail == null);
+    try std.testing.expect(snapshot.pid == null);
+    try std.testing.expect(snapshot.uptime_seconds == null);
+    try std.testing.expect(snapshot.active_config == null);
+    try std.testing.expect(std.mem.endsWith(u8, snapshot.pid_file, "zc.pid"));
+    try std.testing.expect(std.mem.endsWith(u8, snapshot.lock_file, "zc.lock"));
+    try std.testing.expect(std.mem.endsWith(u8, snapshot.log_file, "zc.log"));
+}
+
+test "collectStatusSnapshot reports stale pid file and removes it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+
+    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    defer allocator.free(pid_file);
+    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    defer allocator.free(lock_file);
+    const log_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
+    defer allocator.free(log_file);
+
+    try writePidAtPath(pid_file, 999999);
+
+    var snapshot = try collectStatusSnapshotAtPaths(
+        allocator,
+        try allocator.dupe(u8, pid_file),
+        try allocator.dupe(u8, lock_file),
+        try allocator.dupe(u8, log_file),
+        null,
+    );
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqualStrings("stopped", snapshot.state);
+    try std.testing.expectEqualStrings("stale_pid_file", snapshot.detail.?);
+    try std.testing.expectEqual(@as(i32, 999999), snapshot.pid.?);
+    try std.testing.expect(snapshot.uptime_seconds == null);
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(snapshot.pid_file, .{}));
+}
+
+test "collectStatusSnapshot reports running when lock is held but pid is untracked" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+
+    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    defer allocator.free(pid_file);
+    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    defer allocator.free(lock_file);
+    const log_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
+    defer allocator.free(log_file);
+
+    var held_lock = try acquireDaemonLockFileAtPath(lock_file);
+    defer held_lock.close();
+
+    var snapshot = try collectStatusSnapshotAtPaths(
+        allocator,
+        try allocator.dupe(u8, pid_file),
+        try allocator.dupe(u8, lock_file),
+        try allocator.dupe(u8, log_file),
+        null,
+    );
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqualStrings("running", snapshot.state);
+    try std.testing.expectEqualStrings("lock_held_pid_untracked", snapshot.detail.?);
+    try std.testing.expect(snapshot.pid == null);
+    try std.testing.expect(snapshot.uptime_seconds == null);
+    try std.testing.expect(snapshot.active_config == null);
+}
+
+test "formatStatusJson preserves status compatibility fields and adds rich data" {
+    const allocator = std.testing.allocator;
+    var snapshot = StatusSnapshot{
+        .state = "running",
+        .pid = 321,
+        .uptime_seconds = 42,
+        .active_config = try allocator.dupe(u8, "demo"),
+        .pid_file = try allocator.dupe(u8, "/tmp/zc.pid"),
+        .lock_file = try allocator.dupe(u8, "/tmp/zc.lock"),
+        .log_file = try allocator.dupe(u8, "/tmp/zc.log"),
+    };
+    defer snapshot.deinit(allocator);
+
+    const out = try formatStatusJson(allocator, &snapshot);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"action\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"pid\":321") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"uptime_seconds\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"active_config\":\"demo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"paths\":{\"pid_file\":\"/tmp/zc.pid\",\"lock_file\":\"/tmp/zc.lock\",\"log_file\":\"/tmp/zc.log\"}") != null);
+}
+
+test "parseDaemonPidCandidateFromPsOutput finds daemon-run process" {
+    const output =
+        \\  100 /usr/bin/login /usr/bin/login -pfl like /bin/zsh -l
+        \\62559 /Users/like/.local/bin/zc /Users/like/.local/bin/zc --daemon-run
+        \\71242 rg rg zc
+        \\
+    ;
+
+    const pid = parseDaemonPidCandidateFromPsOutput(output);
+    try std.testing.expectEqual(@as(?i32, 62559), pid);
+}
+
+test "parseDaemonPidCandidateFromPsOutput accepts full args output" {
+    const output =
+        \\81256 /System/Library/ExtensionKit/Extensions/ClassroomSettings.appex/Contents/MacOS/ClassroomSettings /System/Library/ExtensionKit/Extensions/ClassroomSettings.appex/Contents/MacOS/ClassroomSettings -LaunchArguments xxx
+        \\62559 /Users/like/.local/bin/zc /Users/like/.local/bin/zc --daemon-run -c /Users/like/.config/zc/configs/D5koNO7H.yaml
+        \\
+    ;
+
+    const pid = parseDaemonPidCandidateFromPsOutput(output);
+    try std.testing.expectEqual(@as(?i32, 62559), pid);
+}
+
+test "parseDaemonPidCandidateFromPsOutput ignores shell wrapper processes" {
+    const output =
+        \\62558 /bin/zsh /bin/zsh -lc /Users/like/.local/bin/zc --daemon-run
+        \\62559 /Users/like/.local/bin/zc /Users/like/.local/bin/zc --daemon-run
+        \\
+    ;
+
+    const pid = parseDaemonPidCandidateFromPsOutput(output);
+    try std.testing.expectEqual(@as(?i32, 62559), pid);
+}
+
+test "parseDaemonPidCandidateFromPsOutput tolerates truncated comm column on macOS" {
+    const output =
+        \\14597 /Users/like/.loc /Users/like/.local/bin/zc --daemon-run
+        \\
+    ;
+
+    const pid = parseDaemonPidCandidateFromPsOutput(output);
+    try std.testing.expectEqual(@as(?i32, 14597), pid);
+}
+
+test "parsePidFirstToken accepts pgrep pid-only and pid-with-command lines" {
+    try std.testing.expectEqual(@as(?i32, 14597), parsePidFirstToken("14597"));
+    try std.testing.expectEqual(@as(?i32, 14597), parsePidFirstToken("14597 /Users/like/.local/bin/zc --daemon-run"));
+    try std.testing.expectEqual(@as(?i32, null), parsePidFirstToken("not-a-pid"));
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const net = std.net;
+const http = std.http;
 const outbound = @import("outbound/manager.zig");
 const ProxyStream = outbound.ProxyStream;
 const Engine = @import("../rule/engine.zig").Engine;
@@ -146,12 +147,20 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
 }
 
 fn handleHttp(allocator: std.mem.Allocator, conn: net.Server.Connection, first_byte: u8, engine: *Engine, manager: *OutboundManager) !void {
-    // 读取完整请求
+    // Read a full HTTP header block. CONNECT headers may arrive fragmented across
+    // multiple TCP reads; tunneling before seeing \r\n\r\n can leak the remaining
+    // proxy headers into the upstream TLS stream.
     var buf: [4096]u8 = undefined;
     buf[0] = first_byte;
-    const n = try conn.stream.read(buf[1..]);
-    if (n == 0) return;
-    const request = buf[0 .. n + 1];
+    var total: usize = 1;
+
+    while (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") == null) {
+        if (total == buf.len) return error.HttpHeaderTooLarge;
+        const n = try conn.stream.read(buf[total..]);
+        if (n == 0) return error.UnexpectedEof;
+        total += n;
+    }
+    const request = buf[0..total];
 
     // 查找 HTTP 方法
     const method_end = std.mem.indexOf(u8, request, " ");
@@ -165,9 +174,304 @@ fn handleHttp(allocator: std.mem.Allocator, conn: net.Server.Connection, first_b
     }
 }
 
+const ForwardScheme = enum {
+    http,
+    https,
+};
+
+const ForwardRequest = struct {
+    method_text: []const u8,
+    method: http.Method,
+    version_text: []const u8,
+    host: []const u8,
+    port: u16,
+    scheme: ForwardScheme,
+    origin_target: []const u8,
+    header_end: usize,
+    content_length: usize,
+    absolute_form: bool,
+
+    fn deinit(self: *ForwardRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.host);
+        allocator.free(self.origin_target);
+    }
+};
+
+const HttpsForwardStream = struct {
+    allocator: std.mem.Allocator,
+    inner: ProxyStream,
+    ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    tls_client: std.crypto.tls.Client = undefined,
+    tls_read_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_write_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    upstream_reader: UpstreamReader = undefined,
+    upstream_writer: UpstreamWriter = undefined,
+
+    const UpstreamReader = struct {
+        parent: *HttpsForwardStream,
+        interface: std.Io.Reader,
+
+        fn init(parent: *HttpsForwardStream, buffer: []u8) UpstreamReader {
+            return .{
+                .parent = parent,
+                .interface = .{
+                    .vtable = &.{ .stream = stream },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *UpstreamReader = @alignCast(@fieldParentPtr("interface", io_r));
+            var buf: [4096]u8 = undefined;
+            const n = self.parent.inner.read(&buf) catch return error.ReadFailed;
+            if (n == 0) return error.EndOfStream;
+            return try w.write(buf[0..n]);
+        }
+    };
+
+    const UpstreamWriter = struct {
+        parent: *HttpsForwardStream,
+        interface: std.Io.Writer,
+
+        fn init(parent: *HttpsForwardStream, buffer: []u8) UpstreamWriter {
+            return .{
+                .parent = parent,
+                .interface = .{
+                    .vtable = &.{ .drain = drain },
+                    .buffer = buffer,
+                },
+            };
+        }
+
+        fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *UpstreamWriter = @alignCast(@fieldParentPtr("interface", io_w));
+            var total: usize = 0;
+
+            const buffered = io_w.buffered();
+            if (buffered.len > 0) {
+                self.parent.inner.write(buffered) catch return error.WriteFailed;
+                _ = io_w.consume(buffered.len);
+                total += buffered.len;
+            }
+
+            if (data.len == 0) return total;
+
+            for (data[0 .. data.len - 1]) |chunk| {
+                if (chunk.len == 0) continue;
+                self.parent.inner.write(chunk) catch return error.WriteFailed;
+                total += chunk.len;
+            }
+
+            const last = data[data.len - 1];
+            var i: usize = 0;
+            while (i < splat) : (i += 1) {
+                if (last.len == 0) continue;
+                self.parent.inner.write(last) catch return error.WriteFailed;
+                total += last.len;
+            }
+
+            return total;
+        }
+    };
+
+    fn init(self: *HttpsForwardStream, allocator: std.mem.Allocator, inner: ProxyStream, host: []const u8) !void {
+        self.* = .{
+            .allocator = allocator,
+            .inner = inner,
+        };
+        errdefer self.inner.close();
+
+        self.upstream_reader = UpstreamReader.init(self, &self.tls_read_buffer);
+        self.upstream_writer = UpstreamWriter.init(self, &self.tls_write_buffer);
+
+        self.ca_bundle = std.crypto.Certificate.Bundle{};
+        if (self.ca_bundle) |*bundle| {
+            try bundle.rescan(allocator);
+        }
+        errdefer if (self.ca_bundle) |*bundle| bundle.deinit(allocator);
+
+        self.tls_client = try std.crypto.tls.Client.init(
+            &self.upstream_reader.interface,
+            &self.upstream_writer.interface,
+            .{
+                .host = .{ .explicit = host },
+                .ca = .{ .bundle = self.ca_bundle.? },
+                .allow_truncation_attacks = true,
+                .read_buffer = &self.tls_read_buffer,
+                .write_buffer = &self.tls_write_buffer,
+            },
+        );
+    }
+
+    fn deinit(self: *HttpsForwardStream) void {
+        _ = self.tls_client.end() catch {};
+        if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
+        self.inner.close();
+    }
+
+    fn writeAll(self: *HttpsForwardStream, data: []const u8) !void {
+        try self.tls_client.writer.writeAll(data);
+        try self.tls_client.writer.flush();
+    }
+
+    fn read(self: *HttpsForwardStream, buf: []u8) !usize {
+        return try self.tls_client.reader.readSliceShort(buf);
+    }
+};
+
+fn parseForwardRequest(allocator: std.mem.Allocator, request: []const u8) !ForwardRequest {
+    const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return error.InvalidRequest;
+    const request_head = request[0..header_end];
+    const first_line_end = std.mem.indexOf(u8, request_head, "\r\n") orelse request_head.len;
+    const first_line = request_head[0..first_line_end];
+
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    const method_text = parts.next() orelse return error.InvalidRequest;
+    const target_text = parts.next() orelse return error.InvalidRequest;
+    const version_text = parts.next() orelse return error.InvalidRequest;
+    const method = std.meta.stringToEnum(http.Method, method_text) orelse return error.UnsupportedHttpMethod;
+
+    var host_header: ?[]const u8 = null;
+    var content_length: usize = 0;
+    var lines = std.mem.splitSequence(u8, request_head[first_line_end..], "\r\n");
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const name = std.mem.trim(u8, trimmed[0..colon], " \t");
+        const value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "host")) {
+            host_header = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch 0;
+        }
+    }
+
+    if (std.mem.indexOf(u8, target_text, "://")) |_| {
+        const uri = try std.Uri.parse(target_text);
+        const host = try uri.getHostAlloc(allocator);
+        const scheme: ForwardScheme = if (std.mem.eql(u8, uri.scheme, "https"))
+            .https
+        else if (std.mem.eql(u8, uri.scheme, "http"))
+            .http
+        else
+            return error.UnsupportedUriScheme;
+        const port: u16 = uri.port orelse switch (scheme) {
+            .http => 80,
+            .https => 443,
+        };
+        const origin_target = try buildOriginTarget(allocator, uri);
+        return .{
+            .method_text = method_text,
+            .method = method,
+            .version_text = version_text,
+            .host = host,
+            .port = port,
+            .scheme = scheme,
+            .origin_target = origin_target,
+            .header_end = header_end,
+            .content_length = content_length,
+            .absolute_form = true,
+        };
+    }
+
+    const host_value = host_header orelse return error.NoHost;
+    const host = try normalizeHostValue(allocator, host_value, false);
+    const parsed_port = parsePortFromHostValue(host_value);
+    const port = parsed_port orelse 80;
+    return .{
+        .method_text = method_text,
+        .method = method,
+        .version_text = version_text,
+        .host = host,
+        .port = port,
+        .scheme = .http,
+        .origin_target = try allocator.dupe(u8, target_text),
+        .header_end = header_end,
+        .content_length = content_length,
+        .absolute_form = false,
+    };
+}
+
+fn buildOriginTarget(allocator: std.mem.Allocator, uri: std.Uri) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    if (uri.path.isEmpty()) {
+        try out.append(allocator, '/');
+    } else {
+        try out.writer(allocator).print("{f}", .{std.fmt.alt(uri.path, .formatRaw)});
+    }
+
+    if (uri.query) |query| {
+        try out.append(allocator, '?');
+        try out.writer(allocator).print("{f}", .{std.fmt.alt(query, .formatRaw)});
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn parsePortFromHostValue(host_value: []const u8) ?u16 {
+    if (std.mem.lastIndexOfScalar(u8, host_value, ':')) |colon| {
+        const maybe_port = host_value[colon + 1 ..];
+        return std.fmt.parseInt(u16, maybe_port, 10) catch null;
+    }
+    return null;
+}
+
+fn normalizeHostValue(allocator: std.mem.Allocator, host_value: []const u8, keep_port: bool) ![]const u8 {
+    if (keep_port) return try allocator.dupe(u8, host_value);
+    if (std.mem.lastIndexOfScalar(u8, host_value, ':')) |colon| {
+        if (std.fmt.parseInt(u16, host_value[colon + 1 ..], 10)) |_| {
+            return try allocator.dupe(u8, host_value[0..colon]);
+        } else |_| {}
+    }
+    return try allocator.dupe(u8, host_value);
+}
+
+fn buildForwardRequestHead(allocator: std.mem.Allocator, request_head: []const u8, forward: *const ForwardRequest, force_connection_close: bool) ![]u8 {
+    const first_line_end = std.mem.indexOf(u8, request_head, "\r\n") orelse request_head.len;
+    const header_lines = if (first_line_end + 2 <= request_head.len) request_head[first_line_end + 2 ..] else request_head[request_head.len..];
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try out.writer(allocator).print("{s} {s} {s}\r\n", .{
+        forward.method_text,
+        forward.origin_target,
+        forward.version_text,
+    });
+
+    var lines = std.mem.splitSequence(u8, header_lines, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
+            try out.writer(allocator).print("{s}\r\n", .{line});
+            continue;
+        };
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "proxy-connection")) continue;
+        if (force_connection_close and (std.ascii.eqlIgnoreCase(name, "connection") or std.ascii.eqlIgnoreCase(name, "keep-alive"))) continue;
+        try out.writer(allocator).print("{s}\r\n", .{line});
+    }
+
+    if (force_connection_close) {
+        try out.appendSlice(allocator, "Connection: close\r\n");
+    }
+    try out.appendSlice(allocator, "\r\n");
+    return out.toOwnedSlice(allocator);
+}
+
 fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request: []const u8, engine: *Engine, manager: *OutboundManager) !void {
     // 解析 CONNECT 请求
-    const parts = std.mem.splitScalar(u8, request, ' ');
+    const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
+    const request_head = request[0..header_end];
+    const request_tail = if (header_end + 4 <= request.len) request[header_end + 4 ..] else request[request.len..];
+
+    const parts = std.mem.splitScalar(u8, request_head, ' ');
     var part_iter = parts;
     _ = part_iter.next(); // "CONNECT"
     const target = part_iter.next();
@@ -191,43 +495,277 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
     std.debug.print("[Mixed] CONNECT route: {s}:{d} -> {s}\n", .{ host, port, proxy_name });
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
         logConnectionFailure(host, port, proxy_name, err);
-        _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        try conn.stream.writeAll("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     };
     defer target_stream.close();
 
     // 发送成功响应
-    _ = try conn.stream.write("HTTP/1.1 200 Connection established\r\n\r\n");
+    try conn.stream.writeAll("HTTP/1.1 200 Connection established\r\n\r\n");
+
+    // Some clients pipeline initial TLS bytes with CONNECT headers in the same TCP packet.
+    // Forward any already-buffered tunnel payload instead of dropping it.
+    if (request_tail.len > 0) {
+        try target_stream.write(request_tail);
+    }
 
     // 双向转发
     try relay(conn.stream, &target_stream);
 }
 
 fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, request: []const u8, engine: *Engine, manager: *OutboundManager) !void {
-    // 解析目标 host
-    const host = extractHost(request) catch {
+    var forward = parseForwardRequest(allocator, request) catch |err| {
+        logHttpRequestParseError(request, err);
         return;
     };
-    const port: u16 = 80;
+    defer forward.deinit(allocator);
 
-    std.debug.print("[Mixed] HTTP {s}:{d}\n", .{ host, port });
+    std.debug.print(
+        "[Mixed] HTTP parsed: method={s} scheme={s} host={s} port={d} absolute_form={} target={s}\n",
+        .{
+            forward.method_text,
+            schemeLabel(forward.scheme),
+            forward.host,
+            forward.port,
+            forward.absolute_form,
+            forward.origin_target,
+        },
+    );
 
-    // 连接目标
-    const proxy_name = engine.match(host, true) orelse "DIRECT";
-    std.debug.print("[Mixed] HTTP route: {s}:{d} -> {s}\n", .{ host, port, proxy_name });
-    var target_stream = manager.connect(proxy_name, host, port) catch |err| {
-        logConnectionFailure(host, port, proxy_name, err);
-        _ = try conn.stream.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    if (forward.absolute_form and forward.scheme == .https) {
+        try handleHttpsForwardRequest(allocator, conn, request, &forward, engine, manager);
+        return;
+    }
+
+    std.debug.print("[Mixed] HTTP {s}:{d}\n", .{ forward.host, forward.port });
+
+    const proxy_name = engine.match(forward.host, true) orelse "DIRECT";
+    std.debug.print("[Mixed] HTTP route: {s}:{d} -> {s}\n", .{ forward.host, forward.port, proxy_name });
+    var target_stream = manager.connect(proxy_name, forward.host, forward.port) catch |err| {
+        logConnectionFailure(forward.host, forward.port, proxy_name, err);
+        try conn.stream.writeAll("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     };
     defer target_stream.close();
 
-    // 转发请求
-    try target_stream.write(request);
+    const rewritten_head = try buildForwardRequestHead(allocator, request[0..forward.header_end], &forward, false);
+    defer allocator.free(rewritten_head);
 
-    // 双向转发（使用 poll 避免阻塞）
+    try target_stream.write(rewritten_head);
+    const request_tail = if (forward.header_end + 4 <= request.len) request[forward.header_end + 4 ..] else request[request.len..];
+    if (request_tail.len > 0) {
+        try target_stream.write(request_tail);
+    }
+
     try relay(conn.stream, &target_stream);
-    _ = allocator;
+}
+
+fn handleHttpsForwardRequest(
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    request: []const u8,
+    forward: *const ForwardRequest,
+    engine: *Engine,
+    manager: *OutboundManager,
+) !void {
+    std.debug.print("[Mixed] HTTPS forward {s}:{d}\n", .{ forward.host, forward.port });
+
+    const proxy_name = engine.match(forward.host, true) orelse "DIRECT";
+    std.debug.print("[Mixed] HTTPS forward route: {s}:{d} -> {s}\n", .{ forward.host, forward.port, proxy_name });
+
+    var target_stream = manager.connect(proxy_name, forward.host, forward.port) catch |err| {
+        logConnectionFailure(forward.host, forward.port, proxy_name, err);
+        try conn.stream.writeAll("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        return;
+    };
+    if (target_stream.owned_ss_client == null and target_stream.owned_trojan_client == null) {
+        defer target_stream.close();
+        try handleDirectHttpsForwardStream(allocator, conn, request, forward, &target_stream);
+        return;
+    }
+    errdefer target_stream.close();
+
+    var tls_stream: HttpsForwardStream = undefined;
+    tls_stream.init(allocator, target_stream, forward.host) catch |err| {
+        std.debug.print("[Mixed] HTTPS forward failed: stage=tls_init target={s}:{d} proxy={s} err={}\n", .{
+            forward.host,
+            forward.port,
+            proxy_name,
+            err,
+        });
+        try conn.stream.writeAll("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        return;
+    };
+    defer tls_stream.deinit();
+    std.debug.print("[Mixed] HTTPS forward tls ready: target={s}:{d}\n", .{ forward.host, forward.port });
+
+    const request_head = try buildForwardRequestHead(allocator, request[0..forward.header_end], forward, true);
+    defer allocator.free(request_head);
+
+    const body = try readRequestBody(allocator, conn.stream, request, forward);
+    defer allocator.free(body);
+
+    tls_stream.writeAll(request_head) catch |err| {
+        std.debug.print("[Mixed] HTTPS forward failed: stage=request_head_write target={s}:{d} err={}\n", .{
+            forward.host,
+            forward.port,
+            err,
+        });
+        return err;
+    };
+    if (body.len > 0) {
+        tls_stream.writeAll(body) catch |err| {
+            std.debug.print("[Mixed] HTTPS forward failed: stage=request_body_write target={s}:{d} len={} err={}\n", .{
+                forward.host,
+                forward.port,
+                body.len,
+                err,
+            });
+            return err;
+        };
+    }
+    std.debug.print("[Mixed] HTTPS forward request sent: target={s}:{d} body_len={}\n", .{ forward.host, forward.port, body.len });
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = tls_stream.read(&buf) catch |err| {
+            std.debug.print("[Mixed] HTTPS forward failed: stage=response_read target={s}:{d} err={}\n", .{
+                forward.host,
+                forward.port,
+                err,
+            });
+            return err;
+        };
+        if (n == 0) break;
+        try conn.stream.writeAll(buf[0..n]);
+    }
+}
+
+fn handleDirectHttpsForwardStream(
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    request: []const u8,
+    forward: *const ForwardRequest,
+    target_stream: *ProxyStream,
+) !void {
+    var ca_bundle = std.crypto.Certificate.Bundle{};
+    try ca_bundle.rescan(allocator);
+    defer ca_bundle.deinit(allocator);
+
+    var tls_read_buffer: [std.crypto.tls.Client.min_buffer_len + 8192]u8 = undefined;
+    var tls_write_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var socket_write_buffer: [1024]u8 = undefined;
+    var socket_read_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+
+    var socket_writer = target_stream.base_stream.writer(&tls_write_buffer);
+    var socket_reader = target_stream.base_stream.reader(&socket_read_buffer);
+    var tls_client = try std.crypto.tls.Client.init(
+        socket_reader.interface(),
+        &socket_writer.interface,
+        .{
+            .host = .{ .explicit = forward.host },
+            .ca = .{ .bundle = ca_bundle },
+            .read_buffer = &tls_read_buffer,
+            .write_buffer = &socket_write_buffer,
+            .allow_truncation_attacks = true,
+        },
+    );
+    defer _ = tls_client.end() catch {};
+
+    std.debug.print("[Mixed] HTTPS forward tls ready: target={s}:{d} mode=direct\n", .{ forward.host, forward.port });
+
+    const request_head = try buildForwardRequestHead(allocator, request[0..forward.header_end], forward, true);
+    defer allocator.free(request_head);
+
+    const body = try readRequestBody(allocator, conn.stream, request, forward);
+    defer allocator.free(body);
+
+    tls_client.writer.writeAll(request_head) catch |err| {
+        std.debug.print("[Mixed] HTTPS forward failed: stage=request_head_write target={s}:{d} mode=direct err={} stream_err={any}\n", .{
+            forward.host,
+            forward.port,
+            err,
+            socket_writer.err,
+        });
+        return err;
+    };
+    if (body.len > 0) {
+        tls_client.writer.writeAll(body) catch |err| {
+            std.debug.print("[Mixed] HTTPS forward failed: stage=request_body_write target={s}:{d} mode=direct len={} err={} stream_err={any}\n", .{
+                forward.host,
+                forward.port,
+                body.len,
+                err,
+                socket_writer.err,
+            });
+            return err;
+        };
+    }
+    tls_client.writer.flush() catch |err| {
+        std.debug.print("[Mixed] HTTPS forward failed: stage=request_flush target={s}:{d} mode=direct err={} stream_err={any}\n", .{
+            forward.host,
+            forward.port,
+            err,
+            socket_writer.err,
+        });
+        return err;
+    };
+    socket_writer.interface.flush() catch |err| {
+        std.debug.print("[Mixed] HTTPS forward failed: stage=socket_flush target={s}:{d} mode=direct err={} stream_err={any}\n", .{
+            forward.host,
+            forward.port,
+            err,
+            socket_writer.err,
+        });
+        return err;
+    };
+    std.debug.print("[Mixed] HTTPS forward request sent: target={s}:{d} body_len={} mode=direct\n", .{ forward.host, forward.port, body.len });
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = tls_client.reader.readSliceShort(&buf) catch |err| {
+            std.debug.print("[Mixed] HTTPS forward failed: stage=response_read target={s}:{d} mode=direct err={}\n", .{
+                forward.host,
+                forward.port,
+                err,
+            });
+            return err;
+        };
+        if (n == 0) break;
+        try conn.stream.writeAll(buf[0..n]);
+    }
+}
+
+fn readRequestBody(allocator: std.mem.Allocator, client_stream: net.Stream, request: []const u8, forward: *const ForwardRequest) ![]u8 {
+    if (forward.content_length == 0) {
+        return try allocator.alloc(u8, 0);
+    }
+
+    const initial_body = if (forward.header_end + 4 <= request.len) request[forward.header_end + 4 ..] else request[request.len..];
+    const body = try allocator.alloc(u8, forward.content_length);
+    const copied = @min(initial_body.len, body.len);
+    @memcpy(body[0..copied], initial_body[0..copied]);
+
+    var filled = copied;
+    while (filled < body.len) {
+        const n = try client_stream.read(body[filled..]);
+        if (n == 0) return error.UnexpectedEof;
+        filled += n;
+    }
+    return body;
+}
+
+fn schemeLabel(scheme: ForwardScheme) []const u8 {
+    return switch (scheme) {
+        .http => "http",
+        .https => "https",
+    };
+}
+
+fn logHttpRequestParseError(request: []const u8, err: anyerror) void {
+    const header_end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
+    const first_line = request[0..header_end];
+    std.debug.print("[Mixed] HTTP parse failed: err={} first_line={s}\n", .{ err, first_line });
 }
 
 fn logConnectionFailure(target: []const u8, port: u16, proxy_name: []const u8, err: anyerror) void {
@@ -254,38 +792,97 @@ fn extractHost(request: []const u8) ![]const u8 {
 
 fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     relayLog("Starting relay", .{});
-    var poll_fds = [_]std.posix.pollfd{
-        .{ .fd = client_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = target_stream.base_stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
-    };
-
     var buf: [8192]u8 = undefined;
     var up_bytes: usize = 0;
     var down_bytes: usize = 0;
     var last_report_ms = std.time.milliTimestamp();
+    var client_read_open = true;
+    var target_read_open = true;
+    var client_write_shutdown = false;
+    var target_write_shutdown = false;
 
     while (true) {
         // Important: encrypted upstream may still have decrypted leftover bytes in memory
         // even when socket has no new readable event.
-        try drainTargetPending(client_stream, target_stream, &buf, &down_bytes);
+        try drainTargetPending(
+            client_stream,
+            target_stream,
+            &buf,
+            &down_bytes,
+            &client_read_open,
+            &target_read_open,
+            &client_write_shutdown,
+            &target_write_shutdown,
+        );
+
+        if (!client_read_open and !target_read_open and !target_stream.hasPendingRead()) {
+            break;
+        }
+
+        var poll_fds = [_]std.posix.pollfd{
+            .{
+                .fd = client_stream.handle,
+                .events = if (client_read_open) std.posix.POLL.IN else 0,
+                .revents = 0,
+            },
+            .{
+                .fd = target_stream.getHandle(),
+                .events = if (target_read_open) std.posix.POLL.IN else 0,
+                .revents = 0,
+            },
+        };
 
         _ = try std.posix.poll(&poll_fds, relay_poll_timeout_ms);
 
-        if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
-            const n = try std.posix.read(client_stream.handle, &buf);
-            if (n == 0) break;
-            try target_stream.write(buf[0..n]);
-            up_bytes += n;
+        if (client_read_open and (poll_fds[0].revents & std.posix.POLL.IN != 0)) {
+            const n = std.posix.read(client_stream.handle, &buf) catch |err| {
+                if (clientReadClosedBy(err)) {
+                    relayLog("client read closed: {}", .{err});
+                    closeClientReadSide(&client_read_open, target_stream, &target_write_shutdown);
+                    continue;
+                }
+                return err;
+            };
+            if (n == 0) {
+                closeClientReadSide(&client_read_open, target_stream, &target_write_shutdown);
+            } else {
+                const forwarded = try writeTargetChunk(
+                    target_stream,
+                    buf[0..n],
+                    client_stream,
+                    &client_read_open,
+                    &target_read_open,
+                    &client_write_shutdown,
+                    &target_write_shutdown,
+                );
+                if (!forwarded) continue;
+                up_bytes += n;
+            }
         }
 
-        if (poll_fds[1].revents & std.posix.POLL.IN != 0) {
-            const n = try target_stream.read(&buf);
-            if (n == 0) break;
-            var written: usize = 0;
-            while (written < n) {
-                written += try std.posix.write(client_stream.handle, buf[written..n]);
+        if (target_read_open and (poll_fds[1].revents & std.posix.POLL.IN != 0)) {
+            const n = target_stream.read(&buf) catch |err| switch (err) {
+                error.ConnectionClosed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
+                    closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
+                    continue;
+                },
+                else => return err,
+            };
+            if (n == 0) {
+                closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
+            } else {
+                const delivered = try writeClientChunk(
+                    client_stream,
+                    buf[0..n],
+                    target_stream,
+                    &client_read_open,
+                    &target_read_open,
+                    &client_write_shutdown,
+                    &target_write_shutdown,
+                );
+                if (!delivered) continue;
+                down_bytes += n;
             }
-            down_bytes += n;
         }
 
         const now_ms = std.time.milliTimestamp();
@@ -294,28 +891,131 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             last_report_ms = now_ms;
         }
 
-        if ((poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0 or
-            (poll_fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0)
+        if (client_read_open and
+            (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0 and
+            (poll_fds[0].revents & std.posix.POLL.IN) == 0)
         {
-            relayFlushStats(&up_bytes, &down_bytes, true);
-            relayLog("Poll error/hup", .{});
-            break;
+            relayLog("Client poll error/hup", .{});
+            closeClientReadSide(&client_read_open, target_stream, &target_write_shutdown);
+        }
+
+        if (target_read_open and
+            (poll_fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0 and
+            (poll_fds[1].revents & std.posix.POLL.IN) == 0 and
+            !target_stream.hasPendingRead())
+        {
+            relayLog("Target poll error/hup", .{});
+            closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
         }
     }
     relayFlushStats(&up_bytes, &down_bytes, true);
     relayLog("Done", .{});
 }
 
-fn drainTargetPending(client_stream: net.Stream, target_stream: *ProxyStream, buf: []u8, down_bytes: *usize) !void {
+fn closeClientReadSide(client_read_open: *bool, target_stream: *ProxyStream, target_write_shutdown: *bool) void {
+    if (!client_read_open.*) return;
+    client_read_open.* = false;
+    shutdownTargetWrite(target_stream, target_write_shutdown);
+}
+
+fn closeTargetReadSide(target_read_open: *bool, client_stream: net.Stream, client_write_shutdown: *bool) void {
+    if (!target_read_open.*) return;
+    target_read_open.* = false;
+    shutdownClientWrite(client_stream, client_write_shutdown);
+}
+
+fn shutdownClientWrite(stream: net.Stream, already_shutdown: *bool) void {
+    if (already_shutdown.*) return;
+    already_shutdown.* = true;
+    std.posix.shutdown(stream.handle, .send) catch |err| {
+        relayLog("client shutdown(send) ignored: {}", .{err});
+    };
+}
+
+fn shutdownTargetWrite(target_stream: *ProxyStream, already_shutdown: *bool) void {
+    if (already_shutdown.*) return;
+    already_shutdown.* = true;
+    std.posix.shutdown(target_stream.getHandle(), .send) catch |err| {
+        relayLog("target shutdown(send) ignored: {}", .{err});
+    };
+}
+
+fn drainTargetPending(
+    client_stream: net.Stream,
+    target_stream: *ProxyStream,
+    buf: []u8,
+    down_bytes: *usize,
+    client_read_open: *bool,
+    target_read_open: *bool,
+    client_write_shutdown: *bool,
+    target_write_shutdown: *bool,
+) !void {
     while (target_stream.hasPendingRead()) {
-        const n = try target_stream.read(buf);
+        const n = target_stream.read(buf) catch |err| {
+            if (targetReadClosedBy(err)) {
+                closeTargetReadSide(target_read_open, client_stream, client_write_shutdown);
+                return;
+            }
+            return err;
+        };
         if (n == 0) break;
-        var written: usize = 0;
-        while (written < n) {
-            written += try std.posix.write(client_stream.handle, buf[written..n]);
-        }
+        const delivered = try writeClientChunk(
+            client_stream,
+            buf[0..n],
+            target_stream,
+            client_read_open,
+            target_read_open,
+            client_write_shutdown,
+            target_write_shutdown,
+        );
+        if (!delivered) return;
         down_bytes.* += n;
     }
+}
+
+fn writeClientChunk(
+    client_stream: net.Stream,
+    data: []const u8,
+    target_stream: *ProxyStream,
+    client_read_open: *bool,
+    target_read_open: *bool,
+    client_write_shutdown: *bool,
+    target_write_shutdown: *bool,
+) !bool {
+    var written: usize = 0;
+    while (written < data.len) {
+        written += std.posix.write(client_stream.handle, data[written..]) catch |err| {
+            if (clientWriteClosedBy(err)) {
+                relayLog("client write closed: {}", .{err});
+                closeClientReadSide(client_read_open, target_stream, target_write_shutdown);
+                closeTargetReadSide(target_read_open, client_stream, client_write_shutdown);
+                return false;
+            }
+            return err;
+        };
+    }
+    return true;
+}
+
+fn writeTargetChunk(
+    target_stream: *ProxyStream,
+    data: []const u8,
+    client_stream: net.Stream,
+    client_read_open: *bool,
+    target_read_open: *bool,
+    client_write_shutdown: *bool,
+    target_write_shutdown: *bool,
+) !bool {
+    target_stream.write(data) catch |err| {
+        if (targetWriteClosedBy(err)) {
+            relayLog("target write closed: {}", .{err});
+            closeClientReadSide(client_read_open, target_stream, target_write_shutdown);
+            closeTargetReadSide(target_read_open, client_stream, client_write_shutdown);
+            return false;
+        }
+        return err;
+    };
+    return true;
 }
 
 fn relayFlushStats(up_bytes: *usize, down_bytes: *usize, force: bool) void {
@@ -386,13 +1086,13 @@ test "relay forwards traffic in both directions (direct stream)" {
         }
     }.run, .{ client_stream, &proxy_stream });
 
-    try std.posix.writeAll(client_peer.handle, "ping");
+    try writeAllFd(client_peer.handle, "ping");
     var buf: [4]u8 = undefined;
     const n1 = try std.posix.read(target_peer.handle, &buf);
     try std.testing.expectEqual(@as(usize, 4), n1);
     try std.testing.expectEqualStrings("ping", buf[0..n1]);
 
-    try std.posix.writeAll(target_peer.handle, "pong");
+    try writeAllFd(target_peer.handle, "pong");
     var buf2: [4]u8 = undefined;
     const n2 = try std.posix.read(client_peer.handle, &buf2);
     try std.testing.expectEqual(@as(usize, 4), n2);
@@ -401,6 +1101,360 @@ test "relay forwards traffic in both directions (direct stream)" {
     client_peer.close();
     target_peer.close();
     relay_thread.join();
+}
+
+test "relay preserves upstream response after client half-closes its write side" {
+    const client_pair = try makeTcpStreamPair();
+    defer client_pair.left.close();
+    defer client_pair.right.close();
+    const target_pair = try makeTcpStreamPair();
+    defer target_pair.right.close();
+
+    const client_stream = client_pair.left;
+    const client_peer = client_pair.right;
+    const target_stream = target_pair.left;
+    const target_peer = target_pair.right;
+
+    var proxy_stream = ProxyStream.initDirect(target_stream);
+    defer proxy_stream.close();
+
+    var relay_thread = try std.Thread.spawn(.{}, struct {
+        fn run(cs: net.Stream, ts: *ProxyStream) void {
+            _ = relay(cs, ts) catch {};
+        }
+    }.run, .{ client_stream, &proxy_stream });
+    defer relay_thread.join();
+
+    var upstream_thread = try std.Thread.spawn(.{}, struct {
+        fn run(peer: net.Stream) void {
+            defer peer.close();
+
+            var buf: [4]u8 = undefined;
+            const n = std.posix.read(peer.handle, &buf) catch return;
+            std.testing.expectEqual(@as(usize, 4), n) catch return;
+            std.testing.expectEqualStrings("ping", buf[0..n]) catch return;
+
+            std.Thread.sleep(150 * std.time.ns_per_ms);
+            writeAllFd(peer.handle, "pong") catch return;
+        }
+    }.run, .{target_peer});
+    defer upstream_thread.join();
+
+    try writeAllFd(client_peer.handle, "ping");
+    try std.posix.shutdown(client_peer.handle, .send);
+
+    try setReadTimeoutMs(client_peer.handle, 1000);
+    var resp: [4]u8 = undefined;
+    const n = try std.posix.read(client_peer.handle, &resp);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("pong", resp[0..n]);
+}
+
+test "relay should treat client reset during downstream write as graceful close" {
+    const client_pair = try makeTcpStreamPair();
+    defer client_pair.left.close();
+    const target_pair = try makeTcpStreamPair();
+
+    const client_stream = client_pair.left;
+    const client_peer = client_pair.right;
+    const target_stream = target_pair.left;
+    const target_peer = target_pair.right;
+
+    var proxy_stream = ProxyStream.initDirect(target_stream);
+    defer proxy_stream.close();
+
+    var upstream_thread = try std.Thread.spawn(.{}, struct {
+        fn run(peer: net.Stream) void {
+            defer peer.close();
+
+            var buf: [4]u8 = undefined;
+            const n = std.posix.read(peer.handle, &buf) catch return;
+            std.testing.expectEqual(@as(usize, 4), n) catch return;
+            std.testing.expectEqualStrings("ping", buf[0..n]) catch return;
+
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            writeAllFd(peer.handle, "pong") catch return;
+        }
+    }.run, .{target_peer});
+    defer upstream_thread.join();
+
+    try writeAllFd(client_peer.handle, "ping");
+    try setResetOnClose(client_peer.handle);
+    client_peer.close();
+
+    try relay(client_stream, &proxy_stream);
+}
+
+test "relay should treat target reset before upstream write as graceful close" {
+    const client_pair = try makeTcpStreamPair();
+    defer client_pair.left.close();
+    const target_pair = try makeTcpStreamPair();
+
+    const client_stream = client_pair.left;
+    const client_peer = client_pair.right;
+    const target_stream = target_pair.left;
+    const target_peer = target_pair.right;
+
+    var proxy_stream = ProxyStream.initDirect(target_stream);
+    defer proxy_stream.close();
+
+    try setResetOnClose(target_peer.handle);
+    target_peer.close();
+
+    var sender_thread = try std.Thread.spawn(.{}, struct {
+        fn run(peer: net.Stream) void {
+            defer peer.close();
+            writeAllFd(peer.handle, "ping") catch return;
+        }
+    }.run, .{client_peer});
+    defer sender_thread.join();
+
+    try relay(client_stream, &proxy_stream);
+}
+
+test "handleConnection should preserve CONNECT payload buffered after headers" {
+    const allocator = std.testing.allocator;
+
+    var cfg = @import("../config.zig").Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(@import("../config.zig").Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var manager = try outbound.OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    const upstream_addr = try net.Address.parseIp4("127.0.0.1", 0);
+    var upstream_server = try upstream_addr.listen(.{ .reuse_address = true });
+    defer upstream_server.deinit();
+
+    var upstream_thread = try std.Thread.spawn(.{}, struct {
+        fn run(server: *net.Server) void {
+            const conn = server.accept() catch return;
+            defer conn.stream.close();
+
+            var buf: [4]u8 = undefined;
+            const n = conn.stream.read(&buf) catch return;
+            std.testing.expectEqual(@as(usize, 4), n) catch return;
+            std.testing.expectEqualStrings("ping", buf[0..n]) catch return;
+        }
+    }.run, .{&upstream_server});
+    defer upstream_thread.join();
+
+    const target_port = upstream_server.listen_address.getPort();
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "CONNECT 127.0.0.1:{d} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n\r\nping",
+        .{ target_port, target_port },
+    );
+    defer allocator.free(req);
+
+    const mixed_pair = try makeTcpStreamPair();
+    defer mixed_pair.left.close();
+    defer mixed_pair.right.close();
+
+    const mixed_conn = net.Server.Connection{
+        .stream = mixed_pair.left,
+        .address = try net.Address.parseIp4("127.0.0.1", 12345),
+    };
+    const mixed_client = mixed_pair.right;
+
+    var relay_thread = try std.Thread.spawn(.{}, struct {
+        fn run(alloc: std.mem.Allocator, conn: net.Server.Connection, eng: *Engine, mgr: *OutboundManager) void {
+            handleConnection(alloc, conn, eng, mgr) catch {};
+        }
+    }.run, .{ allocator, mixed_conn, &engine, &manager });
+    defer relay_thread.join();
+
+    try mixed_client.writeAll(req);
+    try setReadTimeoutMs(mixed_client.handle, 1000);
+
+    var resp_buf: [1024]u8 = undefined;
+    const resp_n = try mixed_client.read(&resp_buf);
+    try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..resp_n], "200 Connection established") != null);
+}
+
+test "handleConnection should wait for full CONNECT headers before tunneling" {
+    const allocator = std.testing.allocator;
+
+    var cfg = @import("../config.zig").Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(@import("../config.zig").Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var manager = try outbound.OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    const upstream_addr = try net.Address.parseIp4("127.0.0.1", 0);
+    var upstream_server = try upstream_addr.listen(.{ .reuse_address = true });
+    defer upstream_server.deinit();
+
+    var upstream_thread = try std.Thread.spawn(.{}, struct {
+        fn run(server: *net.Server) void {
+            const conn = server.accept() catch return;
+            defer conn.stream.close();
+
+            var buf: [4]u8 = undefined;
+            const n = conn.stream.read(&buf) catch return;
+            std.testing.expectEqual(@as(usize, 4), n) catch return;
+            std.testing.expectEqualStrings("ping", buf[0..n]) catch return;
+        }
+    }.run, .{&upstream_server});
+    defer upstream_thread.join();
+
+    const target_port = upstream_server.listen_address.getPort();
+    const part1 = try std.fmt.allocPrint(
+        allocator,
+        "CONNECT 127.0.0.1:{d} HTTP/1.1\r\nHost: 127.0.0.1:{d}",
+        .{ target_port, target_port },
+    );
+    defer allocator.free(part1);
+    const part2 = "\r\n\r\nping";
+
+    const mixed_pair = try makeTcpStreamPair();
+    defer mixed_pair.left.close();
+    defer mixed_pair.right.close();
+
+    const mixed_conn = net.Server.Connection{
+        .stream = mixed_pair.left,
+        .address = try net.Address.parseIp4("127.0.0.1", 12345),
+    };
+    const mixed_client = mixed_pair.right;
+
+    var relay_thread = try std.Thread.spawn(.{}, struct {
+        fn run(alloc: std.mem.Allocator, conn: net.Server.Connection, eng: *Engine, mgr: *OutboundManager) void {
+            handleConnection(alloc, conn, eng, mgr) catch {};
+        }
+    }.run, .{ allocator, mixed_conn, &engine, &manager });
+    defer relay_thread.join();
+
+    try mixed_client.writeAll(part1);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    try mixed_client.writeAll(part2);
+    try setReadTimeoutMs(mixed_client.handle, 1000);
+
+    var resp_buf: [1024]u8 = undefined;
+    const resp_n = try mixed_client.read(&resp_buf);
+    try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..resp_n], "200 Connection established") != null);
+}
+
+test "relay treats target ConnectionClosed as a graceful half-close" {
+    try std.testing.expect(targetReadClosedBy(error.ConnectionClosed));
+    try std.testing.expect(!targetReadClosedBy(error.NotOpenForReading));
+}
+
+test "relay treats client-side reset errors as graceful close" {
+    try std.testing.expect(clientReadClosedBy(error.ConnectionResetByPeer));
+    try std.testing.expect(clientWriteClosedBy(error.BrokenPipe));
+    try std.testing.expect(!clientWriteClosedBy(error.NotOpenForReading));
+}
+
+test "relay treats target-side reset errors as graceful close" {
+    try std.testing.expect(targetWriteClosedBy(error.ConnectionResetByPeer));
+    try std.testing.expect(targetWriteClosedBy(error.BrokenPipe));
+    try std.testing.expect(!targetWriteClosedBy(error.NotOpenForReading));
+}
+
+test "parseForwardRequest accepts lowercase host and absolute https target" {
+    const allocator = std.testing.allocator;
+    const request =
+        "POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal HTTP/1.1\r\n" ++
+        "host: open.feishu.cn\r\n" ++
+        "Content-Length: 81\r\n" ++
+        "\r\n";
+
+    var parsed = try parseForwardRequest(allocator, request);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectEqual(http.Method.POST, parsed.method);
+    try std.testing.expectEqualStrings("open.feishu.cn", parsed.host);
+    try std.testing.expectEqual(@as(u16, 443), parsed.port);
+    try std.testing.expectEqual(ForwardScheme.https, parsed.scheme);
+    try std.testing.expectEqual(@as(usize, 81), parsed.content_length);
+    try std.testing.expect(parsed.absolute_form);
+    try std.testing.expectEqualStrings("/open-apis/auth/v3/tenant_access_token/internal", parsed.origin_target);
+}
+
+test "buildForwardRequestHead rewrites absolute-form request line and forces connection close" {
+    const allocator = std.testing.allocator;
+    const request =
+        "POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal HTTP/1.1\r\n" ++
+        "host: open.feishu.cn\r\n" ++
+        "Proxy-Connection: close\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Content-Length: 81\r\n" ++
+        "\r\n";
+
+    var parsed = try parseForwardRequest(allocator, request);
+    defer parsed.deinit(allocator);
+
+    const rewritten = try buildForwardRequestHead(allocator, request[0..parsed.header_end], &parsed, true);
+    defer allocator.free(rewritten);
+
+    try std.testing.expect(std.mem.startsWith(u8, rewritten, "POST /open-apis/auth/v3/tenant_access_token/internal HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "host: open.feishu.cn\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "Content-Length: 81\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "Proxy-Connection:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "Connection: keep-alive") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "Connection: close\r\n") != null);
+}
+
+fn targetReadClosedBy(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed => true,
+        error.ConnectionResetByPeer => true,
+        error.BrokenPipe => true,
+        error.NotOpenForReading => true,
+        else => false,
+    };
+}
+
+fn clientReadClosedBy(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed => true,
+        error.ConnectionResetByPeer => true,
+        error.BrokenPipe => true,
+        error.NotOpenForReading => true,
+        else => false,
+    };
+}
+
+fn clientWriteClosedBy(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed => true,
+        error.ConnectionResetByPeer => true,
+        error.BrokenPipe => true,
+        error.NotOpenForWriting => true,
+        else => false,
+    };
+}
+
+fn targetWriteClosedBy(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed => true,
+        error.ConnectionResetByPeer => true,
+        error.BrokenPipe => true,
+        error.NotOpenForWriting => true,
+        else => false,
+    };
 }
 
 test "handleConnection should close client stream after successful HTTP relay" {
@@ -474,6 +1528,25 @@ fn setReadTimeoutMs(fd: std.posix.fd_t, timeout_ms: u32) !void {
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
     try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+}
+
+fn setResetOnClose(fd: std.posix.fd_t) !void {
+    const Linger = extern struct {
+        l_onoff: i32,
+        l_linger: i32,
+    };
+    const linger = Linger{
+        .l_onoff = 1,
+        .l_linger = 0,
+    };
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger));
+}
+
+fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        written += try std.posix.write(fd, data[written..]);
+    }
 }
 
 const StreamPair = struct {

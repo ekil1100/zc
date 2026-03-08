@@ -72,6 +72,7 @@ pub fn main() !void {
                 }
             }
         }
+        daemon.writePid(allocator, std.c.getpid()) catch {};
         // 在 daemon 模式下运行代理（无 TUI）
         try runProxy(allocator, config_path, false, &override_opts, "daemon-run");
         return;

@@ -22,6 +22,76 @@
 
 ---
 
+## 临时任务：丰富 zc status 输出（2026-03-06）
+
+### FEATURE-STATUS-RICH-OUTPUT
+- 状态：DONE
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/daemon.zig`, `src/main.zig`, `docs/cli/spec.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 文本态 `zc status` 在 `running/stopped` 之外，补充直观运行态字段（至少含 `pid`、`uptime`、`active_config`、运行时文件路径）
+  - [x] `zc status --json` 输出新增对应结构化字段，且保留现有 `action/state/detail` 兼容语义
+  - [x] `stale_pid_file` 场景输出可解释，并在返回后自动清理陈旧 pid 文件
+  - [x] 新增/更新测试覆盖 `running`、`stopped`、`stale_pid_file` 三类核心场景并通过
+- 备注：2026-03-06 16:02 +0800 进入 DOING（先收敛轻量状态字段，再补测试与文档，避免把 `status` 做成慢速版 `doctor`）。2026-03-06 16:15 +0800 完成实现。实现要点：`status` 改为基于状态快照输出，文本态新增 `pid/uptime_seconds/active_config/pid_file/lock_file/log_file`；JSON 保留 `action/state/detail/pid` 并新增 `uptime_seconds/active_config/paths`；`stale_pid_file` 场景仍自动清理陈旧 pid 文件。2026-03-06 16:31 +0800 追加修复“lock 文件存在但 pid 文件丢失”场景：`--daemon-run` 进程启动即自写 pid；`start/stop/status/restart` 会在 pid 缺失时回退扫描 `ps` 中的 `zc --daemon-run` 进程并自愈 pid 文件；`restart` 不再在 daemon 不可追踪时错误打印 `state=running`。2026-03-06 16:39 +0800 根据 macOS 实机回执再修兜底发现：`ps` 改为 `ps -ww -axo pid=,args=`，避免参数截断；daemon 识别条件从固定子串 `zc --daemon-run` 放宽为“命令包含 `--daemon-run` 且主程序为 `zc`”。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/daemon.zig`、`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all` 通过（42/42 passed）。
+
+## 临时任务：修复 zc status 假阴性 stopped（2026-03-08）
+
+### HOTFIX-STATUS-FALSE-NEGATIVE
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/daemon.zig`, `docs/cli/spec.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 当 daemon 实际持有 runtime lock、但 pid 文件缺失或 pid/ps 恢复链失手时，`zc status` 不再误报 `stopped`
+  - [x] `zc start` / `zc restart` / `zc stop` 在 “lock 已持有但 pid 不可追踪” 场景下不再把 daemon 误判为 `already_stopped` / `service_was_stopped`
+  - [x] 新增/更新测试覆盖 “lock held but pid untracked” 与 `ps` shell wrapper 干扰两类场景并通过
+  - [x] `env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/daemon.zig` 与 `env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all` 通过
+- 备注：2026-03-08 17:58 +0800 进入 DOING（先用失败测试固化“daemon 实际运行但 `status` 假阴性”的状态探测缺口，再统一 lock/pid/ps 三条判断链）。本次问题证据已明确：`zc restart` 曾错误返回 `state=stopped detail=service_was_stopped`，随后 `zc start` 又提示 daemon already running / startup in progress；`ps` 可见真实进程 `/Users/like/.local/bin/zc --daemon-run`；`~/.local/share/zc/zc.log` 持续有 `CONNECT ...` 与 `[Relay] Done`；通过 `127.0.0.1:7899` 的 Node/Axios 请求已可正常返回 Feishu HTTP/API 响应。2026-03-08 18:00 +0800 完成第一轮修复。实现要点：状态探测新增 lock 兜底，`status` 在 lock 被持有但 pid 不可追踪时改报 `state=running detail=lock_held_pid_untracked`，避免再出现假阴性 `stopped`；`isRunning`/`stopDaemon` 同步复用同一 runtime 检测结果，避免 `restart`/`stop` 与 `status` 判定分叉。2026-03-08 18:04 +0800 根据实机 `ps` 输出继续修正：确认 macOS 上 `ps -ww -axo pid=,comm=,args=` 的 `comm` 列会把 `/Users/like/.local/bin/zc` 截断成 `/Users/like/.loc`，导致第一轮 `basename(comm)==zc` 匹配漏掉真实 daemon。随后将识别逻辑改为基于 `args` 首个可执行参数判断 `zc --daemon-run`，保留对 shell wrapper 的过滤；新增“truncated comm column on macOS”回归测试。2026-03-08 19:25 +0800 完成最终修复并做 live 验证。继续深挖后确认还有两个隐藏根因：1) `discoverDaemonPid` 直接抓全量 `ps` 输出，在进程较多的机器上会触发 `std.process.Child.run` 的默认 stdout 上限并被 `catch return null` 吃掉，导致实际 daemon 存在时仍拿不到 PID；现已为 `ps`/`pgrep` 扫描显式放宽输出上限。2) `startDaemon` 在成功拿到 runtime lock 后又调用 `isRunning()`，而新的 lock 兜底会把“当前 start 进程自己刚持有的 lock”误判成已有 daemon 运行，导致干净启动错误报 `already running or startup is in progress`；现已改为仅检查 `readTrackedPid()`，避免自持 lock 误报。最终实机验证：重新安装 `~/.local/bin/zc` 后，`zc start` 成功拉起 daemon（pid `52841`），`zc status` 正确显示 `state: running` 与 `pid: 52841`，`zc restart` 成功 stop/start 并切换到新 pid `52940`，随后 `zc status` 正确显示 `pid: 52940`。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/daemon.zig`（10/10 passed）；`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（46/46 passed）。
+
+## 临时任务：修复 mixed relay 半关闭丢响应（2026-03-08）
+
+### HOTFIX-MIXED-RELAY-HALF-CLOSE
+- 状态：DONE
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 客户端在发送完请求后半关闭写端时，relay 仍可继续接收并转发上游响应
+  - [x] target 侧 `error.ConnectionClosed` 被视为正常半关闭，不再直接中断整个 relay
+  - [x] 新增/更新测试覆盖客户端 half-close 与 target graceful close 两类核心场景并通过
+- 备注：2026-03-08 11:44 +0800 进入 DOING（按 BDD 先固化“客户端先发完再等响应”的直觉行为，再修 relay 两端半关闭语义）。2026-03-08 11:58 +0800 完成实现。实现要点：relay 改为分别跟踪 client/target 读侧开启状态，并在任一侧 EOF/HUP 后仅 shutdown 对端写侧而非立即整体退出；target 读到 `error.ConnectionClosed` 时按 graceful half-close 处理；补充 socketpair e2e 测试覆盖客户端 half-close 后仍收到 `pong`，以及 `ConnectionClosed` 分类行为。验证待本次提交前统一执行。
+
+## 临时任务：修复 mixed relay 对 RST/reset 的误报与误中断（2026-03-08）
+
+### HOTFIX-MIXED-RELAY-RESET-CLOSE
+- 状态：DONE
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `src/mixed_repro_test.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 在本地单测复现 `client` 侧 reset 导致 relay 从 `std.posix.read` 异常退出
+  - [x] 在本地单测复现 `target` 侧 reset / broken pipe 导致 relay 异常退出
+  - [x] relay 将 `ConnectionResetByPeer` / `BrokenPipe` 归一化为正常关闭路径，不再把 tunnel 当作致命错误
+  - [x] 新增聚焦测试入口，可单独快速回归 mixed reset 场景
+  - [x] `zig build test --summary all` 与 `zig build` 通过
+- 备注：2026-03-08 17:47 +0800 进入 DOING（按“先缩小到 mixed 本地单测，再回到真实 Feishu 链路”执行）。先新增 `src/mixed_repro_test.zig` 作为薄测试入口，避免默认测试入口遗漏 mixed case。随后用 socket `SO_LINGER=0` 构造 RST，成功复现两类关闭语义缺口：1) `client` reset 使 relay 在 `std.posix.read` 上抛 `ConnectionResetByPeer`；2) `target` reset 使 relay 在 target read/write 路径抛 `BrokenPipe` / `ConnectionResetByPeer`。2026-03-08 17:52 +0800 完成修复：补齐 client/target 两侧 read/write 的 peer-closed 分类处理，pending-drain 路径同步收敛，HTTP CONNECT/502 响应改为 `writeAll`。验证：`zig test src/mixed_repro_test.zig --test-filter reset` 4/4 passed；`zig build test --summary all` 通过（42/42 passed）；`zig build` 通过。
+
+## 临时任务：修复 7899 对 axios env-proxy HTTP 路径的不兼容（2026-03-08）
+
+### HOTFIX-MIXED-AXIOS-ENV-PROXY
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `src/mixed_repro_test.zig`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 在同机复现：`127.0.0.1:7899` 对显式 `HttpsProxyAgent` 路径可通，但对 axios 默认 env-proxy HTTP 路径仍稳定触发 `ECONNRESET` / `socket hang up`
+  - [x] 明确根因到 `zc mixed` 具体代码路径，而不是仅停留在 “axios/环境代理兼容性不好” 的描述
+  - [x] 完成修复后，`7899` 对同一 axios env-proxy Feishu token 请求返回正常 HTTP/API 响应，不再 `ECONNRESET`
+  - [x] 保留并通过针对该路径的最小回归测试或可复现脚本
+- 备注：2026-03-08 19:28 +0800 进入 DOING（按“先复现三组对照，再缩小到 mixed 实现差异，最后补回归”执行）。当前已知现象：`openclaw` 飞书扩展的 HTTP 登录/token 路径走 Lark SDK 默认 `axios + 环境代理`，在 `http_proxy/https_proxy/all_proxy -> 127.0.0.1:7899` 下仍稳定报 `AxiosError: socket hang up` / `ECONNRESET`；但显式 `HttpsProxyAgent("http://127.0.0.1:7899")` 可通，同机将 env-proxy 改到 `7897` 也可通。2026-03-08 20:17 +0800 完成同机复现与协议级抓包。实测：1) 使用 openclaw 飞书扩展同版 axios + 显式 `HttpsProxyAgent("http://127.0.0.1:7899")` 请求 `tenant_access_token/internal`，`7899` 返回 HTTP 200 + `code=0`；2) 仅设置 `http_proxy/https_proxy/all_proxy=http://127.0.0.1:7899` 时，同一 axios 请求稳定 `ECONNRESET/socket hang up`；3) 同样 env-proxy 改到 `7897` 时可返回 HTTP 200 + `code=0`。进一步通过本地临时 capture proxy 抓到两条路径的原始代理首包：显式 agent 发的是 `CONNECT open.feishu.cn:443 HTTP/1.1`，而 axios env-proxy 发的是明文 `POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal HTTP/1.1`（absolute-form request-target）。这说明当前 `zc mixed` 仍只支持 `CONNECT` 隧道和普通 HTTP 转发，不支持 HTTPS forward-proxy 的 absolute-form 语义；现有 `handleHttpRequest()` 会把非 CONNECT 请求统一按明文 HTTP 处理，默认连 `host:80` 并原样转发请求，因此遇到 `POST https://...` 时属于能力缺口，不再是单纯的 half-close/reset 关闭语义 bug。2026-03-08 20:48 +0800 完成修复并做同机 live 验证。最终实现：1) `handleHttpRequest()` 识别 absolute-form `https://...` 请求，按 HTTPS forward-proxy 语义处理；2) DIRECT 路径不再走自定义 `Io.Reader/Writer` 包装，而是对 `net.Stream.reader()/writer()` 直接挂 `std.crypto.tls.Client`，避免自定义包装在响应读取阶段触发 `ReadFailed` 和清理期 panic；3) 修正 DIRECT TLS 缓冲布局，按 Zig 标准库 `std.http.Client` 的模式区分 `tls_write_buffer`（底层 socket writer，大缓冲）和 `socket_write_buffer`（TLS 明文 writer，小缓冲），消除 `request_flush` 阶段的 `MessageTooBig`；4) 在 `tls_client.writer.flush()` 后补上底层 `socket_writer.interface.flush()`，修复“请求已加密但未真正发出，客户端 30s 超时”的问题。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（46/46 passed）；`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast` 通过；安装到 `~/.local/bin/zc` 后，用 `/Users/like/.local/bin/zc --daemon-run` 做单 shell e2e 复现，`http_proxy/https_proxy/all_proxy -> 127.0.0.1:7899` 的 axios env-proxy Feishu token 请求返回 `HTTP 200` + `code=0`，不再出现 `ECONNRESET/socket hang up`。
+
 ## 临时任务：daemon 单实例保护修复（2026-03-06）
 
 ### HOTFIX-DAEMON-SINGLETON-GUARD
