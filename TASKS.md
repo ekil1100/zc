@@ -8,6 +8,29 @@
 
 ## 临时任务：本地/私网目标旁路远端代理（2026-03-08）
 
+### DOC-AGENTS-DEVELOPMENT-WORKFLOW
+- 状态：DONE
+- 优先级：P2
+- 负责人：Codex
+- 输出：`AGENTS.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] `AGENTS.md` 明确要求 feature / bugfix / hotfix 先通过 git worktree 开始，并指定 `.worktrees/` 为默认目录
+  - [x] `AGENTS.md` 明确规定本地开发不要占用 `7899`，并要求启动链路优先提供 `zc start --port <port>` 这类显式入口；端口冲突时只报错、不自动切换端口
+  - [x] `AGENTS.md` 明确要求完成实现后先 review，再 commit 并合并回 `main`
+- 备注：2026-03-08 22:01 +0800 按最新协作要求更新开发流程，仅调整协作文档，不涉及产品代码与运行行为。2026-03-08 22:09 +0800 根据进一步确认，将默认 worktree 目录修正为 `.worktrees/`，并把端口策略从“自动探测 fallback”收敛为“显式 `zc start --port <port>`，冲突时报错拒绝启动”。
+
+### FEATURE-START-EXPLICIT-PORT
+- 状态：DOING
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/main.zig`, `src/daemon.zig`, `README.md`, `docs/cli/spec.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [ ] `zc start --port <port>` 支持显式覆盖本次 daemon 启动使用的 mixed port
+  - [ ] 未显式传入 `--port` 时，默认行为仍保持 `7899`
+  - [ ] 当请求端口已被占用时，`zc start --port <port>` 明确报错且 daemon 不启动到其他端口
+  - [ ] 新增/更新测试覆盖 CLI 解析与端口冲突关键路径，并同步 README / CLI 文档
+- 备注：2026-03-08 22:09 +0800 进入 DOING。目标是把“开发时不要占用 7899”收敛成显式 CLI 能力，而不是自动 fallback 到未知端口，避免误启动后用户不知道服务实际监听在哪个端口。
+
 ### HOTFIX-LOCAL-TARGET-DIRECT-BYPASS
 - 状态：BLOCKED
 - 优先级：P1
