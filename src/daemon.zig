@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("config.zig");
 const constants = @import("constants.zig");
 
@@ -9,6 +10,7 @@ const LOG_FILE = "/tmp/zc.log";
 const startup_poll_interval_ms: u64 = 200;
 const startup_poll_attempts: usize = 10;
 const process_scan_max_output_bytes: usize = 16 * 1024 * 1024;
+const command_probe_max_output_bytes: usize = 16 * 1024;
 
 pub const ApplyMode = enum {
     auto,
@@ -50,6 +52,11 @@ const RuntimeState = struct {
     fn isRunning(self: RuntimeState) bool {
         return self.pid != null or self.lock_held;
     }
+};
+
+const RuntimeInspector = struct {
+    pid_is_daemon: *const fn (std.mem.Allocator, i32) anyerror!bool,
+    discover_pid: *const fn (std.mem.Allocator) anyerror!?i32,
 };
 
 /// 获取 PID 文件路径
@@ -146,25 +153,72 @@ fn removePidFileAtPath(pid_file: []const u8) void {
     std.fs.deleteFileAbsolute(pid_file) catch {};
 }
 
-fn isPidRunning(allocator: std.mem.Allocator, pid: i32) !bool {
-    std.posix.kill(pid, 0) catch return false;
+fn isDaemonBinaryPath(argv0: []const u8) bool {
+    return std.mem.eql(u8, std.fs.path.basename(argv0), "zc");
+}
 
-    // Linux: 读取 /proc/<pid>/comm 验证进程名，防止 PID 回收误判
-    if (comptime @import("builtin").os.tag == .linux) {
-        var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return false;
-        const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-        defer file.close();
-        var buf: [256]u8 = undefined;
-        const n = file.read(&buf) catch return false;
-        const comm = std.mem.trimRight(u8, buf[0..n], "\n");
-        if (!std.mem.eql(u8, comm, "zc")) {
-            return false;
-        }
+fn commandLineLooksLikeDaemon(command_line: []const u8) bool {
+    var parts = std.mem.tokenizeAny(u8, std.mem.trim(u8, command_line, " \t\r\n"), " \t");
+    const argv0 = parts.next() orelse return false;
+    if (!isDaemonBinaryPath(argv0)) return false;
+
+    while (parts.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--daemon-run")) return true;
     }
 
-    _ = allocator;
-    return true;
+    return false;
+}
+
+fn cmdlineBufferLooksLikeDaemon(cmdline: []const u8) bool {
+    if (cmdline.len == 0) return false;
+
+    var parts = std.mem.tokenizeScalar(u8, cmdline, 0);
+    const argv0 = parts.next() orelse return false;
+    if (!isDaemonBinaryPath(argv0)) return false;
+
+    while (parts.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--daemon-run")) return true;
+    }
+
+    return false;
+}
+
+fn linuxPidLooksLikeDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return false;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+
+    const cmdline = file.readToEndAlloc(allocator, command_probe_max_output_bytes) catch return false;
+    defer allocator.free(cmdline);
+
+    return cmdlineBufferLooksLikeDaemon(cmdline);
+}
+
+fn psPidLooksLikeDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
+    var pid_buf: [32]u8 = undefined;
+    const pid_text = try std.fmt.bufPrint(&pid_buf, "{d}", .{pid});
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "ps", "-ww", "-o", "command=", "-p", pid_text },
+        .max_output_bytes = command_probe_max_output_bytes,
+    }) catch return false;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    if (result.term.Exited != 0) return false;
+
+    return commandLineLooksLikeDaemon(result.stdout);
+}
+
+fn pidMatchesRunningDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
+    std.posix.kill(pid, 0) catch return false;
+
+    return switch (builtin.os.tag) {
+        .linux => try linuxPidLooksLikeDaemon(allocator, pid),
+        else => try psPidLooksLikeDaemon(allocator, pid),
+    };
 }
 
 fn discoverDaemonPid(allocator: std.mem.Allocator) !?i32 {
@@ -180,7 +234,7 @@ fn discoverDaemonPid(allocator: std.mem.Allocator) !?i32 {
     if (result.term.Exited != 0) return null;
 
     if (parseDaemonPidCandidateFromPsOutput(result.stdout)) |pid| {
-        if (try isPidRunning(allocator, pid)) return pid;
+        if (try pidMatchesRunningDaemon(allocator, pid)) return pid;
     }
 
     const pgrep_result = std.process.Child.run(.{
@@ -198,7 +252,7 @@ fn discoverDaemonPid(allocator: std.mem.Allocator) !?i32 {
     while (lines.next()) |line| {
         const pid = parsePidFirstToken(line) orelse continue;
         if (pid == std.c.getpid()) continue;
-        if (try isPidRunning(allocator, pid)) return pid;
+        if (try pidMatchesRunningDaemon(allocator, pid)) return pid;
     }
 
     return null;
@@ -239,11 +293,16 @@ fn parsePidFirstToken(line: []const u8) ?i32 {
     return std.fmt.parseInt(i32, pid_text, 10) catch null;
 }
 
-fn inspectRuntimeAtPaths(allocator: std.mem.Allocator, pid_file: []const u8, lock_file: []const u8) !RuntimeState {
+fn inspectRuntimeAtPathsWithInspector(
+    allocator: std.mem.Allocator,
+    pid_file: []const u8,
+    lock_file: []const u8,
+    inspector: RuntimeInspector,
+) !RuntimeState {
     var stale_pid: ?i32 = null;
 
     if (try readPidAtPath(pid_file)) |pid| {
-        if (try isPidRunning(allocator, pid)) {
+        if (try inspector.pid_is_daemon(allocator, pid)) {
             return .{
                 .pid = pid,
                 .lock_held = true,
@@ -253,7 +312,7 @@ fn inspectRuntimeAtPaths(allocator: std.mem.Allocator, pid_file: []const u8, loc
         removePidFileAtPath(pid_file);
     }
 
-    if (try discoverDaemonPid(allocator)) |pid| {
+    if (try inspector.discover_pid(allocator)) |pid| {
         writePidAtPath(pid_file, pid) catch {};
         return .{
             .pid = pid,
@@ -273,6 +332,13 @@ fn inspectRuntimeAtPaths(allocator: std.mem.Allocator, pid_file: []const u8, loc
         .detail = if (stale_pid != null) "stale_pid_file" else null,
         .stale_pid = stale_pid,
     };
+}
+
+fn inspectRuntimeAtPaths(allocator: std.mem.Allocator, pid_file: []const u8, lock_file: []const u8) !RuntimeState {
+    return inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, .{
+        .pid_is_daemon = pidMatchesRunningDaemon,
+        .discover_pid = discoverDaemonPid,
+    });
 }
 
 fn inspectRuntime(allocator: std.mem.Allocator) !RuntimeState {
@@ -1009,6 +1075,18 @@ fn printTimestampedLine(line: []const u8) void {
     std.debug.print("[{d}] {s}\n", .{ ts, line });
 }
 
+fn testPidNeverMatchesDaemon(_: std.mem.Allocator, _: i32) !bool {
+    return false;
+}
+
+fn testDiscoverNoDaemon(_: std.mem.Allocator) !?i32 {
+    return null;
+}
+
+fn testDiscoverRecoveredDaemon(_: std.mem.Allocator) !?i32 {
+    return 4321;
+}
+
 test "daemon lock prevents duplicate acquisition and can be reacquired after close" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1099,6 +1177,60 @@ test "collectStatusSnapshot reports stale pid file and removes it" {
     try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(snapshot.pid_file, .{}));
 }
 
+test "inspectRuntime ignores stale live pid when it is not a zc daemon" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+
+    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    defer allocator.free(pid_file);
+    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    defer allocator.free(lock_file);
+
+    try writePidAtPath(pid_file, std.c.getpid());
+
+    const runtime = try inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, .{
+        .pid_is_daemon = testPidNeverMatchesDaemon,
+        .discover_pid = testDiscoverNoDaemon,
+    });
+
+    try std.testing.expect(runtime.pid == null);
+    try std.testing.expect(!runtime.lock_held);
+    try std.testing.expectEqualStrings("stale_pid_file", runtime.detail.?);
+    try std.testing.expectEqual(std.c.getpid(), runtime.stale_pid.?);
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(pid_file, .{}));
+}
+
+test "inspectRuntime replaces stale pid file with discovered daemon pid" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+
+    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    defer allocator.free(pid_file);
+    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    defer allocator.free(lock_file);
+
+    try writePidAtPath(pid_file, 999999);
+
+    const runtime = try inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, .{
+        .pid_is_daemon = testPidNeverMatchesDaemon,
+        .discover_pid = testDiscoverRecoveredDaemon,
+    });
+
+    try std.testing.expectEqual(@as(?i32, 4321), runtime.pid);
+    try std.testing.expect(runtime.lock_held);
+    try std.testing.expect(runtime.detail == null);
+    try std.testing.expectEqual(@as(?i32, null), runtime.stale_pid);
+    try std.testing.expectEqual(@as(?i32, 4321), try readPidAtPath(pid_file));
+}
+
 test "collectStatusSnapshot reports running when lock is held but pid is untracked" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1131,6 +1263,20 @@ test "collectStatusSnapshot reports running when lock is held but pid is untrack
     try std.testing.expect(snapshot.pid == null);
     try std.testing.expect(snapshot.uptime_seconds == null);
     try std.testing.expect(snapshot.active_config == null);
+}
+
+test "commandLineLooksLikeDaemon requires zc daemon-run invocation" {
+    try std.testing.expect(commandLineLooksLikeDaemon("/Users/like/.local/bin/zc --daemon-run -c /tmp/demo.yaml"));
+    try std.testing.expect(!commandLineLooksLikeDaemon("/Users/like/.local/bin/zc status"));
+    try std.testing.expect(!commandLineLooksLikeDaemon("/bin/zsh -lc /Users/like/.local/bin/zc --daemon-run"));
+}
+
+test "cmdlineBufferLooksLikeDaemon parses nul-separated argv" {
+    const daemon_cmdline = "/Users/like/.local/bin/zc\x00--daemon-run\x00-c\x00/tmp/demo.yaml\x00";
+    const cli_cmdline = "/Users/like/.local/bin/zc\x00status\x00";
+
+    try std.testing.expect(cmdlineBufferLooksLikeDaemon(daemon_cmdline));
+    try std.testing.expect(!cmdlineBufferLooksLikeDaemon(cli_cmdline));
 }
 
 test "formatStatusJson preserves status compatibility fields and adds rich data" {

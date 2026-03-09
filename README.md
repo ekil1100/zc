@@ -32,6 +32,8 @@ zc status
 
 `zc restart` now does the same mixed-port preflight as `zc start`, so a port conflict is reported in the foreground instead of only appearing in `zc log`.
 
+`zc` runtime management now validates the tracked PID against the actual `zc --daemon-run` process, so a reused stale PID will not cause `zc stop` or `zc restart` to terminate an unrelated process.
+
 `zc` mixed proxy now keeps long-lived Shadowsocks-backed `CONNECT` and WebSocket tunnels draining correctly even when upstream data is already buffered in memory, which improves Discord Gateway and similar traffic stability.
 
 ## License

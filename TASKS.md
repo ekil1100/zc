@@ -6,6 +6,19 @@
 
 ---
 
+## 临时任务：修复 runtime pid 复用误判导致 restart 杀错进程（2026-03-09）
+
+### HOTFIX-RUNTIME-PID-VERIFY
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/daemon.zig`, `README.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 当 pid 文件指向一个仍存活、但并非 `zc --daemon-run` 的进程时，`status` / `stop` / `restart` 不再把它误判成当前 daemon
+  - [x] 当真实 daemon 仍在运行但 pid 文件已陈旧时，runtime 探测会回退发现真实 `zc --daemon-run` pid，而不是先杀错进程再报 `RESTART_PORT_IN_USE`
+  - [x] 新增/更新测试覆盖“stale pid 命中非 daemon 进程”和“用真实 daemon pid 修复陈旧 pid 文件”两条回归路径
+- 备注：2026-03-09 17:0x +0800 进入 DOING。当前现场证据是：`zc restart` 先打印 `ok action=stop state=stopped pid=96613`，随后前台立即报 `RESTART_PORT_IN_USE`；同机实查 `lsof -nP -iTCP:7899 -sTCP:LISTEN` 显示真实监听者是 `zc` pid `80499`，`zc status` 也返回 `state: running pid: 80499`。现有代码在 `src/daemon.zig` 的 `inspectRuntimeAtPaths()` 中，对 pid 文件里的 pid 仅做 `kill(pid, 0)` 存活判断；在 macOS 上这不足以确认该 pid 仍然属于 `zc --daemon-run`。一旦 pid 文件陈旧且 pid 被系统复用，`restart`/`stop` 就可能把无关进程误当 daemon 发送终止信号，而真正的 `zc` 继续占用 7899，随后 restart 的前台端口预检命中真实 listener 并报 `RESTART_PORT_IN_USE`。本次修复方向：把“pid 存活”收敛为“pid 对应的仍是 `zc --daemon-run`”，并让陈旧 pid 能回退到真实 daemon 发现链路。2026-03-09 17:2x +0800 完成实现：新增基于命令行的 daemon pid 校验，Linux 读取 `/proc/<pid>/cmdline`，其他平台回退 `ps -ww -o command= -p <pid>`，只有 `argv0` basename 为 `zc` 且参数中包含 `--daemon-run` 才接受该 pid；`inspectRuntimeAtPaths()` 改为在 pid 文件命中失败后继续走真实 daemon 发现链路并回写正确 pid。新增回归测试覆盖“live 但非 daemon 的 stale pid 不再被接受”“发现真实 daemon 后自动修复 pid 文件”以及命令行/NUL 分隔 cmdline 解析。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/daemon.zig`（14/14 passed）、`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（58/58 passed）、`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast` 通过。
+
 ## 临时任务：修复 mixed 代理下 Discord Gateway 长连接异常断开（2026-03-09）
 
 ### HOTFIX-MIXED-DISCORD-GATEWAY-DISCONNECT
