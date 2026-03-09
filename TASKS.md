@@ -6,6 +6,20 @@
 
 ---
 
+## 临时任务：修复 mixed 代理下 Discord Gateway 长连接异常断开（2026-03-09）
+
+### HOTFIX-MIXED-DISCORD-GATEWAY-DISCONNECT
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `src/proxy/outbound/manager.zig`, `src/proxy/outbound/shadowsocks.zig`, `README.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 明确复现并定位 `gateway.discord.gg:443` 经过 `zc mixed` 后异常断开的根因，结论落到具体代码路径
+  - [x] 修复后，mixed 代理下长生命周期 `CONNECT`/WebSocket 隧道不会在空闲或单侧半关闭场景被 `zc` 提前切断
+  - [x] 新增回归测试覆盖这次根因对应的 relay / 出站流生命周期
+  - [x] 相关测试与隔离运行时验证通过；当前主机上 `zig build test --summary all` 仅剩 2 个受现网 `zc --daemon-run` 干扰的 `daemon.collectStatusSnapshot*` 用例失败，确认不属于本次 proxy 修复回归
+- 备注：2026-03-09 00:xx +0800 进入 DOING。OpenClaw/Discord 侧现象是图片消息会进入会话，但 Discord 网关经 `http://127.0.0.1:7899` 代理时出现反复 `WebSocket 1006` 与重连；本地 `zc.log` 可见 `CONNECT gateway.discord.gg:443` 建链后很快出现 relay 完成，说明问题更可能在 mixed 长连接隧道生命周期，而不是 OpenClaw 模型是否支持图片。2026-03-09 16:xx +0800 已定位根因到 `src/proxy/outbound/shadowsocks.zig`：`ShadowsocksClient.hasPendingRead()` 只检查了解密后的 `read_payload_leftover`，忽略了已经从上游 socket 读入、但仍处于加密态的 `read_leftover`。在 Discord Gateway/WebSocket 握手早期，obfs 响应后会一次性带下多个 SS chunk；旧逻辑会把后续 chunk 留在内存里却向 relay 报告“无 pending read”，导致 `mixed` 回到 `poll()`，把已经到内存里的上游数据卡住。修复方式：新增 `hasBufferedEncryptedChunk()`，在 `read_leftover` 已经足够组成完整 SS chunk 时也向 relay 报告 pending。新增回归测试覆盖 `shadowsocks` 完整加密 leftover 判定，以及 `mixed relay drains SS encrypted leftover without poll event`。非生产运行时验证：基于 rebased worktree 构建隔离二进制，在独立 `XDG_RUNTIME_DIR=/tmp/zc-verify-runtime`、独立 `HOME=/tmp/zc-verify-home`、非生产端口 `24021` 上启动 verifier，并用 `CONNECT gateway.discord.gg:443` + TLS + WebSocket upgrade 验证通过，收到 `HTTP/1.1 101 Switching Protocols` 和后续 Discord `op:10` Hello 帧。补充说明：当前机上存在生产 `zc --daemon-run`，`zig build test --summary all` 仍有 2 个 `daemon.collectStatusSnapshot*` 测试因全局进程发现逻辑看到现网 daemon 而失败，属于环境干扰，不是本次 proxy 修复回归。
+
 ## 临时任务：本地/私网目标旁路远端代理（2026-03-08）
 
 ### HOTFIX-RESTART-PREFLIGHT-ERROR-ALIGNMENT

@@ -5,6 +5,7 @@ const outbound = @import("outbound/manager.zig");
 const ProxyStream = outbound.ProxyStream;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = outbound.OutboundManager;
+const aead = @import("../crypto/aead.zig");
 const ss = @import("outbound/shadowsocks.zig");
 const socket_options = @import("../socket_options.zig");
 const relay_poll_timeout_ms: i32 = -1;
@@ -1037,13 +1038,14 @@ test "relay drains SS pending leftover without poll event" {
 
     const client_pair = try makeTcpStreamPair();
     defer client_pair.left.close();
-    defer client_pair.right.close();
+    errdefer client_pair.right.close();
     const target_pair = try makeTcpStreamPair();
-    defer target_pair.right.close();
+    errdefer target_pair.right.close();
 
     const client_stream = client_pair.left;
     const peer_stream = client_pair.right;
     const target_base = target_pair.left;
+    const target_peer = target_pair.right;
 
     const ss_client = try allocator.create(ss.ShadowsocksClient);
     errdefer allocator.destroy(ss_client);
@@ -1065,6 +1067,53 @@ test "relay drains SS pending leftover without poll event" {
     try std.testing.expectEqualStrings("hello", out[0..n]);
 
     peer_stream.close();
+    target_peer.close();
+    relay_thread.join();
+}
+
+test "relay drains SS encrypted leftover without poll event" {
+    const allocator = std.testing.allocator;
+
+    const client_pair = try makeTcpStreamPair();
+    defer client_pair.left.close();
+    errdefer client_pair.right.close();
+    const target_pair = try makeTcpStreamPair();
+    errdefer target_pair.right.close();
+
+    const client_stream = client_pair.left;
+    const peer_stream = client_pair.right;
+    const target_base = target_pair.left;
+    const target_peer = target_pair.right;
+
+    const ss_client = try allocator.create(ss.ShadowsocksClient);
+    errdefer allocator.destroy(ss_client);
+    ss_client.* = try ss.ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    ss_client.stream = target_base;
+
+    const salt = [_]u8{0} ** 16;
+    var enc_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    ss_client.dec_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+
+    var encrypted: [256]u8 = undefined;
+    const enc_len = try enc_ctx.encryptChunk("hello", &encrypted);
+    ss_client.read_leftover = try allocator.dupe(u8, encrypted[0..enc_len]);
+
+    var target_stream = ProxyStream.initShadowsocks(allocator, target_base, ss_client);
+    defer target_stream.close();
+
+    var relay_thread = try std.Thread.spawn(.{}, struct {
+        fn run(cs: net.Stream, ts: *ProxyStream) void {
+            _ = relay(cs, ts) catch {};
+        }
+    }.run, .{ client_stream, &target_stream });
+
+    var out: [5]u8 = undefined;
+    const n = try std.posix.read(peer_stream.handle, &out);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("hello", out[0..n]);
+
+    peer_stream.close();
+    target_peer.close();
     relay_thread.join();
 }
 

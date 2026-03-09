@@ -312,7 +312,20 @@ pub const ShadowsocksClient = struct {
     }
 
     pub fn hasPendingRead(self: *const ShadowsocksClient) bool {
-        return self.read_payload_leftover != null;
+        if (self.read_payload_leftover != null) return true;
+        return self.hasBufferedEncryptedChunk();
+    }
+
+    fn hasBufferedEncryptedChunk(self: *const ShadowsocksClient) bool {
+        const leftover = self.read_leftover orelse return false;
+        const dec_ctx = self.dec_ctx orelse return false;
+        const tag_len = dec_ctx.cipher.tagLen();
+        const len_hdr_len = 2 + tag_len;
+        if (leftover.len < len_hdr_len) return false;
+
+        var preview_ctx = dec_ctx;
+        const payload_len = preview_ctx.decryptLen(leftover[0..len_hdr_len]) catch return false;
+        return leftover.len >= len_hdr_len + @as(usize, payload_len) + tag_len;
     }
 
     /// Initialize decryption context: strip obfs HTTP response + read server salt
@@ -414,11 +427,27 @@ test "Shadowsocks client init" {
     defer client.deinit();
 }
 
-test "hasPendingRead should be false when only encrypted leftover exists" {
+test "hasPendingRead should be false when encrypted leftover is incomplete" {
     const allocator = std.testing.allocator;
     var client = try ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
     defer client.deinit();
 
     client.read_leftover = try allocator.dupe(u8, "x");
     try std.testing.expect(!client.hasPendingRead());
+}
+
+test "hasPendingRead should be true when encrypted leftover contains a full chunk" {
+    const allocator = std.testing.allocator;
+    var client = try ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    defer client.deinit();
+
+    const salt = [_]u8{0} ** 16;
+    var enc_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    client.dec_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+
+    var encrypted: [256]u8 = undefined;
+    const enc_len = try enc_ctx.encryptChunk("hello", &encrypted);
+    client.read_leftover = try allocator.dupe(u8, encrypted[0..enc_len]);
+
+    try std.testing.expect(client.hasPendingRead());
 }

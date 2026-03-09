@@ -32,6 +32,8 @@ zc status
 
 `zc restart` now does the same mixed-port preflight as `zc start`, so a port conflict is reported in the foreground instead of only appearing in `zc log`.
 
+`zc` mixed proxy now keeps long-lived Shadowsocks-backed `CONNECT` and WebSocket tunnels draining correctly even when upstream data is already buffered in memory, which improves Discord Gateway and similar traffic stability.
+
 ## License
 
 MIT
