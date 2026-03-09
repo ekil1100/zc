@@ -68,6 +68,7 @@
 
 ### `restart`
 - 语义：先 stop 再 start；中间失败必须显式报错
+- mixed-port / bind-address 预检与 `start` 保持一致；端口冲突时在前台直接报错，不只写 daemon 日志
 - 成功：返回新进程状态与配置摘要
 
 ### `status`

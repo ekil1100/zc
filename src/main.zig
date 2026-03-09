@@ -25,6 +25,11 @@ const ConfigOverrideAction = union(enum) {
     set: []const u8,
 };
 
+const RuntimeCommand = enum {
+    start,
+    restart,
+};
+
 const StartCommandOptions = struct {
     config_path: ?[]const u8 = null,
     port: ?u16 = null,
@@ -95,9 +100,9 @@ pub fn main() !void {
             printStartCommandOptionError(json_output, err);
             return err;
         };
-        preflightStartCommand(allocator, start_opts, &override_opts) catch |err| {
+        preflightRuntimeCommand(allocator, .start, start_opts, &override_opts) catch |err| {
             if (printOverrideRuntimeError(json_output, err)) return err;
-            printStartPreflightError(json_output, err);
+            printRuntimeCommandPreflightError(.start, json_output, err);
             return err;
         };
 
@@ -128,16 +133,7 @@ pub fn main() !void {
 
     // 处理 restart 命令
     if (std.mem.eql(u8, cmd, "restart")) {
-        var config_path: ?[]const u8 = null;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "-c")) {
-                if (i + 1 < args.len) {
-                    config_path = args[i + 1];
-                    i += 1;
-                }
-            }
-        }
+        const config_path = parseConfigPathArg(args, 2);
         var forward_args = std.ArrayList([]const u8).empty;
         defer {
             for (forward_args.items) |item| allocator.free(item);
@@ -145,8 +141,17 @@ pub fn main() !void {
         }
         try override_opts.appendForwardArgs(allocator, &forward_args);
 
-        daemon.restartDaemon(allocator, config_path, json_output, forward_args.items) catch |err| {
-            printCliError(json_output, "RESTART_FAILED", "failed to restart daemon", "check logs and retry `zc restart -c <config>`");
+        runRestartCommand(allocator, config_path, json_output, &override_opts, forward_args.items) catch |err| {
+            if (printOverrideRuntimeError(json_output, err)) return err;
+            switch (err) {
+                error.PortAlreadyInUse, error.PortConflict, error.InvalidBindAddress, error.InvalidExternalController => {
+                    printRuntimeCommandPreflightError(.restart, json_output, err);
+                },
+                error.StartFailed, error.DaemonPidUntracked => {},
+                else => {
+                    printCliError(json_output, "RESTART_FAILED", "failed to restart daemon", "check logs and retry `zc restart -c <config>`");
+                },
+            }
             return err;
         };
         return;
@@ -994,6 +999,47 @@ fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint:
     std.debug.print("error.hint={s}\n", .{hint});
 }
 
+fn printCliOk(json_output: bool, action: []const u8, state: []const u8, detail: ?[]const u8, pid: ?i32) void {
+    if (json_output) {
+        if (detail) |d| {
+            if (pid) |p| {
+                std.debug.print(
+                    "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"detail\":\"{s}\",\"pid\":{d}}}}}\n",
+                    .{ action, state, d, p },
+                );
+            } else {
+                std.debug.print(
+                    "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"detail\":\"{s}\"}}}}\n",
+                    .{ action, state, d },
+                );
+            }
+        } else if (pid) |p| {
+            std.debug.print(
+                "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"pid\":{d}}}}}\n",
+                .{ action, state, p },
+            );
+        } else {
+            std.debug.print(
+                "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\"}}}}\n",
+                .{ action, state },
+            );
+        }
+        return;
+    }
+
+    if (detail) |d| {
+        if (pid) |p| {
+            std.debug.print("ok action={s} state={s} detail={s} pid={d}\n", .{ action, state, d, p });
+        } else {
+            std.debug.print("ok action={s} state={s} detail={s}\n", .{ action, state, d });
+        }
+    } else if (pid) |p| {
+        std.debug.print("ok action={s} state={s} pid={d}\n", .{ action, state, p });
+    } else {
+        std.debug.print("ok action={s} state={s}\n", .{ action, state });
+    }
+}
+
 fn printOverrideOptionError(json_output: bool, err: anyerror) void {
     switch (err) {
         error.MissingOverrideScriptPath => printCliError(json_output, "OVERRIDE_SCRIPT_NOT_FOUND", "missing --override-script path", "use `--override-script <path>`"),
@@ -1246,24 +1292,79 @@ fn printStartCommandOptionError(json_output: bool, err: anyerror) void {
     }
 }
 
-fn printStartPreflightError(json_output: bool, err: anyerror) void {
-    switch (err) {
-        error.PortAlreadyInUse => printCliError(json_output, "START_PORT_IN_USE", "requested start port is already in use", "retry with `zc start --port <free-port>`"),
-        error.PortConflict => printCliError(json_output, "START_PORT_CONFLICT", "requested start port conflicts with another runtime listener", "change the port or fix the conflicting runtime config"),
-        error.InvalidBindAddress => printCliError(json_output, "START_BIND_ADDRESS_INVALID", "invalid bind address for start preflight", "fix `bind-address` in config and retry"),
-        error.InvalidExternalController => printCliError(json_output, "START_EXTERNAL_CONTROLLER_INVALID", "invalid `external-controller` address in config", "fix `external-controller` to `host:port` format"),
-        else => printCliError(json_output, "START_PREFLIGHT_FAILED", "failed to validate daemon start ports", "check config and retry"),
-    }
+const CliErrorInfo = struct {
+    code: []const u8,
+    message: []const u8,
+    hint: []const u8,
+};
+
+fn runtimeCommandPreflightErrorInfo(command: RuntimeCommand, err: anyerror) CliErrorInfo {
+    return switch (command) {
+        .start => switch (err) {
+            error.PortAlreadyInUse => .{ .code = "START_PORT_IN_USE", .message = "requested start port is already in use", .hint = "retry with `zc start --port <free-port>`" },
+            error.PortConflict => .{ .code = "START_PORT_CONFLICT", .message = "requested start port conflicts with another runtime listener", .hint = "change the port or fix the conflicting runtime config" },
+            error.InvalidBindAddress => .{ .code = "START_BIND_ADDRESS_INVALID", .message = "invalid bind address for start preflight", .hint = "fix `bind-address` in config and retry" },
+            error.InvalidExternalController => .{ .code = "START_EXTERNAL_CONTROLLER_INVALID", .message = "invalid `external-controller` address in config", .hint = "fix `external-controller` to `host:port` format" },
+            else => .{ .code = "START_PREFLIGHT_FAILED", .message = "failed to validate daemon start ports", .hint = "check config and retry" },
+        },
+        .restart => switch (err) {
+            error.PortAlreadyInUse => .{ .code = "RESTART_PORT_IN_USE", .message = "restart target port is already in use", .hint = "free the occupied port, then retry `zc restart` or use `zc start --port <free-port>`" },
+            error.PortConflict => .{ .code = "RESTART_PORT_CONFLICT", .message = "restart target port conflicts with another runtime listener", .hint = "fix the conflicting runtime config before retrying `zc restart`" },
+            error.InvalidBindAddress => .{ .code = "RESTART_BIND_ADDRESS_INVALID", .message = "invalid bind address for restart preflight", .hint = "fix `bind-address` in config and retry `zc restart`" },
+            error.InvalidExternalController => .{ .code = "RESTART_EXTERNAL_CONTROLLER_INVALID", .message = "invalid `external-controller` address in config", .hint = "fix `external-controller` to `host:port` format before retrying `zc restart`" },
+            else => .{ .code = "RESTART_PREFLIGHT_FAILED", .message = "failed to validate daemon restart ports", .hint = "check config and retry `zc restart`" },
+        },
+    };
 }
 
-fn preflightStartCommand(
+fn printRuntimeCommandPreflightError(command: RuntimeCommand, json_output: bool, err: anyerror) void {
+    const info = runtimeCommandPreflightErrorInfo(command, err);
+    printCliError(json_output, info.code, info.message, info.hint);
+}
+
+fn runtimeCommandName(command: RuntimeCommand) []const u8 {
+    return switch (command) {
+        .start => "start",
+        .restart => "restart",
+    };
+}
+
+fn preflightRuntimeCommand(
     allocator: std.mem.Allocator,
+    command: RuntimeCommand,
     start_opts: StartCommandOptions,
     override_opts: *const override.CliOptions,
 ) !void {
-    var cfg = try loadRuntimeConfig(allocator, start_opts.config_path, start_opts.port, override_opts, "start", false);
+    var cfg = try loadRuntimeConfig(allocator, start_opts.config_path, start_opts.port, override_opts, runtimeCommandName(command), false);
     defer cfg.deinit();
     try preflightPortCheck(&cfg, false);
+}
+
+fn runRestartCommand(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    json_output: bool,
+    override_opts: *const override.CliOptions,
+    extra_args: []const []const u8,
+) !void {
+    const was_running = try daemon.isRunning(allocator);
+
+    if (was_running) {
+        try daemon.stopDaemon(allocator, json_output);
+    }
+
+    try preflightRuntimeCommand(allocator, .restart, .{ .config_path = config_path }, override_opts);
+
+    if (!was_running) {
+        printCliOk(json_output, "restart", "stopped", "service_was_stopped", null);
+    }
+
+    try daemon.startDaemon(allocator, config_path, json_output, extra_args);
+    const pid = try daemon.readPid(allocator) orelse {
+        printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details");
+        return error.StartFailed;
+    };
+    printCliOk(json_output, "restart", "running", null, pid);
 }
 
 fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) void {
@@ -1865,6 +1966,31 @@ test "preflightPortCheck rejects mixed-port conflicts without fallback" {
     try testing.expectError(error.PortConflict, preflightPortCheck(&cfg, false));
     try testing.expectEqual(@as(u16, 7901), cfg.mixed_port);
     try testing.expectEqualStrings("127.0.0.1:7901", cfg.external_controller.?);
+}
+
+test "runtimeCommandPreflightErrorInfo maps restart port conflicts" {
+    const testing = std.testing;
+
+    const info = runtimeCommandPreflightErrorInfo(.restart, error.PortAlreadyInUse);
+    try testing.expectEqualStrings("RESTART_PORT_IN_USE", info.code);
+    try testing.expectEqualStrings("restart target port is already in use", info.message);
+    try testing.expect(std.mem.indexOf(u8, info.hint, "zc restart") != null);
+}
+
+test "restart command preflights ports before spawning a new daemon" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try std.fs.cwd().readFileAlloc(allocator, "src/main.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    const fn_pos = std.mem.indexOf(u8, content, "fn runRestartCommand(") orelse return error.TestUnexpectedResult;
+    const next_fn_pos = std.mem.indexOfPos(u8, content, fn_pos, "fn applyRuntimePortSelection(") orelse return error.TestUnexpectedResult;
+    const fn_body = content[fn_pos..next_fn_pos];
+
+    const preflight_pos = std.mem.indexOf(u8, fn_body, "preflightRuntimeCommand(allocator, .restart") orelse return error.TestUnexpectedResult;
+    const start_pos = std.mem.indexOf(u8, fn_body, "daemon.startDaemon(") orelse return error.TestUnexpectedResult;
+    try testing.expect(preflight_pos < start_pos);
 }
 
 test "mixed handler should explicitly close client stream on success path" {

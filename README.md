@@ -30,6 +30,8 @@ zc start --port 7901
 zc status
 ```
 
+`zc restart` now does the same mixed-port preflight as `zc start`, so a port conflict is reported in the foreground instead of only appearing in `zc log`.
+
 ## License
 
 MIT

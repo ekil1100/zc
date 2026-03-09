@@ -8,6 +8,17 @@
 
 ## 临时任务：本地/私网目标旁路远端代理（2026-03-08）
 
+### HOTFIX-RESTART-PREFLIGHT-ERROR-ALIGNMENT
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/main.zig`, `README.md`, `docs/cli/spec.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] `zc restart` 在“旧 daemon 已停，但目标 mixed port 被其他进程占用”场景下，前台直接报出端口占用原因，而不是只让后台 daemon 把细节写进日志
+  - [x] `zc restart` 与 `zc start` 对 mixed-port 预检保持一致：冲突时拒绝启动、不误报成功
+  - [x] 新增/更新测试覆盖 restart 端口预检与错误映射语义
+- 备注：2026-03-09 11:03 +0800 进入 DOING。现网观察到：`zc status` 先返回 `state: stopped detail: stale_pid_file pid: 71375`，说明旧 daemon 已退出；随后第一次 `zc restart` 没有在前台提示端口占用，但 `zc.log` 中明确记录了 `Port precheck failed: 127.0.0.1:7899 is already in use`，第二次 `zc restart` 才在端口释放后成功拉起新 pid `72725`。根因是 `start` 命令会在前台先做 `preflightStartCommand()`，而 `restart` 直接进入 `daemon.restartDaemon()`，端口预检发生在后台 `--daemon-run` 进程里，stdout/stderr 已经被重定向到 log。当前修复方向：让 `restart` 在 stop 后、start 前复用同一套前台端口预检和错误映射。2026-03-09 11:12 +0800 完成实现：`restart` 入口改为 `runRestartCommand()`，执行顺序调整为“按当前 runtime 状态决定是否 stop -> 前台执行 `preflightRuntimeCommand(.restart)` -> 再调用 `daemon.startDaemon()`”；同时把 start/restart 的端口预检错误映射收敛成同一套 helper，`restart` 在端口占用场景下现在会直接返回 `RESTART_PORT_IN_USE`，不再让用户只在 `zc log` 里看到 `Port precheck failed`。文档同步到 README 和 CLI spec。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（53/53 passed）、`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast` 通过；新增单测覆盖 `RESTART_PORT_IN_USE` 错误映射，以及源码级顺序断言“restart preflight 必须发生在 `daemon.startDaemon()` 之前”。
+
 ### HOTFIX-STATUS-AFTER-KILL-RECOVERY
 - 状态：DONE
 - 优先级：P0
