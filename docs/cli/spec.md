@@ -302,7 +302,8 @@
 - `rules` 中支持 `RULE-SET`；运行时会按 `rule-providers.<name>.path` 加载本地规则文件。
 - provider 文件自动同步策略：
   - 缺失且有 `url`：必须下载成功，否则报错
-  - 已存在且到达 `interval`：尝试刷新，失败保留本地缓存
+  - 已存在且到达 `interval`：运行时命令会尝试刷新，失败保留本地缓存
+  - `zc test` 例外：已有 provider 缓存时不做按 `interval` 刷新，只在缺失时下载
   - 缺失且无 `url`：报错
 - 未知或暂不支持的键直接报错（`OVERRIDE_OUTPUT_INVALID`）。
 

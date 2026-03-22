@@ -84,6 +84,11 @@ pub const RuleProviderBehavior = enum {
     classical,
 };
 
+pub const RuleProviderSyncPolicy = enum {
+    eager,
+    missing_only,
+};
+
 pub const RuleProvider = struct {
     name: []const u8,
     provider_type: []const u8,
@@ -700,7 +705,16 @@ pub fn prepareRuleProvidersForRuntime(
     cfg: *Config,
     config_path: ?[]const u8,
 ) !void {
-    try syncRuleProviderFilesIfNeeded(allocator, cfg, config_path);
+    try prepareRuleProvidersForRuntimeWithPolicy(allocator, cfg, config_path, .eager);
+}
+
+pub fn prepareRuleProvidersForRuntimeWithPolicy(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    config_path: ?[]const u8,
+    sync_policy: RuleProviderSyncPolicy,
+) !void {
+    try syncRuleProviderFilesIfNeeded(allocator, cfg, config_path, sync_policy);
     try loadRuleProviderEntries(allocator, cfg, config_path);
     try expandRuleSetRules(allocator, cfg);
 }
@@ -709,6 +723,7 @@ fn syncRuleProviderFilesIfNeeded(
     allocator: std.mem.Allocator,
     cfg: *Config,
     config_path: ?[]const u8,
+    sync_policy: RuleProviderSyncPolicy,
 ) !void {
     for (cfg.rule_providers.items) |*provider| {
         const resolved_path = try resolveRuleProviderPath(allocator, provider.path, config_path);
@@ -728,7 +743,7 @@ fn syncRuleProviderFilesIfNeeded(
         const stat = try file.stat();
 
         if (provider.url) |url| {
-            if (isRuleProviderRefreshDue(stat.mtime, provider.interval)) {
+            if (sync_policy == .eager and isRuleProviderRefreshDue(stat.mtime, provider.interval)) {
                 downloadRuleProviderFile(allocator, provider.name, url, resolved_path, false) catch |err| {
                     std.debug.print(
                         "rule-provider refresh failed (using cached file): name={s} url={s} path={s} error={s}\n",
@@ -1727,6 +1742,92 @@ test "prepareRuleProvidersForRuntime supports yaml payload style classical provi
     try std.testing.expectEqual(@as(RuleType, .process_name), cfg.rules.items[1].rule_type);
     try std.testing.expectEqualStrings("tailscaled", cfg.rules.items[1].payload);
     try std.testing.expectEqual(@as(RuleType, .final), cfg.rules.items[2].rule_type);
+}
+
+test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cached provider files" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("direct.txt", .{});
+        defer f.close();
+        try f.writeAll("example.com\n");
+    }
+
+    var provider_file = try tmp.dir.openFile("direct.txt", .{ .mode = .read_write });
+    defer provider_file.close();
+    const stale_ns = (@as(i128, @intCast(std.time.timestamp())) - 10) * std.time.ns_per_s;
+    try provider_file.updateTimes(stale_ns, stale_ns);
+
+    var server = try (try std.net.Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    var hits = std.atomic.Value(u32).init(0);
+    const response_body = "example.net\n";
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(http_server: *std.net.Server, request_hits: *std.atomic.Value(u32), body: []const u8) void {
+            while (true) {
+                var conn = http_server.accept() catch return;
+                defer conn.stream.close();
+                _ = request_hits.fetchAdd(1, .monotonic);
+
+                var req_buf: [1024]u8 = undefined;
+                _ = conn.stream.read(&req_buf) catch {};
+
+                var resp_buf: [256]u8 = undefined;
+                const response = std.fmt.bufPrint(
+                    &resp_buf,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                    .{ body.len, body },
+                ) catch return;
+                conn.stream.writeAll(response) catch {};
+            }
+        }
+    }.run, .{ &server, &hits, response_body });
+    defer {
+        server.deinit();
+        thread.join();
+    }
+
+    const provider_abs = try tmp.dir.realpathAlloc(allocator, "direct.txt");
+    defer allocator.free(provider_abs);
+    const provider_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/direct.txt", .{server.listen_address.getPort()});
+    defer allocator.free(provider_url);
+
+    const yaml_config = try std.fmt.allocPrint(allocator,
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+        \\rule-providers:
+        \\  directset:
+        \\    type: file
+        \\    behavior: domain
+        \\    url: {s}
+        \\    path: {s}
+        \\    interval: 1
+        \\rules:
+        \\  - RULE-SET,directset,DIRECT
+        \\  - MATCH,DIRECT
+    , .{ provider_url, provider_abs });
+    defer allocator.free(yaml_config);
+
+    var cfg = try parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    try prepareRuleProvidersForRuntimeWithPolicy(allocator, &cfg, null, .missing_only);
+
+    try std.testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), cfg.rules.items.len);
+    try std.testing.expectEqual(@as(RuleType, .domain_suffix), cfg.rules.items[0].rule_type);
+    try std.testing.expectEqualStrings("example.com", cfg.rules.items[0].payload);
+    try std.testing.expectEqualStrings("DIRECT", cfg.rules.items[0].target);
+
+    const cached = try tmp.dir.readFileAlloc(allocator, "direct.txt", 1024);
+    defer allocator.free(cached);
+    try std.testing.expectEqualStrings("example.com\n", cached);
 }
 
 test "normalizeRuleProviderLine strips payload dash and quotes" {

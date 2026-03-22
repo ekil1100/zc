@@ -94,6 +94,7 @@ Runtime preparation behavior:
 
 - missing provider file + `url` present: download required (failure returns error)
 - existing provider file + `url` present + interval due: best-effort refresh (failure keeps cached file)
+- `zc test` exception: if the provider file already exists, skip interval-based refresh and reuse the local cache
 - missing provider file without `url`: `RULE_PROVIDER_FILE_NOT_FOUND`
 
 ## Dump Output

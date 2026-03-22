@@ -6,6 +6,21 @@
 
 ---
 
+## 临时任务：避免 `zc test` 刷新已有 rule-provider 缓存（2026-03-22）
+
+### HOTFIX-TEST-RULE-PROVIDER-MISSING-ONLY
+- 状态：DONE
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/config.zig`, `src/main.zig`, `docs/cli/spec.md`, `docs/config/override.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] `zc test` 在 rule-provider 本地文件缺失且存在 `url` 时，仍会下载缺失文件
+  - [x] `zc test` 在 rule-provider 本地文件已存在时，不再因为 `interval` 到期而刷新缓存文件
+  - [x] 其他运行时入口继续保持现有 eager sync 语义
+  - [x] 新增/更新测试覆盖命令级 sync policy 与 provider cache 行为
+  - [x] CLI / override 文档同步更新
+- 备注：2026-03-22 10:0x +0800 进入 DOING。用户反馈当前 `zc test` 每次加载带 `rule-providers` 的配置时，已有缓存文件只要超过 `interval` 就会被自动 refresh；期望语义改为“缺失时允许下载，已有缓存时不刷新”。根因定位为 `src/main.zig` 的 `test` 命令与其他运行时入口共用 `loadAndValidateConfig(...) -> prepareRuleProvidersForRuntime(...)`，而 `src/config.zig` 的同步逻辑此前只有 eager 一种策略：存在 `url` 且 `mtime` 超过 `interval` 就尝试刷新。2026-03-22 10:1x +0800 完成实现：为 rule-provider 准备链路新增 `RuleProviderSyncPolicy`，默认仍走 `eager`；`zc test` 通过 `ruleProviderSyncPolicyForCommand("test")` 切到 `missing_only`，因此仅在文件缺失时下载，已有缓存直接复用。新增回归测试覆盖“stale cache + missing_only 不触发 HTTP refresh”以及命令级策略映射。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/config.zig`（16/16 passed）；`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（58/60 passed，剩余 2 个 `daemon.collectStatusSnapshot*` 失败，受本机现网 daemon 干扰，和本次改动无关）。
+
 ## 临时任务：修复 runtime pid 复用误判导致 restart 杀错进程（2026-03-09）
 
 ### HOTFIX-RUNTIME-PID-VERIFY

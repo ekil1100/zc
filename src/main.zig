@@ -1377,6 +1377,11 @@ fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) voi
     cfg.socks_port = 0;
 }
 
+fn ruleProviderSyncPolicyForCommand(command_name: []const u8) config.RuleProviderSyncPolicy {
+    if (std.mem.eql(u8, command_name, "test")) return .missing_only;
+    return .eager;
+}
+
 fn loadRuntimeConfig(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
@@ -1408,7 +1413,12 @@ fn loadRuntimeConfig(
     try override.apply(allocator, &cfg, &effective_override, command_name, config_path);
     applyRuntimePortSelection(&cfg, mixed_port_override);
     if (prepare_runtime_artifacts) {
-        try config.prepareRuleProvidersForRuntime(allocator, &cfg, config_path);
+        try config.prepareRuleProvidersForRuntimeWithPolicy(
+            allocator,
+            &cfg,
+            config_path,
+            ruleProviderSyncPolicyForCommand(command_name),
+        );
     }
     return cfg;
 }
@@ -1920,6 +1930,14 @@ test "appendStartForwardArgs forwards explicit port override" {
     try appendStartForwardArgs(allocator, &args, .{ .port = 7901 });
     try testing.expectEqual(@as(usize, 1), args.items.len);
     try testing.expectEqualStrings("--port=7901", args.items[0]);
+}
+
+test "ruleProviderSyncPolicyForCommand keeps zc test missing-only" {
+    const testing = std.testing;
+
+    try testing.expectEqual(config.RuleProviderSyncPolicy.missing_only, ruleProviderSyncPolicyForCommand("test"));
+    try testing.expectEqual(config.RuleProviderSyncPolicy.eager, ruleProviderSyncPolicyForCommand("start"));
+    try testing.expectEqual(config.RuleProviderSyncPolicy.eager, ruleProviderSyncPolicyForCommand("proxy.test"));
 }
 
 test "applyRuntimePortSelection prefers explicit port and keeps mixed mode" {
