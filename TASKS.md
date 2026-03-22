@@ -6,6 +6,21 @@
 
 ---
 
+## 临时任务：修复 `zc start` 启动后立即掉回 stopped（2026-03-22）
+
+### HOTFIX-START-COMPRESSED-RULE-PROVIDER-CRASH
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/config.zig`, `README.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 复现并定位 `zc start` 成功后很快 `zc status -> stopped/stale_pid_file` 的根因到具体代码路径
+  - [x] 修复后，rule-provider 刷新遇到压缩 HTTP 响应时，daemon 启动不再在 provider 下载阶段崩溃
+  - [x] 新增回归测试覆盖 provider 下载请求头，确保显式请求 `Accept-Encoding: identity`
+  - [x] 测试通过，并在真实 `zc start --port <port>` 场景下验证状态稳定
+  - [x] README / TASKS 同步更新
+- 备注：2026-03-22 11:3x +0800 进入 DOING。已在真实环境稳定复现：`zc start --port 24031` 前台返回成功，但随后 `zc status` 间歇性显示 `state: stopped detail: stale_pid_file`；`ps` 中对应 daemon pid 已消失，且 `~/Library/Logs/DiagnosticReports/zc-*.ips` 明确给出 `SIGTRAP`，堆栈定位到 `config.fetchConfig -> std.http.Client.fetch -> compress.flate.Decompress`。根因是 daemon 启动阶段会刷新 rule-provider，当前 `fetchConfig` 使用 Zig std 默认 `Accept-Encoding`，会接收 gzip/deflate 响应；当 Cloudflare/jsDelivr 返回压缩规则集时，std 解压路径在当前 Zig 版本上会触发 trap，导致 daemon 在 provider 下载阶段直接退出，于是前台看起来像“start 成功后马上 stopped”。2026-03-22 11:4x +0800 完成修复：`fetchConfig` 改为通过标准请求头显式发送 `Accept-Encoding: identity` 与 `User-Agent: clash`，彻底绕开压缩解压路径；新增回归测试验证 provider 下载请求头包含 `accept-encoding: identity`。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/config.zig`（17/17 passed）、`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all`（61/61 passed）；基于修复后的 worktree 二进制，连续 5 轮 `zc start --port 24031 -> zc status -> sleep 2 -> zc status` 均保持 `state: running`，不再复现 `stale_pid_file`。
+
 ## 临时任务：避免 `zc test` 刷新已有 rule-provider 缓存（2026-03-22）
 
 ### HOTFIX-TEST-RULE-PROVIDER-MISSING-ONLY

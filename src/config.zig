@@ -1084,8 +1084,9 @@ pub fn fetchConfig(allocator: std.mem.Allocator, url: []const u8) !DownloadResul
         .location = .{ .url = url },
         .method = .GET,
         .response_writer = &response_writer.writer,
-        .extra_headers = &.{
-            .{ .name = "User-Agent", .value = "clash" },
+        .headers = .{
+            .user_agent = .{ .override = "clash" },
+            .accept_encoding = .{ .override = "identity" },
         },
     }) catch |err| {
         std.debug.print("Failed to download config: {s}\n", .{@errorName(err)});
@@ -1828,6 +1829,47 @@ test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cache
     const cached = try tmp.dir.readFileAlloc(allocator, "direct.txt", 1024);
     defer allocator.free(cached);
     try std.testing.expectEqualStrings("example.com\n", cached);
+}
+
+test "fetchConfig requests identity encoding to avoid compressed provider responses" {
+    const allocator = std.testing.allocator;
+
+    var server = try (try std.net.Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    var request_bytes = std.ArrayList(u8).empty;
+    defer request_bytes.deinit(allocator);
+
+    const response_body = "ok\n";
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(http_server: *std.net.Server, allocator_: std.mem.Allocator, request_capture: *std.ArrayList(u8), body: []const u8) void {
+            var conn = http_server.accept() catch return;
+            defer conn.stream.close();
+
+            var req_buf: [2048]u8 = undefined;
+            const n = conn.stream.read(&req_buf) catch return;
+            request_capture.appendSlice(allocator_, req_buf[0..n]) catch return;
+
+            var resp_buf: [256]u8 = undefined;
+            const response = std.fmt.bufPrint(
+                &resp_buf,
+                "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ body.len, body },
+            ) catch return;
+            conn.stream.writeAll(response) catch {};
+        }
+    }.run, .{ &server, allocator, &request_bytes, response_body });
+    defer thread.join();
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/config.yaml", .{server.listen_address.getPort()});
+    defer allocator.free(url);
+
+    const result = try fetchConfig(allocator, url);
+    defer allocator.free(result.body);
+
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+    try std.testing.expectEqualStrings(response_body, result.body);
+    try std.testing.expect(std.mem.indexOf(u8, request_bytes.items, "accept-encoding: identity\r\n") != null);
 }
 
 test "normalizeRuleProviderLine strips payload dash and quotes" {

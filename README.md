@@ -36,6 +36,8 @@ zc status
 
 `zc` mixed proxy now keeps long-lived Shadowsocks-backed `CONNECT` and WebSocket tunnels draining correctly even when upstream data is already buffered in memory, which improves Discord Gateway and similar traffic stability.
 
+`zc start` no longer crashes during startup when rule-provider downloads return compressed HTTP bodies; provider fetches now explicitly request `identity` encoding so daemon startup stays stable while refreshing rule-providers.
+
 ## License
 
 MIT
