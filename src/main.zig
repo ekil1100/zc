@@ -2023,6 +2023,27 @@ test "mixed handler should explicitly close client stream on success path" {
     try testing.expect(std.mem.indexOf(u8, fn_body, "defer conn.stream.close();") != null);
 }
 
+test "mixed connection workers use bounded stack size" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try std.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "connection_task_stack_size: usize = 512 * 1024") != null);
+    try testing.expect(std.mem.indexOf(u8, content, ".stack_size = connection_task_stack_size") != null);
+}
+
+test "mixed relay uses finite idle reap instead of infinite poll" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try std.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "const relay_poll_timeout_ms: i32 = 30 * 1000") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "const relay_idle_reap_ms: i64 = 15 * 60 * 1000") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "shouldReapIdleRelay(now_ms, last_activity_ms, relay_idle_reap_ms)") != null);
+}
+
 test "shadowsocks hasPendingRead should ignore encrypted leftover-only state" {
     const testing = std.testing;
     const allocator = testing.allocator;

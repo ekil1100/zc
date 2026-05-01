@@ -8,7 +8,18 @@ const OutboundManager = outbound.OutboundManager;
 const aead = @import("../crypto/aead.zig");
 const ss = @import("outbound/shadowsocks.zig");
 const socket_options = @import("../socket_options.zig");
-const relay_poll_timeout_ms: i32 = -1;
+
+// macOS reserves 16MiB of virtual stack per pthread by default. The mixed
+// proxy creates one detached worker per accepted connection, so the default
+// stack size makes a small number of stale/idle tunnels look like hundreds of
+// megabytes in Activity Monitor. Keep the worker stack explicit and bounded.
+const connection_task_stack_size: usize = 512 * 1024;
+
+// Use a heartbeat instead of an infinite poll so relays that miss EOF/HUP on
+// macOS can still be reaped. The idle budget is intentionally much larger than
+// the old 30s timeout that broke long-lived tunnels/WebSockets.
+const relay_poll_timeout_ms: i32 = 30 * 1000;
+const relay_idle_reap_ms: i64 = 15 * 60 * 1000;
 
 /// 混合端口（HTTP + SOCKS5）
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
@@ -49,7 +60,7 @@ fn spawnConnectionTask(allocator: std.mem.Allocator, conn: net.Server.Connection
         .manager = manager,
     };
 
-    const thread = try std.Thread.spawn(.{}, connectionTaskMain, .{task});
+    const thread = try std.Thread.spawn(.{ .stack_size = connection_task_stack_size }, connectionTaskMain, .{task});
     thread.detach();
 }
 
@@ -804,6 +815,7 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     var up_bytes: usize = 0;
     var down_bytes: usize = 0;
     var last_report_ms = std.time.milliTimestamp();
+    var last_activity_ms = last_report_ms;
     var client_read_open = true;
     var target_read_open = true;
     var client_write_shutdown = false;
@@ -821,6 +833,7 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             &target_read_open,
             &client_write_shutdown,
             &target_write_shutdown,
+            &last_activity_ms,
         );
 
         if (!client_read_open and !target_read_open and !target_stream.hasPendingRead()) {
@@ -865,6 +878,7 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
                 );
                 if (!forwarded) continue;
                 up_bytes += n;
+                last_activity_ms = std.time.milliTimestamp();
             }
         }
 
@@ -890,6 +904,7 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
                 );
                 if (!delivered) continue;
                 down_bytes += n;
+                last_activity_ms = std.time.milliTimestamp();
             }
         }
 
@@ -897,6 +912,11 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         if (now_ms - last_report_ms >= 1000) {
             relayFlushStats(&up_bytes, &down_bytes, false);
             last_report_ms = now_ms;
+        }
+
+        if (shouldReapIdleRelay(now_ms, last_activity_ms, relay_idle_reap_ms)) {
+            relayLog("idle reap after {}ms without traffic", .{now_ms - last_activity_ms});
+            break;
         }
 
         if (client_read_open and
@@ -957,6 +977,7 @@ fn drainTargetPending(
     target_read_open: *bool,
     client_write_shutdown: *bool,
     target_write_shutdown: *bool,
+    last_activity_ms: *i64,
 ) !void {
     while (target_stream.hasPendingRead()) {
         const n = target_stream.read(buf) catch |err| {
@@ -978,6 +999,7 @@ fn drainTargetPending(
         );
         if (!delivered) return;
         down_bytes.* += n;
+        last_activity_ms.* = std.time.milliTimestamp();
     }
 }
 
@@ -1031,6 +1053,21 @@ fn relayFlushStats(up_bytes: *usize, down_bytes: *usize, force: bool) void {
     relayLog("window traffic: up={}B down={}B", .{ up_bytes.*, down_bytes.* });
     up_bytes.* = 0;
     down_bytes.* = 0;
+}
+
+fn shouldReapIdleRelay(now_ms: i64, last_activity_ms: i64, idle_reap_ms: i64) bool {
+    return now_ms - last_activity_ms >= idle_reap_ms;
+}
+
+test "mixed connection worker uses bounded stack" {
+    try std.testing.expect(connection_task_stack_size <= 1024 * 1024);
+}
+
+test "relay idle reap uses long finite timeout" {
+    try std.testing.expect(relay_poll_timeout_ms > 0);
+    try std.testing.expect(relay_idle_reap_ms >= 10 * 60 * 1000);
+    try std.testing.expect(!shouldReapIdleRelay(10_000, 0, relay_idle_reap_ms));
+    try std.testing.expect(shouldReapIdleRelay(relay_idle_reap_ms, 0, relay_idle_reap_ms));
 }
 
 test "relay drains SS pending leftover without poll event" {
@@ -1117,8 +1154,8 @@ test "relay drains SS encrypted leftover without poll event" {
     relay_thread.join();
 }
 
-test "mixed relay keeps idle tunnels open by default" {
-    try std.testing.expectEqual(@as(i32, -1), relay_poll_timeout_ms);
+test "mixed relay keeps long-lived tunnels open past short idle gaps" {
+    try std.testing.expect(relay_idle_reap_ms > 30 * 1000);
 }
 
 test "relay forwards traffic in both directions (direct stream)" {

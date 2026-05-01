@@ -6,6 +6,21 @@
 
 ---
 
+## 临时任务：降低 zc daemon 长稳内存占用（2026-05-01）
+
+### HOTFIX-DAEMON-MEMORY-FOOTPRINT
+- 状态：DONE
+- 优先级：P1
+- 负责人：Codex
+- 输出：`src/proxy/mixed.zig`, `src/main.zig`, `README.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 对当前高内存现场完成采样，明确 Activity Monitor 中约 458MB memory/71 ports 的主要来源
+  - [x] 根因定位到具体代码路径，而不是停留在“macOS 统计口径”或“可能泄漏”的模糊结论
+  - [x] 修复后，daemon 在空闲/长稳/连接关闭后不再保留异常 VM_ALLOCATE footprint 或已关闭 socket FD
+  - [x] 新增回归测试覆盖根因路径，并通过相关 `zig test` / `zig build test`
+  - [x] 完成隔离端口 live 验证；不使用生产保留端口 `7899`
+- 备注：2026-05-01 09:1x +0800 进入 DOING。用户反馈 Activity Monitor 中 `zc` memory 约 458.3MB、threads 30、ports 71，直觉上不应这么高。初步现场采样：`ps -p 1695` 显示 RSS 仅约 6MB，但 `vmmap -summary 1695` 显示 Physical footprint 458.2MB，其中 `VM_ALLOCATE` 约 460.1MB 且 453.8MB swapped；`lsof -p 1695` 可见大量 `127.0.0.1:7899` CLOSED 与远端 FIN_WAIT_2 socket FD，说明除 footprint 统计口径外，还存在连接/FD 生命周期可疑点。根因收敛为 `src/proxy/mixed.zig` 两点叠加：1) mixed 每个连接创建一个 detached worker，Zig/macOS 默认 pthread stack 为 16MiB，少量长时间挂住的 relay 线程就会把 Activity Monitor footprint 顶到数百 MB；2) `relay_poll_timeout_ms = -1` 无限 `poll()`，在 macOS 某些 CLOSED/FIN_WAIT_2 组合下会错过 EOF/HUP，导致线程和 socket FD 长时间不退出。2026-05-01 09:4x +0800 完成修复：mixed worker 显式使用 512KiB stack；relay 改为 30s heartbeat + 15min idle reap，保留 active long-lived/WebSocket 流量，同时清理无流量陈旧隧道；README 同步默认运行行为变化。新增回归测试覆盖 bounded stack 与 finite idle reap。验证：使用项目要求 Zig 0.15.2，定向 `zig test ... --test-filter 'mixed connection workers'` 与 `--test-filter 'mixed relay uses finite idle reap'` 均通过；`zig build -Doptimize=ReleaseFast --summary all` 通过；`zig build test --summary all` 为 61/63 passed，剩余 2 个 daemon status 用例继续受本机现网 daemon 干扰（同既有备注），非本次回归。隔离 live 验证：在随机非生产端口 `26279/26280` 上启动 patched ReleaseFast 二进制并保持 20 条 idle CONNECT，`vmmap` 显示 Physical footprint 约 1.9MiB、Stack virtual 约 42.7MiB、VM_ALLOCATE 约 896KiB，相比现场 458MiB footprint 明显收敛。2026-05-01 09:5x +0800 完成自审：`git diff --check` 通过，风险点是极端长时间完全无流量的 TCP tunnel 会在 15min 后被回收；README 已明确该默认行为。
+
 ## 临时任务：修复 `zc start` 启动后立即掉回 stopped（2026-03-22）
 
 ### HOTFIX-START-COMPRESSED-RULE-PROVIDER-CRASH
