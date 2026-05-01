@@ -42,7 +42,7 @@ pub const Engine = struct {
 
     // Domain rules
     domain_set: std.StringHashMap(void),
-    domain_suffix_trie: TrieNode,
+    domain_suffix_set: std.StringHashMap(void),
     domain_keywords: std.ArrayList([]const u8),
 
     // IP rules
@@ -69,10 +69,7 @@ pub const Engine = struct {
             .rules = rules,
             .dns_client = if (dns_config) |cfg| dns.DnsClient.init(allocator, cfg) else null,
             .domain_set = std.StringHashMap(void).init(allocator),
-            .domain_suffix_trie = TrieNode{
-                .children = std.AutoHashMap(u8, *TrieNode).init(allocator),
-                .is_end = false,
-            },
+            .domain_suffix_set = std.StringHashMap(void).init(allocator),
             .domain_keywords = std.ArrayList([]const u8).empty,
             .ip_cidrs = std.ArrayList(IpCidr).empty,
             .ip_cidr6s = std.ArrayList(IpCidr6).empty,
@@ -137,7 +134,7 @@ pub const Engine = struct {
             client.deinit();
         }
         self.domain_set.deinit();
-        self.domain_suffix_trie.deinit(self.allocator);
+        self.domain_suffix_set.deinit();
         self.domain_keywords.deinit(self.allocator);
         self.ip_cidrs.deinit(self.allocator);
         self.ip_cidr6s.deinit(self.allocator);
@@ -402,74 +399,30 @@ pub const Engine = struct {
         return null;
     }
 
-    // ============ Domain Suffix Trie ============
+    // ============ Domain Suffix Index ============
 
     fn addDomainSuffix(self: *Engine, suffix: []const u8) !void {
-        var node = &self.domain_suffix_trie;
-        var i: usize = suffix.len;
-        while (i > 0) {
-            i -= 1;
-            const c = suffix[i];
-            const entry = try node.children.getOrPut(c);
-            if (!entry.found_existing) {
-                const new_node = try self.allocator.create(TrieNode);
-                new_node.* = TrieNode{
-                    .children = std.AutoHashMap(u8, *TrieNode).init(self.allocator),
-                    .is_end = false,
-                };
-                entry.value_ptr.* = new_node;
-            }
-            node = entry.value_ptr.*;
-        }
-        node.is_end = true;
+        try self.domain_suffix_set.put(suffix, {});
     }
 
     fn matchDomainSuffix(self: *const Engine, domain: []const u8) bool {
-        var node: ?*const TrieNode = &self.domain_suffix_trie;
-        var i: usize = domain.len;
-        while (i > 0) {
-            i -= 1;
-            const c = domain[i];
-            node = node.?.children.get(c) orelse return false;
-            if (node.?.is_end) return true;
-        }
-        return false;
+        return self.findMatchingSuffix(domain) != null;
     }
 
     fn findMatchingSuffix(self: *const Engine, domain: []const u8) ?[]const u8 {
-        var node: ?*const TrieNode = &self.domain_suffix_trie;
-        var i: usize = domain.len;
-        var match_start: usize = domain.len;
-        while (i > 0) {
-            i -= 1;
-            const c = domain[i];
-            node = node.?.children.get(c) orelse break;
-            if (node.?.is_end) {
-                match_start = i;
-            }
-        }
-        if (match_start < domain.len) {
-            return domain[match_start..];
+        var start: usize = 0;
+        while (start < domain.len) {
+            const candidate = domain[start..];
+            if (self.domain_suffix_set.contains(candidate)) return candidate;
+
+            const dot = std.mem.indexOfScalar(u8, candidate, '.') orelse break;
+            start += dot + 1;
         }
         return null;
     }
 };
 
 // ============ Data Structures ============
-
-const TrieNode = struct {
-    children: std.AutoHashMap(u8, *TrieNode),
-    is_end: bool,
-
-    fn deinit(self: *TrieNode, allocator: std.mem.Allocator) void {
-        var iter = self.children.valueIterator();
-        while (iter.next()) |child| {
-            child.*.deinit(allocator);
-            allocator.destroy(child.*);
-        }
-        self.children.deinit();
-    }
-};
 
 // IPv4 CIDR
 const IpCidr = struct {
@@ -591,6 +544,58 @@ fn parsePortRange(payload: []const u8, target: []const u8) !PortRange {
         .end = port,
         .target = target,
     };
+}
+
+fn appendTestRule(
+    allocator: std.mem.Allocator,
+    rules: *std.ArrayList(Rule),
+    rule_type: RuleType,
+    payload: []const u8,
+    target: []const u8,
+) !void {
+    try rules.append(allocator, .{
+        .rule_type = rule_type,
+        .payload = try allocator.dupe(u8, payload),
+        .target = try allocator.dupe(u8, target),
+    });
+}
+
+fn deinitTestRules(allocator: std.mem.Allocator, rules: *std.ArrayList(Rule)) void {
+    for (rules.items) |*rule| rule.deinit(allocator);
+    rules.deinit(allocator);
+}
+
+test "domain suffix index stores one hash entry per suffix rule" {
+    const allocator = std.testing.allocator;
+
+    var rules = std.ArrayList(Rule).empty;
+    defer deinitTestRules(allocator, &rules);
+    try appendTestRule(allocator, &rules, .domain_suffix, "example.com", "DIRECT");
+    try appendTestRule(allocator, &rules, .domain_suffix, "b.example.com", "PROXY");
+    try appendTestRule(allocator, &rules, .final, "", "DIRECT");
+
+    var engine = try Engine.init(allocator, &rules);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), engine.domain_suffix_set.count());
+    try std.testing.expect(engine.matchDomainSuffix("a.b.example.com"));
+    try std.testing.expectEqualStrings("b.example.com", engine.findMatchingSuffix("a.b.example.com").?);
+}
+
+test "domain suffix matching honors label boundaries" {
+    const allocator = std.testing.allocator;
+
+    var rules = std.ArrayList(Rule).empty;
+    defer deinitTestRules(allocator, &rules);
+    try appendTestRule(allocator, &rules, .domain_suffix, "example.com", "DIRECT");
+    try appendTestRule(allocator, &rules, .final, "", "PROXY");
+
+    var engine = try Engine.init(allocator, &rules);
+    defer engine.deinit();
+
+    try std.testing.expectEqualStrings("DIRECT", engine.match("www.example.com", true).?);
+    try std.testing.expectEqualStrings("DIRECT", engine.match("example.com", true).?);
+    try std.testing.expectEqualStrings("PROXY", engine.match("badexample.com", true).?);
 }
 
 // ============ Simplified Match Interface ============

@@ -110,7 +110,7 @@ pub const RuleProvider = struct {
 
     pub fn clearEntries(self: *RuleProvider, allocator: std.mem.Allocator) void {
         for (self.entries.items) |item| allocator.free(item);
-        self.entries.clearRetainingCapacity();
+        self.entries.clearAndFree(allocator);
     }
 };
 
@@ -718,6 +718,13 @@ pub fn prepareRuleProvidersForRuntimeWithPolicy(
     try syncRuleProviderFilesIfNeeded(allocator, cfg, config_path, sync_policy);
     try loadRuleProviderEntries(allocator, cfg, config_path);
     try expandRuleSetRules(allocator, cfg);
+    clearRuleProviderEntries(allocator, cfg);
+}
+
+fn clearRuleProviderEntries(allocator: std.mem.Allocator, cfg: *Config) void {
+    for (cfg.rule_providers.items) |*provider| {
+        provider.clearEntries(allocator);
+    }
 }
 
 fn syncRuleProviderFilesIfNeeded(
@@ -1698,6 +1705,7 @@ test "prepareRuleProvidersForRuntime expands rule-set rules" {
     try std.testing.expectEqualStrings("example.com", cfg.rules.items[0].payload);
     try std.testing.expectEqualStrings("DIRECT", cfg.rules.items[0].target);
     try std.testing.expectEqual(@as(RuleType, .final), cfg.rules.items[1].rule_type);
+    try std.testing.expectEqual(@as(usize, 0), cfg.rule_providers.items[0].entries.items.len);
 }
 
 test "prepareRuleProvidersForRuntime supports yaml payload style classical provider" {
@@ -1750,6 +1758,7 @@ test "prepareRuleProvidersForRuntime supports yaml payload style classical provi
     try std.testing.expectEqual(@as(RuleType, .process_name), cfg.rules.items[1].rule_type);
     try std.testing.expectEqualStrings("tailscaled", cfg.rules.items[1].payload);
     try std.testing.expectEqual(@as(RuleType, .final), cfg.rules.items[2].rule_type);
+    try std.testing.expectEqual(@as(usize, 0), cfg.rule_providers.items[0].entries.items.len);
 }
 
 test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cached provider files" {

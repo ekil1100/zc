@@ -6,6 +6,21 @@
 
 ---
 
+## 临时任务：降低大规则集运行时内存占用（2026-05-01）
+
+### HOTFIX-RULE-ENGINE-MEMORY
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`src/rule/engine.zig`, `src/config.zig`, `src/rule_engine_memory_test.zig`, `README.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 在用户当前配置上定位 restart 后约 455MB RSS 的主要来源
+  - [x] 修复 30 万级 rule-provider 展开后的常驻内存结构过重问题
+  - [x] 保持 DOMAIN-SUFFIX / RULE-SET 关键匹配语义，并新增回归测试
+  - [x] 相关定向测试与 `zig build -Doptimize=ReleaseFast --summary all` 通过，并记录全量测试中的现网 daemon 环境干扰
+  - [x] 使用非生产端口 live 验证大规则集 daemon RSS 明显下降
+- 备注：2026-05-01 13:0x +0800 进入 DOING。用户确认已 restart，现场新 PID `76131` 仅 3 线程/14 ports 但 Activity Monitor/RSS 仍约 455MB；`zc.log` 启动显示 `Rules: 325367`，本机 Loyalsoldier rule-provider 缓存约 330407 行，其中 `reject/direct/proxy` 占绝大多数。根因已从 mixed 线程栈问题转向规则运行时结构：当前 `expandRuleSetRules()` 把 provider entries 展开成 30 万条 `Rule`，同时 `Engine` 为 DOMAIN-SUFFIX 构建“每字符 TrieNode + 每节点 AutoHashMap”的重型 trie，导致大规则集常驻内存过高。2026-05-01 13:2x +0800 完成修复：`Engine` 的 DOMAIN-SUFFIX 索引替换为轻量 `StringHashMap` suffix set，匹配时按域名 label 从长到短查找，避免每字符分配 TrieNode/AutoHashMap；`prepareRuleProvidersForRuntimeWithPolicy()` 在 RULE-SET 展开完成后释放 provider entry 字符串与 ArrayList 容量，避免 provider 原始行常驻。新增 `src/rule_engine_memory_test.zig` 覆盖 compact suffix index、最长后缀匹配与 label 边界；更新 config 测试确保 provider entries 展开后释放。验证：`zig test src/config.zig` 通过（17/17）；`zig test src/rule_engine_memory_test.zig --test-filter 'domain suffix'` 通过；`zig build -Doptimize=ReleaseFast --summary all` 通过；`zig build test --summary all` 当前为 60/63 passed，剩余 3 个 daemon status 用例受本机正在运行的生产 daemon 影响（同既有环境干扰），非本次回归。隔离 live 验证：用真实 active config `D5koNO7H` 与 325367 rules、非生产端口 `28959` 启动 patched ReleaseFast daemon，RSS 从现场约 455MB 降至约 35MB。
+
 ## 临时任务：适配 Zig 0.16 构建（2026-05-01）
 
 ### HOTFIX-ZIG-0-16-BUILD

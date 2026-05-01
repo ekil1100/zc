@@ -38,6 +38,8 @@ zc status
 
 `zc` mixed proxy uses a bounded worker stack and reaps relay tunnels after 15 minutes without traffic. Active long-lived tunnels continue to stay open, while stale sockets no longer accumulate threads, ports, and macOS Activity Monitor memory footprint.
 
+`zc` keeps large `rule-provider` configurations lightweight by compiling `DOMAIN-SUFFIX` rules into a compact suffix set and releasing provider line buffers after expansion.
+
 `zc start` no longer crashes during startup when rule-provider downloads return compressed HTTP bodies; provider fetches now explicitly request `identity` encoding so daemon startup stays stable while refreshing rule-providers.
 
 ## License
