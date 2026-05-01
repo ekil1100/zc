@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../../compat.zig");
+const net = compat.net;
 const aead = @import("../../crypto/aead.zig");
 const socket_options = @import("../../socket_options.zig");
 pub const Address = aead.Address;
@@ -84,7 +85,7 @@ pub const ShadowsocksClient = struct {
         const salt_len = self.cipher_type.saltLen();
         var salt_buf: [32]u8 = undefined;
         const salt = salt_buf[0..salt_len];
-        std.crypto.random.bytes(salt);
+        compat.randomBytes(salt);
 
         std.debug.print("[SS] Client salt ({} bytes): ", .{salt_len});
         for (salt) |b| std.debug.print("{x:0>2}", .{b});
@@ -418,7 +419,7 @@ pub const ShadowsocksClient = struct {
 
 fn sleepBeforeRetry(attempt_index: usize, max_attempts: usize) void {
     if (attempt_index + 1 >= max_attempts) return;
-    std.Thread.sleep(ShadowsocksClient.retryBackoffMs(attempt_index) * std.time.ns_per_ms);
+    compat.sleepNs(ShadowsocksClient.retryBackoffMs(attempt_index) * std.time.ns_per_ms);
 }
 
 test "Shadowsocks client init" {

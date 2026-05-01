@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const config = @import("config.zig");
 
 /// 测试目标网站列表
@@ -53,19 +54,19 @@ pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, pr
     var first = true;
     if (effective.mixed) |p| {
         const listening = try isLocalPortListening(allocator, p);
-        try out.writer(allocator).print("{{\"label\":\"mixed\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
+        try out.print(allocator, "{{\"label\":\"mixed\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
         first = false;
     }
     if (effective.http) |p| {
         if (!first) try out.appendSlice(allocator, ",");
         const listening = try isLocalPortListening(allocator, p);
-        try out.writer(allocator).print("{{\"label\":\"http\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
+        try out.print(allocator, "{{\"label\":\"http\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
         first = false;
     }
     if (effective.socks) |p| {
         if (!first) try out.appendSlice(allocator, ",");
         const listening = try isLocalPortListening(allocator, p);
-        try out.writer(allocator).print("{{\"label\":\"socks\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
+        try out.print(allocator, "{{\"label\":\"socks\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
     }
 
     try out.appendSlice(allocator, "]}}\n");
@@ -159,7 +160,7 @@ fn notListeningSuggestedCommand() []const u8 {
 }
 
 fn isLocalPortListening(allocator: std.mem.Allocator, port: u16) !bool {
-    const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return false;
+    const stream = compat.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return false;
     stream.close();
     return true;
 }
@@ -276,9 +277,9 @@ fn testUrlLatency(allocator: std.mem.Allocator, url: []const u8, proxy_url: []co
     ok: u64,
     failed: FailureReason,
 } {
-    const start_time = std.time.milliTimestamp();
+    const start_time = compat.milliTimestamp();
     const curl_result = runCurl(allocator, proxy_url, url, true);
-    const end_time = std.time.milliTimestamp();
+    const end_time = compat.milliTimestamp();
 
     return switch (curl_result) {
         .ok => |out| blk: {
@@ -305,15 +306,12 @@ fn runCurl(allocator: std.mem.Allocator, proxy_url: []const u8, url: []const u8,
         return .{ .failed = .unknown };
     };
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = args.items,
-    }) catch {
+    const result = compat.childRun(allocator, args.items, 1024 * 1024) catch {
         return .{ .failed = .unknown };
     };
     defer allocator.free(result.stderr);
 
-    if (result.term == .Exited and result.term.Exited == 0) {
+    if (result.term == .exited and result.term.exited == 0) {
         // 检查 HTTP 状态码
         const output = result.stdout;
         if (output.len >= 3) {
@@ -326,7 +324,7 @@ fn runCurl(allocator: std.mem.Allocator, proxy_url: []const u8, url: []const u8,
     }
 
     allocator.free(result.stdout);
-    const exit_code: u8 = if (result.term == .Exited) result.term.Exited else 255;
+    const exit_code: u8 = if (result.term == .exited) result.term.exited else 255;
     return .{ .failed = classifyCurlFailure(exit_code, result.stderr) };
 }
 

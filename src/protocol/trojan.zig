@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const crypto = std.crypto;
 const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
@@ -127,24 +128,34 @@ pub const Client = struct {
         conn.stream_writer = conn.stream.writer(&conn.socket_write_buffer);
         conn.tls_client = undefined;
 
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        compat.randomBytes(&entropy);
+        const now = std.Io.Timestamp.now(compat.io(), .real);
+        var root_bundle: Certificate.Bundle = .empty;
+        defer root_bundle.deinit(self.allocator);
+        var ca_lock: std.Io.RwLock = .init;
         var options = tls.Client.Options{
             .host = .{ .explicit = self.tlsHost() },
             .ca = .{ .no_verification = {} },
             .allow_truncation_attacks = true,
             .read_buffer = &conn.tls_read_buffer,
             .write_buffer = &conn.tls_write_buffer,
+            .entropy = &entropy,
+            .realtime_now = now,
         };
 
         if (!self.config.skip_cert_verify) {
-            conn.ca_bundle = Certificate.Bundle{};
-            if (conn.ca_bundle) |*ca_bundle| {
-                try ca_bundle.rescan(self.allocator);
-                options.ca = .{ .bundle = ca_bundle.* };
-            }
+            try root_bundle.rescan(self.allocator, compat.io(), now);
+            options.ca = .{ .bundle = .{
+                .gpa = self.allocator,
+                .io = compat.io(),
+                .lock = &ca_lock,
+                .bundle = &root_bundle,
+            } };
         }
 
         conn.tls_client = tls.Client.init(
-            conn.stream_reader.interface(),
+            &conn.stream_reader.interface,
             &conn.stream_writer.interface,
             options,
         ) catch |err| {

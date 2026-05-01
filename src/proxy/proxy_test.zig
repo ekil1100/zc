@@ -1,6 +1,7 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const testing = std.testing;
-const net = std.net;
+const net = compat.net;
 
 // HTTP 代理测试
 test "HTTP proxy request parsing" {

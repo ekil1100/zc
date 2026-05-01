@@ -1,6 +1,7 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const builtin = @import("builtin");
-const net = std.net;
+const net = compat.net;
 
 pub fn configureConnectedSocket(fd: std.posix.fd_t) !void {
     if (comptime builtin.os.tag == .macos) {

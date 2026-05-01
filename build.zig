@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    test_mod.link_libc = true;
     test_mod.addOptions("build_options", options);
 
     const exe_unit_tests = b.addTest(.{
@@ -57,6 +58,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    fuzz_mod.link_libc = true;
 
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_mod,

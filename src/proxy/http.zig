@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const Engine = @import("../rule/engine.zig").Engine;
 const outbound = @import("outbound/manager.zig");
 const OutboundManager = outbound.OutboundManager;
@@ -146,7 +147,7 @@ fn relayHttp(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         _ = try std.posix.poll(&poll_fds, -1);
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
-            const n = try std.posix.read(client_stream.handle, &buf);
+            const n = try compat.posixRead(client_stream.handle, &buf);
             if (n == 0) break;
             try target_stream.write(buf[0..n]);
         }
@@ -156,7 +157,7 @@ fn relayHttp(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
-                written += try std.posix.write(client_stream.handle, buf[written..n]);
+                written += try compat.posixWrite(client_stream.handle, buf[written..n]);
             }
         }
 

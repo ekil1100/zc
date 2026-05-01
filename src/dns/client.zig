@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const protocol = @import("protocol.zig");
 
 /// DNS 客户端配置
@@ -39,14 +40,14 @@ pub const DnsClient = struct {
     allocator: std.mem.Allocator,
     config: DnsConfig,
     cache: std.StringHashMap(CacheEntry),
-    cache_mutex: std.Thread.Mutex,
+    cache_mutex: std.Io.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, config: DnsConfig) DnsClient {
         return .{
             .allocator = allocator,
             .config = config,
             .cache = std.StringHashMap(CacheEntry).init(allocator),
-            .cache_mutex = .{},
+            .cache_mutex = .init,
         };
     }
 
@@ -62,11 +63,11 @@ pub const DnsClient = struct {
     pub fn resolve(self: *DnsClient, domain: []const u8) ![]net.Address {
         // Check cache
         if (self.config.enable_cache) {
-            self.cache_mutex.lock();
-            defer self.cache_mutex.unlock();
+            self.cache_mutex.lockUncancelable(compat.io());
+            defer self.cache_mutex.unlock(compat.io());
 
             if (self.cache.get(domain)) |entry| {
-                const now = std.time.timestamp();
+                const now = compat.timestamp();
                 if (entry.expires_at > now) {
                     const result = try self.allocator.alloc(net.Address, entry.addresses.items.len);
                     @memcpy(result, entry.addresses.items);
@@ -83,12 +84,12 @@ pub const DnsClient = struct {
 
         // Add to cache
         if (self.config.enable_cache) {
-            self.cache_mutex.lock();
-            defer self.cache_mutex.unlock();
+            self.cache_mutex.lockUncancelable(compat.io());
+            defer self.cache_mutex.unlock(compat.io());
 
             var entry = CacheEntry{
                 .addresses = std.ArrayList(net.Address).empty,
-                .expires_at = std.time.timestamp() + self.config.cache_ttl,
+                .expires_at = compat.timestamp() + self.config.cache_ttl,
             };
             try entry.addresses.appendSlice(self.allocator, addresses);
             try self.cache.put(try self.allocator.dupe(u8, domain), entry);
@@ -128,8 +129,8 @@ pub const DnsClient = struct {
 
         if (addrs.addrs.len == 0) return error.HostNotFound;
 
-        const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-        defer std.posix.close(sock);
+        const sock = try compat.udpSocket4();
+        defer compat.posixClose(sock);
 
         // Set timeout
         const timeout = std.posix.timeval{
@@ -151,12 +152,11 @@ pub const DnsClient = struct {
             @as(*const [4]u8, @ptrCast(&addrs.addrs[0].in.sa.addr)).*,
             self.config.port
         );
-        const addr_bytes = std.mem.asBytes(&addr.in.sa);
-        _ = try std.posix.sendto(sock, query_data, 0, @ptrCast(addr_bytes), @sizeOf(@TypeOf(addr.in.sa)));
+        _ = try compat.posixSendTo(sock, query_data, 0, @ptrCast(&addr.in.sa), @sizeOf(@TypeOf(addr.in.sa)));
 
         // Receive response
         var resp_buf: [512]u8 = undefined;
-        const recv_len = try std.posix.recv(sock, &resp_buf, 0);
+        const recv_len = try compat.posixRecv(sock, &resp_buf, 0);
 
         // Parse response
         var response = protocol.Message.init(self.allocator);
@@ -212,18 +212,18 @@ pub const DnsClient = struct {
         // Send length-prefixed message
         const len = @as(u16, @intCast(query_data.len));
         const len_bytes = [_]u8{@intCast(len >> 8), @intCast(len & 0xFF)};
-        _ = try std.posix.write(sock, &len_bytes);
-        _ = try std.posix.write(sock, query_data);
+        _ = try compat.posixWrite(sock, &len_bytes);
+        _ = try compat.posixWrite(sock, query_data);
 
         // Read length
         var len_buf: [2]u8 = undefined;
-        _ = try std.posix.read(sock, &len_buf);
+        _ = try compat.posixRead(sock, &len_buf);
         const resp_len = (@as(u16, len_buf[0]) << 8) | len_buf[1];
 
         // Read response
         const resp_data = try self.allocator.alloc(u8, resp_len);
         defer self.allocator.free(resp_data);
-        _ = try std.posix.read(sock, resp_data);
+        _ = try compat.posixRead(sock, resp_data);
 
         // Parse response
         var response = protocol.Message.init(self.allocator);
@@ -263,10 +263,10 @@ pub const DnsClient = struct {
 
     /// 清除过期缓存
     pub fn cleanupCache(self: *DnsClient) void {
-        self.cache_mutex.lock();
-        defer self.cache_mutex.unlock();
+        self.cache_mutex.lockUncancelable(compat.io());
+        defer self.cache_mutex.unlock(compat.io());
 
-        const now = std.time.timestamp();
+        const now = compat.timestamp();
         var iter = self.cache.iterator();
         var to_remove = std.ArrayList([]const u8).empty;
         defer to_remove.deinit();

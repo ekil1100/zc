@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("compat.zig");
+const net = compat.net;
 const posix = std.posix;
 const Config = @import("config.zig").Config;
 const Proxy = @import("config.zig").Proxy;
@@ -133,7 +134,7 @@ pub const TuiManager = struct {
         manager.updateTerminalSize();
 
         // 检查 stdin 是否为终端
-        const is_terminal = posix.isatty(posix.STDIN_FILENO);
+        const is_terminal = std.c.isatty(posix.STDIN_FILENO) != 0;
 
         if (is_terminal) {
             // 保存原始终端设置
@@ -167,7 +168,7 @@ pub const TuiManager = struct {
     }
 
     pub fn deinit(self: *TuiManager) void {
-        const is_terminal = posix.isatty(posix.STDIN_FILENO);
+        const is_terminal = std.c.isatty(posix.STDIN_FILENO) != 0;
 
         if (is_terminal) {
             disableMouse() catch {};
@@ -193,7 +194,7 @@ pub const TuiManager = struct {
 
     /// 运行 TUI 主循环
     pub fn run(self: *TuiManager) !void {
-        const is_terminal = posix.isatty(posix.STDIN_FILENO);
+        const is_terminal = std.c.isatty(posix.STDIN_FILENO) != 0;
 
         if (!is_terminal) {
             std.debug.print("Error: TUI requires a terminal. Please run in an interactive terminal.\n", .{});
@@ -209,9 +210,9 @@ pub const TuiManager = struct {
         last_term_size[1] = self.state.term_height;
 
         // 设置 stdin 为非阻塞模式
-        const stdin_flags = posix.fcntl(posix.STDIN_FILENO, posix.F.GETFL, 0) catch 0;
+        const stdin_flags = std.c.fcntl(posix.STDIN_FILENO, std.c.F.GETFL, @as(c_int, 0));
         const new_flags = stdin_flags | 4;
-        _ = posix.fcntl(posix.STDIN_FILENO, posix.F.SETFL, new_flags) catch stdin_flags;
+        _ = std.c.fcntl(posix.STDIN_FILENO, std.c.F.SETFL, @as(c_int, @intCast(new_flags)));
 
         while (self.state.running) {
             // 只有终端大小变化时才更新
@@ -227,7 +228,7 @@ pub const TuiManager = struct {
             }
 
             // 读取输入 (非阻塞)
-            const n = posix.read(posix.STDIN_FILENO, &buf) catch 0;
+            const n = compat.posixRead(posix.STDIN_FILENO, &buf) catch 0;
             if (n > 0) {
                 try self.handleInput(buf[0..n]);
                 self.state.dirty = true;
@@ -243,11 +244,11 @@ pub const TuiManager = struct {
             }
 
             // 降低 CPU 使用率，16ms 间隔 (约 60fps)
-            std.Thread.sleep(16 * std.time.ns_per_ms);
+            compat.sleepNs(16 * std.time.ns_per_ms);
         }
 
         // 恢复 stdin 模式
-        const reset_result = posix.fcntl(posix.STDIN_FILENO, posix.F.SETFL, stdin_flags) catch 0;
+        const reset_result = std.c.fcntl(posix.STDIN_FILENO, std.c.F.SETFL, @as(c_int, @intCast(stdin_flags)));
         _ = reset_result;
 
         showCursor() catch {};
@@ -639,7 +640,7 @@ pub const TuiManager = struct {
     const ProxyProto = enum { http, socks5 };
 
     fn curlLatency(server: []const u8, port: u16, url: []const u8, proto: ProxyProto, timeout_ms: i64) i64 {
-        const start = std.time.milliTimestamp();
+        const start = compat.milliTimestamp();
 
         // 使用固定 allocator，因为这是同步调用
         const allocator = std.heap.page_allocator;
@@ -659,19 +660,16 @@ pub const TuiManager = struct {
 
         args.appendSlice(allocator, &.{ "curl", "--silent", "--show-error", "-x", proxy_url, "--max-time", timeout_str, "-o", "/dev/null", "-w", "%{http_code}", url }) catch return -1;
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = args.items,
-        }) catch return -1;
+        const result = compat.childRun(allocator, args.items, 1024 * 1024) catch return -1;
         defer {
             allocator.free(result.stdout);
             allocator.free(result.stderr);
         }
 
-        const end = std.time.milliTimestamp();
+        const end = compat.milliTimestamp();
         const latency = end - start;
 
-        if (result.term == .Exited and result.term.Exited == 0) {
+        if (result.term == .exited and result.term.exited == 0) {
             // 检查 HTTP 状态码
             if (result.stdout.len >= 3) {
                 const status = result.stdout[result.stdout.len - 3 ..];
@@ -690,7 +688,7 @@ pub const TuiManager = struct {
     }
 
     pub fn addConnection(self: *TuiManager, target_host: []const u8, target_port: u16, proxy_name: []const u8) !u64 {
-        const id = std.crypto.random.int(u64);
+        const id = std.mem.readInt(u64, blk: { var b: [8]u8 = undefined; compat.randomBytes(&b); break :blk &b; }, .little);
         const host = try self.allocator.dupe(u8, target_host);
         const proxy = try self.allocator.dupe(u8, proxy_name);
 
@@ -701,7 +699,7 @@ pub const TuiManager = struct {
             .proxy_name = proxy,
             .upload_bytes = 0,
             .download_bytes = 0,
-            .start_time = std.time.milliTimestamp(),
+            .start_time = compat.milliTimestamp(),
         });
 
         self.state.dirty = true;
@@ -1052,7 +1050,7 @@ pub const TuiManager = struct {
             try printPadded(down_str, 8);
 
             // Duration
-            const duration = std.time.milliTimestamp() - conn.start_time;
+            const duration = compat.milliTimestamp() - conn.start_time;
             const dur_str = try formatDuration(duration);
             defer self.allocator.free(dur_str);
             try setFgColor(theme.text);

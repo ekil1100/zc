@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 
 /// DNS 查询类型
 pub const QueryType = enum(u16) {
@@ -295,7 +296,7 @@ pub fn createAQuery(allocator: std.mem.Allocator, domain: []const u8) !Message {
 
     // Random ID
     var buf: [2]u8 = undefined;
-    std.crypto.random.bytes(&buf);
+    compat.randomBytes(&buf);
     msg.id = std.mem.readInt(u16, &buf, .big);
 
     // Standard query

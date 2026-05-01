@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const config_mod = @import("config.zig");
 
 /// 单个配置的元数据
@@ -70,14 +71,14 @@ pub const MetaData = struct {
 pub fn getConfigsDir(allocator: std.mem.Allocator) !?[]const u8 {
     const config_dir = try config_mod.getDefaultConfigDir(allocator) orelse return null;
     defer allocator.free(config_dir);
-    return try std.fs.path.join(allocator, &.{ config_dir, "configs" });
+    return try compat.fs.path.join(allocator, &.{ config_dir, "configs" });
 }
 
 /// 获取 meta.json 文件路径
 pub fn getMetaPath(allocator: std.mem.Allocator) !?[]const u8 {
     const config_dir = try config_mod.getDefaultConfigDir(allocator) orelse return null;
     defer allocator.free(config_dir);
-    return try std.fs.path.join(allocator, &.{ config_dir, "meta.json" });
+    return try compat.fs.path.join(allocator, &.{ config_dir, "meta.json" });
 }
 
 /// 确保 configs/ 目录存在
@@ -89,10 +90,10 @@ pub fn ensureConfigsDir(allocator: std.mem.Allocator) !void {
     const config_dir = try config_mod.getDefaultConfigDir(allocator) orelse return;
     defer allocator.free(config_dir);
 
-    std.fs.makeDirAbsolute(config_dir) catch |err| {
+    compat.fs.makeDirAbsolute(config_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
-    std.fs.makeDirAbsolute(configs_dir) catch |err| {
+    compat.fs.makeDirAbsolute(configs_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 }
@@ -105,7 +106,7 @@ pub fn load(allocator: std.mem.Allocator) !MetaData {
     const meta_path = try getMetaPath(allocator) orelse return meta;
     defer allocator.free(meta_path);
 
-    const file = std.fs.openFileAbsolute(meta_path, .{}) catch |err| {
+    const file = compat.fs.openFileAbsolute(meta_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             // meta.json 不存在，扫描 configs/ 补全
             try syncFromDisk(allocator, &meta);
@@ -113,9 +114,9 @@ pub fn load(allocator: std.mem.Allocator) !MetaData {
         }
         return err;
     };
-    defer file.close();
+    defer file.close(compat.io());
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const content = try compat.fileReadToEndAlloc(file, allocator, 1024 * 1024);
     defer allocator.free(content);
 
     if (content.len == 0) {
@@ -228,9 +229,9 @@ pub fn save(allocator: std.mem.Allocator, meta: *const MetaData) !void {
     }
     try buf.appendSlice(allocator, "\n  }\n}\n");
 
-    const file = try std.fs.createFileAbsolute(meta_path, .{});
-    defer file.close();
-    try file.writeAll(buf.items);
+    const file = try compat.fs.createFileAbsolute(meta_path, .{});
+    defer file.close(compat.io());
+    try compat.fileWriteAll(file, buf.items);
 }
 
 /// 扫描 configs/ 目录，为不在 meta 中的 .yaml 文件创建空 entry
@@ -238,14 +239,14 @@ pub fn syncFromDisk(allocator: std.mem.Allocator, meta: *MetaData) !void {
     const configs_dir = try getConfigsDir(allocator) orelse return;
     defer allocator.free(configs_dir);
 
-    var dir = std.fs.openDirAbsolute(configs_dir, .{ .iterate = true }) catch |err| {
+    var dir = compat.fs.openDirAbsolute(configs_dir, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
-    defer dir.close();
+    defer dir.close(compat.io());
 
     var dir_it = dir.iterate();
-    while (try dir_it.next()) |entry| {
+    while (try dir_it.next(compat.io())) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".yaml")) {
             const key = entry.name[0 .. entry.name.len - 5]; // 去掉 .yaml
             if (!meta.configs.contains(key)) {
@@ -270,7 +271,7 @@ pub fn generateKey(allocator: std.mem.Allocator) ![]const u8 {
     var i: usize = 0;
     while (i < buf.len) {
         var b: [1]u8 = undefined;
-        std.crypto.random.bytes(&b);
+        compat.randomBytes(&b);
         // rejection sampling: 248 可被 62 整除，避免 modulo bias
         if (b[0] >= 248) continue;
         buf[i] = charset[b[0] % charset.len];

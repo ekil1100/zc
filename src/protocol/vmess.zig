@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const crypto = std.crypto;
 const socket_options = @import("../socket_options.zig");
 
@@ -84,8 +85,8 @@ pub const Client = struct {
     /// VMess 握手
     fn handshake(self: *Client, stream: *net.Stream, target_host: []const u8, target_port: u16) !void {
         // 生成请求密钥和 IV
-        crypto.random.bytes(&self.request_key);
-        crypto.random.bytes(&self.request_iv);
+        compat.randomBytes(&self.request_key);
+        compat.randomBytes(&self.request_iv);
 
         // 生成响应密钥和 IV (基于请求密钥/IV)
         deriveResponseKeyIv(&self.request_key, &self.request_iv, &self.response_key, &self.response_iv);
@@ -104,7 +105,7 @@ pub const Client = struct {
         try header.appendSlice(self.allocator, &self.uuid);
 
         // Timestamp (8 bytes, big endian) - VMess 使用 UTC 时间的秒数
-        const timestamp = @as(u64, @intCast(std.time.timestamp()));
+        const timestamp = @as(u64, @intCast(compat.timestamp()));
         const ts_bytes = std.mem.toBytes(timestamp);
         try header.appendSlice(self.allocator, &ts_bytes);
 
@@ -135,7 +136,7 @@ pub const Client = struct {
 
         // Build authentication header (16 bytes random)
         var auth: [16]u8 = undefined;
-        crypto.random.bytes(&auth);
+        compat.randomBytes(&auth);
 
         // Send: auth(16) + encrypted_length(2) + encrypted_header
         const header_len = @as(u16, @intCast(encrypted_header.len));

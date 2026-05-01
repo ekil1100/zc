@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const constants = @import("constants.zig");
@@ -71,8 +72,8 @@ fn getLockFilePath(allocator: std.mem.Allocator) ![]const u8 {
 
 fn getRuntimeFilePath(allocator: std.mem.Allocator, basename: []const u8, fallback: []const u8) ![]const u8 {
     // 优先使用 XDG_RUNTIME_DIR，否则使用 /tmp
-    if (std.process.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR")) |runtime_dir| {
-        const path = try std.fs.path.join(allocator, &.{ runtime_dir, basename });
+    if (compat.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR")) |runtime_dir| {
+        const path = try compat.fs.path.join(allocator, &.{ runtime_dir, basename });
         allocator.free(runtime_dir);
         return path;
     } else |_| {
@@ -82,24 +83,24 @@ fn getRuntimeFilePath(allocator: std.mem.Allocator, basename: []const u8, fallba
 
 /// 获取日志文件路径
 pub fn getLogFilePath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+    const home = compat.getEnvVarOwned(allocator, "HOME") catch {
         return try allocator.dupe(u8, LOG_FILE);
     };
     defer allocator.free(home);
 
     // 使用 ~/.local/share/zc/zc.log
-    const log_dir = try std.fs.path.join(allocator, &.{ home, ".local/share/zc" });
+    const log_dir = try compat.fs.path.join(allocator, &.{ home, ".local/share/zc" });
     defer allocator.free(log_dir);
 
     // 创建目录
-    std.fs.makeDirAbsolute(log_dir) catch |err| {
+    compat.fs.makeDirAbsolute(log_dir) catch |err| {
         if (err != error.PathAlreadyExists) {
             // 回退到 /tmp
             return try allocator.dupe(u8, LOG_FILE);
         }
     };
 
-    return try std.fs.path.join(allocator, &.{ log_dir, "zc.log" });
+    return try compat.fs.path.join(allocator, &.{ log_dir, "zc.log" });
 }
 
 /// 读取 PID 文件
@@ -111,14 +112,14 @@ pub fn readPid(allocator: std.mem.Allocator) !?i32 {
 }
 
 fn readPidAtPath(pid_file: []const u8) !?i32 {
-    const file = std.fs.openFileAbsolute(pid_file, .{}) catch |err| {
+    const file = compat.fs.openFileAbsolute(pid_file, .{}) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
-    defer file.close();
+    defer file.close(compat.io());
 
     var buf: [32]u8 = undefined;
-    const n = try file.read(&buf);
+    const n = try compat.fileRead(file, &buf);
     if (n == 0) return null;
 
     const pid_str = std.mem.trim(u8, buf[0..n], " \t\n\r");
@@ -134,12 +135,12 @@ pub fn writePid(allocator: std.mem.Allocator, pid: i32) !void {
 }
 
 fn writePidAtPath(pid_file: []const u8, pid: i32) !void {
-    const file = try std.fs.createFileAbsolute(pid_file, .{});
-    defer file.close();
+    const file = try compat.fs.createFileAbsolute(pid_file, .{});
+    defer file.close(compat.io());
 
     var buf: [32]u8 = undefined;
     const pid_str = try std.fmt.bufPrint(&buf, "{d}\n", .{pid});
-    try file.writeAll(pid_str);
+    try compat.fileWriteAll(file, pid_str);
 }
 
 /// 删除 PID 文件
@@ -150,11 +151,11 @@ pub fn removePidFile(allocator: std.mem.Allocator) void {
 }
 
 fn removePidFileAtPath(pid_file: []const u8) void {
-    std.fs.deleteFileAbsolute(pid_file) catch {};
+    compat.fs.deleteFileAbsolute(pid_file) catch {};
 }
 
 fn isDaemonBinaryPath(argv0: []const u8) bool {
-    return std.mem.eql(u8, std.fs.path.basename(argv0), "zc");
+    return std.mem.eql(u8, compat.fs.path.basename(argv0), "zc");
 }
 
 fn commandLineLooksLikeDaemon(command_line: []const u8) bool {
@@ -186,10 +187,10 @@ fn cmdlineBufferLooksLikeDaemon(cmdline: []const u8) bool {
 fn linuxPidLooksLikeDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
     var path_buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return false;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    defer file.close();
+    const file = compat.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close(compat.io());
 
-    const cmdline = file.readToEndAlloc(allocator, command_probe_max_output_bytes) catch return false;
+    const cmdline = compat.fileReadToEndAlloc(file, allocator, command_probe_max_output_bytes) catch return false;
     defer allocator.free(cmdline);
 
     return cmdlineBufferLooksLikeDaemon(cmdline);
@@ -198,22 +199,18 @@ fn linuxPidLooksLikeDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
 fn psPidLooksLikeDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
     var pid_buf: [32]u8 = undefined;
     const pid_text = try std.fmt.bufPrint(&pid_buf, "{d}", .{pid});
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "ps", "-ww", "-o", "command=", "-p", pid_text },
-        .max_output_bytes = command_probe_max_output_bytes,
-    }) catch return false;
+    const result = compat.childRun(allocator, &.{ "ps", "-ww", "-o", "command=", "-p", pid_text }, command_probe_max_output_bytes) catch return false;
     defer {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
     }
-    if (result.term.Exited != 0) return false;
+    if (result.term.exited != 0) return false;
 
     return commandLineLooksLikeDaemon(result.stdout);
 }
 
 fn pidMatchesRunningDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
-    std.posix.kill(pid, 0) catch return false;
+    std.posix.kill(pid, @enumFromInt(0)) catch return false;
 
     return switch (builtin.os.tag) {
         .linux => try linuxPidLooksLikeDaemon(allocator, pid),
@@ -222,31 +219,23 @@ fn pidMatchesRunningDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
 }
 
 fn discoverDaemonPid(allocator: std.mem.Allocator) !?i32 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "ps", "-ww", "-axo", "pid=,comm=,args=" },
-        .max_output_bytes = process_scan_max_output_bytes,
-    }) catch return null;
+    const result = compat.childRun(allocator, &.{ "ps", "-ww", "-axo", "pid=,comm=,args=" }, process_scan_max_output_bytes) catch return null;
     defer {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
     }
-    if (result.term.Exited != 0) return null;
+    if (result.term.exited != 0) return null;
 
     if (parseDaemonPidCandidateFromPsOutput(result.stdout)) |pid| {
         if (try pidMatchesRunningDaemon(allocator, pid)) return pid;
     }
 
-    const pgrep_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "pgrep", "-f", "--", "--daemon-run" },
-        .max_output_bytes = process_scan_max_output_bytes,
-    }) catch return null;
+    const pgrep_result = compat.childRun(allocator, &.{ "pgrep", "-f", "--", "--daemon-run" }, process_scan_max_output_bytes) catch return null;
     defer {
         allocator.free(pgrep_result.stdout);
         allocator.free(pgrep_result.stderr);
     }
-    if (pgrep_result.term.Exited != 0) return null;
+    if (pgrep_result.term.exited != 0) return null;
 
     var lines = std.mem.tokenizeScalar(u8, pgrep_result.stdout, '\n');
     while (lines.next()) |line| {
@@ -269,14 +258,14 @@ fn parseDaemonPidCandidateFromPsOutput(output: []const u8) ?i32 {
         const pid = std.fmt.parseInt(i32, pid_text, 10) catch continue;
         if (pid == std.c.getpid()) continue;
 
-        const after_pid = std.mem.trimLeft(u8, trimmed[pid_text.len..], " \t");
+        const after_pid = std.mem.trimStart(u8, trimmed[pid_text.len..], " \t");
         var after_pid_parts = std.mem.tokenizeAny(u8, after_pid, " \t");
         const _comm_text = after_pid_parts.next() orelse continue;
-        const args = std.mem.trimLeft(u8, after_pid[_comm_text.len..], " \t");
+        const args = std.mem.trimStart(u8, after_pid[_comm_text.len..], " \t");
         var arg_parts = std.mem.tokenizeAny(u8, args, " \t");
         const argv0 = arg_parts.next() orelse continue;
 
-        if (!std.mem.eql(u8, std.fs.path.basename(argv0), "zc")) continue;
+        if (!std.mem.eql(u8, compat.fs.path.basename(argv0), "zc")) continue;
         if (std.mem.indexOf(u8, args, "--daemon-run") == null) continue;
         return pid;
     }
@@ -357,19 +346,20 @@ fn waitForTrackedRunningPid(allocator: std.mem.Allocator) !?i32 {
     var attempt: usize = 0;
     while (attempt < startup_poll_attempts) : (attempt += 1) {
         if (try readTrackedPid(allocator)) |pid| return pid;
-        std.Thread.sleep(startup_poll_interval_ms * std.time.ns_per_ms);
+        compat.sleepNs(startup_poll_interval_ms * std.time.ns_per_ms);
     }
     return null;
 }
 
-fn duplicateWithoutCloexec(file: std.fs.File) !std.fs.File {
-    const dup_fd = try std.posix.dup(file.handle);
-    file.close();
-    return .{ .handle = dup_fd };
+fn duplicateWithoutCloexec(file: compat.fs.File) !compat.fs.File {
+    const dup_fd = std.c.dup(file.handle);
+    if (dup_fd < 0) return error.Unexpected;
+    file.close(compat.io());
+    return .{ .handle = dup_fd, .flags = file.flags };
 }
 
-fn acquireDaemonLockFileAtPath(lock_file_path: []const u8) !std.fs.File {
-    const lock_file = std.fs.createFileAbsolute(lock_file_path, .{
+fn acquireDaemonLockFileAtPath(lock_file_path: []const u8) !compat.fs.File {
+    const lock_file = compat.fs.createFileAbsolute(lock_file_path, .{
         .read = true,
         .truncate = false,
         .lock = .exclusive,
@@ -378,11 +368,11 @@ fn acquireDaemonLockFileAtPath(lock_file_path: []const u8) !std.fs.File {
         error.WouldBlock => return error.DaemonAlreadyRunning,
         else => return err,
     };
-    errdefer lock_file.close();
+    errdefer lock_file.close(compat.io());
     return try duplicateWithoutCloexec(lock_file);
 }
 
-fn acquireDaemonLockFile(allocator: std.mem.Allocator) !std.fs.File {
+fn acquireDaemonLockFile(allocator: std.mem.Allocator) !compat.fs.File {
     const lock_file_path = try getLockFilePath(allocator);
     defer allocator.free(lock_file_path);
     return try acquireDaemonLockFileAtPath(lock_file_path);
@@ -393,7 +383,7 @@ fn isDaemonLockHeldAtPath(lock_file_path: []const u8) !bool {
         error.DaemonAlreadyRunning => return true,
         else => return err,
     };
-    lock_file.close();
+    lock_file.close(compat.io());
     return false;
 }
 
@@ -474,15 +464,12 @@ fn getDaemonUptime(pid: ?i32) !?i64 {
     const p = pid orelse return null;
     var buf: [256]u8 = undefined;
     const cmd = try std.fmt.bufPrint(&buf, "ps -o etimes= -p {d}", .{p});
-    const result = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &.{ "sh", "-c", cmd },
-    }) catch return null;
+    const result = compat.childRun(std.heap.page_allocator, &.{ "sh", "-c", cmd }, command_probe_max_output_bytes) catch return null;
     defer {
         std.heap.page_allocator.free(result.stdout);
         std.heap.page_allocator.free(result.stderr);
     }
-    if (result.term.Exited != 0) return null;
+    if (result.term.exited != 0) return null;
     const trimmed = std.mem.trim(u8, result.stdout, " \t\n\r");
     return std.fmt.parseInt(i64, trimmed, 10) catch null;
 }
@@ -595,15 +582,15 @@ fn formatStatusJson(allocator: std.mem.Allocator, snapshot: *const StatusSnapsho
 
     try out.appendSlice(allocator, "{\"ok\":true,\"data\":{");
     try out.appendSlice(allocator, "\"action\":\"status\"");
-    try out.writer(allocator).print(",\"state\":\"{s}\"", .{snapshot.state});
+    try out.print(allocator, ",\"state\":\"{s}\"", .{snapshot.state});
     if (snapshot.detail) |detail| {
-        try out.writer(allocator).print(",\"detail\":\"{s}\"", .{detail});
+        try out.print(allocator, ",\"detail\":\"{s}\"", .{detail});
     }
     if (snapshot.pid) |pid| {
-        try out.writer(allocator).print(",\"pid\":{d}", .{pid});
+        try out.print(allocator, ",\"pid\":{d}", .{pid});
     }
     if (snapshot.uptime_seconds) |uptime_seconds| {
-        try out.writer(allocator).print(",\"uptime_seconds\":{d}", .{uptime_seconds});
+        try out.print(allocator, ",\"uptime_seconds\":{d}", .{uptime_seconds});
     } else {
         try out.appendSlice(allocator, ",\"uptime_seconds\":null");
     }
@@ -708,7 +695,7 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
         },
         else => return err,
     };
-    errdefer lock_file.close();
+    errdefer lock_file.close(compat.io());
 
     // 兼容旧版本 daemon：即使没有 lock，也不要在已有可追踪 pid 存活时再启动一个实例。
     // 这里不能用 isRunning()，因为当前 start 进程自己已经拿到了 lock。
@@ -718,10 +705,12 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
     }
 
     // Fork 子进程
-    const pid = std.posix.fork() catch |err| {
-        std.debug.print("Failed to fork: {s}\n", .{@errorName(err)});
-        return err;
-    };
+    const fork_result = std.c.fork();
+    if (fork_result < 0) {
+        std.debug.print("Failed to fork\n", .{});
+        return error.Unexpected;
+    }
+    const pid: std.posix.pid_t = @intCast(fork_result);
 
     if (pid > 0) {
         // 父进程：轮询最多 2s，每 200ms 检查子进程是否存活
@@ -730,10 +719,10 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
 
         var i: usize = 0;
         while (i < startup_poll_attempts) : (i += 1) { // 10 × 200ms = 2s
-            std.Thread.sleep(startup_poll_interval_ms * std.time.ns_per_ms);
+            compat.sleepNs(startup_poll_interval_ms * std.time.ns_per_ms);
 
             // 检查子进程是否还活着
-            std.posix.kill(pid, 0) catch {
+            std.posix.kill(pid, @enumFromInt(0)) catch {
                 // 子进程已退出，启动失败
                 if (json_output) {
                     printCliError(json_output, "START_FAILED", "daemon exited during startup", "check `zc log --no-follow` for details");
@@ -753,7 +742,7 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
 
         // 子进程在 2s 后仍然存活，视为启动成功
         try writePid(allocator, pid);
-        lock_file.close();
+        lock_file.close(compat.io());
 
         if (json_output) {
             printCliOk(json_output, "start", "running", null, pid);
@@ -772,31 +761,32 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
 
     // 子进程：成为守护进程
     // 创建新会话
-    _ = std.posix.setsid() catch {};
+    _ = std.c.setsid();
 
     // 重定向标准输出/错误到日志文件
     const log_path = try getLogFilePath(allocator);
     defer allocator.free(log_path);
 
-    const log_fd = std.posix.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch |err| {
+    const log_file = compat.fs.createFileAbsolute(log_path, .{ .truncate = false }) catch |err| {
         std.debug.print("Failed to open log file: {s}\n", .{@errorName(err)});
         return err;
     };
+    const log_fd = log_file.handle;
 
     // 重定向 stdout 和 stderr
-    std.posix.dup2(log_fd, std.posix.STDOUT_FILENO) catch {};
-    std.posix.dup2(log_fd, std.posix.STDERR_FILENO) catch {};
-    std.posix.close(log_fd);
+    _ = std.c.dup2(log_fd, std.c.STDOUT_FILENO);
+    _ = std.c.dup2(log_fd, std.c.STDERR_FILENO);
+    compat.posixClose(log_fd);
 
     // 关闭 stdin
-    const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0) catch null;
-    if (dev_null) |fd| {
-        std.posix.dup2(fd, std.posix.STDIN_FILENO) catch {};
-        std.posix.close(fd);
+    const dev_null = compat.fs.openFileAbsolute("/dev/null", .{}) catch null;
+    if (dev_null) |file| {
+        _ = std.c.dup2(file.handle, std.c.STDIN_FILENO);
+        file.close(compat.io());
     }
 
     // 获取当前可执行文件路径
-    const exe_path = std.fs.selfExePathAlloc(allocator) catch |err| {
+    const exe_path = compat.fs.selfExePathAlloc(allocator) catch |err| {
         std.debug.print("Failed to get exe path: {s}\n", .{@errorName(err)});
         return err;
     };
@@ -836,15 +826,15 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
     argv[argv_list.items.len] = null;
 
     // 执行新的进程
-    const err = std.posix.execvpeZ(
+    _ = std.c.execve(
         argv[0].?,
         @ptrCast(argv.ptr),
         @ptrCast(std.c.environ),
     );
 
     // execve 不应该返回，如果返回说明出错了
-    std.debug.print("Failed to exec: {s}\n", .{@errorName(err)});
-    return err;
+    std.debug.print("Failed to exec\n", .{});
+    return error.ExecFailed;
 }
 
 /// 停止守护进程
@@ -874,8 +864,8 @@ pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
     var stopped = false;
     var i: usize = 0;
     while (i < 20) : (i += 1) { // 最多等待 2 秒
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-        _ = std.posix.kill(pid, 0) catch {
+        compat.sleepNs(100 * std.time.ns_per_ms);
+        _ = std.posix.kill(pid, @enumFromInt(0)) catch {
             stopped = true;
             break;
         };
@@ -884,7 +874,7 @@ pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
     if (!stopped) {
         // 强制停止
         std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        compat.sleepNs(100 * std.time.ns_per_ms);
     }
 
     // 删除 PID 文件
@@ -956,14 +946,14 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
     const log_path = try getLogFilePath(allocator);
     defer allocator.free(log_path);
 
-    const file = std.fs.openFileAbsolute(log_path, .{}) catch |err| {
+    const file = compat.fs.openFileAbsolute(log_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("No log file found\n", .{});
             return;
         }
         return err;
     };
-    defer file.close();
+    defer file.close(compat.io());
 
     // 首先显示最后 N 行
     const n = lines orelse 50;
@@ -976,23 +966,23 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
         defer carry.deinit(allocator);
 
         // 获取当前文件位置
-        const stat = try file.stat();
+        const stat = try file.stat(compat.io());
         var last_pos = stat.size;
 
         while (true) {
-            std.Thread.sleep(500 * std.time.ns_per_ms); // 500ms 刷新一次
+            compat.sleepNs(500 * std.time.ns_per_ms); // 500ms 刷新一次
 
             // 重新获取文件大小
-            const new_stat = try file.stat();
+            const new_stat = try file.stat(compat.io());
             const new_size = new_stat.size;
 
             if (new_size > last_pos) {
                 // 有新内容，读取并输出
-                try file.seekTo(last_pos);
+                try compat.fileSeekTo(file, last_pos);
 
                 var buffer: [4096]u8 = undefined;
                 while (true) {
-                    const bytes_read = try file.read(&buffer);
+                    const bytes_read = try compat.fileRead(file, &buffer);
                     if (bytes_read == 0) break;
                     try printTimestampedChunk(allocator, buffer[0..bytes_read], &carry);
                 }
@@ -1005,7 +995,7 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
                     carry.clearRetainingCapacity();
                 }
                 std.debug.print("\n--- Log file rotated, restarting from beginning ---\n", .{});
-                try file.seekTo(0);
+                try compat.fileSeekTo(file, 0);
                 last_pos = 0;
             }
         }
@@ -1013,8 +1003,8 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
 }
 
 /// 打印文件最后 N 行
-fn printLastNLines(allocator: std.mem.Allocator, file: std.fs.File, n: usize) !void {
-    const file_size = (try file.stat()).size;
+fn printLastNLines(allocator: std.mem.Allocator, file: compat.fs.File, n: usize) !void {
+    const file_size = (try file.stat(compat.io())).size;
     const max_size = 1024 * 1024 * 10; // 10MB max
     const read_size = @min(file_size, max_size);
 
@@ -1025,8 +1015,8 @@ fn printLastNLines(allocator: std.mem.Allocator, file: std.fs.File, n: usize) !v
     const content = try allocator.alloc(u8, read_size);
     defer allocator.free(content);
 
-    try file.seekTo(file_size - read_size);
-    _ = try file.readAll(content);
+    try compat.fileSeekTo(file, file_size - read_size);
+    _ = try compat.fileReadAll(file, content);
 
     // 找到最后 N 行的起始位置
     var line_count: usize = 0;
@@ -1071,7 +1061,7 @@ fn printTimestampedChunk(allocator: std.mem.Allocator, chunk: []const u8, carry:
 }
 
 fn printTimestampedLine(line: []const u8) void {
-    const ts = std.time.timestamp();
+    const ts = compat.timestamp();
     std.debug.print("[{d}] {s}\n", .{ ts, line });
 }
 
@@ -1087,27 +1077,33 @@ fn testDiscoverRecoveredDaemon(_: std.mem.Allocator) !?i32 {
     return 4321;
 }
 
+fn testTmpRootAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(compat.io(), allocator);
+    defer allocator.free(cwd);
+    return try compat.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+}
+
 test "daemon lock prevents duplicate acquisition and can be reacquired after close" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try testTmpRootAlloc(allocator, &tmp);
     defer allocator.free(tmp_root);
 
-    const lock_path = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    const lock_path = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
     defer allocator.free(lock_path);
 
-    var first_lock: ?std.fs.File = try acquireDaemonLockFileAtPath(lock_path);
-    defer if (first_lock) |file| file.close();
+    var first_lock: ?compat.fs.File = try acquireDaemonLockFileAtPath(lock_path);
+    defer if (first_lock) |file| file.close(compat.io());
 
     try std.testing.expectError(error.DaemonAlreadyRunning, acquireDaemonLockFileAtPath(lock_path));
 
-    first_lock.?.close();
+    first_lock.?.close(compat.io());
     first_lock = null;
 
     var second_lock = try acquireDaemonLockFileAtPath(lock_path);
-    defer second_lock.close();
+    defer second_lock.close(compat.io());
 }
 
 test "collectStatusSnapshot reports stopped state without pid file" {
@@ -1115,14 +1111,14 @@ test "collectStatusSnapshot reports stopped state without pid file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try testTmpRootAlloc(allocator, &tmp);
     defer allocator.free(tmp_root);
 
-    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    const pid_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
     defer allocator.free(pid_file);
-    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    const lock_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
     defer allocator.free(lock_file);
-    const log_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
+    const log_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
     defer allocator.free(log_file);
 
     var snapshot = try collectStatusSnapshotAtPaths(
@@ -1149,14 +1145,14 @@ test "collectStatusSnapshot reports stale pid file and removes it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try testTmpRootAlloc(allocator, &tmp);
     defer allocator.free(tmp_root);
 
-    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    const pid_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
     defer allocator.free(pid_file);
-    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    const lock_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
     defer allocator.free(lock_file);
-    const log_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
+    const log_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
     defer allocator.free(log_file);
 
     try writePidAtPath(pid_file, 999999);
@@ -1174,7 +1170,7 @@ test "collectStatusSnapshot reports stale pid file and removes it" {
     try std.testing.expectEqualStrings("stale_pid_file", snapshot.detail.?);
     try std.testing.expectEqual(@as(i32, 999999), snapshot.pid.?);
     try std.testing.expect(snapshot.uptime_seconds == null);
-    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(snapshot.pid_file, .{}));
+    try std.testing.expectError(error.FileNotFound, compat.fs.openFileAbsolute(snapshot.pid_file, .{}));
 }
 
 test "inspectRuntime ignores stale live pid when it is not a zc daemon" {
@@ -1182,12 +1178,12 @@ test "inspectRuntime ignores stale live pid when it is not a zc daemon" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try testTmpRootAlloc(allocator, &tmp);
     defer allocator.free(tmp_root);
 
-    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    const pid_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
     defer allocator.free(pid_file);
-    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    const lock_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
     defer allocator.free(lock_file);
 
     try writePidAtPath(pid_file, std.c.getpid());
@@ -1201,7 +1197,7 @@ test "inspectRuntime ignores stale live pid when it is not a zc daemon" {
     try std.testing.expect(!runtime.lock_held);
     try std.testing.expectEqualStrings("stale_pid_file", runtime.detail.?);
     try std.testing.expectEqual(std.c.getpid(), runtime.stale_pid.?);
-    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(pid_file, .{}));
+    try std.testing.expectError(error.FileNotFound, compat.fs.openFileAbsolute(pid_file, .{}));
 }
 
 test "inspectRuntime replaces stale pid file with discovered daemon pid" {
@@ -1209,12 +1205,12 @@ test "inspectRuntime replaces stale pid file with discovered daemon pid" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try testTmpRootAlloc(allocator, &tmp);
     defer allocator.free(tmp_root);
 
-    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    const pid_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
     defer allocator.free(pid_file);
-    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    const lock_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
     defer allocator.free(lock_file);
 
     try writePidAtPath(pid_file, 999999);
@@ -1236,18 +1232,18 @@ test "collectStatusSnapshot reports running when lock is held but pid is untrack
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try testTmpRootAlloc(allocator, &tmp);
     defer allocator.free(tmp_root);
 
-    const pid_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
+    const pid_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
     defer allocator.free(pid_file);
-    const lock_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
+    const lock_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
     defer allocator.free(lock_file);
-    const log_file = try std.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
+    const log_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.log" });
     defer allocator.free(log_file);
 
     var held_lock = try acquireDaemonLockFileAtPath(lock_file);
-    defer held_lock.close();
+    defer held_lock.close(compat.io());
 
     var snapshot = try collectStatusSnapshotAtPaths(
         allocator,

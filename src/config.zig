@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const yaml = @import("util/yaml.zig");
 const meta = @import("meta.zig");
 
@@ -193,10 +194,10 @@ pub const Config = struct {
 
 /// 从文件加载配置
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try compat.fs.cwd().openFile(path, .{});
+    defer file.close(compat.io());
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const content = try compat.fileReadToEndAlloc(file, allocator, 1024 * 1024);
     defer allocator.free(content);
 
     return try parse(allocator, content);
@@ -629,8 +630,8 @@ fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
         if (meta_data.active) |active_key| {
             const yaml_name = try std.fmt.allocPrint(allocator, "{s}.yaml", .{active_key});
             defer allocator.free(yaml_name);
-            const full_path = try std.fs.path.join(allocator, &.{ configs_dir, yaml_name });
-            if (std.fs.accessAbsolute(full_path, .{})) |_| {
+            const full_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_name });
+            if (compat.fs.accessAbsolute(full_path, .{})) |_| {
                 return full_path;
             } else |_| {
                 allocator.free(full_path);
@@ -638,8 +639,8 @@ fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
         }
 
         // 1b. 尝试 configs/ 目录下的 config.yaml
-        const configs_default = try std.fs.path.join(allocator, &.{ configs_dir, "config.yaml" });
-        if (std.fs.accessAbsolute(configs_default, .{})) |_| {
+        const configs_default = try compat.fs.path.join(allocator, &.{ configs_dir, "config.yaml" });
+        if (compat.fs.accessAbsolute(configs_default, .{})) |_| {
             return configs_default;
         } else |_| {
             allocator.free(configs_default);
@@ -647,26 +648,26 @@ fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
     }
 
     // 2. 回退到旧路径
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    const home = compat.getEnvVarOwned(allocator, "HOME") catch return null;
     defer allocator.free(home);
 
     // 旧的 config.yaml（符号链接或直接文件）
-    const old_config = try std.fs.path.join(allocator, &.{ home, ".config/zc/config.yaml" });
-    if (std.fs.accessAbsolute(old_config, .{})) |_| {
+    const old_config = try compat.fs.path.join(allocator, &.{ home, ".config/zc/config.yaml" });
+    if (compat.fs.accessAbsolute(old_config, .{})) |_| {
         return old_config;
     } else |_| {
         allocator.free(old_config);
     }
 
-    const old_config2 = try std.fs.path.join(allocator, &.{ home, ".zc/config.yaml" });
-    if (std.fs.accessAbsolute(old_config2, .{})) |_| {
+    const old_config2 = try compat.fs.path.join(allocator, &.{ home, ".zc/config.yaml" });
+    if (compat.fs.accessAbsolute(old_config2, .{})) |_| {
         return old_config2;
     } else |_| {
         allocator.free(old_config2);
     }
 
     // 检查当前目录的 config.yaml
-    std.fs.cwd().access("config.yaml", .{}) catch return null;
+    compat.fs.cwd().access("config.yaml", .{}) catch return null;
     return try allocator.dupe(u8, "config.yaml");
 }
 
@@ -729,7 +730,7 @@ fn syncRuleProviderFilesIfNeeded(
         const resolved_path = try resolveRuleProviderPath(allocator, provider.path, config_path);
         defer allocator.free(resolved_path);
 
-        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
+        const file = compat.fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 if (provider.url) |url| {
                     try downloadRuleProviderFile(allocator, provider.name, url, resolved_path, true);
@@ -739,11 +740,11 @@ fn syncRuleProviderFilesIfNeeded(
             },
             else => return err,
         };
-        defer file.close();
-        const stat = try file.stat();
+        defer file.close(compat.io());
+        const stat = try file.stat(compat.io());
 
         if (provider.url) |url| {
-            if (sync_policy == .eager and isRuleProviderRefreshDue(stat.mtime, provider.interval)) {
+            if (sync_policy == .eager and isRuleProviderRefreshDue(stat.mtime.nanoseconds, provider.interval)) {
                 downloadRuleProviderFile(allocator, provider.name, url, resolved_path, false) catch |err| {
                     std.debug.print(
                         "rule-provider refresh failed (using cached file): name={s} url={s} path={s} error={s}\n",
@@ -779,8 +780,8 @@ fn downloadRuleProviderFile(
         return error.RuleProviderDownloadFailed;
     }
 
-    const parent = std.fs.path.dirname(resolved_path) orelse return error.RuleProviderDownloadFailed;
-    std.fs.cwd().makePath(parent) catch |err| {
+    const parent = compat.fs.path.dirname(resolved_path) orelse return error.RuleProviderDownloadFailed;
+    compat.fs.cwd().makePath(parent) catch |err| {
         std.debug.print(
             "rule-provider download failed: name={s} url={s} path={s} mkdir_error={s}\n",
             .{ provider_name, url, resolved_path, @errorName(err) },
@@ -788,15 +789,15 @@ fn downloadRuleProviderFile(
         return error.RuleProviderDownloadFailed;
     };
 
-    const file = std.fs.createFileAbsolute(resolved_path, .{}) catch |err| {
+    const file = compat.fs.createFileAbsolute(resolved_path, .{}) catch |err| {
         std.debug.print(
             "rule-provider download failed: name={s} url={s} path={s} file_error={s}\n",
             .{ provider_name, url, resolved_path, @errorName(err) },
         );
         return error.RuleProviderDownloadFailed;
     };
-    defer file.close();
-    file.writeAll(result.body) catch |err| {
+    defer file.close(compat.io());
+    compat.fileWriteAll(file, result.body) catch |err| {
         std.debug.print(
             "rule-provider download failed: name={s} url={s} path={s} write_error={s}\n",
             .{ provider_name, url, resolved_path, @errorName(err) },
@@ -813,7 +814,7 @@ fn downloadRuleProviderFile(
 
 fn isRuleProviderRefreshDue(mtime: i128, interval_seconds: u32) bool {
     if (interval_seconds == 0) return true;
-    const now_sec = std.time.timestamp();
+    const now_sec = compat.timestamp();
     const mtime_sec = statTimestampToSeconds(mtime);
     if (mtime_sec <= 0) return true;
     return now_sec - mtime_sec >= @as(i64, @intCast(interval_seconds));
@@ -837,15 +838,15 @@ fn loadRuleProviderEntries(
         const resolved_path = try resolveRuleProviderPath(allocator, provider.path, config_path);
         defer allocator.free(resolved_path);
 
-        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch |err| {
+        const file = compat.fs.openFileAbsolute(resolved_path, .{}) catch |err| {
             switch (err) {
                 error.FileNotFound => return error.RuleProviderFileNotFound,
                 else => return err,
             }
         };
-        defer file.close();
+        defer file.close(compat.io());
 
-        const content = try file.readToEndAlloc(allocator, 8 * 1024 * 1024);
+        const content = try compat.fileReadToEndAlloc(file, allocator, 8 * 1024 * 1024);
         defer allocator.free(content);
 
         var it = std.mem.splitScalar(u8, content, '\n');
@@ -1028,18 +1029,18 @@ fn resolveRuleProviderPath(
     provider_path: []const u8,
     config_path: ?[]const u8,
 ) ![]u8 {
-    if (std.fs.path.isAbsolute(provider_path)) {
-        return try std.fs.path.resolve(allocator, &.{provider_path});
+    if (compat.fs.path.isAbsolute(provider_path)) {
+        return try compat.fs.path.resolve(allocator, &.{provider_path});
     }
 
     if (config_path) |cfg_path| {
-        const dir = std.fs.path.dirname(cfg_path) orelse ".";
-        return try std.fs.path.resolve(allocator, &.{ dir, provider_path });
+        const dir = compat.fs.path.dirname(cfg_path) orelse ".";
+        return try compat.fs.path.resolve(allocator, &.{ dir, provider_path });
     }
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(compat.io(), allocator);
     defer allocator.free(cwd);
-    return try std.fs.path.resolve(allocator, &.{ cwd, provider_path });
+    return try compat.fs.path.resolve(allocator, &.{ cwd, provider_path });
 }
 
 fn findRuleProvider(cfg: *const Config, name: []const u8) ?*const RuleProvider {
@@ -1060,9 +1061,9 @@ fn cloneRule(allocator: std.mem.Allocator, rule: Rule) !Rule {
 
 /// 获取默认配置目录路径 (~/.config/zc)
 pub fn getDefaultConfigDir(allocator: std.mem.Allocator) !?[]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    const home = compat.getEnvVarOwned(allocator, "HOME") catch return null;
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".config/zc" });
+    return try compat.fs.path.join(allocator, &.{ home, ".config/zc" });
 }
 
 /// 下载结果结构体
@@ -1074,7 +1075,7 @@ pub const DownloadResult = struct {
 /// fetchConfig 内部函数：执行 HTTP 请求获取配置内容
 /// 可独立测试，验证 User-Agent 等头部设置
 pub fn fetchConfig(allocator: std.mem.Allocator, url: []const u8) !DownloadResult {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1132,12 +1133,12 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     const yaml_filename = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
     defer allocator.free(yaml_filename);
 
-    const config_path = try std.fs.path.join(allocator, &.{ configs_dir, yaml_filename });
+    const config_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_filename });
     defer allocator.free(config_path);
 
-    const file = try std.fs.createFileAbsolute(config_path, .{});
-    defer file.close();
-    try file.writeAll(fetch_result.body);
+    const file = try compat.fs.createFileAbsolute(config_path, .{});
+    defer file.close(compat.io());
+    try compat.fileWriteAll(file, fetch_result.body);
 
     // 解析 URL 参数并写入 meta.json
     var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
@@ -1229,7 +1230,7 @@ pub fn getPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator) 
 pub fn getOverrideScriptsDir(allocator: std.mem.Allocator) !?[]const u8 {
     const config_dir = try getDefaultConfigDir(allocator) orelse return null;
     defer allocator.free(config_dir);
-    return try std.fs.path.join(allocator, &.{ config_dir, "override" });
+    return try compat.fs.path.join(allocator, &.{ config_dir, "override" });
 }
 
 /// 为当前配置复制 override 脚本到托管目录，返回托管脚本绝对路径
@@ -1240,16 +1241,16 @@ pub fn copyOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_p
     const abs_script = try toAbsoluteNormalizedPath(allocator, script_path);
     defer allocator.free(abs_script);
 
-    var file = std.fs.openFileAbsolute(abs_script, .{}) catch |err| switch (err) {
+    var file = compat.fs.openFileAbsolute(abs_script, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
-    file.close();
+    file.close(compat.io());
 
     const overrides_dir = (try getOverrideScriptsDir(allocator)) orelse return error.NoConfigDir;
     defer allocator.free(overrides_dir);
 
-    std.fs.cwd().makePath(overrides_dir) catch |err| switch (err) {
+    compat.fs.cwd().makePath(overrides_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -1257,7 +1258,7 @@ pub fn copyOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_p
     const managed_path = try makeManagedOverrideScriptPathForKey(allocator, key, abs_script, overrides_dir);
     errdefer allocator.free(managed_path);
 
-    try std.fs.copyFileAbsolute(abs_script, managed_path, .{});
+    try compat.fs.copyFileAbsolute(abs_script, managed_path, .{});
     return managed_path;
 }
 
@@ -1269,11 +1270,11 @@ pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, s
     const abs_script = try toAbsoluteNormalizedPath(allocator, script_path);
     defer allocator.free(abs_script);
 
-    var file = std.fs.openFileAbsolute(abs_script, .{}) catch |err| switch (err) {
+    var file = compat.fs.openFileAbsolute(abs_script, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
-    file.close();
+    file.close(compat.io());
 
     const overrides_dir = (try getOverrideScriptsDir(allocator)) orelse return error.NoConfigDir;
     defer allocator.free(overrides_dir);
@@ -1285,7 +1286,7 @@ pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, s
     if (cm.override_script) |old| {
         const should_delete = isManagedOverrideScriptPath(allocator, old, overrides_dir) catch false;
         if (should_delete and !std.mem.eql(u8, old, abs_script)) {
-            std.fs.deleteFileAbsolute(old) catch |err| switch (err) {
+            compat.fs.deleteFileAbsolute(old) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
             };
@@ -1301,7 +1302,7 @@ pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, s
 pub fn setPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) ![]u8 {
     const managed_path = try copyOverrideScriptForCurrentConfig(allocator, script_path);
     errdefer {
-        std.fs.deleteFileAbsolute(managed_path) catch {};
+        compat.fs.deleteFileAbsolute(managed_path) catch {};
         allocator.free(managed_path);
     }
 
@@ -1325,7 +1326,7 @@ pub fn clearPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator
     if (cm.override_script) |old| {
         const should_delete = isManagedOverrideScriptPath(allocator, old, overrides_dir) catch false;
         if (should_delete) {
-            std.fs.deleteFileAbsolute(old) catch |err| switch (err) {
+            compat.fs.deleteFileAbsolute(old) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
             };
@@ -1357,11 +1358,11 @@ fn makeManagedOverrideScriptPathForKey(
     source_abs_path: []const u8,
     overrides_dir: []const u8,
 ) ![]u8 {
-    const ext = std.fs.path.extension(source_abs_path);
-    const ts = std.time.nanoTimestamp();
+    const ext = compat.fs.path.extension(source_abs_path);
+    const ts = compat.nanoTimestamp();
     const filename = try std.fmt.allocPrint(allocator, "{s}-{d}{s}", .{ key, ts, ext });
     defer allocator.free(filename);
-    return try std.fs.path.join(allocator, &.{ overrides_dir, filename });
+    return try compat.fs.path.join(allocator, &.{ overrides_dir, filename });
 }
 
 fn isManagedOverrideScriptPath(
@@ -1369,9 +1370,9 @@ fn isManagedOverrideScriptPath(
     script_path: []const u8,
     overrides_dir: []const u8,
 ) !bool {
-    const resolved_script = try std.fs.path.resolve(allocator, &.{script_path});
+    const resolved_script = try compat.fs.path.resolve(allocator, &.{script_path});
     defer allocator.free(resolved_script);
-    const resolved_overrides = try std.fs.path.resolve(allocator, &.{overrides_dir});
+    const resolved_overrides = try compat.fs.path.resolve(allocator, &.{overrides_dir});
     defer allocator.free(resolved_overrides);
     return isPathWithinDir(resolved_script, resolved_overrides);
 }
@@ -1392,7 +1393,7 @@ fn inferConfigKeyFromPathWithConfigsDir(allocator: std.mem.Allocator, path: []co
 
     if (!isPathWithinDir(resolved_path, resolved_configs_dir)) return null;
 
-    const basename = std.fs.path.basename(resolved_path);
+    const basename = compat.fs.path.basename(resolved_path);
     if (!std.mem.endsWith(u8, basename, ".yaml")) return null;
     if (basename.len <= ".yaml".len) return null;
 
@@ -1402,24 +1403,24 @@ fn inferConfigKeyFromPathWithConfigsDir(allocator: std.mem.Allocator, path: []co
 fn isPathWithinDir(path: []const u8, dir: []const u8) bool {
     if (!std.mem.startsWith(u8, path, dir)) return false;
     if (path.len == dir.len) return true;
-    return path[dir.len] == std.fs.path.sep;
+    return path[dir.len] == compat.fs.path.sep;
 }
 
 fn toAbsoluteNormalizedPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(path)) {
-        return std.fs.path.resolve(allocator, &.{path});
+    if (compat.fs.path.isAbsolute(path)) {
+        return compat.fs.path.resolve(allocator, &.{path});
     }
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(compat.io(), allocator);
     defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &.{ cwd, path });
+    return compat.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
 fn toResolvedPathForKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const abs_path = try toAbsoluteNormalizedPath(allocator, path);
     defer allocator.free(abs_path);
 
-    return std.fs.realpathAlloc(allocator, abs_path) catch |err| switch (err) {
+    return compat.fs.realpathAlloc(allocator, abs_path) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => try allocator.dupe(u8, abs_path),
     };
@@ -1478,12 +1479,12 @@ pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8) !?[]c
     const yaml_filename = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
     defer allocator.free(yaml_filename);
 
-    const config_path = try std.fs.path.join(allocator, &.{ configs_dir, yaml_filename });
+    const config_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_filename });
     defer allocator.free(config_path);
 
-    const file = try std.fs.createFileAbsolute(config_path, .{});
-    defer file.close();
-    try file.writeAll(fetch_result.body);
+    const file = try compat.fs.createFileAbsolute(config_path, .{});
+    defer file.close(compat.io());
+    try compat.fileWriteAll(file, fetch_result.body);
 
     std.debug.print("Config updated: {s}\n", .{config_path});
 
@@ -1563,10 +1564,10 @@ pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8) !void {
         const yaml_name = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
         defer allocator.free(yaml_name);
 
-        const file_path = try std.fs.path.join(allocator, &.{ configs_dir, yaml_name });
+        const file_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_name });
         defer allocator.free(file_path);
 
-        std.fs.accessAbsolute(file_path, .{}) catch {
+        compat.fs.accessAbsolute(file_path, .{}) catch {
             std.debug.print("Config not found: {s}\n", .{key});
             std.debug.print("Use 'zc config ls' to see available configs\n", .{});
             return error.ConfigNotFound;
@@ -1647,6 +1648,12 @@ test "config parsing supports rule-providers and rule-set" {
     try std.testing.expectEqualStrings("directset", cfg.rules.items[0].payload);
 }
 
+fn testTmpPathAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir, name: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(compat.io(), allocator);
+    defer allocator.free(cwd);
+    return try compat.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..], name });
+}
+
 test "prepareRuleProvidersForRuntime expands rule-set rules" {
     const allocator = std.testing.allocator;
 
@@ -1654,12 +1661,12 @@ test "prepareRuleProvidersForRuntime expands rule-set rules" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("direct.txt", .{});
-        defer f.close();
-        try f.writeAll("example.com\n");
+        const f = try tmp.dir.createFile(compat.io(), "direct.txt", .{});
+        defer f.close(compat.io());
+        try compat.fileWriteAll(f, "example.com\n");
     }
 
-    const provider_abs = try tmp.dir.realpathAlloc(allocator, "direct.txt");
+    const provider_abs = try testTmpPathAlloc(allocator, &tmp, "direct.txt");
     defer allocator.free(provider_abs);
 
     const yaml_config = try std.fmt.allocPrint(allocator,
@@ -1700,9 +1707,9 @@ test "prepareRuleProvidersForRuntime supports yaml payload style classical provi
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("applications.txt", .{});
-        defer f.close();
-        try f.writeAll(
+        const f = try tmp.dir.createFile(compat.io(), "applications.txt", .{});
+        defer f.close(compat.io());
+        try compat.fileWriteAll(f,
             \\payload:
             \\  - PROCESS-NAME,tailscale
             \\  - PROCESS-NAME,tailscaled
@@ -1710,7 +1717,7 @@ test "prepareRuleProvidersForRuntime supports yaml payload style classical provi
         );
     }
 
-    const provider_abs = try tmp.dir.realpathAlloc(allocator, "applications.txt");
+    const provider_abs = try testTmpPathAlloc(allocator, &tmp, "applications.txt");
     defer allocator.free(provider_abs);
 
     const yaml_config = try std.fmt.allocPrint(allocator,
@@ -1752,21 +1759,24 @@ test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cache
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("direct.txt", .{});
-        defer f.close();
-        try f.writeAll("example.com\n");
+        const f = try tmp.dir.createFile(compat.io(), "direct.txt", .{});
+        defer f.close(compat.io());
+        try compat.fileWriteAll(f, "example.com\n");
     }
 
-    var provider_file = try tmp.dir.openFile("direct.txt", .{ .mode = .read_write });
-    defer provider_file.close();
-    const stale_ns = (@as(i128, @intCast(std.time.timestamp())) - 10) * std.time.ns_per_s;
-    try provider_file.updateTimes(stale_ns, stale_ns);
+    var provider_file = try tmp.dir.openFile(compat.io(), "direct.txt", .{ .mode = .read_write });
+    defer provider_file.close(compat.io());
+    const stale_ns = (@as(i128, @intCast(compat.timestamp())) - 10) * std.time.ns_per_s;
+    try provider_file.setTimestamps(compat.io(), .{
+        .access_timestamp = .{ .new = .{ .nanoseconds = @intCast(stale_ns) } },
+        .modify_timestamp = .{ .new = .{ .nanoseconds = @intCast(stale_ns) } },
+    });
 
-    var server = try (try std.net.Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    var server = try (try compat.net.Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     var hits = std.atomic.Value(u32).init(0);
     const response_body = "example.net\n";
     const thread = try std.Thread.spawn(.{}, struct {
-        fn run(http_server: *std.net.Server, request_hits: *std.atomic.Value(u32), body: []const u8) void {
+        fn run(http_server: *compat.net.Server, request_hits: *std.atomic.Value(u32), body: []const u8) void {
             while (true) {
                 var conn = http_server.accept() catch return;
                 defer conn.stream.close();
@@ -1790,7 +1800,7 @@ test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cache
         thread.join();
     }
 
-    const provider_abs = try tmp.dir.realpathAlloc(allocator, "direct.txt");
+    const provider_abs = try testTmpPathAlloc(allocator, &tmp, "direct.txt");
     defer allocator.free(provider_abs);
     const provider_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/direct.txt", .{server.listen_address.getPort()});
     defer allocator.free(provider_url);
@@ -1826,7 +1836,7 @@ test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cache
     try std.testing.expectEqualStrings("example.com", cfg.rules.items[0].payload);
     try std.testing.expectEqualStrings("DIRECT", cfg.rules.items[0].target);
 
-    const cached = try tmp.dir.readFileAlloc(allocator, "direct.txt", 1024);
+    const cached = try tmp.dir.readFileAlloc(compat.io(), "direct.txt", allocator, .limited(1024));
     defer allocator.free(cached);
     try std.testing.expectEqualStrings("example.com\n", cached);
 }
@@ -1834,7 +1844,7 @@ test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cache
 test "fetchConfig requests identity encoding to avoid compressed provider responses" {
     const allocator = std.testing.allocator;
 
-    var server = try (try std.net.Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    var server = try (try compat.net.Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer server.deinit();
 
     var request_bytes = std.ArrayList(u8).empty;
@@ -1842,7 +1852,7 @@ test "fetchConfig requests identity encoding to avoid compressed provider respon
 
     const response_body = "ok\n";
     const thread = try std.Thread.spawn(.{}, struct {
-        fn run(http_server: *std.net.Server, allocator_: std.mem.Allocator, request_capture: *std.ArrayList(u8), body: []const u8) void {
+        fn run(http_server: *compat.net.Server, allocator_: std.mem.Allocator, request_capture: *std.ArrayList(u8), body: []const u8) void {
             var conn = http_server.accept() catch return;
             defer conn.stream.close();
 
@@ -1889,7 +1899,7 @@ test "resolveRuntimeConfigKey infers key from explicit configs path" {
     const configs_dir = (try meta.getConfigsDir(allocator)).?;
     defer allocator.free(configs_dir);
 
-    const cfg_path = try std.fs.path.join(allocator, &.{ configs_dir, "manual.yaml" });
+    const cfg_path = try compat.fs.path.join(allocator, &.{ configs_dir, "manual.yaml" });
     defer allocator.free(cfg_path);
 
     const key = (try resolveRuntimeConfigKey(allocator, cfg_path)).?;
@@ -1903,24 +1913,24 @@ test "inferConfigKeyFromPath resolves symlinked config path for non-download con
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var configs = try tmp.dir.makeOpenPath("configs", .{});
-    defer configs.close();
+    var configs = try tmp.dir.createDirPathOpen(compat.io(), "configs", .{});
+    defer configs.close(compat.io());
 
     {
-        const f = try configs.createFile("manual.yaml", .{});
-        f.close();
+        const f = try configs.createFile(compat.io(), "manual.yaml", .{});
+        f.close(compat.io());
     }
 
-    tmp.dir.symLink("configs/manual.yaml", "config.yaml", .{}) catch return error.SkipZigTest;
+    tmp.dir.symLink(compat.io(), "configs/manual.yaml", "config.yaml", .{}) catch return error.SkipZigTest;
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(compat.io(), allocator);
     defer allocator.free(cwd);
 
-    const tmp_abs = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    const tmp_abs = try compat.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(tmp_abs);
-    const configs_abs = try std.fs.path.join(allocator, &.{ tmp_abs, "configs" });
+    const configs_abs = try compat.fs.path.join(allocator, &.{ tmp_abs, "configs" });
     defer allocator.free(configs_abs);
-    const link_abs = try std.fs.path.join(allocator, &.{ tmp_abs, "config.yaml" });
+    const link_abs = try compat.fs.path.join(allocator, &.{ tmp_abs, "config.yaml" });
     defer allocator.free(link_abs);
 
     const key = (try inferConfigKeyFromPathWithConfigsDir(allocator, link_abs, configs_abs)).?;
@@ -1929,7 +1939,7 @@ test "inferConfigKeyFromPath resolves symlinked config path for non-download con
 }
 
 test "isRuleProviderRefreshDue supports second and nanosecond timestamps" {
-    const now = std.time.timestamp();
+    const now = compat.timestamp();
 
     const stale_sec = @as(i128, @intCast(now - 1000));
     try std.testing.expect(isRuleProviderRefreshDue(stale_sec, 300));

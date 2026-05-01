@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const socket_options = @import("../socket_options.zig");
 
 /// VLESS 命令类型

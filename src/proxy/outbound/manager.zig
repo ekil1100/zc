@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../../compat.zig");
+const net = compat.net;
 const Config = @import("../../config.zig").Config;
 const Proxy = @import("../../config.zig").Proxy;
 const ProxyType = @import("../../config.zig").ProxyType;
@@ -394,7 +395,7 @@ pub const OutboundManager = struct {
 fn shouldBypassProxyForTarget(target: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(target, "localhost")) return true;
 
-    if (std.net.Address.parseIp4(target, 0)) |addr| {
+    if (compat.net.Address.parseIp4(target, 0)) |addr| {
         const ip = addr.in.sa.addr;
         const a = @as(u8, @truncate(ip >> 0));
         const b = @as(u8, @truncate(ip >> 8));
@@ -407,7 +408,7 @@ fn shouldBypassProxyForTarget(target: []const u8) bool {
         return false;
     } else |_| {}
 
-    if (std.net.Address.parseIp6(target, 0)) |addr6| {
+    if (compat.net.Address.parseIp6(target, 0)) |addr6| {
         const ip = addr6.in6.sa.addr;
         if (isIpv6Loopback(ip)) return true;
         if ((ip[0] & 0xfe) == 0xfc) return true; // fc00::/7

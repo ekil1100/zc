@@ -6,6 +6,20 @@
 
 ---
 
+## 临时任务：适配 Zig 0.16 构建（2026-05-01）
+
+### HOTFIX-ZIG-0-16-BUILD
+- 状态：DONE
+- 优先级：P0
+- 负责人：Codex
+- 输出：`build.zig`, `src/compat.zig`, Zig 0.16 API 适配相关源码, `AGENTS.md`, `TASKS.md`
+- 验收标准（Acceptance Criteria / DoD）：
+  - [x] 使用本机 Zig 0.16 复现并收敛当前构建错误
+  - [x] `zig build test --summary all` 至少完成编译并通过非环境干扰用例
+  - [x] `zig build -Doptimize=ReleaseFast --summary all` 通过
+  - [x] `AGENTS.md` 同步更新 Zig 0.16 技术约束
+- 备注：2026-05-01 进入 DOING。初始复现：`zig version` 为 `0.16.0`，`zig build test --summary all` 因 Zig 0.16 std API 调整失败，首批错误包含 `std.net`/`std.fs.cwd`/`std.process.getEnvVarOwned`/`std.time.timestamp`/`std.crypto.random`/`ArrayList.writer` 等移除或迁移。完成适配：新增 `src/compat.zig` 承接 Zig 0.16 `std.Io`/net/fs/process/time/random 迁移，更新主入口为 `std.process.Init`，补齐 ReleaseFast 路径下的 TUI/daemon/DNS/TLS/CLI 编译适配；`AGENTS.md` Zig 约束同步更新到 0.16。验证：`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all` 通过（63/63）；`env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all` 通过。
+
 ## 临时任务：降低 zc daemon 长稳内存占用（2026-05-01）
 
 ### HOTFIX-DAEMON-MEMORY-FOOTPRINT

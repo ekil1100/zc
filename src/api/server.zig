@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const Config = @import("../config.zig").Config;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = @import("../proxy/outbound/manager.zig").OutboundManager;
@@ -119,7 +120,7 @@ pub const ApiServer = struct {
                 .vless => "Vless",
             };
 
-            try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\",\"server\":\"{s}\",\"port\":{d}}}", .{ proxy.name, type_str, proxy.server, proxy.port });
+            try json.print(self.allocator, "{{\"name\":\"{s}\",\"type\":\"{s}\",\"server\":\"{s}\",\"port\":{d}}}", .{ proxy.name, type_str, proxy.server, proxy.port });
         }
 
         try json.appendSlice(self.allocator, "]}");
@@ -150,7 +151,7 @@ pub const ApiServer = struct {
                 .final => "MATCH",
             };
 
-            try json.writer(self.allocator).print("{{\"type\":\"{s}\",\"payload\":\"{s}\",\"target\":\"{s}\"}}", .{ type_str, rule.payload, rule.target });
+            try json.print(self.allocator, "{{\"type\":\"{s}\",\"payload\":\"{s}\",\"target\":\"{s}\"}}", .{ type_str, rule.payload, rule.target });
         }
 
         try json.appendSlice(self.allocator, "]}");

@@ -1,11 +1,12 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const testing = std.testing;
 const WebSocket = @import("websocket.zig").WebSocket;
 const base64 = std.base64;
 
 test "WebSocket generate key" {
     var key_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&key_bytes);
+    compat.randomBytes(&key_bytes);
 
     var key_b64: [24]u8 = undefined;
     _ = base64.standard.Encoder.encode(&key_b64, &key_bytes);

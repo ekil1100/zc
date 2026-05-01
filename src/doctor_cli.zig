@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const config = @import("config.zig");
 const validator = @import("config_validator.zig");
 const daemon = @import("daemon.zig");
@@ -73,7 +74,7 @@ fn emitDoctorJson(allocator: std.mem.Allocator, data: *const DoctorData) !void {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
-    try out.writer(allocator).print("{{\"ok\":true,\"data\":{{\"action\":\"doctor\",\"version\":\"{s}\",\"config_path\":\"{s}\",\"config_ok\":{s},\"config_source\":\"{s}\",\"daemon_running\":{s},\"network_ok\":{s},\"daemon_pid\":", .{
+    try out.print(allocator, "{{\"ok\":true,\"data\":{{\"action\":\"doctor\",\"version\":\"{s}\",\"config_path\":\"{s}\",\"config_ok\":{s},\"config_source\":\"{s}\",\"daemon_running\":{s},\"network_ok\":{s},\"daemon_pid\":", .{
         data.version,
         data.config_path,
         if (data.config_ok) "true" else "false",
@@ -83,7 +84,7 @@ fn emitDoctorJson(allocator: std.mem.Allocator, data: *const DoctorData) !void {
     });
 
     if (data.daemon_pid) |pid| {
-        try out.writer(allocator).print("{d}", .{pid});
+        try out.print(allocator, "{d}", .{pid});
     } else {
         try out.appendSlice(allocator, "null");
     }
@@ -93,7 +94,7 @@ fn emitDoctorJson(allocator: std.mem.Allocator, data: *const DoctorData) !void {
     while (i < data.port_count) : (i += 1) {
         if (i > 0) try out.appendSlice(allocator, ",");
         const p = data.ports[i];
-        try out.writer(allocator).print("{{\"label\":\"{s}\",\"port\":{d},\"listening\":{s}}}", .{ p.label, p.port, if (p.listening) "true" else "false" });
+        try out.print(allocator, "{{\"label\":\"{s}\",\"port\":{d},\"listening\":{s}}}", .{ p.label, p.port, if (p.listening) "true" else "false" });
     }
     try out.appendSlice(allocator, "],\"proxy_reachable\":");
     try out.appendSlice(allocator, if (data.proxy_reachable) "true" else "false");
@@ -122,7 +123,7 @@ fn emitDoctorJson(allocator: std.mem.Allocator, data: *const DoctorData) !void {
     }
     try out.appendSlice(allocator, "],\"daemon_uptime_seconds\":");
     if (data.daemon_uptime_seconds) |uptime| {
-        try out.writer(allocator).print("{d}}}}}\n", .{uptime});
+        try out.print(allocator, "{d}}}}}\n", .{uptime});
     } else {
         try out.appendSlice(allocator, "null}}}\n");
     }
@@ -224,7 +225,7 @@ fn populateConfigData(
 }
 
 fn checkNetworkConnectivity() bool {
-    const stream = std.net.tcpConnectToHost(std.heap.page_allocator, "1.1.1.1", 53) catch return false;
+    const stream = compat.net.tcpConnectToHost(std.heap.page_allocator, "1.1.1.1", 53) catch return false;
     stream.close();
     return true;
 }
@@ -234,22 +235,19 @@ fn getDaemonUptime(pid: ?i32) !?i64 {
     // Try to get process start time using ps
     var buf: [256]u8 = undefined;
     const cmd = try std.fmt.bufPrint(&buf, "ps -o etimes= -p {d}", .{p});
-    const result = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &.{ "sh", "-c", cmd },
-    }) catch return null;
+    const result = compat.childRun(std.heap.page_allocator, &.{ "sh", "-c", cmd }, 1024 * 1024) catch return null;
     defer {
         std.heap.page_allocator.free(result.stdout);
         std.heap.page_allocator.free(result.stderr);
     }
-    if (result.term.Exited != 0) return null;
+    if (result.term.exited != 0) return null;
     const trimmed = std.mem.trim(u8, result.stdout, " \t\n\r");
     return std.fmt.parseInt(i64, trimmed, 10) catch null;
 }
 
 fn collectMigrationHints(allocator: std.mem.Allocator, config_path: ?[]const u8) ![]const []const u8 {
     const path = config_path orelse return &.{};
-    const file_content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch return &.{};
+    const file_content = compat.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch return &.{};
     defer allocator.free(file_content);
 
     var hints = std.ArrayList([]const u8).empty;
@@ -313,7 +311,7 @@ fn fillEffectivePorts(allocator: std.mem.Allocator, cfg: *const config.Config, d
 
 fn isLocalPortListening(port: u16) !bool {
     const allocator = std.heap.page_allocator;
-    const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return false;
+    const stream = compat.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return false;
     stream.close();
     return true;
 }
@@ -322,44 +320,43 @@ pub fn formatDoctorReport(allocator: std.mem.Allocator, data: *const DoctorData)
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    const w = out.writer(allocator);
-    try w.print("zc doctor\n", .{});
-    try w.print("{s:-^60}\n", .{""});
+    try out.print(allocator, "zc doctor\n", .{});
+    try out.print(allocator, "{s:-^60}\n", .{""});
 
-    try w.print("Version: {s}\n", .{data.version});
-    try w.print("Config path: {s}\n", .{data.config_path});
-    try w.print("Config: {s} ({s})\n", .{ if (data.config_ok) "OK" else "FAILED", data.config_source });
+    try out.print(allocator, "Version: {s}\n", .{data.version});
+    try out.print(allocator, "Config path: {s}\n", .{data.config_path});
+    try out.print(allocator, "Config: {s} ({s})\n", .{ if (data.config_ok) "OK" else "FAILED", data.config_source });
 
     if (data.daemon_running) {
-        try w.print("Daemon: running", .{});
+        try out.print(allocator, "Daemon: running", .{});
         if (data.daemon_pid) |pid| {
-            try w.print(" (PID: {d})\n", .{pid});
+            try out.print(allocator, " (PID: {d})\n", .{pid});
         } else {
-            try w.print("\n", .{});
+            try out.print(allocator, "\n", .{});
         }
     } else {
-        try w.print("Daemon: not running\n", .{});
+        try out.print(allocator, "Daemon: not running\n", .{});
     }
 
-    try w.print("Network: {s}\n", .{if (data.network_ok) "OK" else "UNREACHABLE"});
-    try w.print("Proxy reachable: {s}\n", .{if (data.proxy_reachable) "YES" else "NO"});
-    try w.print("Effective ports:\n", .{});
+    try out.print(allocator, "Network: {s}\n", .{if (data.network_ok) "OK" else "UNREACHABLE"});
+    try out.print(allocator, "Proxy reachable: {s}\n", .{if (data.proxy_reachable) "YES" else "NO"});
+    try out.print(allocator, "Effective ports:\n", .{});
     if (data.port_count == 0) {
-        try w.print("  - none\n", .{});
+        try out.print(allocator, "  - none\n", .{});
     } else {
         var i: usize = 0;
         while (i < data.port_count) : (i += 1) {
             const p = data.ports[i];
-            try w.print("  - {s}: 127.0.0.1:{d} [{s}]\n", .{ p.label, p.port, if (p.listening) "listening" else "not listening" });
+            try out.print(allocator, "  - {s}: 127.0.0.1:{d} [{s}]\n", .{ p.label, p.port, if (p.listening) "listening" else "not listening" });
         }
     }
 
-    try w.print("Suggestions:\n", .{});
+    try out.print(allocator, "Suggestions:\n", .{});
     if (!data.config_ok) {
-        try w.print("  1. Fix config syntax/validation issues, then rerun `zc doctor`.\n", .{});
+        try out.print(allocator, "  1. Fix config syntax/validation issues, then rerun `zc doctor`.\n", .{});
     }
     if (!data.daemon_running) {
-        try w.print("  2. Start service: zc start -c <config>\n", .{});
+        try out.print(allocator, "  2. Start service: zc start -c <config>\n", .{});
     }
     var has_not_listening = false;
     var i: usize = 0;
@@ -370,10 +367,10 @@ pub fn formatDoctorReport(allocator: std.mem.Allocator, data: *const DoctorData)
         }
     }
     if (has_not_listening) {
-        try w.print("  3. Ensure configured proxy ports are bound by zc process.\n", .{});
+        try out.print(allocator, "  3. Ensure configured proxy ports are bound by zc process.\n", .{});
     }
     if (data.config_ok and data.daemon_running and !has_not_listening) {
-        try w.print("  - No action needed.\n", .{});
+        try out.print(allocator, "  - No action needed.\n", .{});
     }
 
     return try out.toOwnedSlice(allocator);

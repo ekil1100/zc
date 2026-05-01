@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const Rule = @import("../config.zig").Rule;
 const RuleType = @import("../config.zig").RuleType;
 const dns = @import("../dns.zig");
@@ -241,7 +242,7 @@ pub const Engine = struct {
 
                 for (addresses) |addr| {
                     // IPv4
-                    if (addr.any.family == std.posix.AF.INET) {
+                    if (addr == .in) {
                         const ip = addr.in.sa.addr;
 
                         std.debug.print("[Engine] IPv4: {}.{}.{}.{}\n", .{ (ip >> 0) & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF });
@@ -264,7 +265,7 @@ pub const Engine = struct {
                         }
                     }
                     // IPv6
-                    else if (addr.any.family == std.posix.AF.INET6) {
+                    else if (addr == .in6) {
                         var ip6: [16]u8 = undefined;
                         @memcpy(&ip6, &addr.in6.sa.addr);
 
@@ -289,7 +290,7 @@ pub const Engine = struct {
             }
         } else {
             // 6. 直接是 IP 地址
-            if (std.net.Address.parseIp4(ctx.target_host, 0)) |addr| {
+            if (compat.net.Address.parseIp4(ctx.target_host, 0)) |addr| {
                 const ip = addr.in.sa.addr;
 
                 // GEOIP
@@ -309,7 +310,7 @@ pub const Engine = struct {
                 }
             } else |_| {
                 // IPv6?
-                if (std.net.Address.parseIp6(ctx.target_host, 0)) |addr6| {
+                if (compat.net.Address.parseIp6(ctx.target_host, 0)) |addr6| {
                     var ip6: [16]u8 = undefined;
                     @memcpy(&ip6, &addr6.in6.sa.addr);
 
@@ -362,7 +363,7 @@ pub const Engine = struct {
     }
 
     fn matchSrcIpCidr(self: *Engine, src_ip: []const u8) ?[]const u8 {
-        if (std.net.Address.parseIp4(src_ip, 0)) |addr| {
+        if (compat.net.Address.parseIp4(src_ip, 0)) |addr| {
             const ip = addr.in.sa.addr;
             for (self.src_ip_cidrs.items) |cidr| {
                 if (cidr.contains(ip)) {
@@ -513,7 +514,7 @@ fn parseCidr(s: []const u8) !IpCidr {
     const ip_str = s[0..slash_pos.?];
     const prefix_len = try std.fmt.parseInt(u8, s[slash_pos.? + 1 ..], 10);
 
-    const addr = try std.net.Address.parseIp4(ip_str, 0);
+    const addr = try compat.net.Address.parseIp4(ip_str, 0);
     const ip = addr.in.sa.addr;
 
     if (prefix_len > 32) return error.InvalidPrefix;
@@ -536,7 +537,7 @@ fn parseCidr6(s: []const u8) !IpCidr6 {
 
     if (prefix_len > 128) return error.InvalidPrefix;
 
-    const addr = try std.net.Address.parseIp6(ip_str, 0);
+    const addr = try compat.net.Address.parseIp6(ip_str, 0);
 
     var prefix: [16]u8 = undefined;
     @memcpy(&prefix, &addr.in6.sa.addr);

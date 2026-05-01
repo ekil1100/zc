@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 /// HKDF-SHA1 for Shadowsocks AEAD subkey derivation
 const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
@@ -214,7 +215,7 @@ pub const Address = struct {
 
     pub fn encode(self: Address, buf: []u8) !usize {
         // Try to parse as IPv4 first
-        if (std.net.Address.parseIp4(self.host, self.port)) |parsed| {
+        if (compat.net.Address.parseIp4(self.host, self.port)) |parsed| {
             const ip_bytes = std.mem.asBytes(&parsed.in.sa.addr);
             buf[0] = 0x01;
             @memcpy(buf[1..5], ip_bytes);
@@ -224,7 +225,7 @@ pub const Address = struct {
         } else |_| {}
 
         // Try IPv6
-        if (std.net.Address.parseIp6(self.host, self.port)) |parsed| {
+        if (compat.net.Address.parseIp6(self.host, self.port)) |parsed| {
             buf[0] = 0x04;
             const bytes = std.mem.asBytes(&parsed.in6.sa.addr);
             @memcpy(buf[1..17], bytes);
@@ -251,7 +252,7 @@ test "evp bytes to key md5" {
 test "chacha20-poly1305 encrypt/decrypt" {
     const password = "C7a6kndb";
     var salt: [32]u8 = undefined;
-    std.crypto.random.bytes(&salt);
+    compat.randomBytes(&salt);
 
     var stream = try AeadStream.init(.chacha20_poly1305, password, &salt);
 

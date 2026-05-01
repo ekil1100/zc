@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const http = std.http;
 const outbound = @import("outbound/manager.zig");
 const ProxyStream = outbound.ProxyStream;
@@ -305,21 +306,33 @@ const HttpsForwardStream = struct {
         self.upstream_reader = UpstreamReader.init(self, &self.tls_read_buffer);
         self.upstream_writer = UpstreamWriter.init(self, &self.tls_write_buffer);
 
-        self.ca_bundle = std.crypto.Certificate.Bundle{};
+        self.ca_bundle = std.crypto.Certificate.Bundle.empty;
         if (self.ca_bundle) |*bundle| {
-            try bundle.rescan(allocator);
+            try bundle.rescan(allocator, compat.io(), std.Io.Timestamp.now(compat.io(), .real));
         }
         errdefer if (self.ca_bundle) |*bundle| bundle.deinit(allocator);
+
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        compat.randomBytes(&entropy);
+        var ca_lock: std.Io.RwLock = .init;
+        const now = std.Io.Timestamp.now(compat.io(), .real);
 
         self.tls_client = try std.crypto.tls.Client.init(
             &self.upstream_reader.interface,
             &self.upstream_writer.interface,
             .{
                 .host = .{ .explicit = host },
-                .ca = .{ .bundle = self.ca_bundle.? },
+                .ca = .{ .bundle = .{
+                    .gpa = allocator,
+                    .io = compat.io(),
+                    .lock = &ca_lock,
+                    .bundle = &self.ca_bundle.?,
+                } },
                 .allow_truncation_attacks = true,
                 .read_buffer = &self.tls_read_buffer,
                 .write_buffer = &self.tls_write_buffer,
+                .entropy = &entropy,
+                .realtime_now = now,
             },
         );
     }
@@ -370,8 +383,8 @@ fn parseForwardRequest(allocator: std.mem.Allocator, request: []const u8) !Forwa
 
     if (std.mem.indexOf(u8, target_text, "://")) |_| {
         const uri = try std.Uri.parse(target_text);
-        var host_buf: [std.Uri.host_name_max]u8 = undefined;
-        const host = try allocator.dupe(u8, try uri.getHost(&host_buf));
+        var host_buf: [255]u8 = undefined;
+        const host = try allocator.dupe(u8, (try uri.getHost(&host_buf)).bytes);
         const scheme: ForwardScheme = if (std.mem.eql(u8, uri.scheme, "https"))
             .https
         else if (std.mem.eql(u8, uri.scheme, "http"))
@@ -422,12 +435,12 @@ fn buildOriginTarget(allocator: std.mem.Allocator, uri: std.Uri) ![]const u8 {
     if (uri.path.isEmpty()) {
         try out.append(allocator, '/');
     } else {
-        try out.writer(allocator).print("{f}", .{std.fmt.alt(uri.path, .formatRaw)});
+        try out.print(allocator, "{f}", .{std.fmt.alt(uri.path, .formatRaw)});
     }
 
     if (uri.query) |query| {
         try out.append(allocator, '?');
-        try out.writer(allocator).print("{f}", .{std.fmt.alt(query, .formatRaw)});
+        try out.print(allocator, "{f}", .{std.fmt.alt(query, .formatRaw)});
     }
 
     return out.toOwnedSlice(allocator);
@@ -458,7 +471,7 @@ fn buildForwardRequestHead(allocator: std.mem.Allocator, request_head: []const u
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    try out.writer(allocator).print("{s} {s} {s}\r\n", .{
+    try out.print(allocator, "{s} {s} {s}\r\n", .{
         forward.method_text,
         forward.origin_target,
         forward.version_text,
@@ -468,13 +481,13 @@ fn buildForwardRequestHead(allocator: std.mem.Allocator, request_head: []const u
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
-            try out.writer(allocator).print("{s}\r\n", .{line});
+            try out.print(allocator, "{s}\r\n", .{line});
             continue;
         };
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (std.ascii.eqlIgnoreCase(name, "proxy-connection")) continue;
         if (force_connection_close and (std.ascii.eqlIgnoreCase(name, "connection") or std.ascii.eqlIgnoreCase(name, "keep-alive"))) continue;
-        try out.writer(allocator).print("{s}\r\n", .{line});
+        try out.print(allocator, "{s}\r\n", .{line});
     }
 
     if (force_connection_close) {
@@ -667,9 +680,11 @@ fn handleDirectHttpsForwardStream(
     forward: *const ForwardRequest,
     target_stream: *ProxyStream,
 ) !void {
-    var ca_bundle = std.crypto.Certificate.Bundle{};
-    try ca_bundle.rescan(allocator);
+    var ca_bundle: std.crypto.Certificate.Bundle = .empty;
+    const now = std.Io.Timestamp.now(compat.io(), .real);
+    try ca_bundle.rescan(allocator, compat.io(), now);
     defer ca_bundle.deinit(allocator);
+    var ca_lock: std.Io.RwLock = .init;
 
     var tls_read_buffer: [std.crypto.tls.Client.min_buffer_len + 8192]u8 = undefined;
     var tls_write_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
@@ -678,15 +693,24 @@ fn handleDirectHttpsForwardStream(
 
     var socket_writer = target_stream.base_stream.writer(&tls_write_buffer);
     var socket_reader = target_stream.base_stream.reader(&socket_read_buffer);
+    var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+    compat.randomBytes(&entropy);
     var tls_client = try std.crypto.tls.Client.init(
-        socket_reader.interface(),
+        &socket_reader.interface,
         &socket_writer.interface,
         .{
             .host = .{ .explicit = forward.host },
-            .ca = .{ .bundle = ca_bundle },
+            .ca = .{ .bundle = .{
+                .gpa = allocator,
+                .io = compat.io(),
+                .lock = &ca_lock,
+                .bundle = &ca_bundle,
+            } },
             .read_buffer = &tls_read_buffer,
             .write_buffer = &socket_write_buffer,
             .allow_truncation_attacks = true,
+            .entropy = &entropy,
+            .realtime_now = now,
         },
     );
     defer _ = tls_client.end() catch {};
@@ -814,7 +838,7 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     var buf: [8192]u8 = undefined;
     var up_bytes: usize = 0;
     var down_bytes: usize = 0;
-    var last_report_ms = std.time.milliTimestamp();
+    var last_report_ms = compat.milliTimestamp();
     var last_activity_ms = last_report_ms;
     var client_read_open = true;
     var target_read_open = true;
@@ -856,7 +880,7 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         _ = try std.posix.poll(&poll_fds, relay_poll_timeout_ms);
 
         if (client_read_open and (poll_fds[0].revents & std.posix.POLL.IN != 0)) {
-            const n = std.posix.read(client_stream.handle, &buf) catch |err| {
+            const n = compat.posixRead(client_stream.handle, &buf) catch |err| {
                 if (clientReadClosedBy(err)) {
                     relayLog("client read closed: {}", .{err});
                     closeClientReadSide(&client_read_open, target_stream, &target_write_shutdown);
@@ -878,13 +902,13 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
                 );
                 if (!forwarded) continue;
                 up_bytes += n;
-                last_activity_ms = std.time.milliTimestamp();
+                last_activity_ms = compat.milliTimestamp();
             }
         }
 
         if (target_read_open and (poll_fds[1].revents & std.posix.POLL.IN != 0)) {
             const n = target_stream.read(&buf) catch |err| switch (err) {
-                error.ConnectionClosed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
+                error.ConnectionClosed => {
                     closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
                     continue;
                 },
@@ -904,11 +928,11 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
                 );
                 if (!delivered) continue;
                 down_bytes += n;
-                last_activity_ms = std.time.milliTimestamp();
+                last_activity_ms = compat.milliTimestamp();
             }
         }
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
         if (now_ms - last_report_ms >= 1000) {
             relayFlushStats(&up_bytes, &down_bytes, false);
             last_report_ms = now_ms;
@@ -955,7 +979,7 @@ fn closeTargetReadSide(target_read_open: *bool, client_stream: net.Stream, clien
 fn shutdownClientWrite(stream: net.Stream, already_shutdown: *bool) void {
     if (already_shutdown.*) return;
     already_shutdown.* = true;
-    std.posix.shutdown(stream.handle, .send) catch |err| {
+    compat.shutdownWrite(stream.handle) catch |err| {
         relayLog("client shutdown(send) ignored: {}", .{err});
     };
 }
@@ -963,7 +987,7 @@ fn shutdownClientWrite(stream: net.Stream, already_shutdown: *bool) void {
 fn shutdownTargetWrite(target_stream: *ProxyStream, already_shutdown: *bool) void {
     if (already_shutdown.*) return;
     already_shutdown.* = true;
-    std.posix.shutdown(target_stream.getHandle(), .send) catch |err| {
+    compat.shutdownWrite(target_stream.getHandle()) catch |err| {
         relayLog("target shutdown(send) ignored: {}", .{err});
     };
 }
@@ -999,7 +1023,7 @@ fn drainTargetPending(
         );
         if (!delivered) return;
         down_bytes.* += n;
-        last_activity_ms.* = std.time.milliTimestamp();
+        last_activity_ms.* = compat.milliTimestamp();
     }
 }
 
@@ -1014,7 +1038,7 @@ fn writeClientChunk(
 ) !bool {
     var written: usize = 0;
     while (written < data.len) {
-        written += std.posix.write(client_stream.handle, data[written..]) catch |err| {
+        written += compat.posixWrite(client_stream.handle, data[written..]) catch |err| {
             if (clientWriteClosedBy(err)) {
                 relayLog("client write closed: {}", .{err});
                 closeClientReadSide(client_read_open, target_stream, target_write_shutdown);
@@ -1099,7 +1123,7 @@ test "relay drains SS pending leftover without poll event" {
     }.run, .{ client_stream, &target_stream });
 
     var out: [5]u8 = undefined;
-    const n = try std.posix.read(peer_stream.handle, &out);
+    const n = try compat.posixRead(peer_stream.handle, &out);
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqualStrings("hello", out[0..n]);
 
@@ -1145,7 +1169,7 @@ test "relay drains SS encrypted leftover without poll event" {
     }.run, .{ client_stream, &target_stream });
 
     var out: [5]u8 = undefined;
-    const n = try std.posix.read(peer_stream.handle, &out);
+    const n = try compat.posixRead(peer_stream.handle, &out);
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqualStrings("hello", out[0..n]);
 
@@ -1181,13 +1205,13 @@ test "relay forwards traffic in both directions (direct stream)" {
 
     try writeAllFd(client_peer.handle, "ping");
     var buf: [4]u8 = undefined;
-    const n1 = try std.posix.read(target_peer.handle, &buf);
+    const n1 = try compat.posixRead(target_peer.handle, &buf);
     try std.testing.expectEqual(@as(usize, 4), n1);
     try std.testing.expectEqualStrings("ping", buf[0..n1]);
 
     try writeAllFd(target_peer.handle, "pong");
     var buf2: [4]u8 = undefined;
-    const n2 = try std.posix.read(client_peer.handle, &buf2);
+    const n2 = try compat.posixRead(client_peer.handle, &buf2);
     try std.testing.expectEqual(@as(usize, 4), n2);
     try std.testing.expectEqualStrings("pong", buf2[0..n2]);
 
@@ -1223,11 +1247,11 @@ test "relay preserves upstream response after client half-closes its write side"
             defer peer.close();
 
             var buf: [4]u8 = undefined;
-            const n = std.posix.read(peer.handle, &buf) catch return;
+            const n = compat.posixRead(peer.handle, &buf) catch return;
             std.testing.expectEqual(@as(usize, 4), n) catch return;
             std.testing.expectEqualStrings("ping", buf[0..n]) catch return;
 
-            std.Thread.sleep(150 * std.time.ns_per_ms);
+            compat.sleepNs(150 * std.time.ns_per_ms);
             writeAllFd(peer.handle, "pong") catch return;
         }
     }.run, .{target_peer});
@@ -1238,7 +1262,7 @@ test "relay preserves upstream response after client half-closes its write side"
 
     try setReadTimeoutMs(client_peer.handle, 1000);
     var resp: [4]u8 = undefined;
-    const n = try std.posix.read(client_peer.handle, &resp);
+    const n = try compat.posixRead(client_peer.handle, &resp);
     try std.testing.expectEqual(@as(usize, 4), n);
     try std.testing.expectEqualStrings("pong", resp[0..n]);
 }
@@ -1261,11 +1285,11 @@ test "relay should treat client reset during downstream write as graceful close"
             defer peer.close();
 
             var buf: [4]u8 = undefined;
-            const n = std.posix.read(peer.handle, &buf) catch return;
+            const n = compat.posixRead(peer.handle, &buf) catch return;
             std.testing.expectEqual(@as(usize, 4), n) catch return;
             std.testing.expectEqualStrings("ping", buf[0..n]) catch return;
 
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            compat.sleepNs(100 * std.time.ns_per_ms);
             writeAllFd(peer.handle, "pong") catch return;
         }
     }.run, .{target_peer});
@@ -1439,7 +1463,7 @@ test "handleConnection should wait for full CONNECT headers before tunneling" {
     defer relay_thread.join();
 
     try mixed_client.writeAll(part1);
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    compat.sleepNs(100 * std.time.ns_per_ms);
     try mixed_client.writeAll(part2);
     try setReadTimeoutMs(mixed_client.handle, 1000);
 
@@ -1658,7 +1682,7 @@ fn setResetOnClose(fd: std.posix.fd_t) !void {
 fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
-        written += try std.posix.write(fd, data[written..]);
+        written += try compat.posixWrite(fd, data[written..]);
     }
 }
 
@@ -1681,7 +1705,7 @@ fn makeTcpStreamPair() !StreamPair {
 }
 
 fn relayLog(comptime format: []const u8, args: anytype) void {
-    const ts = std.time.timestamp();
+    const ts = compat.timestamp();
     std.debug.print("[{d}] [Relay] ", .{ts});
     std.debug.print(format, args);
     std.debug.print("\n", .{});

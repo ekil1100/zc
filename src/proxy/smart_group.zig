@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const http = std.http;
 
 /// 代理健康检查结果
@@ -121,7 +122,7 @@ pub const SmartGroup = struct {
 
     /// 执行健康检查
     pub fn checkHealth(self: *SmartGroup, testFn: *const fn ([]const u8, []const u8, u32) u32) !void {
-        const now = std.time.timestamp();
+        const now = compat.timestamp();
         
         // 检查是否需要重新测试
         if (now - self.last_check_time < self.interval) {
@@ -208,7 +209,7 @@ pub const SmartGroup = struct {
             },
             .random => {
                 var buf: [8]u8 = undefined;
-                std.crypto.random.bytes(&buf);
+                compat.randomBytes(&buf);
                 const idx = std.mem.readInt(u64, &buf, .little) % self.proxies.items.len;
                 return self.proxies.items[idx];
             },
@@ -228,7 +229,7 @@ pub fn testProxyDelay(proxy_name: []const u8, url: []const u8, timeout: u32) u32
     
     // 简化：返回随机延迟，实际应该通过代理连接测试
     var buf: [4]u8 = undefined;
-    std.crypto.random.bytes(&buf);
+    compat.randomBytes(&buf);
     const delay = @as(u32, @intCast(buf[0])) * 10;
     
     std.debug.print("[DelayTest] {s}: {d}ms (placeholder)\n", .{ proxy_name, delay });

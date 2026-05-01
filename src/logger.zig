@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 
 pub const Level = enum {
     debug,
@@ -10,7 +11,7 @@ pub const Level = enum {
 pub const Logger = struct {
     allocator: std.mem.Allocator,
     level: Level,
-    file: ?std.fs.File = null,
+    file: ?compat.fs.File = null,
     enable_console: bool = true,
     enable_file: bool = true,
 
@@ -23,7 +24,7 @@ pub const Logger = struct {
 
     pub fn deinit(self: *Logger) void {
         if (self.file) |f| {
-            f.close();
+            f.close(compat.io());
         }
     }
 
@@ -32,7 +33,7 @@ pub const Logger = struct {
     }
 
     pub fn setFile(self: *Logger, path: []const u8) !void {
-        self.file = try std.fs.createFileAbsolute(path, .{
+        self.file = try compat.fs.createFileAbsolute(path, .{
             .access_sub_path = true,
             .append = true,
         });
@@ -88,7 +89,7 @@ pub const Logger = struct {
         }
 
         if (self.enable_file and self.file) |f| {
-            f.writeAll(line) catch {};
+            compat.fileWriteAll(f, line) catch {};
         }
     }
 

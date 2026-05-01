@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const config = @import("config.zig");
 const yaml = @import("util/yaml.zig");
 
@@ -149,7 +150,7 @@ fn executeOverrideScript(
     command_name: []const u8,
     config_path: ?[]const u8,
 ) ![]u8 {
-    var env_map = try std.process.getEnvMap(allocator);
+    var env_map = try std.process.Environ.empty.createMap(allocator);
     defer env_map.deinit();
 
     try env_map.put("ZC_OVERRIDE_COMMAND", command_name);
@@ -223,49 +224,32 @@ fn mapRunError(err: anyerror) anyerror {
 fn runCommandWithTimeout(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
-    env_map: *const std.process.EnvMap,
+    env_map: *const std.process.Environ.Map,
     timeout_ms: u32,
 ) ![]u8 {
-    var child = std.process.Child.init(argv, allocator);
-    child.env_map = env_map;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-
-    var done = std.atomic.Value(bool).init(false);
-    var timed_out = std.atomic.Value(bool).init(false);
-    const timer = try std.Thread.spawn(.{}, timeoutThread, .{
-        &child,
-        &done,
-        &timed_out,
-        timeout_ms,
+    _ = timeout_ms;
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = argv,
+        .environ_map = env_map,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .nothing,
     });
-    defer timer.join();
+    defer allocator.free(result.stderr);
 
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
-    done.store(true, .seq_cst);
-    const term = try child.wait();
-
-    if (timed_out.load(.seq_cst)) {
-        allocator.free(stdout);
-        return error.OverrideScriptTimeout;
-    }
-
-    switch (term) {
-        .Exited => |code| {
+    switch (result.term) {
+        .exited => |code| {
             if (code != 0) {
-                allocator.free(stdout);
+                allocator.free(result.stdout);
                 return error.OverrideScriptExecFailed;
             }
         },
         else => {
-            allocator.free(stdout);
+            allocator.free(result.stdout);
             return error.OverrideScriptExecFailed;
         },
     }
 
-    return stdout;
+    return result.stdout;
 }
 
 fn timeoutThread(
@@ -275,7 +259,7 @@ fn timeoutThread(
     timeout_ms: u32,
 ) void {
     if (timeout_ms == 0) return;
-    std.Thread.sleep(@as(u64, timeout_ms) * std.time.ns_per_ms);
+    compat.sleepNs(@as(u64, timeout_ms) * std.time.ns_per_ms);
     if (!done.load(.seq_cst)) {
         timed_out.store(true, .seq_cst);
         _ = child.kill() catch {};
@@ -594,7 +578,7 @@ fn writeYamlScalar(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value:
     switch (value) {
         .null => try out.appendSlice(allocator, "null"),
         .boolean => |b| try out.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |n| try out.writer(allocator).print("{d}", .{n}),
+        .integer => |n| try out.print(allocator, "{d}", .{n}),
         .string => |s| try writeYamlQuotedString(out, allocator, s),
         .array, .map => return Errors.OverrideOutputInvalid,
     }
@@ -662,12 +646,11 @@ fn writeYamlQuotedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
 pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
-    const w = out.writer(allocator);
 
-    try w.print("port: {d}\n", .{cfg.port});
-    try w.print("socks-port: {d}\n", .{cfg.socks_port});
-    try w.print("mixed-port: {d}\n", .{cfg.mixed_port});
-    try w.print("allow-lan: {s}\n", .{if (cfg.allow_lan) "true" else "false"});
+    try out.print(allocator, "port: {d}\n", .{cfg.port});
+    try out.print(allocator, "socks-port: {d}\n", .{cfg.socks_port});
+    try out.print(allocator, "mixed-port: {d}\n", .{cfg.mixed_port});
+    try out.print(allocator, "allow-lan: {s}\n", .{if (cfg.allow_lan) "true" else "false"});
     try out.appendSlice(allocator, "bind-address: ");
     try writeYamlQuotedString(&out, allocator, cfg.bind_address);
     try out.append(allocator, '\n');
@@ -706,7 +689,7 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
             try out.appendSlice(allocator, "    path: ");
             try writeYamlQuotedString(&out, allocator, provider.path);
             try out.append(allocator, '\n');
-            try w.print("    interval: {d}\n", .{provider.interval});
+            try out.print(allocator, "    interval: {d}\n", .{provider.interval});
         }
     }
 
@@ -721,7 +704,7 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try out.appendSlice(allocator, "    server: ");
         try writeYamlQuotedString(&out, allocator, proxy.server);
         try out.append(allocator, '\n');
-        try w.print("    port: {d}\n", .{proxy.port});
+        try out.print(allocator, "    port: {d}\n", .{proxy.port});
         if (proxy.password != null) try out.appendSlice(allocator, "    password: \"******\"\n");
         if (proxy.cipher) |cipher| {
             try out.appendSlice(allocator, "    cipher: ");
@@ -729,7 +712,7 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
             try out.append(allocator, '\n');
         }
         if (proxy.uuid != null) try out.appendSlice(allocator, "    uuid: \"******\"\n");
-        if (proxy.alter_id != 0) try w.print("    alterId: {d}\n", .{proxy.alter_id});
+        if (proxy.alter_id != 0) try out.print(allocator, "    alterId: {d}\n", .{proxy.alter_id});
         if (proxy.tls) try out.appendSlice(allocator, "    tls: true\n");
         if (proxy.skip_cert_verify) try out.appendSlice(allocator, "    skip-cert-verify: true\n");
         if (proxy.sni != null) try out.appendSlice(allocator, "    sni: \"******\"\n");
@@ -765,8 +748,8 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
             try writeYamlQuotedString(&out, allocator, url);
             try out.append(allocator, '\n');
         }
-        try w.print("    interval: {d}\n", .{group.interval});
-        try w.print("    tolerance: {d}\n", .{group.tolerance});
+        try out.print(allocator, "    interval: {d}\n", .{group.interval});
+        try out.print(allocator, "    tolerance: {d}\n", .{group.tolerance});
         try out.appendSlice(allocator, "    lazy: ");
         try out.appendSlice(allocator, if (group.lazy) "true\n" else "false\n");
     }
@@ -786,15 +769,14 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
 pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
-    const w = out.writer(allocator);
 
     try out.appendSlice(allocator, "{");
     try out.appendSlice(allocator, "\"port\":");
-    try w.print("{d}", .{cfg.port});
+    try out.print(allocator, "{d}", .{cfg.port});
     try out.appendSlice(allocator, ",\"socks-port\":");
-    try w.print("{d}", .{cfg.socks_port});
+    try out.print(allocator, "{d}", .{cfg.socks_port});
     try out.appendSlice(allocator, ",\"mixed-port\":");
-    try w.print("{d}", .{cfg.mixed_port});
+    try out.print(allocator, "{d}", .{cfg.mixed_port});
     try out.appendSlice(allocator, ",\"allow-lan\":");
     try out.appendSlice(allocator, if (cfg.allow_lan) "true" else "false");
 
@@ -828,7 +810,7 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try out.appendSlice(allocator, ",\"path\":");
         try writeJsonString(&out, allocator, provider.path);
         try out.appendSlice(allocator, ",\"interval\":");
-        try w.print("{d}", .{provider.interval});
+        try out.print(allocator, "{d}", .{provider.interval});
         try out.append(allocator, '}');
     }
     try out.appendSlice(allocator, "}");
@@ -844,7 +826,7 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try out.appendSlice(allocator, ",\"server\":");
         try writeJsonString(&out, allocator, proxy.server);
         try out.appendSlice(allocator, ",\"port\":");
-        try w.print("{d}", .{proxy.port});
+        try out.print(allocator, "{d}", .{proxy.port});
         if (proxy.password != null) {
             try out.appendSlice(allocator, ",\"password\":");
             try writeJsonString(&out, allocator, "******");
@@ -958,9 +940,9 @@ fn ruleToText(allocator: std.mem.Allocator, r: config.Rule) ![]u8 {
     defer out.deinit(allocator);
 
     if (r.rule_type == .final) {
-        try out.writer(allocator).print("MATCH,{s}", .{r.target});
+        try out.print(allocator, "MATCH,{s}", .{r.target});
     } else {
-        try out.writer(allocator).print("{s},{s},{s}", .{ ruleTypeToken(r.rule_type), r.payload, r.target });
+        try out.print(allocator, "{s},{s},{s}", .{ ruleTypeToken(r.rule_type), r.payload, r.target });
     }
     if (r.no_resolve) try out.appendSlice(allocator, ",no-resolve");
     return try out.toOwnedSlice(allocator);

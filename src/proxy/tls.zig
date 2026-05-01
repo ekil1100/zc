@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const compat = @import("../compat.zig");
+const net = compat.net;
 const tls = std.crypto.tls;
 
 /// TLS 包装流 - 使用标准库的 TLS Client

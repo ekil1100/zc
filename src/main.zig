@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const config = @import("config.zig");
 const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
@@ -37,10 +38,33 @@ const StartCommandOptions = struct {
 
 // 全局配置路径，用于重载
 var g_config_path: ?[]const u8 = null;
-var gpa_holder: ?*std.heap.GeneralPurposeAllocator(.{}) = null;
+var gpa_holder: ?*std.heap.DebugAllocator(.{}) = null;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+fn collectArgs(allocator: std.mem.Allocator, raw_args: std.process.Args) ![]const []const u8 {
+    var it = try std.process.Args.Iterator.initAllocator(raw_args, allocator);
+    defer it.deinit();
+
+    var args = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (args.items) |arg| allocator.free(arg);
+        args.deinit(allocator);
+    }
+
+    while (it.next()) |arg| {
+        try args.append(allocator, try allocator.dupe(u8, arg));
+    }
+    return args.toOwnedSlice(allocator);
+}
+
+fn freeArgs(allocator: std.mem.Allocator, args: []const []const u8) void {
+    for (args) |arg| allocator.free(arg);
+    allocator.free(args);
+}
+
+pub fn main(init: std.process.Init) !void {
+    compat.setIo(init.io);
+
+    var gpa = std.heap.DebugAllocator(.{}){};
     gpa_holder = &gpa;
     defer {
         if (g_config_path) |path| {
@@ -51,8 +75,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Parse command line args
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try collectArgs(allocator, init.minimal.args);
+    defer freeArgs(allocator, args);
 
     // 检查是否有子命令
     if (args.len < 2) {
@@ -367,14 +391,14 @@ pub fn main() !void {
                     defer allocator.free(managed_path);
 
                     validateOverrideAndPrepareRuleProviders(allocator, managed_path) catch |err| {
-                        std.fs.deleteFileAbsolute(managed_path) catch {};
+                        compat.fs.deleteFileAbsolute(managed_path) catch {};
                         if (printOverrideRuntimeError(json_output, err)) return err;
                         printConfigOverridePrepareError(json_output, err);
                         return err;
                     };
 
                     config.persistOverrideScriptPathForCurrentConfig(allocator, managed_path) catch |err| {
-                        std.fs.deleteFileAbsolute(managed_path) catch {};
+                        compat.fs.deleteFileAbsolute(managed_path) catch {};
                         printConfigOverrideError(json_output, err);
                         return err;
                     };
@@ -813,7 +837,7 @@ pub fn main() !void {
 }
 
 fn importLocalProfile(allocator: std.mem.Allocator, source: []const u8, import_name: ?[]const u8) !?[]const u8 {
-    const src_abs = std.fs.cwd().realpathAlloc(allocator, source) catch {
+    const src_abs = compat.fs.cwd().realpathAlloc(allocator, source) catch {
         return error.FileNotFound;
     };
     defer allocator.free(src_abs);
@@ -821,21 +845,21 @@ fn importLocalProfile(allocator: std.mem.Allocator, source: []const u8, import_n
     const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return error.NoConfigDir;
     defer allocator.free(config_dir);
 
-    std.fs.makeDirAbsolute(config_dir) catch |err| {
+    compat.fs.makeDirAbsolute(config_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
-    const basename = std.fs.path.basename(src_abs);
+    const basename = compat.fs.path.basename(src_abs);
     const raw_name = import_name orelse basename;
     const final_name = if (std.mem.endsWith(u8, raw_name, ".yaml"))
         try allocator.dupe(u8, raw_name)
     else
         try std.fmt.allocPrint(allocator, "{s}.yaml", .{raw_name});
 
-    const dst_abs = try std.fs.path.join(allocator, &.{ config_dir, final_name });
+    const dst_abs = try compat.fs.path.join(allocator, &.{ config_dir, final_name });
     defer allocator.free(dst_abs);
 
-    try std.fs.copyFileAbsolute(src_abs, dst_abs, .{});
+    try compat.fs.copyFileAbsolute(src_abs, dst_abs, .{});
     return final_name;
 }
 
@@ -852,7 +876,7 @@ fn resolveProfileConfig(allocator: std.mem.Allocator, target: ?[]const u8) !conf
     const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return error.NoConfigDir;
     defer allocator.free(config_dir);
 
-    const profile_path = try std.fs.path.join(allocator, &.{ config_dir, t });
+    const profile_path = try compat.fs.path.join(allocator, &.{ config_dir, t });
     defer allocator.free(profile_path);
 
     return try config.load(allocator, profile_path);
@@ -889,19 +913,19 @@ fn switchProfileSilent(allocator: std.mem.Allocator, filename: []const u8) !void
     const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return error.NoConfigDir;
     defer allocator.free(config_dir);
 
-    const source_path = try std.fs.path.join(allocator, &.{ config_dir, filename });
+    const source_path = try compat.fs.path.join(allocator, &.{ config_dir, filename });
     defer allocator.free(source_path);
 
-    const link_path = try std.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
+    const link_path = try compat.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
     defer allocator.free(link_path);
 
-    std.fs.deleteFileAbsolute(link_path) catch {};
+    compat.fs.deleteFileAbsolute(link_path) catch {};
 
-    std.fs.symLinkAbsolute(source_path, link_path, .{}) catch |err| {
+    compat.fs.symLinkAbsolute(source_path, link_path, .{}) catch |err| {
         if (err == error.AccessDenied or err == error.NotSupported or err == error.InvalidArgument) {
-            try std.fs.copyFileAbsolute(source_path, link_path, .{});
+            try compat.fs.copyFileAbsolute(source_path, link_path, .{});
         } else {
-            try std.fs.copyFileAbsolute(source_path, link_path, .{});
+            try compat.fs.copyFileAbsolute(source_path, link_path, .{});
         }
     };
 }
@@ -910,10 +934,10 @@ fn profileExists(allocator: std.mem.Allocator, name: []const u8) !bool {
     const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return false;
     defer allocator.free(config_dir);
 
-    const profile_path = try std.fs.path.join(allocator, &.{ config_dir, name });
+    const profile_path = try compat.fs.path.join(allocator, &.{ config_dir, name });
     defer allocator.free(profile_path);
 
-    std.fs.accessAbsolute(profile_path, .{}) catch return false;
+    compat.fs.accessAbsolute(profile_path, .{}) catch return false;
     return true;
 }
 
@@ -924,7 +948,7 @@ fn printProfileListJson(allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(config_dir);
 
-    var dir = std.fs.openDirAbsolute(config_dir, .{ .iterate = true }) catch |err| {
+    var dir = compat.fs.openDirAbsolute(config_dir, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("{{\"ok\":true,\"data\":{{\"profiles\":[],\"active\":null}}}}\n", .{});
             return;
@@ -934,15 +958,15 @@ fn printProfileListJson(allocator: std.mem.Allocator) !void {
     };
     defer dir.close();
 
-    const active_path = try std.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
+    const active_path = try compat.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
     defer allocator.free(active_path);
 
-    var active_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var active_buf: [compat.fs.max_path_bytes]u8 = undefined;
     var active_name: ?[]const u8 = null;
 
-    if (std.fs.accessAbsolute(active_path, .{})) |_| {
-        if (std.fs.readLinkAbsolute(active_path, &active_buf)) |target| {
-            active_name = std.fs.path.basename(target);
+    if (compat.fs.accessAbsolute(active_path, .{})) |_| {
+        if (compat.fs.readLinkAbsolute(active_path, &active_buf)) |target| {
+            active_name = compat.fs.path.basename(target);
         } else |_| {
             active_name = "config.yaml";
         }
@@ -1237,7 +1261,7 @@ fn runProxy(
         std.debug.print("\nProxy server running. Press Ctrl+C to stop.\n", .{});
 
         while (true) {
-            std.Thread.sleep(1 * std.time.ns_per_s);
+            compat.sleepNs(1 * std.time.ns_per_s);
         }
     }
 }
@@ -1465,7 +1489,7 @@ fn resolveEffectiveOverrideOptions(
 }
 
 fn proxyThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine: *rule_engine.Engine, manager: *outbound.OutboundManager) void {
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    compat.sleepNs(100 * std.time.ns_per_ms);
 
     const bind_ip = effectiveBindAddress(cfg);
 
@@ -1626,14 +1650,14 @@ fn preflightPortCheck(cfg: *config.Config, emit_errors: bool) !void {
 }
 
 fn isPortAvailable(ip: []const u8, port: u16) bool {
-    const address = std.net.Address.parseIp4(ip, port) catch return false;
+    const address = compat.net.Address.parseIp4(ip, port) catch return false;
     var server = address.listen(.{ .reuse_address = false }) catch return false;
     server.deinit();
     return true;
 }
 
 fn checkPortAvailable(ip: []const u8, port: u16, emit_errors: bool) !void {
-    const address = std.net.Address.parseIp4(ip, port) catch {
+    const address = compat.net.Address.parseIp4(ip, port) catch {
         if (emit_errors) std.debug.print("Invalid bind-address '{s}'\n", .{ip});
         return error.InvalidBindAddress;
     };
@@ -1999,7 +2023,7 @@ test "restart command preflights ports before spawning a new daemon" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const content = try std.fs.cwd().readFileAlloc(allocator, "src/main.zig", 1024 * 1024);
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/main.zig", 1024 * 1024);
     defer allocator.free(content);
 
     const fn_pos = std.mem.indexOf(u8, content, "fn runRestartCommand(") orelse return error.TestUnexpectedResult;
@@ -2014,7 +2038,7 @@ test "restart command preflights ports before spawning a new daemon" {
 test "mixed handler should explicitly close client stream on success path" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try std.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
     defer allocator.free(content);
 
     const fn_pos = std.mem.indexOf(u8, content, "fn handleConnection(") orelse return error.TestUnexpectedResult;
@@ -2026,7 +2050,7 @@ test "mixed handler should explicitly close client stream on success path" {
 test "mixed connection workers use bounded stack size" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try std.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
     defer allocator.free(content);
 
     try testing.expect(std.mem.indexOf(u8, content, "connection_task_stack_size: usize = 512 * 1024") != null);
@@ -2036,7 +2060,7 @@ test "mixed connection workers use bounded stack size" {
 test "mixed relay uses finite idle reap instead of infinite poll" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try std.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
     defer allocator.free(content);
 
     try testing.expect(std.mem.indexOf(u8, content, "const relay_poll_timeout_ms: i32 = 30 * 1000") != null);

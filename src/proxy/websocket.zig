@@ -1,6 +1,7 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const socket_options = @import("../socket_options.zig");
-const net = std.net;
+const net = compat.net;
 const crypto = std.crypto;
 const base64 = std.base64;
 const TlsStream = @import("tls.zig").TlsStream;
@@ -76,12 +77,12 @@ pub const WebSocket = struct {
 
         // 生成 Sec-WebSocket-Key
         var key_bytes: [16]u8 = undefined;
-        crypto.random.bytes(&key_bytes);
+        compat.randomBytes(&key_bytes);
         var key_b64: [24]u8 = undefined;
         _ = base64.standard.Encoder.encode(&key_b64, &key_bytes);
 
         // 构建请求
-        try request.writer(self.allocator).print(
+        try request.print(self.allocator,
             "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -152,7 +153,7 @@ pub const WebSocket = struct {
 
         // Masking key
         var mask: [4]u8 = undefined;
-        crypto.random.bytes(&mask);
+        compat.randomBytes(&mask);
         try frame.appendSlice(self.allocator, &mask);
 
         // Masked payload
@@ -258,4 +259,4 @@ pub fn connectWs(allocator: std.mem.Allocator, host: []const u8, port: u16, path
     return ws;
 }
 
-const net = std.net;
+const net = compat.net;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const config = @import("config.zig");
 const posix = std.posix;
 
@@ -28,7 +29,7 @@ fn groupTypeString(gt: config.ProxyGroupType) []const u8 {
 // ── Terminal output helpers ──
 
 fn writeStr(s: []const u8) void {
-    _ = posix.write(posix.STDERR_FILENO, s) catch {};
+    _ = compat.posixWrite(posix.STDERR_FILENO, s) catch {};
 }
 
 fn writeFmt(comptime fmt: []const u8, args: anytype) void {
@@ -90,7 +91,6 @@ pub fn listProxiesJson(allocator: std.mem.Allocator, cfg: *const config.Config) 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
-    const w = out.writer(allocator);
     try out.appendSlice(allocator, "{\"ok\":true,\"data\":{\"groups\":[");
 
     for (cfg.proxy_groups.items, 0..) |group, gi| {
@@ -129,9 +129,9 @@ pub fn listProxiesJson(allocator: std.mem.Allocator, cfg: *const config.Config) 
     }
 
     try out.appendSlice(allocator, "],\"stats\":{\"group_count\":");
-    try w.print("{d}", .{cfg.proxy_groups.items.len});
+    try out.print(allocator, "{d}", .{cfg.proxy_groups.items.len});
     try out.appendSlice(allocator, ",\"proxy_count\":");
-    try w.print("{d}", .{cfg.proxies.items.len});
+    try out.print(allocator, "{d}", .{cfg.proxies.items.len});
     try out.appendSlice(allocator, "}}}\n");
     std.debug.print("{s}", .{out.items});
 }
@@ -422,7 +422,7 @@ fn notifyDaemon(allocator: std.mem.Allocator, cfg: *config.Config, group_name: [
     const req = std.fmt.allocPrint(allocator, "PUT /proxies/{s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ group_name, ec, body.len, body }) catch return;
     defer allocator.free(req);
 
-    const stream = std.net.tcpConnectToHost(allocator, host, port) catch {
+    const stream = compat.net.tcpConnectToHost(allocator, host, port) catch {
         writeFmt("\x1b[2m(daemon not reachable at {s}, restart to apply)\x1b[0m\n", .{ec});
         return;
     };
@@ -442,7 +442,7 @@ fn notifyDaemon(allocator: std.mem.Allocator, cfg: *config.Config, group_name: [
 const Key = enum { up, down, enter, quit, other };
 
 fn enableRawMode() !posix.termios {
-    if (!posix.isatty(posix.STDIN_FILENO)) return error.NotATerminal;
+    if (std.c.isatty(posix.STDIN_FILENO) == 0) return error.NotATerminal;
     var raw = try posix.tcgetattr(posix.STDIN_FILENO);
     const original = raw;
     raw.lflag.ECHO = false;
