@@ -10,7 +10,7 @@
 
 ### 24h 长稳
 ```bash
-# 使用默认配置路径（~/.config/zclash/config.yaml）
+# 使用默认配置路径（~/.config/zc/config.yaml）
 bash scripts/reliability/run-soak-real.sh 24
 
 # 指定配置
@@ -24,7 +24,7 @@ bash scripts/reliability/run-soak-real.sh 72 --config /path/to/config.yaml
 
 ### 在 tmux 中运行（推荐）
 ```bash
-tmux new-session -d -s soak 'bash scripts/reliability/run-soak-real.sh 24 --config ~/.config/zclash/config.yaml'
+tmux new-session -d -s soak 'bash scripts/reliability/run-soak-real.sh 24 --config ~/.config/zc/config.yaml'
 tmux attach -t soak  # 查看进度
 ```
 
@@ -48,4 +48,4 @@ tmux attach -t soak  # 查看进度
 
 - `config-missing`：提供 `--config` 路径
 - `build`：检查 `zig build` 是否通过
-- `start-failed`：运行 `zclash doctor -c <config>` 检查配置
+- `start-failed`：运行 `zc doctor -c <config>` 检查配置

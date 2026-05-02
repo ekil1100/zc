@@ -10,7 +10,6 @@ const rule_engine = @import("rule/engine.zig");
 const outbound = @import("proxy/outbound/manager.zig");
 const meta = @import("meta.zig");
 const api = @import("api/server.zig");
-const tui = @import("tui.zig");
 const daemon = @import("daemon.zig");
 const proxy_cli = @import("proxy_cli.zig");
 const test_cli = @import("test_cli.zig");
@@ -63,6 +62,7 @@ fn freeArgs(allocator: std.mem.Allocator, args: []const []const u8) void {
 
 pub fn main(init: std.process.Init) !void {
     compat.setIo(init.io);
+    compat.setEnvironMap(init.environ_map);
 
     var gpa = std.heap.DebugAllocator(.{}){};
     gpa_holder = &gpa;
@@ -101,20 +101,13 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         daemon.writePid(allocator, std.c.getpid()) catch {};
-        // 在 daemon 模式下运行代理（无 TUI）
-        try runProxy(allocator, start_opts.config_path, start_opts.port, false, &override_opts, "daemon-run");
+        try runProxy(allocator, start_opts.config_path, start_opts.port, &override_opts, "daemon-run");
         return;
     }
 
     // 处理 help
     if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "help")) {
         try printHelp();
-        return;
-    }
-
-    // 处理 tui 命令
-    if (std.mem.eql(u8, cmd, "tui")) {
-        try runProxy(allocator, null, null, true, &override_opts, "tui");
         return;
     }
 
@@ -832,8 +825,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // 未知命令
-    std.debug.print("Unknown command: {s}\n", .{cmd});
-    try printHelp();
+    if (json_output) {
+        printCliError(true, "COMMAND_UNKNOWN", "unknown command", "use `zc help` to list supported commands");
+    } else {
+        std.debug.print("Unknown command: {s}\n", .{cmd});
+        try printHelp();
+    }
+    std.process.exit(1);
 }
 
 fn importLocalProfile(allocator: std.mem.Allocator, source: []const u8, import_name: ?[]const u8) !?[]const u8 {
@@ -1203,7 +1201,6 @@ fn runProxy(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
     mixed_port_override: ?u16,
-    use_tui: bool,
     override_opts: *const override.CliOptions,
     command_name: []const u8,
 ) !void {
@@ -1247,22 +1244,17 @@ fn runProxy(
         api_thread.detach();
     }
 
-    // Run TUI or stay in background
-    if (use_tui) {
-        try runTui(allocator, &cfg, &engine, &manager);
-    } else {
-        std.debug.print("Configuration loaded:\n", .{});
-        std.debug.print("  Port: {}\n", .{cfg.port});
-        std.debug.print("  SOCKS Port: {}\n", .{cfg.socks_port});
-        std.debug.print("  Mixed Port: {}\n", .{cfg.mixed_port});
-        std.debug.print("  Mode: {s}\n", .{cfg.mode});
-        std.debug.print("  Proxies: {}\n", .{cfg.proxies.items.len});
-        std.debug.print("  Rules: {}\n", .{cfg.rules.items.len});
-        std.debug.print("\nProxy server running. Press Ctrl+C to stop.\n", .{});
+    std.debug.print("Configuration loaded:\n", .{});
+    std.debug.print("  Port: {}\n", .{cfg.port});
+    std.debug.print("  SOCKS Port: {}\n", .{cfg.socks_port});
+    std.debug.print("  Mixed Port: {}\n", .{cfg.mixed_port});
+    std.debug.print("  Mode: {s}\n", .{cfg.mode});
+    std.debug.print("  Proxies: {}\n", .{cfg.proxies.items.len});
+    std.debug.print("  Rules: {}\n", .{cfg.rules.items.len});
+    std.debug.print("\nProxy server running. Press Ctrl+C to stop.\n", .{});
 
-        while (true) {
-            compat.sleepNs(1 * std.time.ns_per_s);
-        }
+    while (true) {
+        compat.sleepNs(1 * std.time.ns_per_s);
     }
 }
 
@@ -1525,32 +1517,6 @@ fn proxyThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine
     if (socks_thread) |t| t.join();
 }
 
-fn runTui(allocator: std.mem.Allocator, cfg: *const config.Config, engine: *rule_engine.Engine, manager: *outbound.OutboundManager) !void {
-    _ = engine;
-
-    var tui_manager = try tui.TuiManager.init(allocator, cfg);
-    tui_manager.outbound_manager = manager;
-    defer tui_manager.deinit();
-
-    // 设置重载回调
-    tui_manager.setReloadCallback(struct {
-        fn reload() void {
-            std.debug.print("\nConfiguration reload requested\n", .{});
-        }
-    }.reload);
-
-    // Add some sample logs
-    try tui_manager.log("zc started");
-    try tui_manager.log("Configuration loaded");
-    try tui_manager.log("Proxy servers starting...");
-
-    // Update stats
-    tui_manager.updateStats(1024, 2048, 5);
-
-    // Run TUI
-    try tui_manager.run();
-}
-
 fn apiThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine: *rule_engine.Engine, manager: *outbound.OutboundManager, port: u16) void {
     var api_server = api.ApiServer.init(allocator, cfg, engine, manager, port);
     api_server.start() catch |err| {
@@ -1691,7 +1657,6 @@ fn printHelp() !void {
     std.debug.print("\n", .{});
     std.debug.print("COMMANDS:\n", .{});
     std.debug.print("    help                    Show this help message\n", .{});
-    std.debug.print("    tui                     Start TUI dashboard\n", .{});
     std.debug.print("    start [-c <config>] [--port <port>]\n", .{});
     std.debug.print("                            Start proxy in background\n", .{});
     std.debug.print("    stop                    Stop proxy\n", .{});
@@ -1736,9 +1701,6 @@ fn printHelp() !void {
     std.debug.print("\n", .{});
     std.debug.print("    # Start with an explicit mixed port for local development\n", .{});
     std.debug.print("    zc start --port 7901\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("    # Start TUI\n", .{});
-    std.debug.print("    zc tui\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("    # Check status\n", .{});
     std.debug.print("    zc status\n", .{});

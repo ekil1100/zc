@@ -2,7 +2,7 @@
 
 ## 1) 目标
 
-建立 zclash 性能回归最小脚手架，保证后续优化有统一口径：
+建立 zc 性能回归最小脚手架，保证后续优化有统一口径：
 - 可重复采样
 - 可对比历史结果
 - 可设置门禁阈值
@@ -190,7 +190,7 @@ bash scripts/perf/prune-history.sh 30
 终端输出：
 ```text
 PERF_REGRESSION_RESULT=PASS
-PERF_REGRESSION_REPORT=/path/to/zclash/docs/perf/reports/latest.json
+PERF_REGRESSION_REPORT=/path/to/zc/docs/perf/reports/latest.json
 ```
 返回码：`0`
 

@@ -6,7 +6,7 @@
 
 **Architecture:** Keep rule-provider preparation centralized in `src/config.zig`, but add a small sync-policy enum so callers can choose between eager sync and missing-only sync. Thread that policy through config-loading helpers in `src/main.zig`, and make `zc test` use missing-only while other commands keep eager behavior.
 
-**Tech Stack:** Zig 0.15.x, std.testing, existing CLI/config loading pipeline
+**Tech Stack:** Zig 0.16.0+, std.testing, existing CLI/config loading pipeline
 
 ---
 

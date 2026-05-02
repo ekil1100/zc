@@ -1085,6 +1085,9 @@ pub fn fetchConfig(allocator: std.mem.Allocator, url: []const u8) !DownloadResul
     var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
 
+    var proxy_arena = try initDefaultProxyEnv(allocator, &client);
+    defer proxy_arena.deinit();
+
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
     defer response_writer.deinit();
 
@@ -1107,6 +1110,15 @@ pub fn fetchConfig(allocator: std.mem.Allocator, url: []const u8) !DownloadResul
         .status = result.status,
         .body = body,
     };
+}
+
+fn initDefaultProxyEnv(allocator: std.mem.Allocator, client: *std.http.Client) !std.heap.ArenaAllocator {
+    var proxy_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer proxy_arena.deinit();
+    if (compat.environMap()) |environ_map| {
+        try client.initDefaultProxies(proxy_arena.allocator(), environ_map);
+    }
+    return proxy_arena;
 }
 
 /// 下载配置文件从 URL 并保存到 configs/ 目录
@@ -1865,17 +1877,23 @@ test "fetchConfig requests identity encoding to avoid compressed provider respon
             var conn = http_server.accept() catch return;
             defer conn.stream.close();
 
-            var req_buf: [2048]u8 = undefined;
-            const n = conn.stream.read(&req_buf) catch return;
-            request_capture.appendSlice(allocator_, req_buf[0..n]) catch return;
-
+            var req_buf: [512]u8 = undefined;
+            while (std.mem.indexOf(u8, request_capture.items, "\r\n\r\n") == null) {
+                const n = conn.stream.read(&req_buf) catch return;
+                if (n == 0) return;
+                request_capture.appendSlice(allocator_, req_buf[0..n]) catch return;
+                if (request_capture.items.len > 4096) return;
+            }
             var resp_buf: [256]u8 = undefined;
             const response = std.fmt.bufPrint(
                 &resp_buf,
                 "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
                 .{ body.len, body },
             ) catch return;
-            conn.stream.writeAll(response) catch {};
+            var write_buf: [1024]u8 = undefined;
+            var writer = conn.stream.writer(&write_buf);
+            writer.interface.writeAll(response) catch return;
+            writer.interface.flush() catch return;
         }
     }.run, .{ &server, allocator, &request_bytes, response_body });
     defer thread.join();
@@ -1889,6 +1907,30 @@ test "fetchConfig requests identity encoding to avoid compressed provider respon
     try std.testing.expectEqual(std.http.Status.ok, result.status);
     try std.testing.expectEqualStrings(response_body, result.body);
     try std.testing.expect(std.mem.indexOf(u8, request_bytes.items, "accept-encoding: identity\r\n") != null);
+}
+
+test "initDefaultProxyEnv configures standard proxy variables" {
+    const allocator = std.testing.allocator;
+
+    var env_map = try std.process.Environ.empty.createMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("http_proxy", "http://127.0.0.1:18080");
+    try env_map.put("https_proxy", "http://127.0.0.1:18443");
+    compat.setEnvironMap(&env_map);
+    defer compat.setEnvironMap(null);
+
+    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
+    defer client.deinit();
+
+    var proxy_arena = try initDefaultProxyEnv(allocator, &client);
+    defer proxy_arena.deinit();
+
+    try std.testing.expect(client.http_proxy != null);
+    try std.testing.expect(client.https_proxy != null);
+    try std.testing.expectEqual(@as(u16, 18080), client.http_proxy.?.port);
+    try std.testing.expectEqual(@as(u16, 18443), client.https_proxy.?.port);
+    try std.testing.expect(client.http_proxy.?.supports_connect);
+    try std.testing.expect(client.https_proxy.?.supports_connect);
 }
 
 test "normalizeRuleProviderLine strips payload dash and quotes" {

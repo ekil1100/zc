@@ -2,14 +2,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 var runtime_io: ?std.Io = null;
+var runtime_environ_map: ?*const std.process.Environ.Map = null;
 
 pub fn setIo(new_io: std.Io) void {
     runtime_io = new_io;
 }
 
+pub fn setEnvironMap(environ_map: ?*const std.process.Environ.Map) void {
+    runtime_environ_map = environ_map;
+}
+
 pub fn io() std.Io {
     if (builtin.is_test) return std.testing.io;
     return runtime_io orelse @panic("compat.io used before main initialized std.Io");
+}
+
+pub fn environMap() ?*const std.process.Environ.Map {
+    return runtime_environ_map;
 }
 
 pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {

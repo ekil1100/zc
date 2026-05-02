@@ -2,7 +2,7 @@
 
 ## 1) 目标
 
-为 zclash API 提供稳定、可机器识别、可人类操作的错误码体系。
+为 zc API 提供稳定、可机器识别、可人类操作的错误码体系。
 
 统一错误响应信封：
 
@@ -12,7 +12,7 @@
   "error": {
     "code": "CONFIG_NOT_FOUND",
     "message": "config file not found",
-    "hint": "run `zclash profile list` and choose a valid profile"
+    "hint": "run `zc profile list` and choose a valid profile"
   }
 }
 ```
@@ -41,8 +41,8 @@
 
 | code | message 示例 | hint 示例 |
 |---|---|---|
-| `CONFIG_NOT_FOUND` | config file not found | run `zclash profile list` and select a valid profile |
-| `CONFIG_PARSE_FAILED` | failed to parse config yaml | check yaml syntax and run `zclash profile validate <file>` |
+| `CONFIG_NOT_FOUND` | config file not found | run `zc profile list` and select a valid profile |
+| `CONFIG_PARSE_FAILED` | failed to parse config yaml | check yaml syntax and run `zc profile validate <file>` |
 | `CONFIG_SWITCH_FAILED` | failed to switch active config | verify file permission and retry |
 
 ## B. 网络类（NETWORK_*)
@@ -84,22 +84,22 @@
 | code | message 示例 | hint 示例 |
 |---|---|---|
 | `PROFILE_LIST_FAILED` | failed to list profiles | ensure config directory exists and is readable |
-| `PROFILE_SUBCOMMAND_MISSING` | profile subcommand is required | use `zclash profile list|use|import|validate` |
-| `PROFILE_SUBCOMMAND_UNKNOWN` | unknown profile subcommand | use `zclash profile list|use|import|validate` |
-| `PROFILE_NAME_REQUIRED` | profile name is required | use `zclash profile use <name>` |
-| `PROFILE_NOT_FOUND` | profile not found | run `zclash profile list` and confirm profile name |
+| `PROFILE_SUBCOMMAND_MISSING` | profile subcommand is required | use `zc profile list|use|import|validate` |
+| `PROFILE_SUBCOMMAND_UNKNOWN` | unknown profile subcommand | use `zc profile list|use|import|validate` |
+| `PROFILE_NAME_REQUIRED` | profile name is required | use `zc profile use <name>` |
+| `PROFILE_NOT_FOUND` | profile not found | run `zc profile list` and confirm profile name |
 | `PROFILE_USE_FAILED` | failed to switch profile | verify file permission and retry |
-| `PROFILE_SOURCE_REQUIRED` | profile import source is required | use `zclash profile import <url_or_path> [-n name]` |
+| `PROFILE_SOURCE_REQUIRED` | profile import source is required | use `zc profile import <url_or_path> [-n name]` |
 | `PROFILE_IMPORT_FAILED` | failed to import profile | check source url/path and retry |
-| `PROFILE_VALIDATE_FAILED` | failed to validate profile | run `zclash profile validate <name_or_path>` |
+| `PROFILE_VALIDATE_FAILED` | failed to validate profile | run `zc profile validate <name_or_path>` |
 | `PROXY_CONFIG_LOAD_FAILED` | failed to load config for proxy action | verify `-c` path and config validity |
-| `PROXY_GROUP_NOT_FOUND` | proxy group not found | run `zclash proxy list --json` to inspect groups |
-| `PROXY_NOT_FOUND` | proxy not found in group | run `zclash proxy select -g <group> --json` |
+| `PROXY_GROUP_NOT_FOUND` | proxy group not found | run `zc proxy list --json` to inspect groups |
+| `PROXY_NOT_FOUND` | proxy not found in group | run `zc proxy select -g <group> --json` |
 | `PROXY_SELECT_GROUP_MISSING` | no select-type proxy group found | check proxy-group type in profile |
 | `PROXY_SELECT_FAILED` | failed to select proxy | retry with valid group/proxy arguments |
-| `PROXY_SUBCOMMAND_UNKNOWN` | unknown proxy subcommand | use `zclash proxy list|select|test` |
+| `PROXY_SUBCOMMAND_UNKNOWN` | unknown proxy subcommand | use `zc proxy list|select|test` |
 | `DIAG_DOCTOR_FAILED` | failed to run doctor diagnostics | retry with valid config and inspect logs |
-| `DIAG_SUBCOMMAND_UNKNOWN` | unknown diag subcommand | use `zclash diag doctor [-c <config>] [--json]` |
+| `DIAG_SUBCOMMAND_UNKNOWN` | unknown diag subcommand | use `zc diag doctor [-c <config>] [--json]` |
 | `OVERRIDE_SCRIPT_NOT_FOUND` | override script or runtime not found | check `--override-script` path and lua availability |
 | `OVERRIDE_SCRIPT_EXEC_FAILED` | override script execution failed | ensure script exits 0 and outputs valid override |
 | `OVERRIDE_SCRIPT_TIMEOUT` | override script timed out | increase `--override-timeout-ms` or simplify script |
@@ -126,13 +126,11 @@
 
 ---
 
-## 5) OpenAPI 对齐
+## 5) API 文档对齐
 
-- `docs/api/openapi.yaml` 中通过 `x-error-code-dictionary` 引用本字典。
-- `components.schemas.ErrorResponse.error.code` 使用统一枚举，与本文件保持一致。
-- 新增错误码时，必须同时更新：
-  1) 本字典（`docs/api/error-codes.md`）
-  2) OpenAPI 枚举（`docs/api/openapi.yaml`）
+- 当前 v1.0 active API 文档入口是 `docs/api/README.md`。
+- 旧 OpenAPI 草案已归档到 `docs/archive/api/openapi.yaml`，不再作为当前契约。
+- 新增错误码时，必须同步更新本字典，并在对应 CLI/API 文档中说明可触发场景。
 
 ## 6) 后续落地
 

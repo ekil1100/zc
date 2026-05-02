@@ -13,7 +13,16 @@ if [[ ! -f "$COMPAT_DOC" || ! -f "$MIGRATOR_RUN" ]]; then
   exit 1
 fi
 
-declared_rules=$( (grep -E '^- `[^`]+`$' "$COMPAT_DOC" || true) | sed -E 's/^- `([^`]+)`$/\1/' | sort -u )
+declared_rules=$(awk '
+  /^## Migrator rules$/ { in_section = 1; next }
+  in_section && /^## / { in_section = 0 }
+  in_section && /^- `[^`]+`$/ {
+    line = $0
+    sub(/^- `/, "", line)
+    sub(/`$/, "", line)
+    print line
+  }
+' "$COMPAT_DOC" | sort -u)
 implemented_rules=$( (grep -Eo 'PORT_TYPE_INT|LOG_LEVEL_ENUM|PROXY_GROUP_TYPE_CHECK|DNS_FIELD_CHECK|DNS_NAMESERVER_FORMAT|PROXY_GROUP_EMPTY_PROXIES|TUN_ENABLE_CHECK|EXTERNAL_CONTROLLER_FORMAT|ALLOW_LAN_BIND_CONFLICT|RULE_PROVIDER_REF_CHECK|PROXY_NODE_FIELDS_CHECK|SS_CIPHER_ENUM_CHECK|VMESS_UUID_FORMAT_CHECK|MIXED_PORT_CONFLICT_CHECK|MODE_ENUM_CHECK|PROXY_NAME_UNIQUENESS_CHECK|PORT_RANGE_CHECK|SS_PROTOCOL_CHECK|VMESS_ALTERID_RANGE_CHECK|TROJAN_FIELDS_CHECK|RULES_FORMAT_CHECK|VLESS_FIELDS_CHECK|PROXY_GROUP_REF_CHECK|YAML_SYNTAX_CHECK|SUBSCRIPTION_URL_CHECK|WS_OPTS_FORMAT_CHECK|TLS_SNI_CHECK|UNSUPPORTED_PROXY_TYPE_CHECK|PORT_CONFLICT_CHECK' "$MIGRATOR_RUN" || true) | sort -u )
 
 missing_in_impl=$(comm -23 <(printf '%s

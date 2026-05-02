@@ -4,7 +4,7 @@
 
 zc 以 mihomo/c 为基线，优先做好这几件事：
 - CLI 直觉、默认值合理、错误可操作
-- CLI / API / TUI 概念一致
+- CLI / minimal API 概念一致；TUI 不进入 v1.0 范围
 - 关键路径可观测、稳定、性能可回归
 - 兼容主流配置与生态
 
@@ -15,7 +15,7 @@ zc 以 mihomo/c 为基线，优先做好这几件事：
 - Zig 版本要求 `0.16.0+`
 - CI 使用 `0.16.0`
 - 本地开发默认使用 `0.16.0`
-- 不降级到 `0.15.2` 或更低版本
+- 不降级到低于 `0.16.0` 的版本
 
 ## 工程规则
 
@@ -33,16 +33,15 @@ zc 以 mihomo/c 为基线，优先做好这几件事：
 ## 方法选择
 
 - 核心逻辑、协议边界、解析器：TDD
-- CLI / API / TUI 行为：BDD
+- CLI / minimal API 行为：BDD
 - 性能与稳定性：Benchmark-Driven + Scenario-based
 
 ## 执行要求
 
-- 开发计划放在 `ROADMAP.md`
-- 执行任务统一维护在 `TASKS.md`
-- 任务状态变化时，实时更新 `TASKS.md`
-- 每个功能先定义验收标准，再进入 DOING
-- 路线变更时，先改 `ROADMAP.md`，再同步 `TASKS.md`
+- v1.0 发布计划以 `.agents/zc-v1.0-roadmap.md` 为工作事实源，公开文档入口为 `docs/README.md` 与 `docs/roadmap/v1.0.md`
+- 根目录旧 `ROADMAP.md` / `TASKS.md` 不再作为 canonical，可删除或归档到 `docs/archive/`
+- 任务推进必须先定义验收标准，再进入实现
+- 路线变更时，先更新当前 v1.0 roadmap，再同步 `docs/README.md` / 相关用户文档
 
 ## 开发流程
 

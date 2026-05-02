@@ -1,6 +1,6 @@
 # Runtime Config Override
 
-`zc` supports runtime config override for commands that load config (`start`, `tui`, `test`, `doctor`, `proxy ...`).
+`zc` supports runtime config override for commands that load config (`start`, `test`, `doctor`, `proxy ...`).
 
 Override is in-memory only and does not rewrite profile files.
 You can bind a persistent override script to the current config profile via `zc config override`.

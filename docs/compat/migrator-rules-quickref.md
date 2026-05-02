@@ -1,6 +1,6 @@
 # 迁移规则速查表
 
-> 快速查找 mihomo/clash → zclash 配置迁移规则
+> 快速查找 mihomo/clash → zc 配置迁移规则
 
 ## 规则总览（R1-R21）
 
