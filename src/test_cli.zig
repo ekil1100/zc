@@ -16,8 +16,8 @@ const TEST_TARGETS = [_]struct {
     .{ .name = "Cloudflare", .url = "http://1.1.1.1" },
 };
 
-const CURL_CONNECT_TIMEOUT_SECONDS = "1";
-const CURL_MAX_TIME_SECONDS = "3";
+const CURL_CONNECT_TIMEOUT_SECONDS = "5";
+const CURL_MAX_TIME_SECONDS = "5";
 
 const ProxyType = enum {
     http,
@@ -457,6 +457,11 @@ test "connectivitySucceeded fails when every target fails" {
         .attempted = 2,
         .succeeded = 1,
     }));
+}
+
+test "curl probe timeout is five seconds" {
+    try std.testing.expectEqualStrings("5", CURL_CONNECT_TIMEOUT_SECONDS);
+    try std.testing.expectEqualStrings("5", CURL_MAX_TIME_SECONDS);
 }
 
 test "not listening hint includes executable command" {
