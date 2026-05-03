@@ -17,7 +17,7 @@ const TEST_TARGETS = [_]struct {
 };
 
 const CURL_CONNECT_TIMEOUT_SECONDS = "5";
-const CURL_GEO_MAX_TIME_SECONDS = "30";
+const CURL_GEO_MAX_TIME_SECONDS = "90";
 const CURL_LATENCY_MAX_TIME_SECONDS = "5";
 
 const ProxyType = enum {
@@ -465,7 +465,7 @@ test "connectivitySucceeded fails when every target fails" {
 
 test "curl probe timeouts separate liveness from latency" {
     try std.testing.expectEqualStrings("5", CURL_CONNECT_TIMEOUT_SECONDS);
-    try std.testing.expectEqualStrings("30", CURL_GEO_MAX_TIME_SECONDS);
+    try std.testing.expectEqualStrings("90", CURL_GEO_MAX_TIME_SECONDS);
     try std.testing.expectEqualStrings("5", CURL_LATENCY_MAX_TIME_SECONDS);
 }
 

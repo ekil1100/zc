@@ -109,7 +109,8 @@ pub const Client = struct {
 
     pub fn hasPendingRead(self: *const Client) bool {
         if (self.tls_conn) |conn| {
-            return conn.tls_client.reader.bufferedLen() > 0;
+            return conn.tls_client.reader.bufferedLen() > 0 or
+                conn.stream_reader.interface.bufferedLen() > 0;
         }
         return false;
     }
@@ -453,4 +454,13 @@ test "Trojan write path flushes underlying socket writer" {
 
     try testing.expect(std.mem.indexOf(u8, content, "fn " ++ "flushTlsAndSocket") != null);
     try testing.expect(std.mem.indexOf(u8, content, "conn.stream_writer.interface." ++ "flush()") != null);
+}
+
+test "Trojan pending read includes buffered socket reader data" {
+    const allocator = testing.allocator;
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "conn.tls_client.reader." ++ "bufferedLen() > 0") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_reader.interface." ++ "bufferedLen() > 0") != null);
 }
