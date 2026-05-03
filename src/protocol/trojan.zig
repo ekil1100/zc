@@ -104,13 +104,12 @@ pub const Client = struct {
 
     pub fn read(self: *Client, buf: []u8) !usize {
         const conn = self.tls_conn orelse return error.NotConnected;
-        return try conn.tls_client.reader.readSliceShort(buf);
+        return try readTlsApplicationData(&conn.tls_client.reader, buf);
     }
 
     pub fn hasPendingRead(self: *const Client) bool {
         if (self.tls_conn) |conn| {
-            return conn.tls_client.reader.bufferedLen() > 0 or
-                conn.stream_reader.interface.bufferedLen() > 0;
+            return conn.tls_client.reader.bufferedLen() > 0;
         }
         return false;
     }
@@ -214,6 +213,23 @@ pub const Client = struct {
     fn flushTlsAndSocket(conn: *TlsConnection) !void {
         try conn.tls_client.writer.flush();
         try conn.stream_writer.interface.flush();
+    }
+
+    fn readTlsApplicationData(reader: *std.Io.Reader, out: []u8) !usize {
+        if (out.len == 0) return 0;
+
+        while (reader.bufferedLen() == 0) {
+            reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                error.ReadFailed => return error.ReadFailed,
+            };
+        }
+
+        const buffered = reader.buffered();
+        const n = @min(out.len, buffered.len);
+        @memcpy(out[0..n], buffered[0..n]);
+        reader.seek += n;
+        return n;
     }
 
     /// 编码目标地址
@@ -456,11 +472,23 @@ test "Trojan write path flushes underlying socket writer" {
     try testing.expect(std.mem.indexOf(u8, content, "conn.stream_writer.interface." ++ "flush()") != null);
 }
 
-test "Trojan pending read includes buffered socket reader data" {
+test "Trojan pending read ignores raw TLS socket reader data" {
     const allocator = testing.allocator;
     const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
     defer allocator.free(content);
 
     try testing.expect(std.mem.indexOf(u8, content, "conn.tls_client.reader." ++ "bufferedLen() > 0") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_reader.interface." ++ "bufferedLen() > 0") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_reader.interface." ++ "bufferedLen() > 0") == null);
+}
+
+test "Trojan read uses TLS buffered short-read semantics" {
+    const allocator = testing.allocator;
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    const read_pos = std.mem.indexOf(u8, content, "pub fn read(self: *Client") orelse return error.TestUnexpectedResult;
+    const pending_pos = std.mem.indexOfPos(u8, content, read_pos, "pub fn hasPendingRead") orelse return error.TestUnexpectedResult;
+    const read_body = content[read_pos..pending_pos];
+    try testing.expect(std.mem.indexOf(u8, read_body, "readTlsApplicationData") != null);
+    try testing.expect(std.mem.indexOf(u8, read_body, "readSliceShort") == null);
 }

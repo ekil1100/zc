@@ -2120,6 +2120,7 @@ test "include auxiliary cli tests" {
     _ = @import("test_cli.zig");
     _ = @import("doctor_cli.zig");
     _ = @import("override.zig");
+    _ = @import("protocol/trojan.zig");
 }
 
 test "hasInProcessPortConflict detects conflicts" {
