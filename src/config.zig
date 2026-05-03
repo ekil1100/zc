@@ -1100,9 +1100,16 @@ pub fn fetchConfig(allocator: std.mem.Allocator, url: []const u8) !DownloadResul
             .accept_encoding = .{ .override = "identity" },
         },
     }) catch |err| {
+        if (shouldUseCurlFallback(url)) {
+            if (fetchConfigWithCurl(allocator, url)) |fallback| return fallback else |_| {}
+        }
         std.debug.print("Failed to download config: {s}\n", .{@errorName(err)});
         return err;
     };
+
+    if (result.status == .bad_request and shouldUseCurlFallback(url)) {
+        if (fetchConfigWithCurl(allocator, url)) |fallback| return fallback else |_| {}
+    }
 
     const body = try allocator.dupe(u8, response_writer.written());
 
@@ -1119,6 +1126,58 @@ fn initDefaultProxyEnv(allocator: std.mem.Allocator, client: *std.http.Client) !
         try client.initDefaultProxies(proxy_arena.allocator(), environ_map);
     }
     return proxy_arena;
+}
+
+fn shouldUseCurlFallback(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.mem.eql(u8, uri.scheme, "https")) return false;
+    const environ_map = compat.environMap() orelse return false;
+    return hasEnv(environ_map, "https_proxy") or
+        hasEnv(environ_map, "HTTPS_PROXY") or
+        hasEnv(environ_map, "all_proxy") or
+        hasEnv(environ_map, "ALL_PROXY");
+}
+
+fn hasEnv(environ_map: *const std.process.Environ.Map, key: []const u8) bool {
+    const value = environ_map.get(key) orelse return false;
+    return value.len > 0;
+}
+
+fn fetchConfigWithCurl(allocator: std.mem.Allocator, url: []const u8) !DownloadResult {
+    const result = try compat.childRun(allocator, &.{
+        "curl",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--user-agent",
+        "clash",
+        "--header",
+        "accept-encoding: identity",
+        "--write-out",
+        "\n%{http_code}",
+        url,
+    }, 64 * 1024 * 1024);
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.DownloadFailed,
+        else => return error.DownloadFailed,
+    }
+
+    const parsed = try parseCurlFetchResult(allocator, result.stdout);
+    return parsed;
+}
+
+fn parseCurlFetchResult(allocator: std.mem.Allocator, stdout: []const u8) !DownloadResult {
+    if (stdout.len < 4 or stdout[stdout.len - 4] != '\n') return error.DownloadFailed;
+    const status_text = stdout[stdout.len - 3 ..];
+    const status_code = std.fmt.parseInt(u16, status_text, 10) catch return error.DownloadFailed;
+    const body = try allocator.dupe(u8, stdout[0 .. stdout.len - 4]);
+    return .{
+        .status = @enumFromInt(status_code),
+        .body = body,
+    };
 }
 
 /// 下载配置文件从 URL 并保存到 configs/ 目录
@@ -1931,6 +1990,31 @@ test "initDefaultProxyEnv configures standard proxy variables" {
     try std.testing.expectEqual(@as(u16, 18443), client.https_proxy.?.port);
     try std.testing.expect(client.http_proxy.?.supports_connect);
     try std.testing.expect(client.https_proxy.?.supports_connect);
+}
+
+test "shouldUseCurlFallback only enables https proxy downloads" {
+    const allocator = std.testing.allocator;
+
+    var env_map = try std.process.Environ.empty.createMap(allocator);
+    defer env_map.deinit();
+    compat.setEnvironMap(&env_map);
+    defer compat.setEnvironMap(null);
+
+    try std.testing.expect(!shouldUseCurlFallback("https://example.com/config.yaml"));
+
+    try env_map.put("https_proxy", "http://127.0.0.1:7897");
+    try std.testing.expect(shouldUseCurlFallback("https://example.com/config.yaml"));
+    try std.testing.expect(!shouldUseCurlFallback("http://example.com/config.yaml"));
+}
+
+test "parseCurlFetchResult separates body from trailing status" {
+    const allocator = std.testing.allocator;
+
+    const result = try parseCurlFetchResult(allocator, "mixed-port: 7890\n\n200");
+    defer allocator.free(result.body);
+
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+    try std.testing.expectEqualStrings("mixed-port: 7890\n", result.body);
 }
 
 test "normalizeRuleProviderLine strips payload dash and quotes" {
