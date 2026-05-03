@@ -16,9 +16,17 @@ const TEST_TARGETS = [_]struct {
     .{ .name = "Cloudflare", .url = "http://1.1.1.1" },
 };
 
+const CURL_CONNECT_TIMEOUT_SECONDS = "1";
+const CURL_MAX_TIME_SECONDS = "3";
+
 const ProxyType = enum {
     http,
     socks5,
+};
+
+const TestStats = struct {
+    attempted: usize = 0,
+    succeeded: usize = 0,
 };
 
 const EffectivePorts = struct {
@@ -81,22 +89,25 @@ pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_
 
     const effective = selectEffectivePorts(cfg);
     try printEffectivePortsSummary(effective);
+    var totals: TestStats = .{};
 
     if (effective.mixed) |mixed_port| {
         std.debug.print("\nTesting via Mixed Proxy (127.0.0.1:{d}):\n", .{mixed_port});
         if (try isLocalPortListening(allocator, mixed_port)) {
-            try testViaProxy(allocator, mixed_port, .http);
+            totals = mergeStats(totals, try testViaProxy(allocator, mixed_port, .http));
         } else {
             printPortNotListeningHint(mixed_port);
+            return error.ProxyTestFailed;
         }
         std.debug.print("\n", .{});
+        try ensureConnectivitySucceeded(totals);
         return;
     }
 
     if (effective.http) |http_port| {
         std.debug.print("\nTesting via HTTP Proxy (127.0.0.1:{d}):\n", .{http_port});
         if (try isLocalPortListening(allocator, http_port)) {
-            try testViaProxy(allocator, http_port, .http);
+            totals = mergeStats(totals, try testViaProxy(allocator, http_port, .http));
         } else {
             printPortNotListeningHint(http_port);
         }
@@ -105,13 +116,14 @@ pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_
     if (effective.socks) |socks_port| {
         std.debug.print("\nTesting via SOCKS5 Proxy (127.0.0.1:{d}):\n", .{socks_port});
         if (try isLocalPortListening(allocator, socks_port)) {
-            try testViaProxy(allocator, socks_port, .socks5);
+            totals = mergeStats(totals, try testViaProxy(allocator, socks_port, .socks5));
         } else {
             printPortNotListeningHint(socks_port);
         }
     }
 
     std.debug.print("\n", .{});
+    try ensureConnectivitySucceeded(totals);
 }
 
 fn selectEffectivePorts(cfg: *const config.Config) EffectivePorts {
@@ -166,7 +178,7 @@ fn isLocalPortListening(allocator: std.mem.Allocator, port: u16) !bool {
 }
 
 /// 通过代理测试连接
-fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) !void {
+fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) !TestStats {
     const proxy_url = switch (proxy_type) {
         .http => try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port}),
         .socks5 => try std.fmt.allocPrint(allocator, "socks5://127.0.0.1:{d}", .{port}),
@@ -203,21 +215,44 @@ fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) 
     std.debug.print("\n  Latency Test:\n", .{});
     std.debug.print("  {s:-^50}\n", .{""});
 
+    var stats: TestStats = .{};
     for (TEST_TARGETS[1..]) |target| {
         std.debug.print("  {s:12} ", .{target.name});
 
         const latency = try testUrlLatency(allocator, target.url, proxy_url);
+        stats.attempted += 1;
 
         switch (latency) {
             .ok => |ms| {
                 const color = if (ms < 100) "🟢" else if (ms < 300) "🟡" else "🔴";
                 std.debug.print("{s} {d}ms\n", .{ color, ms });
+                stats.succeeded += 1;
             },
             .failed => |reason| {
                 std.debug.print("⚫ {s}\n", .{failureReasonText(reason)});
             },
         }
     }
+
+    return stats;
+}
+
+fn mergeStats(a: TestStats, b: TestStats) TestStats {
+    return .{
+        .attempted = a.attempted + b.attempted,
+        .succeeded = a.succeeded + b.succeeded,
+    };
+}
+
+fn ensureConnectivitySucceeded(stats: TestStats) !void {
+    if (!connectivitySucceeded(stats)) {
+        std.debug.print("  No connectivity target succeeded; check selected proxy, route rules, or upstream availability.\n", .{});
+        return error.ProxyTestFailed;
+    }
+}
+
+fn connectivitySucceeded(stats: TestStats) bool {
+    return stats.attempted > 0 and stats.succeeded > 0;
 }
 
 /// IP 地理信息
@@ -294,7 +329,7 @@ fn runCurl(allocator: std.mem.Allocator, proxy_url: []const u8, url: []const u8,
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
 
-    args.appendSlice(allocator, &.{ "curl", "--silent", "--show-error", "--max-time", "6", "-x", proxy_url, "-w", "%{http_code}" }) catch {
+    args.appendSlice(allocator, &.{ "curl", "--silent", "--show-error", "--connect-timeout", CURL_CONNECT_TIMEOUT_SECONDS, "--max-time", CURL_MAX_TIME_SECONDS, "-x", proxy_url, "-w", "%{http_code}" }) catch {
         return .{ .failed = .unknown };
     };
     if (ignore_body) {
@@ -411,6 +446,17 @@ test "failureReasonText returns actionable categories" {
     try std.testing.expectEqualStrings("DNS failure", failureReasonText(.dns));
     try std.testing.expectEqualStrings("TCP connect failure", failureReasonText(.tcp_connect));
     try std.testing.expectEqualStrings("TLS/handshake failure", failureReasonText(.tls_handshake));
+}
+
+test "connectivitySucceeded fails when every target fails" {
+    try std.testing.expect(!connectivitySucceeded(.{
+        .attempted = 2,
+        .succeeded = 0,
+    }));
+    try std.testing.expect(connectivitySucceeded(.{
+        .attempted = 2,
+        .succeeded = 1,
+    }));
 }
 
 test "not listening hint includes executable command" {
