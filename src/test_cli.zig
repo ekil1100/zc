@@ -17,7 +17,8 @@ const TEST_TARGETS = [_]struct {
 };
 
 const CURL_CONNECT_TIMEOUT_SECONDS = "5";
-const CURL_MAX_TIME_SECONDS = "5";
+const CURL_GEO_MAX_TIME_SECONDS = "30";
+const CURL_LATENCY_MAX_TIME_SECONDS = "5";
 
 const ProxyType = enum {
     http,
@@ -195,6 +196,9 @@ fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) 
         allocator.destroy(info);
     };
 
+    var stats: TestStats = .{};
+    stats.attempted += 1;
+
     if (ip_geo) |info| {
         std.debug.print("{s}", .{info.ip});
         if (info.city) |city| {
@@ -208,6 +212,7 @@ fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) 
             std.debug.print(")", .{});
         }
         std.debug.print("\n", .{});
+        stats.succeeded += 1;
     } else {
         std.debug.print("Failed to get IP/Location\n", .{});
     }
@@ -215,7 +220,6 @@ fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) 
     std.debug.print("\n  Latency Test:\n", .{});
     std.debug.print("  {s:-^50}\n", .{""});
 
-    var stats: TestStats = .{};
     for (TEST_TARGETS[1..]) |target| {
         std.debug.print("  {s:12} ", .{target.name});
 
@@ -266,7 +270,7 @@ const IpGeoInfo = struct {
 /// 获取出口 IP 和地理位置信息
 fn getIpGeoInfo(allocator: std.mem.Allocator, proxy_url: []const u8) !?*IpGeoInfo {
     // ip-api.com/json 返回 IP + 地理位置
-    const output = runCurl(allocator, proxy_url, "http://ip-api.com/json", false);
+    const output = runCurl(allocator, proxy_url, "http://ip-api.com/json", false, CURL_GEO_MAX_TIME_SECONDS);
     defer switch (output) {
         .ok => |ok| allocator.free(ok),
         .failed => {},
@@ -313,7 +317,7 @@ fn testUrlLatency(allocator: std.mem.Allocator, url: []const u8, proxy_url: []co
     failed: FailureReason,
 } {
     const start_time = compat.milliTimestamp();
-    const curl_result = runCurl(allocator, proxy_url, url, true);
+    const curl_result = runCurl(allocator, proxy_url, url, true, CURL_LATENCY_MAX_TIME_SECONDS);
     const end_time = compat.milliTimestamp();
 
     return switch (curl_result) {
@@ -325,11 +329,11 @@ fn testUrlLatency(allocator: std.mem.Allocator, url: []const u8, proxy_url: []co
     };
 }
 
-fn runCurl(allocator: std.mem.Allocator, proxy_url: []const u8, url: []const u8, ignore_body: bool) CurlResult {
+fn runCurl(allocator: std.mem.Allocator, proxy_url: []const u8, url: []const u8, ignore_body: bool, max_time_seconds: []const u8) CurlResult {
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
 
-    args.appendSlice(allocator, &.{ "curl", "--silent", "--show-error", "--connect-timeout", CURL_CONNECT_TIMEOUT_SECONDS, "--max-time", CURL_MAX_TIME_SECONDS, "-x", proxy_url, "-w", "%{http_code}" }) catch {
+    args.appendSlice(allocator, &.{ "curl", "--silent", "--show-error", "--connect-timeout", CURL_CONNECT_TIMEOUT_SECONDS, "--max-time", max_time_seconds, "-x", proxy_url, "-w", "%{http_code}" }) catch {
         return .{ .failed = .unknown };
     };
     if (ignore_body) {
@@ -459,9 +463,10 @@ test "connectivitySucceeded fails when every target fails" {
     }));
 }
 
-test "curl probe timeout is five seconds" {
+test "curl probe timeouts separate liveness from latency" {
     try std.testing.expectEqualStrings("5", CURL_CONNECT_TIMEOUT_SECONDS);
-    try std.testing.expectEqualStrings("5", CURL_MAX_TIME_SECONDS);
+    try std.testing.expectEqualStrings("30", CURL_GEO_MAX_TIME_SECONDS);
+    try std.testing.expectEqualStrings("5", CURL_LATENCY_MAX_TIME_SECONDS);
 }
 
 test "not listening hint includes executable command" {
