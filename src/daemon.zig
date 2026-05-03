@@ -526,8 +526,9 @@ fn collectStatusSnapshotAtPaths(
     lock_file: []const u8,
     log_file: []const u8,
     active_config: ?[]const u8,
+    inspector: RuntimeInspector,
 ) !StatusSnapshot {
-    const runtime = try inspectRuntimeAtPaths(allocator, pid_file, lock_file);
+    const runtime = try inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, inspector);
     if (runtime.pid) |p| {
         return .{
             .state = "running",
@@ -1127,6 +1128,10 @@ test "collectStatusSnapshot reports stopped state without pid file" {
         try allocator.dupe(u8, lock_file),
         try allocator.dupe(u8, log_file),
         null,
+        .{
+            .pid_is_daemon = testPidNeverMatchesDaemon,
+            .discover_pid = testDiscoverNoDaemon,
+        },
     );
     defer snapshot.deinit(allocator);
 
@@ -1163,6 +1168,10 @@ test "collectStatusSnapshot reports stale pid file and removes it" {
         try allocator.dupe(u8, lock_file),
         try allocator.dupe(u8, log_file),
         null,
+        .{
+            .pid_is_daemon = testPidNeverMatchesDaemon,
+            .discover_pid = testDiscoverNoDaemon,
+        },
     );
     defer snapshot.deinit(allocator);
 
@@ -1251,6 +1260,10 @@ test "collectStatusSnapshot reports running when lock is held but pid is untrack
         try allocator.dupe(u8, lock_file),
         try allocator.dupe(u8, log_file),
         null,
+        .{
+            .pid_is_daemon = testPidNeverMatchesDaemon,
+            .discover_pid = testDiscoverNoDaemon,
+        },
     );
     defer snapshot.deinit(allocator);
 

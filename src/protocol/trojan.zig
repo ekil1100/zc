@@ -14,10 +14,10 @@ pub const Command = enum(u8) {
 
 /// Trojan 配置
 pub const Config = struct {
-    password: []const u8,     // Trojan 密码 (SHA-224 哈希)
-    address: []const u8,     // 服务器地址
-    port: u16,               // 服务器端口 (通常是 443)
-    sni: ?[]const u8 = null,  // TLS SNI
+    password: []const u8, // Trojan 密码 (SHA-224 哈希)
+    address: []const u8, // 服务器地址
+    port: u16, // 服务器端口 (通常是 443)
+    sni: ?[]const u8 = null, // TLS SNI
     skip_cert_verify: bool = false,
 };
 
@@ -25,7 +25,7 @@ pub const Config = struct {
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    password_hash: [56]u8,   // SHA-224 hex string (28 bytes * 2)
+    password_hash: [56]u8, // SHA-224 hex string (28 bytes * 2)
     tls_conn: ?*TlsConnection = null,
 
     const TlsConnection = struct {
@@ -99,7 +99,7 @@ pub const Client = struct {
     pub fn write(self: *Client, data: []const u8) !void {
         const conn = self.tls_conn orelse return error.NotConnected;
         try conn.tls_client.writer.writeAll(data);
-        try conn.tls_client.writer.flush();
+        try flushTlsAndSocket(conn);
     }
 
     pub fn read(self: *Client, buf: []u8) !usize {
@@ -207,7 +207,12 @@ pub const Client = struct {
 
         // 发送握手
         try conn.tls_client.writer.writeAll(buf.items);
+        try flushTlsAndSocket(conn);
+    }
+
+    fn flushTlsAndSocket(conn: *TlsConnection) !void {
         try conn.tls_client.writer.flush();
+        try conn.stream_writer.interface.flush();
     }
 
     /// 编码目标地址
@@ -215,7 +220,7 @@ pub const Client = struct {
         // Try IPv4
         var ipv4: [4]u8 = undefined;
         if (parseIpv4(host, &ipv4)) {
-            try buf.append(self.allocator, 0x01);  // IPv4
+            try buf.append(self.allocator, 0x01); // IPv4
             try buf.appendSlice(self.allocator, &ipv4);
             return;
         }
@@ -223,13 +228,13 @@ pub const Client = struct {
         // Try IPv6
         var ipv6: [16]u8 = undefined;
         if (parseIpv6(host, &ipv6)) {
-            try buf.append(self.allocator, 0x04);  // IPv6
+            try buf.append(self.allocator, 0x04); // IPv6
             try buf.appendSlice(self.allocator, &ipv6);
             return;
         }
 
         // Domain
-        try buf.append(self.allocator, 0x03);  // Domain
+        try buf.append(self.allocator, 0x03); // Domain
         try buf.append(self.allocator, @intCast(host.len));
         try buf.appendSlice(self.allocator, host);
     }
@@ -439,4 +444,13 @@ test "Trojan hasPendingRead returns false when not connected" {
     });
 
     try testing.expect(!client.hasPendingRead());
+}
+
+test "Trojan write path flushes underlying socket writer" {
+    const allocator = testing.allocator;
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "fn " ++ "flushTlsAndSocket") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_writer.interface." ++ "flush()") != null);
 }
