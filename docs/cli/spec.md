@@ -6,7 +6,8 @@ This document describes the command surface implemented by `src/main.zig` for th
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `zc help` / `zc --help` | implemented | Prints help. |
+| `zc help` / `zc --help` | implemented | Prints global help. |
+| `zc help <topic>` | implemented | Prints group help for `config`, `proxy`, `profile`, `diag`, or `doctor`. |
 | `zc start [-c <config>] [--port <port>] [--json]` | implemented | Starts daemon; `--port` overrides mixed-port for this run. |
 | `zc stop [--json]` | implemented | Stops tracked daemon. |
 | `zc restart [-c <config>] [--json]` | implemented | Restarts daemon after preflight. |
@@ -20,8 +21,11 @@ The TUI command is intentionally excluded from v1.0 and is not present in help/d
 
 ## Config commands
 
+All config subcommands accept `help`, `--help`, or `-h` after the subcommand, for example `zc config download --help`.
+
 | Command | Status |
 | --- | --- |
+| `zc config help` / `zc config --help` / `zc config -h` | implemented |
 | `zc config list` / `zc config ls` | implemented |
 | `zc config download <url> [-n <name>]` | implemented |
 | `zc config update [<name>] [--apply <auto|hot|restart>]` | implemented |
@@ -31,14 +35,20 @@ The TUI command is intentionally excluded from v1.0 and is not present in help/d
 
 ## Proxy/profile commands
 
+All proxy/profile subcommands accept `help`, `--help`, or `-h` after the subcommand, for example `zc proxy select --help`.
+
 | Command | Status |
 | --- | --- |
+| `zc proxy help` / `zc proxy --help` / `zc proxy -h` | implemented |
 | `zc proxy list` / `zc proxy ls` | implemented; supports `--json` |
 | `zc proxy select [-g <group>] [-p <proxy>]` | implemented |
 | `zc proxy test` | implemented |
+| `zc profile help` / `zc profile --help` / `zc profile -h` | implemented |
 | `zc profile list` / `zc profile ls` | implemented |
 | `zc profile select` | implemented |
 | `zc profile test` | implemented |
+| `zc diag help` / `zc diag --help` / `zc diag -h` | implemented |
+| `zc diag doctor --help` | implemented |
 
 ## JSON contract
 

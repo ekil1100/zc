@@ -106,8 +106,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // 处理 help
-    if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "help")) {
-        try printHelp();
+    if (isHelpArg(cmd)) {
+        if (std.mem.eql(u8, cmd, "help") and args.len >= 3) {
+            try printHelpTopic(args[2]);
+        } else {
+            try printHelp();
+        }
         return;
     }
 
@@ -217,14 +221,27 @@ pub fn main(init: std.process.Init) !void {
 
         const subcmd = args[2];
 
+        if (isHelpArg(subcmd)) {
+            try printConfigHelp();
+            return;
+        }
+
         if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
+            if (containsHelpArg(args, 3)) {
+                try printConfigListHelp();
+                return;
+            }
             try config.listConfigs(allocator);
             return;
         }
 
         if (std.mem.eql(u8, subcmd, "download")) {
+            if (containsHelpArg(args, 3)) {
+                try printConfigDownloadHelp();
+                return;
+            }
             if (args.len < 4) {
-                std.debug.print("Usage: zc config download <url> [-n <name>]\n", .{});
+                try printConfigDownloadHelp();
                 return;
             }
 
@@ -247,6 +264,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "update")) {
+            if (containsHelpArg(args, 3)) {
+                try printConfigUpdateHelp();
+                return;
+            }
             var config_name: ?[]const u8 = null;
             var apply_mode: UpdateApplyMode = .auto;
 
@@ -254,7 +275,7 @@ pub fn main(init: std.process.Init) !void {
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--apply")) {
                     if (i + 1 >= args.len) {
-                        std.debug.print("Usage: zc config update [<name>] [--apply <auto|hot|restart>]\n", .{});
+                        try printConfigUpdateHelp();
                         return;
                     }
                     apply_mode = parseUpdateApplyMode(args[i + 1]) catch {
@@ -281,8 +302,7 @@ pub fn main(init: std.process.Init) !void {
             defer if (current_config) |c| allocator.free(c);
 
             const target_name = config_name orelse current_config orelse {
-                std.debug.print("Usage: zc config update [<name>]\n", .{});
-                std.debug.print("  <name>  Config name to update (default: current active config)\n", .{});
+                try printConfigUpdateHelp();
                 return;
             };
 
@@ -308,8 +328,12 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "use")) {
+            if (containsHelpArg(args, 3)) {
+                try printConfigUseHelp();
+                return;
+            }
             if (args.len < 4) {
-                std.debug.print("Usage: zc config use <name>\n", .{});
+                try printConfigUseHelp();
                 return;
             }
 
@@ -318,6 +342,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "dump")) {
+            if (containsHelpArg(args, 3)) {
+                try printConfigDumpHelp();
+                return;
+            }
             const config_path = parseConfigPathArg(args, 3);
             const no_override = hasFlag(args, "--no-override");
             var cfg = if (config_path) |path|
@@ -362,11 +390,15 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "override")) {
+            if (containsHelpArg(args, 3)) {
+                try printConfigOverrideHelp();
+                return;
+            }
             const action = parseConfigOverrideAction(args, 3) catch {
                 if (json_output) {
                     printCliError(true, "CONFIG_OVERRIDE_ARGUMENT_INVALID", "invalid config override arguments", "use `zc config override <script.lua>` / `zc config override --clear` / `zc config override`");
                 } else {
-                    std.debug.print("Usage: zc config override [<script.lua>|--clear]\n", .{});
+                    try printConfigOverrideHelp();
                 }
                 return;
             };
@@ -475,7 +507,16 @@ pub fn main(init: std.process.Init) !void {
 
         const subcmd = args[2];
 
+        if (isHelpArg(subcmd)) {
+            try printProxyHelp();
+            return;
+        }
+
         if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
+            if (containsHelpArg(args, 3)) {
+                try printProxyListHelp();
+                return;
+            }
             // 解析 -c 参数
             var config_path: ?[]const u8 = null;
             var i: usize = 3;
@@ -505,6 +546,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "select")) {
+            if (containsHelpArg(args, 3)) {
+                try printProxySelectHelp("proxy");
+                return;
+            }
             var group_name: ?[]const u8 = null;
             var proxy_name: ?[]const u8 = null;
             var config_path: ?[]const u8 = null;
@@ -554,6 +599,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "test")) {
+            if (containsHelpArg(args, 3)) {
+                try printProxyTestHelp("proxy");
+                return;
+            }
             var config_path: ?[]const u8 = null;
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
@@ -592,16 +641,25 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "profile")) {
         if (args.len < 3) {
             if (json_output) {
-                printCliError(json_output, "PROFILE_SUBCOMMAND_MISSING", "profile subcommand is required", "use `zc profile list|use <name>`");
+                printCliError(json_output, "PROFILE_SUBCOMMAND_MISSING", "profile subcommand is required", "use `zc profile --help` or `zc help profile`");
             } else {
-                std.debug.print("Usage: zc profile list|use <name>\n", .{});
+                try printProfileHelp();
             }
             return;
         }
 
         const subcmd = args[2];
 
+        if (isHelpArg(subcmd)) {
+            try printProfileHelp();
+            return;
+        }
+
         if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
+            if (containsHelpArg(args, 3)) {
+                try printProfileListHelp();
+                return;
+            }
             // 解析 -c 参数
             var config_path: ?[]const u8 = null;
             var i: usize = 3;
@@ -631,6 +689,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "select")) {
+            if (containsHelpArg(args, 3)) {
+                try printProxySelectHelp("profile");
+                return;
+            }
             var group_name: ?[]const u8 = null;
             var proxy_name: ?[]const u8 = null;
             var config_path: ?[]const u8 = null;
@@ -680,6 +742,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (std.mem.eql(u8, subcmd, "test")) {
+            if (containsHelpArg(args, 3)) {
+                try printProxyTestHelp("profile");
+                return;
+            }
             var config_path: ?[]const u8 = null;
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
@@ -706,10 +772,10 @@ pub fn main(init: std.process.Init) !void {
 
         // 未知子命令
         if (json_output) {
-            printCliError(json_output, "PROXY_SUBCOMMAND_UNKNOWN", "unknown proxy subcommand", "use `zc proxy --help` or `zc help`");
+            printCliError(json_output, "PROFILE_SUBCOMMAND_UNKNOWN", "unknown profile subcommand", "use `zc profile --help` or `zc help profile`");
         } else {
-            std.debug.print("Unknown proxy subcommand: {s}\n", .{subcmd});
-            try printProxyHelp();
+            std.debug.print("Unknown profile subcommand: {s}\n", .{subcmd});
+            try printProfileHelp();
         }
         return;
     }
@@ -776,8 +842,24 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 diag 子命令（doctor 别名）
     if (std.mem.eql(u8, cmd, "diag")) {
-        if (args.len < 3 or !std.mem.eql(u8, args[2], "doctor")) {
+        if (args.len < 3) {
+            if (json_output) {
+                printCliError(json_output, "DIAG_SUBCOMMAND_UNKNOWN", "unknown diag subcommand", "use `zc diag --help` or `zc diag doctor [-c <config>] [--json]`");
+            } else {
+                try printDiagHelp();
+            }
+            return;
+        }
+        if (args.len >= 3 and isHelpArg(args[2])) {
+            try printDiagHelp();
+            return;
+        }
+        if (!std.mem.eql(u8, args[2], "doctor")) {
             printCliError(json_output, "DIAG_SUBCOMMAND_UNKNOWN", "unknown diag subcommand", "use `zc diag doctor [-c <config>] [--json]`");
+            return;
+        }
+        if (containsHelpArg(args, 3)) {
+            try printDiagDoctorHelp();
             return;
         }
         const config_path = parseConfigPathArg(args, 3);
@@ -1648,6 +1730,35 @@ fn parseExternalControllerPort(ec: []const u8) !u16 {
     return port;
 }
 
+fn isHelpArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "help") or
+        std.mem.eql(u8, arg, "-h") or
+        std.mem.eql(u8, arg, "--help");
+}
+
+fn containsHelpArg(args: []const []const u8, start: usize) bool {
+    var i = start;
+    while (i < args.len) : (i += 1) {
+        if (isHelpArg(args[i])) return true;
+    }
+    return false;
+}
+
+fn printHelpTopic(topic: []const u8) !void {
+    if (std.mem.eql(u8, topic, "config")) {
+        try printConfigHelp();
+    } else if (std.mem.eql(u8, topic, "proxy")) {
+        try printProxyHelp();
+    } else if (std.mem.eql(u8, topic, "profile")) {
+        try printProfileHelp();
+    } else if (std.mem.eql(u8, topic, "diag") or std.mem.eql(u8, topic, "doctor")) {
+        try printDiagHelp();
+    } else {
+        std.debug.print("Unknown help topic: {s}\n", .{topic});
+        try printHelp();
+    }
+}
+
 fn printHelp() !void {
     std.debug.print("\n", .{});
     std.debug.print("zc v{s} - A high-performance proxy tool in Zig\n", .{build_options.version});
@@ -1665,8 +1776,16 @@ fn printHelp() !void {
     std.debug.print("    log [-n <lines>]        View logs\n", .{});
     std.debug.print("    config <subcmd>         Manage configurations\n", .{});
     std.debug.print("    proxy <subcmd>          Manage proxies\n", .{});
+    std.debug.print("    profile <subcmd>        Alias for proxy profile operations\n", .{});
     std.debug.print("    test [-c <config>]      Test network connectivity\n", .{});
     std.debug.print("    doctor [-c <config>]    Diagnose config/service/ports\n", .{});
+    std.debug.print("    diag <subcmd>           Diagnostic command group\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("HELP TOPICS:\n", .{});
+    std.debug.print("    zc help config | zc config --help\n", .{});
+    std.debug.print("    zc help proxy  | zc proxy --help\n", .{});
+    std.debug.print("    zc help profile | zc profile --help\n", .{});
+    std.debug.print("    zc help diag   | zc diag --help\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("OVERRIDE OPTIONS (for config-loading commands):\n", .{});
     std.debug.print("    --override-script <path>       Run override script (lua returns table, or executable prints YAML)\n", .{});
@@ -1679,6 +1798,8 @@ fn printHelp() !void {
     std.debug.print("    zc config download <url>        Download config from URL\n", .{});
     std.debug.print("                            -n <name>   Config filename (default: timestamp)\n", .{});
     std.debug.print("                            -d          Set as default after download\n", .{});
+    std.debug.print("    zc config update [<name>]       Update downloaded config\n", .{});
+    std.debug.print("                            --apply <auto|hot|restart>\n", .{});
     std.debug.print("    zc config use <configname>     Switch to specified config\n", .{});
     std.debug.print("    zc config dump [-c <config>] [--no-override]\n", .{});
     std.debug.print("                               Print merged config (YAML default, JSON with --json)\n", .{});
@@ -1692,6 +1813,7 @@ fn printHelp() !void {
     std.debug.print("    zc proxy select -g <group>      Select proxy for specific group\n", .{});
     std.debug.print("    zc proxy select -g <group>      Select specific proxy\n", .{});
     std.debug.print("              -p <proxy>\n", .{});
+    std.debug.print("    zc proxy test [-c <config>]     Test configured proxy connectivity\n", .{});
     std.debug.print("EXAMPLES:\n", .{});
     std.debug.print("    # Start proxy in background\n", .{});
     std.debug.print("    zc start\n", .{});
@@ -1741,6 +1863,8 @@ fn printConfigHelp() !void {
     std.debug.print("    zc config download <url>        Download config from URL\n", .{});
     std.debug.print("                            -n <name>   Config filename (default: timestamp)\n", .{});
     std.debug.print("                            -d          Set as default after download\n", .{});
+    std.debug.print("    zc config update [<name>]       Update downloaded config\n", .{});
+    std.debug.print("                            --apply <auto|hot|restart>\n", .{});
     std.debug.print("    zc config use <configname>     Switch to specified config\n", .{});
     std.debug.print("    zc config dump [-c <config>] [--no-override]\n", .{});
     std.debug.print("    zc config override [script|--clear]\n", .{});
@@ -1748,6 +1872,7 @@ fn printConfigHelp() !void {
     std.debug.print("EXAMPLES:\n", .{});
     std.debug.print("    zc config download https://example.com/config.yaml\n", .{});
     std.debug.print("    zc config download https://example.com/config.yaml -n myconfig -d\n", .{});
+    std.debug.print("    zc config update --apply auto\n", .{});
     std.debug.print("    zc config list\n", .{});
     std.debug.print("    zc config use myconfig.yaml\n", .{});
     std.debug.print("    zc config dump\n", .{});
@@ -1768,11 +1893,156 @@ fn printProxyHelp() !void {
     std.debug.print("    zc proxy select -g <group>      Select proxy for specific group\n", .{});
     std.debug.print("    zc proxy select -g <group>      Select specific proxy\n", .{});
     std.debug.print("              -p <proxy>\n", .{});
+    std.debug.print("    zc proxy test [-c <config>]     Test configured proxy connectivity\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("EXAMPLES:\n", .{});
     std.debug.print("    zc proxy list\n", .{});
     std.debug.print("    zc proxy select                 # Show selection UI\n", .{});
     std.debug.print("    zc proxy select -g Proxy -p HK  # Select HK in Proxy group\n", .{});
+    std.debug.print("    zc proxy test\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printConfigListHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc config list\n", .{});
+    std.debug.print("    zc config ls\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("List all locally downloaded configs.\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printConfigDownloadHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc config download <url> [-n <name>]\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("OPTIONS:\n", .{});
+    std.debug.print("    -n <name>    Config filename/display name\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printConfigUpdateHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc config update [<name>] [--apply <auto|hot|restart>]\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("OPTIONS:\n", .{});
+    std.debug.print("    <name>                 Config name to update (default: active config)\n", .{});
+    std.debug.print("    --apply auto           Apply hot reload when possible, restart when needed\n", .{});
+    std.debug.print("    --apply hot            Require hot reload\n", .{});
+    std.debug.print("    --apply restart        Restart daemon after update\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printConfigUseHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc config use <name>\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Switch the active config.\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printConfigDumpHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc config dump [-c <config>] [--no-override] [--json]\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("OPTIONS:\n", .{});
+    std.debug.print("    -c <config>       Config file/key to dump\n", .{});
+    std.debug.print("    --no-override     Skip persisted or CLI override script\n", .{});
+    std.debug.print("    --json            Print JSON instead of YAML\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printConfigOverrideHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc config override [<script.lua>|--clear] [--json]\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Bind, clear, or show the persisted override script for the active config.\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printProxyListHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc proxy list [-c <config>] [--json]\n", .{});
+    std.debug.print("    zc proxy ls [-c <config>] [--json]\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printProfileListHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc profile list [-c <config>] [--json]\n", .{});
+    std.debug.print("    zc profile ls [-c <config>] [--json]\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printProxySelectHelp(group: []const u8) !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc {s} select [-c <config>] [-g <group>] [-p <proxy>] [--json]\n", .{group});
+    std.debug.print("\n", .{});
+    std.debug.print("OPTIONS:\n", .{});
+    std.debug.print("    -c <config>    Config file/key to inspect\n", .{});
+    std.debug.print("    -g <group>     Proxy group name\n", .{});
+    std.debug.print("    -p <proxy>     Proxy name to select\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printProxyTestHelp(group: []const u8) !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc {s} test [-c <config>] [--json]\n", .{group});
+    std.debug.print("\n", .{});
+    std.debug.print("Test configured proxy connectivity through the effective local port.\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printProfileHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("zc profile - Manage proxy profiles\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc profile list                 List all proxy groups and nodes\n", .{});
+    std.debug.print("    zc profile ls                   Alias for list\n", .{});
+    std.debug.print("    zc profile select               Show proxy selection UI\n", .{});
+    std.debug.print("    zc profile select -g <group>    Select proxy for specific group\n", .{});
+    std.debug.print("    zc profile select -g <group>    Select specific proxy\n", .{});
+    std.debug.print("                -p <proxy>\n", .{});
+    std.debug.print("    zc profile test [-c <config>]   Test configured proxy connectivity\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("EXAMPLES:\n", .{});
+    std.debug.print("    zc profile list\n", .{});
+    std.debug.print("    zc profile select -g Proxy -p HK\n", .{});
+    std.debug.print("    zc profile test\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printDiagHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("zc diag - Diagnostics\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc diag doctor [-c <config>] [--json]\n", .{});
+    std.debug.print("                               Diagnose config, service state, and ports\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("EXAMPLES:\n", .{});
+    std.debug.print("    zc diag doctor\n", .{});
+    std.debug.print("    zc diag doctor --json\n", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printDiagDoctorHelp() !void {
+    std.debug.print("\n", .{});
+    std.debug.print("USAGE:\n", .{});
+    std.debug.print("    zc diag doctor [-c <config>] [--json]\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Diagnose config validity, daemon state, and local port availability.\n", .{});
     std.debug.print("\n", .{});
 }
 
@@ -1783,6 +2053,25 @@ test "parseExternalControllerPort valid and invalid" {
     try testing.expectError(error.InvalidExternalController, parseExternalControllerPort("127.0.0.1"));
     try testing.expectError(error.InvalidExternalController, parseExternalControllerPort("127.0.0.1:abc"));
     try testing.expectError(error.InvalidExternalController, parseExternalControllerPort("127.0.0.1:0"));
+}
+
+test "isHelpArg accepts common help spellings" {
+    const testing = std.testing;
+
+    try testing.expect(isHelpArg("help"));
+    try testing.expect(isHelpArg("--help"));
+    try testing.expect(isHelpArg("-h"));
+    try testing.expect(!isHelpArg("list"));
+}
+
+test "containsHelpArg scans after subcommand" {
+    const testing = std.testing;
+
+    const args = [_][]const u8{ "zc", "config", "download", "--help" };
+    try testing.expect(containsHelpArg(args[0..], 3));
+
+    const args2 = [_][]const u8{ "zc", "config", "download", "https://example.com" };
+    try testing.expect(!containsHelpArg(args2[0..], 3));
 }
 
 test "parseConfigPathArg handles -c" {
