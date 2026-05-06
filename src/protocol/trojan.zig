@@ -109,9 +109,16 @@ pub const Client = struct {
 
     pub fn hasPendingRead(self: *const Client) bool {
         if (self.tls_conn) |conn| {
-            return conn.tls_client.reader.bufferedLen() > 0;
+            return hasPendingBufferedRead(
+                conn.tls_client.reader.bufferedLen(),
+                conn.stream_reader.interface.bufferedLen(),
+            );
         }
         return false;
+    }
+
+    fn hasPendingBufferedRead(tls_buffered: usize, socket_buffered: usize) bool {
+        return tls_buffered > 0 or socket_buffered > 0;
     }
 
     fn initTlsConnection(self: *Client, stream: net.Stream) !*TlsConnection {
@@ -472,13 +479,16 @@ test "Trojan write path flushes underlying socket writer" {
     try testing.expect(std.mem.indexOf(u8, content, "conn.stream_writer.interface." ++ "flush()") != null);
 }
 
-test "Trojan pending read ignores raw TLS socket reader data" {
+test "Trojan pending read includes raw TLS socket reader data" {
     const allocator = testing.allocator;
     const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
     defer allocator.free(content);
 
-    try testing.expect(std.mem.indexOf(u8, content, "conn.tls_client.reader." ++ "bufferedLen() > 0") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_reader.interface." ++ "bufferedLen() > 0") == null);
+    try testing.expect(Client.hasPendingBufferedRead(1, 0));
+    try testing.expect(Client.hasPendingBufferedRead(0, 1));
+    try testing.expect(!Client.hasPendingBufferedRead(0, 0));
+    try testing.expect(std.mem.indexOf(u8, content, "conn.tls_client.reader." ++ "bufferedLen()") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_reader.interface." ++ "bufferedLen()") != null);
 }
 
 test "Trojan read uses TLS buffered short-read semantics" {
