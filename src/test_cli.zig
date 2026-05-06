@@ -97,7 +97,7 @@ pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_
 
     const effective = selectEffectivePorts(cfg);
     try printEffectivePortsSummary(effective);
-    printSelectedProxiesSummary(selected_proxies);
+    runtime_selection.printSelectedProxiesText(allocator, selected_proxies);
     var totals: TestStats = .{};
 
     if (effective.mixed) |mixed_port| {
@@ -169,24 +169,6 @@ fn printEffectivePortsSummary(effective: EffectivePorts) !void {
     } else {
         std.debug.print("\n", .{});
     }
-}
-
-fn printSelectedProxiesSummary(selected_proxies: []const runtime_selection.SelectedProxy) void {
-    std.debug.print("Selected proxies: ", .{});
-    if (selected_proxies.len == 0) {
-        std.debug.print("none\n", .{});
-        return;
-    }
-
-    for (selected_proxies, 0..) |selection, i| {
-        if (i > 0) std.debug.print(", ", .{});
-        if (selection.proxy_name) |proxy_name| {
-            std.debug.print("{s}={s} ({s})", .{ selection.group_name, proxy_name, runtime_selection.sourceString(selection.source) });
-        } else {
-            std.debug.print("{s}=(none) ({s})", .{ selection.group_name, runtime_selection.sourceString(selection.source) });
-        }
-    }
-    std.debug.print("\n", .{});
 }
 
 fn printPortNotListeningHint(port: u16) void {

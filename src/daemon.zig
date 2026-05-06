@@ -639,7 +639,7 @@ fn emitStatusJson(allocator: std.mem.Allocator, snapshot: *const StatusSnapshot)
     std.debug.print("{s}", .{text});
 }
 
-fn emitStatusText(snapshot: *const StatusSnapshot) void {
+fn emitStatusText(allocator: std.mem.Allocator, snapshot: *const StatusSnapshot) void {
     std.debug.print("zc status\n", .{});
     std.debug.print("state: {s}\n", .{snapshot.state});
     if (snapshot.detail) |detail| {
@@ -660,18 +660,7 @@ fn emitStatusText(snapshot: *const StatusSnapshot) void {
     } else {
         std.debug.print("active_config: (none)\n", .{});
     }
-    if (snapshot.selected_proxies.len > 0) {
-        std.debug.print("selected_proxies:\n", .{});
-        for (snapshot.selected_proxies) |selection| {
-            if (selection.proxy_name) |proxy_name| {
-                std.debug.print("  {s}: {s} ({s})\n", .{ selection.group_name, proxy_name, runtime_selection.sourceString(selection.source) });
-            } else {
-                std.debug.print("  {s}: (none) ({s})\n", .{ selection.group_name, runtime_selection.sourceString(selection.source) });
-            }
-        }
-    } else {
-        std.debug.print("selected_proxies: (none)\n", .{});
-    }
+    runtime_selection.printSelectedProxiesText(allocator, snapshot.selected_proxies);
     std.debug.print("pid_file: {s}\n", .{snapshot.pid_file});
     std.debug.print("lock_file: {s}\n", .{snapshot.lock_file});
     std.debug.print("log_file: {s}\n", .{snapshot.log_file});
@@ -971,7 +960,7 @@ pub fn getStatus(allocator: std.mem.Allocator, json_output: bool) !void {
         return;
     }
 
-    emitStatusText(&snapshot);
+    emitStatusText(allocator, &snapshot);
 }
 
 /// 查看日志（默认显示最后 50 行，持续刷新）

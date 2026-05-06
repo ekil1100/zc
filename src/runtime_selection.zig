@@ -160,6 +160,35 @@ pub fn appendSelectedProxiesJson(
     try out.append(allocator, ']');
 }
 
+pub fn appendSelectedProxiesText(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    selections: []const SelectedProxy,
+) !void {
+    if (selections.len == 0) {
+        try out.appendSlice(allocator, "selected_proxies: (none)\n");
+        return;
+    }
+
+    try out.appendSlice(allocator, "selected_proxies:\n");
+    for (selections) |selection| {
+        try out.print(allocator, "  {s}: ", .{selection.group_name});
+        if (selection.proxy_name) |proxy_name| {
+            try out.print(allocator, "{s}", .{proxy_name});
+        } else {
+            try out.appendSlice(allocator, "(none)");
+        }
+        try out.print(allocator, " ({s})\n", .{sourceString(selection.source)});
+    }
+}
+
+pub fn printSelectedProxiesText(allocator: std.mem.Allocator, selections: []const SelectedProxy) void {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    appendSelectedProxiesText(&out, allocator, selections) catch return;
+    std.debug.print("{s}", .{out.items});
+}
+
 fn makeConfigWithSelectGroup(allocator: std.mem.Allocator) !config.Config {
     var cfg = config.Config{
         .allocator = allocator,
@@ -231,4 +260,23 @@ test "appendSelectedProxiesJson writes node info" {
     try appendSelectedProxiesJson(&out, allocator, selections[0..]);
 
     try std.testing.expectEqualStrings("[{\"group\":\"Proxy\",\"proxy\":\"B\",\"source\":\"persisted\"}]", out.items);
+}
+
+test "appendSelectedProxiesText writes shared CLI node block" {
+    const allocator = std.testing.allocator;
+    const selections = [_]SelectedProxy{.{
+        .group_name = "Proxy",
+        .proxy_name = "B",
+        .source = .persisted,
+    }};
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try appendSelectedProxiesText(&out, allocator, selections[0..]);
+
+    try std.testing.expectEqualStrings(
+        \\selected_proxies:
+        \\  Proxy: B (persisted)
+        \\
+    , out.items);
 }
