@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
+const runtime_selection = @import("runtime_selection.zig");
 
 /// 测试目标网站列表
 const TEST_TARGETS = [_]struct {
@@ -51,14 +52,18 @@ const CurlResult = union(enum) {
 };
 
 /// 网络连接性测试
-pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8) !void {
+pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8, config_key: ?[]const u8) !void {
     _ = proxy_name;
     const effective = selectEffectivePorts(cfg);
+    const selected_proxies = try runtime_selection.collectSelectedProxies(allocator, cfg, config_key);
+    defer runtime_selection.deinitSelectedProxies(allocator, selected_proxies);
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
-    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{\"action\":\"proxy_test\",\"ports\":[");
+    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{\"action\":\"proxy_test\",\"selected_proxies\":");
+    try runtime_selection.appendSelectedProxiesJson(&out, allocator, selected_proxies);
+    try out.appendSlice(allocator, ",\"ports\":[");
 
     var first = true;
     if (effective.mixed) |p| {
@@ -82,14 +87,17 @@ pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, pr
     std.debug.print("{s}", .{out.items});
 }
 
-pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8) !void {
+pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8, config_key: ?[]const u8) !void {
     _ = proxy_name;
+    const selected_proxies = try runtime_selection.collectSelectedProxies(allocator, cfg, config_key);
+    defer runtime_selection.deinitSelectedProxies(allocator, selected_proxies);
 
     std.debug.print("Network Connectivity Test\n", .{});
     std.debug.print("{s:-^60}\n", .{""});
 
     const effective = selectEffectivePorts(cfg);
     try printEffectivePortsSummary(effective);
+    printSelectedProxiesSummary(selected_proxies);
     var totals: TestStats = .{};
 
     if (effective.mixed) |mixed_port| {
@@ -161,6 +169,24 @@ fn printEffectivePortsSummary(effective: EffectivePorts) !void {
     } else {
         std.debug.print("\n", .{});
     }
+}
+
+fn printSelectedProxiesSummary(selected_proxies: []const runtime_selection.SelectedProxy) void {
+    std.debug.print("Selected proxies: ", .{});
+    if (selected_proxies.len == 0) {
+        std.debug.print("none\n", .{});
+        return;
+    }
+
+    for (selected_proxies, 0..) |selection, i| {
+        if (i > 0) std.debug.print(", ", .{});
+        if (selection.proxy_name) |proxy_name| {
+            std.debug.print("{s}={s} ({s})", .{ selection.group_name, proxy_name, runtime_selection.sourceString(selection.source) });
+        } else {
+            std.debug.print("{s}=(none) ({s})", .{ selection.group_name, runtime_selection.sourceString(selection.source) });
+        }
+    }
+    std.debug.print("\n", .{});
 }
 
 fn printPortNotListeningHint(port: u16) void {

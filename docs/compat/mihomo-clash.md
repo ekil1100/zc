@@ -64,7 +64,7 @@ Parsed group types:
 - `load-balance`
 - `relay`
 
-Runtime selection currently prioritizes persisted/user selection and otherwise uses the first group member. Do not assume full mihomo strategy parity unless a scenario test proves it.
+运行时选择优先使用持久化的用户选择；没有持久化选择时，select 组使用第一个组成员作为默认节点。`zc status` 和 `zc test` 会显示同一套节点信息，JSON 字段为 `selected_proxies`。不要在没有场景测试证明前假设完整 mihomo 策略一致性。
 
 ## Rules
 

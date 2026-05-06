@@ -618,11 +618,13 @@ pub fn main(init: std.process.Init) !void {
                 return err;
             };
             defer cfg.deinit();
+            const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
+            defer if (config_key) |key| allocator.free(key);
 
             if (json_output) {
-                try test_cli.testProxyJson(allocator, &cfg, null);
+                try test_cli.testProxyJson(allocator, &cfg, null, config_key);
             } else {
-                try test_cli.testProxy(allocator, &cfg, null);
+                try test_cli.testProxy(allocator, &cfg, null, config_key);
             }
             return;
         }
@@ -761,11 +763,13 @@ pub fn main(init: std.process.Init) !void {
                 return err;
             };
             defer cfg.deinit();
+            const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
+            defer if (config_key) |key| allocator.free(key);
 
             if (json_output) {
-                try test_cli.testProxyJson(allocator, &cfg, null);
+                try test_cli.testProxyJson(allocator, &cfg, null, config_key);
             } else {
-                try test_cli.testProxy(allocator, &cfg, null);
+                try test_cli.testProxy(allocator, &cfg, null, config_key);
             }
             return;
         }
@@ -789,8 +793,14 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         defer cfg.deinit();
+        const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
+        defer if (config_key) |key| allocator.free(key);
 
-        try test_cli.testProxy(allocator, &cfg, null);
+        if (json_output) {
+            try test_cli.testProxyJson(allocator, &cfg, null, config_key);
+        } else {
+            try test_cli.testProxy(allocator, &cfg, null, config_key);
+        }
         return;
     }
 

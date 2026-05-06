@@ -3,6 +3,7 @@ const compat = @import("compat.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const constants = @import("constants.zig");
+const runtime_selection = @import("runtime_selection.zig");
 
 // PID 文件路径
 const PID_FILE = "/tmp/zc.pid";
@@ -32,6 +33,7 @@ const StatusSnapshot = struct {
     pid: ?i32 = null,
     uptime_seconds: ?i64 = null,
     active_config: ?[]const u8 = null,
+    selected_proxies: []runtime_selection.SelectedProxy = &[_]runtime_selection.SelectedProxy{},
     pid_file: []const u8,
     lock_file: []const u8,
     log_file: []const u8,
@@ -41,6 +43,7 @@ const StatusSnapshot = struct {
         allocator.free(self.lock_file);
         allocator.free(self.log_file);
         if (self.active_config) |active_config| allocator.free(active_config);
+        runtime_selection.deinitSelectedProxies(allocator, self.selected_proxies);
     }
 };
 
@@ -483,6 +486,8 @@ fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
     errdefer allocator.free(log_file);
     const active_config = try config.resolveRuntimeConfigKey(allocator, null);
     errdefer if (active_config) |value| allocator.free(value);
+    const selected_proxies = try collectStatusSelectedProxies(allocator, active_config);
+    errdefer runtime_selection.deinitSelectedProxies(allocator, selected_proxies);
 
     const runtime = try inspectRuntimeAtPaths(allocator, pid_file, lock_file);
     if (runtime.pid) |p| {
@@ -492,6 +497,7 @@ fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
             .pid = p,
             .uptime_seconds = try getDaemonUptime(p),
             .active_config = active_config,
+            .selected_proxies = selected_proxies,
             .pid_file = pid_file,
             .lock_file = lock_file,
             .log_file = log_file,
@@ -503,6 +509,7 @@ fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
             .state = "running",
             .detail = runtime.detail,
             .active_config = active_config,
+            .selected_proxies = selected_proxies,
             .pid_file = pid_file,
             .lock_file = lock_file,
             .log_file = log_file,
@@ -514,10 +521,17 @@ fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
         .detail = runtime.detail,
         .pid = runtime.stale_pid,
         .active_config = active_config,
+        .selected_proxies = selected_proxies,
         .pid_file = pid_file,
         .lock_file = lock_file,
         .log_file = log_file,
     };
+}
+
+fn collectStatusSelectedProxies(allocator: std.mem.Allocator, active_config: ?[]const u8) ![]runtime_selection.SelectedProxy {
+    var cfg = config.loadDefault(allocator) catch return try allocator.alloc(runtime_selection.SelectedProxy, 0);
+    defer cfg.deinit();
+    return try runtime_selection.collectSelectedProxies(allocator, &cfg, active_config);
 }
 
 fn collectStatusSnapshotAtPaths(
@@ -529,6 +543,7 @@ fn collectStatusSnapshotAtPaths(
     inspector: RuntimeInspector,
 ) !StatusSnapshot {
     const runtime = try inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, inspector);
+    const empty_selected_proxies = try allocator.alloc(runtime_selection.SelectedProxy, 0);
     if (runtime.pid) |p| {
         return .{
             .state = "running",
@@ -536,6 +551,7 @@ fn collectStatusSnapshotAtPaths(
             .pid = p,
             .uptime_seconds = try getDaemonUptime(p),
             .active_config = active_config,
+            .selected_proxies = empty_selected_proxies,
             .pid_file = pid_file,
             .lock_file = lock_file,
             .log_file = log_file,
@@ -547,6 +563,7 @@ fn collectStatusSnapshotAtPaths(
             .state = "running",
             .detail = runtime.detail,
             .active_config = active_config,
+            .selected_proxies = empty_selected_proxies,
             .pid_file = pid_file,
             .lock_file = lock_file,
             .log_file = log_file,
@@ -558,6 +575,7 @@ fn collectStatusSnapshotAtPaths(
         .detail = runtime.detail,
         .pid = runtime.stale_pid,
         .active_config = active_config,
+        .selected_proxies = empty_selected_proxies,
         .pid_file = pid_file,
         .lock_file = lock_file,
         .log_file = log_file,
@@ -601,6 +619,8 @@ fn formatStatusJson(allocator: std.mem.Allocator, snapshot: *const StatusSnapsho
     } else {
         try out.appendSlice(allocator, "null");
     }
+    try out.appendSlice(allocator, ",\"selected_proxies\":");
+    try runtime_selection.appendSelectedProxiesJson(&out, allocator, snapshot.selected_proxies);
     try out.appendSlice(allocator, ",\"paths\":{");
     try out.appendSlice(allocator, "\"pid_file\":");
     try appendJsonStringEscaped(&out, allocator, snapshot.pid_file);
@@ -639,6 +659,18 @@ fn emitStatusText(snapshot: *const StatusSnapshot) void {
         std.debug.print("active_config: {s}\n", .{active_config});
     } else {
         std.debug.print("active_config: (none)\n", .{});
+    }
+    if (snapshot.selected_proxies.len > 0) {
+        std.debug.print("selected_proxies:\n", .{});
+        for (snapshot.selected_proxies) |selection| {
+            if (selection.proxy_name) |proxy_name| {
+                std.debug.print("  {s}: {s} ({s})\n", .{ selection.group_name, proxy_name, runtime_selection.sourceString(selection.source) });
+            } else {
+                std.debug.print("  {s}: (none) ({s})\n", .{ selection.group_name, runtime_selection.sourceString(selection.source) });
+            }
+        }
+    } else {
+        std.debug.print("selected_proxies: (none)\n", .{});
     }
     std.debug.print("pid_file: {s}\n", .{snapshot.pid_file});
     std.debug.print("lock_file: {s}\n", .{snapshot.lock_file});
@@ -1309,6 +1341,7 @@ test "formatStatusJson preserves status compatibility fields and adds rich data"
     try std.testing.expect(std.mem.indexOf(u8, out, "\"pid\":321") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"uptime_seconds\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"active_config\":\"demo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"selected_proxies\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"paths\":{\"pid_file\":\"/tmp/zc.pid\",\"lock_file\":\"/tmp/zc.lock\",\"log_file\":\"/tmp/zc.log\"}") != null);
 }
 
