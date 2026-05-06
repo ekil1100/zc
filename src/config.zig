@@ -673,15 +673,28 @@ fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
 
 /// 默认配置（先尝试从文件读取，失败则用内置配置）
 pub fn loadDefault(allocator: std.mem.Allocator) !Config {
+    return try loadDefaultWithLogging(allocator, true);
+}
+
+/// 默认配置静默加载，用于已经有结构化输出契约的命令路径
+pub fn loadDefaultQuiet(allocator: std.mem.Allocator) !Config {
+    return try loadDefaultWithLogging(allocator, false);
+}
+
+fn loadDefaultWithLogging(allocator: std.mem.Allocator, log_selection: bool) !Config {
     // 尝试查找默认配置文件
     if (try getDefaultConfigPath(allocator)) |path| {
         defer allocator.free(path);
-        std.debug.print("Loading config from: {s}\n", .{path});
+        if (log_selection) {
+            std.debug.print("Loading config from: {s}\n", .{path});
+        }
         return try load(allocator, path);
     }
 
     // 使用内置默认配置
-    std.debug.print("No config file found, using built-in defaults\n", .{});
+    if (log_selection) {
+        std.debug.print("No config file found, using built-in defaults\n", .{});
+    }
     const yaml_config =
         \\mixed-port: 7899
         \\mode: rule

@@ -529,7 +529,7 @@ fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
 }
 
 fn collectStatusSelectedProxies(allocator: std.mem.Allocator, active_config: ?[]const u8) ![]runtime_selection.SelectedProxy {
-    var cfg = config.loadDefault(allocator) catch return try allocator.alloc(runtime_selection.SelectedProxy, 0);
+    var cfg = config.loadDefaultQuiet(allocator) catch return try allocator.alloc(runtime_selection.SelectedProxy, 0);
     defer cfg.deinit();
     return try runtime_selection.collectSelectedProxies(allocator, &cfg, active_config);
 }
