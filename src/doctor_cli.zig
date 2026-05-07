@@ -158,7 +158,7 @@ fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8, pro
         if (config_path) |path| {
             cfg = config.load(allocator, path) catch null;
         } else {
-            cfg = config.loadDefault(allocator) catch null;
+            cfg = config.loadDefaultQuiet(allocator) catch null;
         }
 
         if (cfg) |*loaded_cfg| {
@@ -383,60 +383,32 @@ pub fn formatDoctorReport(allocator: std.mem.Allocator, data: *const DoctorData)
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    try out.print(allocator, "zc doctor\n", .{});
-    try out.print(allocator, "{s:-^60}\n", .{""});
-
-    try out.print(allocator, "Version: {s}\n", .{data.version});
-    try out.print(allocator, "Config path: {s}\n", .{data.config_path});
-    try out.print(allocator, "Config: {s} ({s})\n", .{ if (data.config_ok) "OK" else "FAILED", data.config_source });
-
-    if (data.daemon_running) {
-        try out.print(allocator, "Daemon: running", .{});
-        if (data.daemon_pid) |pid| {
-            try out.print(allocator, " (PID: {d})\n", .{pid});
-        } else {
-            try out.print(allocator, "\n", .{});
-        }
+    try out.print(allocator, "Config: {s}\n", .{if (data.config_ok) "OK" else "FAILED"});
+    try out.print(allocator, "Daemon: {s}\n", .{if (data.daemon_running) "running" else "stopped"});
+    if (data.daemon_pid) |pid| {
+        try out.print(allocator, "PID: {d}\n", .{pid});
     } else {
-        try out.print(allocator, "Daemon: not running\n", .{});
+        try out.print(allocator, "PID: -\n", .{});
     }
-
-    try out.print(allocator, "Network: {s}\n", .{if (data.network_ok) "OK" else "UNREACHABLE"});
-    try out.print(allocator, "Proxy reachable: {s}\n", .{if (data.proxy_reachable) "YES" else "NO"});
-    try out.print(allocator, "Effective ports:\n", .{});
-    if (data.port_count == 0) {
-        try out.print(allocator, "  - none\n", .{});
-    } else {
-        var i: usize = 0;
-        while (i < data.port_count) : (i += 1) {
-            const p = data.ports[i];
-            try out.print(allocator, "  - {s}: 127.0.0.1:{d} [{s}]\n", .{ p.label, p.port, if (p.listening) "listening" else "not listening" });
-        }
-    }
-
-    try out.print(allocator, "Suggestions:\n", .{});
-    if (!data.config_ok) {
-        try out.print(allocator, "  1. Fix config syntax/validation issues, then rerun `zc doctor`.\n", .{});
-    }
-    if (!data.daemon_running) {
-        try out.print(allocator, "  2. Start service: zc start -c <config>\n", .{});
-    }
-    var has_not_listening = false;
-    var i: usize = 0;
-    while (i < data.port_count) : (i += 1) {
-        if (!data.ports[i].listening) {
-            has_not_listening = true;
-            break;
-        }
-    }
-    if (has_not_listening) {
-        try out.print(allocator, "  3. Ensure configured proxy ports are bound by zc process.\n", .{});
-    }
-    if (data.config_ok and data.daemon_running and !has_not_listening) {
-        try out.print(allocator, "  - No action needed.\n", .{});
-    }
+    try out.print(allocator, "Port: ", .{});
+    try appendPortSummary(allocator, &out, data);
+    try out.print(allocator, "\n", .{});
+    try out.print(allocator, "Connection: {s}\n", .{if (data.proxy_reachable) "OK" else "FAILED"});
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn appendPortSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), data: *const DoctorData) !void {
+    if (data.port_count == 0) {
+        try out.appendSlice(allocator, "-");
+        return;
+    }
+
+    var i: usize = 0;
+    while (i < data.port_count) : (i += 1) {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.print(allocator, "{d}", .{data.ports[i].port});
+    }
 }
 
 test "formatDoctorReport basic output" {
@@ -455,10 +427,11 @@ test "formatDoctorReport basic output" {
     const report = try formatDoctorReport(allocator, &data);
     defer allocator.free(report);
 
-    try std.testing.expect(std.mem.indexOf(u8, report, "zc doctor") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "Effective ports") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "mixed: 127.0.0.1:7890") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "Start service: zc start -c <config>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "Config: OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "Daemon: stopped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "PID: -") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "Port: 7890") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "Connection: FAILED") != null);
 }
 
 test "parseRuntimePortOverrideFromCommand reads daemon port flag" {

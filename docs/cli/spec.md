@@ -14,7 +14,7 @@ This document describes the command surface implemented by `src/main.zig` for th
 | `zc status [--json]` | implemented | 输出运行状态、运行时路径，以及 select 代理组当前节点；无持久化选择时显示该组默认首个节点。 |
 | `zc log [-n <lines>] [-f|--no-follow]` | implemented | Tails daemon log. |
 | `zc test [-c <config>] [--json]` | implemented | 文本和 JSON 输出都会包含 select 代理组当前节点；JSON 模式只做本地监听探测，不执行外部连通性探测。 |
-| `zc doctor [-c <config>] [--json]` | implemented | 轻量配置/服务诊断；端口输出展示有效运行时 mixed 端口，运行中的 daemon 可发现 `start --port` 时优先展示该覆盖端口；普通模式不刷新或展开远程 rule-provider。 |
+| `zc doctor [-c <config>] [--json]` | implemented | 轻量配置/服务诊断；文本输出固定为 `Config`、`Daemon`、`PID`、`Port`、`Connection`；普通模式不刷新或展开远程 rule-provider。 |
 | `zc diag doctor [-c <config>] [--json]` | implemented | `doctor` 别名，端口输出和轻量诊断语义一致。 |
 
 The TUI command is intentionally excluded from v1.0 and is not present in help/dispatch.

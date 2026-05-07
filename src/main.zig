@@ -1442,6 +1442,11 @@ fn ruleProviderSyncPolicyForCommand(command_name: []const u8) config.RuleProvide
     return .eager;
 }
 
+fn commandUsesQuietDefaultConfig(command_name: []const u8) bool {
+    return std.mem.eql(u8, command_name, "doctor") or
+        std.mem.eql(u8, command_name, "diag.doctor");
+}
+
 fn loadRuntimeConfig(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
@@ -1452,6 +1457,8 @@ fn loadRuntimeConfig(
 ) !config.Config {
     var cfg = if (config_path) |path|
         try config.load(allocator, path)
+    else if (commandUsesQuietDefaultConfig(command_name))
+        try config.loadDefaultQuiet(allocator)
     else
         try config.loadDefault(allocator);
     errdefer cfg.deinit();
@@ -2178,6 +2185,14 @@ test "ruleProviderSyncPolicyForCommand keeps zc test missing-only" {
     try testing.expectEqual(config.RuleProviderSyncPolicy.missing_only, ruleProviderSyncPolicyForCommand("diag.doctor"));
     try testing.expectEqual(config.RuleProviderSyncPolicy.eager, ruleProviderSyncPolicyForCommand("start"));
     try testing.expectEqual(config.RuleProviderSyncPolicy.eager, ruleProviderSyncPolicyForCommand("proxy.test"));
+}
+
+test "commandUsesQuietDefaultConfig keeps doctor output clean" {
+    const testing = std.testing;
+
+    try testing.expect(commandUsesQuietDefaultConfig("doctor"));
+    try testing.expect(commandUsesQuietDefaultConfig("diag.doctor"));
+    try testing.expect(!commandUsesQuietDefaultConfig("start"));
 }
 
 test "applyRuntimePortSelection prefers explicit port and keeps mixed mode" {
