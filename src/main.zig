@@ -1433,7 +1433,12 @@ fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) voi
 }
 
 fn ruleProviderSyncPolicyForCommand(command_name: []const u8) config.RuleProviderSyncPolicy {
-    if (std.mem.eql(u8, command_name, "test")) return .missing_only;
+    if (std.mem.eql(u8, command_name, "test") or
+        std.mem.eql(u8, command_name, "doctor") or
+        std.mem.eql(u8, command_name, "diag.doctor"))
+    {
+        return .missing_only;
+    }
     return .eager;
 }
 
@@ -2169,6 +2174,8 @@ test "ruleProviderSyncPolicyForCommand keeps zc test missing-only" {
     const testing = std.testing;
 
     try testing.expectEqual(config.RuleProviderSyncPolicy.missing_only, ruleProviderSyncPolicyForCommand("test"));
+    try testing.expectEqual(config.RuleProviderSyncPolicy.missing_only, ruleProviderSyncPolicyForCommand("doctor"));
+    try testing.expectEqual(config.RuleProviderSyncPolicy.missing_only, ruleProviderSyncPolicyForCommand("diag.doctor"));
     try testing.expectEqual(config.RuleProviderSyncPolicy.eager, ruleProviderSyncPolicyForCommand("start"));
     try testing.expectEqual(config.RuleProviderSyncPolicy.eager, ruleProviderSyncPolicyForCommand("proxy.test"));
 }

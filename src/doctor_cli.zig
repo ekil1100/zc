@@ -5,6 +5,10 @@ const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
 const daemon = @import("daemon.zig");
 
+const network_probe_host = "1.1.1.1";
+const network_probe_port: u16 = 443;
+const network_probe_timeout_ms: i32 = 200;
+
 pub const PortEntry = struct {
     label: []const u8,
     port: u16,
@@ -183,18 +187,6 @@ fn populateConfigData(
     daemon_mixed_port: ?u16,
     data: *DoctorData,
 ) !bool {
-    config.prepareRuleProvidersForRuntime(allocator, loaded_cfg, config_path) catch |err| {
-        data.config_ok = false;
-        data.config_source = if (config_path != null) "custom (parse ok, provider prepare failed)" else "default (parse ok, provider prepare failed)";
-
-        const errs = try allocator.alloc([]const u8, 1);
-        errs[0] = try std.fmt.allocPrint(allocator, "rule-providers preparation failed: {s}", .{@errorName(err)});
-        data.config_errors = errs;
-
-        try fillEffectivePorts(allocator, loaded_cfg, daemon_mixed_port, data);
-        return true;
-    };
-
     var vr = validator.validate(allocator, loaded_cfg) catch {
         data.config_ok = false;
         data.config_source = if (config_path != null) "custom (parse ok, validation failed)" else "default (parse ok, validation failed)";
@@ -225,9 +217,67 @@ fn populateConfigData(
 }
 
 fn checkNetworkConnectivity() bool {
-    const stream = compat.net.tcpConnectToHost(std.heap.page_allocator, "1.1.1.1", 53) catch return false;
-    stream.close();
-    return true;
+    return tcpConnectIp4WithTimeout(network_probe_host, network_probe_port, network_probe_timeout_ms);
+}
+
+fn tcpConnectIp4WithTimeout(host: []const u8, port: u16, timeout_ms: i32) bool {
+    if (timeout_ms <= 0) return false;
+
+    const address = compat.net.Address.parseIp4(host, port) catch return false;
+    const sa = switch (address) {
+        .in => |a| a.sa,
+        .in6 => return false,
+    };
+
+    const fd_rc = std.posix.system.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    switch (std.posix.errno(fd_rc)) {
+        .SUCCESS => {},
+        else => return false,
+    }
+    const fd: std.posix.fd_t = @intCast(fd_rc);
+    defer compat.posixClose(fd);
+
+    const flags_rc = std.posix.system.fcntl(fd, std.c.F.GETFL, @as(usize, 0));
+    switch (std.posix.errno(flags_rc)) {
+        .SUCCESS => {},
+        else => return false,
+    }
+    const nonblock_flags = @as(usize, @intCast(flags_rc)) | (@as(usize, 1) << @bitOffsetOf(std.c.O, "NONBLOCK"));
+    switch (std.posix.errno(std.posix.system.fcntl(fd, std.c.F.SETFL, nonblock_flags))) {
+        .SUCCESS => {},
+        else => return false,
+    }
+
+    const sockaddr: *const std.c.sockaddr = @ptrCast(&sa);
+    const connect_rc = std.c.connect(fd, sockaddr, @sizeOf(@TypeOf(sa)));
+    switch (std.posix.errno(connect_rc)) {
+        .SUCCESS => return true,
+        .INPROGRESS, .ALREADY, .AGAIN => {},
+        else => return false,
+    }
+
+    var poll_fds = [_]std.posix.pollfd{
+        .{
+            .fd = fd,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        },
+    };
+    const ready = std.posix.poll(&poll_fds, timeout_ms) catch return false;
+    if (ready == 0) return false;
+    if ((poll_fds[0].revents & (std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP)) == 0) return false;
+
+    var socket_error: c_int = 0;
+    var socket_error_len: std.c.socklen_t = @sizeOf(@TypeOf(socket_error));
+    const getsockopt_rc = std.c.getsockopt(
+        fd,
+        std.c.SOL.SOCKET,
+        std.c.SO.ERROR,
+        &socket_error,
+        &socket_error_len,
+    );
+    if (getsockopt_rc != 0) return false;
+    return socket_error == 0;
 }
 
 fn getDaemonUptime(pid: ?i32) !?i64 {
@@ -416,6 +466,13 @@ test "parseRuntimePortOverrideFromCommand reads daemon port flag" {
     try std.testing.expectEqual(@as(?u16, 29002), parseRuntimePortOverrideFromCommand("/bin/zc --daemon-run --port 29002"));
     try std.testing.expectEqual(@as(?u16, null), parseRuntimePortOverrideFromCommand("/bin/zc --daemon-run --port nope"));
     try std.testing.expectEqual(@as(?u16, null), parseRuntimePortOverrideFromCommand("/bin/zc --daemon-run"));
+}
+
+test "doctor network probe timeout stays bounded" {
+    try std.testing.expectEqualStrings("1.1.1.1", network_probe_host);
+    try std.testing.expectEqual(@as(u16, 443), network_probe_port);
+    try std.testing.expect(network_probe_timeout_ms > 0);
+    try std.testing.expect(network_probe_timeout_ms <= 1000);
 }
 
 test "fillEffectivePorts reports daemon runtime mixed port" {
