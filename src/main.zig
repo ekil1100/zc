@@ -807,7 +807,7 @@ pub fn main(init: std.process.Init) !void {
     // 处理 doctor 命令
     if (std.mem.eql(u8, cmd, "doctor")) {
         const config_path = parseConfigPathArg(args, 2);
-        var cfg_check = loadRawConfigForDoctor(allocator, config_path) catch |err| {
+        var cfg_check = loadRuntimeConfig(allocator, config_path, null, &override_opts, "doctor", false) catch |err| {
             if (printOverrideRuntimeError(json_output, err)) return err;
             if (json_output) {
                 printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
@@ -815,29 +815,6 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         defer cfg_check.deinit();
-
-        var persisted_script: ?[]u8 = null;
-        defer if (persisted_script) |p| allocator.free(p);
-        var effective_override = resolveEffectiveOverrideOptions(
-            allocator,
-            &override_opts,
-            config_path,
-            &persisted_script,
-        ) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            if (json_output) {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
-            }
-            return err;
-        };
-
-        override.apply(allocator, &cfg_check, &effective_override, "doctor", config_path) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            if (json_output) {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
-            }
-            return err;
-        };
 
         if (json_output) {
             doctor_cli.runDoctorJsonWithConfig(allocator, &cfg_check, config_path) catch |err| {
@@ -873,7 +850,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         const config_path = parseConfigPathArg(args, 3);
-        var cfg_check = loadRawConfigForDoctor(allocator, config_path) catch |err| {
+        var cfg_check = loadRuntimeConfig(allocator, config_path, null, &override_opts, "diag.doctor", false) catch |err| {
             if (printOverrideRuntimeError(json_output, err)) return err;
             if (json_output) {
                 printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
@@ -881,29 +858,6 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         defer cfg_check.deinit();
-
-        var persisted_script: ?[]u8 = null;
-        defer if (persisted_script) |p| allocator.free(p);
-        var effective_override = resolveEffectiveOverrideOptions(
-            allocator,
-            &override_opts,
-            config_path,
-            &persisted_script,
-        ) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            if (json_output) {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
-            }
-            return err;
-        };
-
-        override.apply(allocator, &cfg_check, &effective_override, "diag.doctor", config_path) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            if (json_output) {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
-            }
-            return err;
-        };
 
         if (json_output) {
             doctor_cli.runDoctorJsonWithConfig(allocator, &cfg_check, config_path) catch |err| {
@@ -1090,13 +1044,6 @@ fn printProfileListJson(allocator: std.mem.Allocator) !void {
     try out.appendSlice(allocator, "}}\n");
 
     std.debug.print("{s}", .{out.items});
-}
-
-fn loadRawConfigForDoctor(allocator: std.mem.Allocator, config_path: ?[]const u8) !config.Config {
-    if (config_path) |path| {
-        return config.load(allocator, path);
-    }
-    return config.loadDefault(allocator);
 }
 
 fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
+const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
 const daemon = @import("daemon.zig");
 
@@ -142,8 +143,12 @@ fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8, pro
         .port_count = 0,
     };
 
+    try fillDaemonStatus(allocator, &data);
+    data.daemon_uptime_seconds = try getDaemonUptime(data.daemon_pid);
+    const daemon_mixed_port = try detectDaemonMixedPort(allocator, data.daemon_running, data.daemon_pid);
+
     if (provided_cfg) |loaded_cfg| {
-        if (try populateConfigData(allocator, loaded_cfg, config_path, &data)) return data;
+        if (try populateConfigData(allocator, loaded_cfg, config_path, daemon_mixed_port, &data)) return data;
     } else {
         var cfg: ?config.Config = null;
         if (config_path) |path| {
@@ -154,13 +159,9 @@ fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8, pro
 
         if (cfg) |*loaded_cfg| {
             defer loaded_cfg.deinit();
-            if (try populateConfigData(allocator, loaded_cfg, config_path, &data)) return data;
+            if (try populateConfigData(allocator, loaded_cfg, config_path, daemon_mixed_port, &data)) return data;
         }
     }
-
-    data.daemon_pid = try daemon.readPid(allocator);
-    data.daemon_running = try daemon.isRunning(allocator);
-    data.daemon_uptime_seconds = try getDaemonUptime(data.daemon_pid);
 
     data.network_ok = checkNetworkConnectivity();
     data.migration_hints = try collectMigrationHints(allocator, config_path);
@@ -179,6 +180,7 @@ fn populateConfigData(
     allocator: std.mem.Allocator,
     loaded_cfg: *config.Config,
     config_path: ?[]const u8,
+    daemon_mixed_port: ?u16,
     data: *DoctorData,
 ) !bool {
     config.prepareRuleProvidersForRuntime(allocator, loaded_cfg, config_path) catch |err| {
@@ -189,16 +191,14 @@ fn populateConfigData(
         errs[0] = try std.fmt.allocPrint(allocator, "rule-providers preparation failed: {s}", .{@errorName(err)});
         data.config_errors = errs;
 
-        try fillEffectivePorts(allocator, loaded_cfg, data);
-        try fillDaemonStatus(allocator, data);
+        try fillEffectivePorts(allocator, loaded_cfg, daemon_mixed_port, data);
         return true;
     };
 
     var vr = validator.validate(allocator, loaded_cfg) catch {
         data.config_ok = false;
         data.config_source = if (config_path != null) "custom (parse ok, validation failed)" else "default (parse ok, validation failed)";
-        try fillEffectivePorts(allocator, loaded_cfg, data);
-        try fillDaemonStatus(allocator, data);
+        try fillEffectivePorts(allocator, loaded_cfg, daemon_mixed_port, data);
         return true;
     };
     defer vr.deinit();
@@ -220,7 +220,7 @@ fn populateConfigData(
         data.config_warnings = warns;
     }
 
-    try fillEffectivePorts(allocator, loaded_cfg, data);
+    try fillEffectivePorts(allocator, loaded_cfg, daemon_mixed_port, data);
     return false;
 }
 
@@ -273,40 +273,53 @@ fn collectMigrationHints(allocator: std.mem.Allocator, config_path: ?[]const u8)
 }
 
 fn fillDaemonStatus(allocator: std.mem.Allocator, data: *DoctorData) !void {
-    data.daemon_pid = try daemon.readPid(allocator);
     data.daemon_running = try daemon.isRunning(allocator);
+    data.daemon_pid = try daemon.readPid(allocator);
 }
 
-fn fillEffectivePorts(allocator: std.mem.Allocator, cfg: *const config.Config, data: *DoctorData) !void {
+fn detectDaemonMixedPort(allocator: std.mem.Allocator, daemon_running: bool, daemon_pid: ?i32) !?u16 {
+    if (!daemon_running) return null;
+    const pid = daemon_pid orelse return constants.MIXED_PORT;
+    return (try detectDaemonPortOverride(allocator, pid)) orelse constants.MIXED_PORT;
+}
+
+fn detectDaemonPortOverride(allocator: std.mem.Allocator, pid: i32) !?u16 {
+    var pid_buf: [32]u8 = undefined;
+    const pid_text = try std.fmt.bufPrint(&pid_buf, "{d}", .{pid});
+    const result = compat.childRun(allocator, &.{ "ps", "-ww", "-o", "command=", "-p", pid_text }, 1024 * 1024) catch return null;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    if (result.term.exited != 0) return null;
+    return parseRuntimePortOverrideFromCommand(result.stdout);
+}
+
+fn parseRuntimePortOverrideFromCommand(command: []const u8) ?u16 {
+    var it = std.mem.tokenizeAny(u8, command, " \t\r\n");
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--port")) {
+            const value = it.next() orelse return null;
+            return std.fmt.parseInt(u16, value, 10) catch null;
+        }
+        if (std.mem.startsWith(u8, arg, "--port=")) {
+            return std.fmt.parseInt(u16, arg["--port=".len..], 10) catch null;
+        }
+    }
+    return null;
+}
+
+fn fillEffectivePorts(allocator: std.mem.Allocator, cfg: *const config.Config, daemon_mixed_port: ?u16, data: *DoctorData) !void {
     _ = allocator;
+    data.port_count = 0;
 
-    if (cfg.mixed_port > 0) {
-        data.ports[0] = .{
-            .label = "mixed",
-            .port = cfg.mixed_port,
-            .listening = try isLocalPortListening(cfg.mixed_port),
-        };
-        data.port_count = 1;
-        return;
-    }
-
-    if (cfg.port > 0) {
-        data.ports[data.port_count] = .{
-            .label = "http",
-            .port = cfg.port,
-            .listening = try isLocalPortListening(cfg.port),
-        };
-        data.port_count += 1;
-    }
-
-    if (cfg.socks_port > 0) {
-        data.ports[data.port_count] = .{
-            .label = "socks",
-            .port = cfg.socks_port,
-            .listening = try isLocalPortListening(cfg.socks_port),
-        };
-        data.port_count += 1;
-    }
+    const mixed_port = daemon_mixed_port orelse if (cfg.mixed_port > 0) cfg.mixed_port else constants.MIXED_PORT;
+    data.ports[0] = .{
+        .label = "mixed",
+        .port = mixed_port,
+        .listening = try isLocalPortListening(mixed_port),
+    };
+    data.port_count = 1;
 }
 
 fn isLocalPortListening(port: u16) !bool {
@@ -396,4 +409,43 @@ test "formatDoctorReport basic output" {
     try std.testing.expect(std.mem.indexOf(u8, report, "Effective ports") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "mixed: 127.0.0.1:7890") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "Start service: zc start -c <config>") != null);
+}
+
+test "parseRuntimePortOverrideFromCommand reads daemon port flag" {
+    try std.testing.expectEqual(@as(?u16, 29001), parseRuntimePortOverrideFromCommand("/bin/zc --daemon-run --port=29001"));
+    try std.testing.expectEqual(@as(?u16, 29002), parseRuntimePortOverrideFromCommand("/bin/zc --daemon-run --port 29002"));
+    try std.testing.expectEqual(@as(?u16, null), parseRuntimePortOverrideFromCommand("/bin/zc --daemon-run --port nope"));
+    try std.testing.expectEqual(@as(?u16, null), parseRuntimePortOverrideFromCommand("/bin/zc --daemon-run"));
+}
+
+test "fillEffectivePorts reports daemon runtime mixed port" {
+    const allocator = std.testing.allocator;
+
+    var cfg = config.Config{
+        .allocator = allocator,
+        .port = 7890,
+        .socks_port = 7891,
+        .mixed_port = 7892,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "127.0.0.1"),
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var data = DoctorData{
+        .config_ok = true,
+        .config_source = "custom",
+        .daemon_running = true,
+        .daemon_pid = 123,
+        .ports = undefined,
+        .port_count = 0,
+    };
+
+    try fillEffectivePorts(allocator, &cfg, 29001, &data);
+    try std.testing.expectEqual(@as(usize, 1), data.port_count);
+    try std.testing.expectEqualStrings("mixed", data.ports[0].label);
+    try std.testing.expectEqual(@as(u16, 29001), data.ports[0].port);
 }
