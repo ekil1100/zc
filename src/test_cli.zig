@@ -3,11 +3,13 @@ const compat = @import("compat.zig");
 const config = @import("config.zig");
 const runtime_selection = @import("runtime_selection.zig");
 
-/// 测试目标网站列表
-const TEST_TARGETS = [_]struct {
+const TestTarget = struct {
     name: []const u8,
     url: []const u8,
-}{
+};
+
+/// 测试目标网站列表
+const TEST_TARGETS = [_]TestTarget{
     .{ .name = "IP/Location", .url = "http://ip-api.com/json" },
     .{ .name = "Google", .url = "http://www.google.com/generate_204" },
     .{ .name = "YouTube", .url = "http://www.youtube.com/generate_204" },
@@ -50,6 +52,21 @@ const CurlResult = union(enum) {
     ok: []u8,
     failed: FailureReason,
 };
+
+const LatencyResult = union(enum) {
+    ok: u64,
+    failed: FailureReason,
+};
+
+const LatencyProbeFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!LatencyResult;
+
+const LatencyWorkerSlot = struct {
+    result: LatencyResult = .{ .failed = .unknown },
+    err: ?anyerror = null,
+    order: std.atomic.Value(usize) = std.atomic.Value(usize).init(std.math.maxInt(usize)),
+};
+
+const LatencyResultHandlerFn = *const fn (*anyopaque, TestTarget, LatencyResult) anyerror!void;
 
 /// 网络连接性测试
 pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8, config_key: ?[]const u8) !void {
@@ -228,23 +245,17 @@ fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) 
     std.debug.print("\n  Latency Test:\n", .{});
     std.debug.print("  {s:-^50}\n", .{""});
 
-    for (TEST_TARGETS[1..]) |target| {
-        std.debug.print("  {s:12} ", .{target.name});
-
-        const latency = try testUrlLatency(allocator, target.url, proxy_url);
-        stats.attempted += 1;
-
-        switch (latency) {
-            .ok => |ms| {
-                const color = if (ms < 100) "🟢" else if (ms < 300) "🟡" else "🔴";
-                std.debug.print("{s} {d}ms\n", .{ color, ms });
-                stats.succeeded += 1;
-            },
-            .failed => |reason| {
-                std.debug.print("⚫ {s}\n", .{failureReasonText(reason)});
-            },
-        }
-    }
+    var probe_ctx: u8 = 0;
+    var print_ctx: u8 = 0;
+    stats = mergeStats(stats, try runLatencyTestsInCompletionOrder(
+        allocator,
+        TEST_TARGETS[1..],
+        proxy_url,
+        &probe_ctx,
+        defaultLatencyProbe,
+        &print_ctx,
+        printLatencyResult,
+    ));
 
     return stats;
 }
@@ -320,10 +331,120 @@ fn extractJsonField(allocator: std.mem.Allocator, json: []const u8, field: []con
     return null;
 }
 
-fn testUrlLatency(allocator: std.mem.Allocator, url: []const u8, proxy_url: []const u8) !union(enum) {
-    ok: u64,
-    failed: FailureReason,
-} {
+fn runLatencyTestsInCompletionOrder(
+    allocator: std.mem.Allocator,
+    targets: []const TestTarget,
+    proxy_url: []const u8,
+    probe_ctx: *anyopaque,
+    probe: LatencyProbeFn,
+    handler_ctx: *anyopaque,
+    handler: LatencyResultHandlerFn,
+) !TestStats {
+    if (targets.len == 0) return .{};
+
+    const slots = try allocator.alloc(LatencyWorkerSlot, targets.len);
+    defer allocator.free(slots);
+    for (slots) |*slot| slot.* = .{};
+
+    const threads = try allocator.alloc(std.Thread, targets.len);
+    defer allocator.free(threads);
+
+    var completion_counter = std.atomic.Value(usize).init(0);
+
+    var spawned: usize = 0;
+    while (spawned < targets.len) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, latencyWorkerMain, .{
+            &slots[spawned],
+            &completion_counter,
+            probe_ctx,
+            targets[spawned],
+            proxy_url,
+            probe,
+        }) catch |err| {
+            for (threads[0..spawned]) |thread| thread.join();
+            return err;
+        };
+    }
+
+    var stats: TestStats = .{};
+    var next_order: usize = 0;
+    var first_err: ?anyerror = null;
+    while (next_order < spawned) {
+        if (findCompletedLatencySlot(slots[0..spawned], next_order)) |slot_index| {
+            const slot = &slots[slot_index];
+            stats.attempted += 1;
+            switch (slot.result) {
+                .ok => stats.succeeded += 1,
+                .failed => {},
+            }
+            if (first_err == null) {
+                if (slot.err) |err| {
+                    first_err = err;
+                } else {
+                    handler(handler_ctx, targets[slot_index], slot.result) catch |err| {
+                        first_err = err;
+                    };
+                }
+            }
+            next_order += 1;
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    for (threads[0..spawned]) |thread| thread.join();
+
+    if (first_err) |err| return err;
+    return stats;
+}
+
+fn findCompletedLatencySlot(slots: []const LatencyWorkerSlot, order: usize) ?usize {
+    for (slots, 0..) |*slot, i| {
+        if (slot.order.load(.acquire) == order) return i;
+    }
+    return null;
+}
+
+fn latencyWorkerMain(
+    slot: *LatencyWorkerSlot,
+    completion_counter: *std.atomic.Value(usize),
+    probe_ctx: *anyopaque,
+    target: TestTarget,
+    proxy_url: []const u8,
+    probe: LatencyProbeFn,
+) void {
+    slot.result = probe(probe_ctx, std.heap.smp_allocator, target.url, proxy_url) catch |err| {
+        slot.err = err;
+        markLatencyWorkerComplete(slot, completion_counter);
+        return;
+    };
+    markLatencyWorkerComplete(slot, completion_counter);
+}
+
+fn markLatencyWorkerComplete(slot: *LatencyWorkerSlot, completion_counter: *std.atomic.Value(usize)) void {
+    const order = completion_counter.fetchAdd(1, .acq_rel);
+    slot.order.store(order, .release);
+}
+
+fn defaultLatencyProbe(_: *anyopaque, allocator: std.mem.Allocator, url: []const u8, proxy_url: []const u8) !LatencyResult {
+    return testUrlLatency(allocator, url, proxy_url);
+}
+
+fn printLatencyResult(_: *anyopaque, target: TestTarget, latency: LatencyResult) !void {
+    std.debug.print("  {s:12} ", .{target.name});
+
+    switch (latency) {
+        .ok => |ms| {
+            const color = if (ms < 100) "🟢" else if (ms < 300) "🟡" else "🔴";
+            std.debug.print("{s} {d}ms\n", .{ color, ms });
+        },
+        .failed => |reason| {
+            std.debug.print("⚫ {s}\n", .{failureReasonText(reason)});
+        },
+    }
+}
+
+fn testUrlLatency(allocator: std.mem.Allocator, url: []const u8, proxy_url: []const u8) !LatencyResult {
     const start_time = compat.milliTimestamp();
     const curl_result = runCurl(allocator, proxy_url, url, true, CURL_LATENCY_MAX_TIME_SECONDS);
     const end_time = compat.milliTimestamp();
@@ -479,4 +600,100 @@ test "curl probe timeouts separate liveness from latency" {
 
 test "not listening hint includes executable command" {
     try std.testing.expectEqualStrings("zc start -c <config>", notListeningSuggestedCommand());
+}
+
+test "latency probes print in completion order" {
+    const targets = [_]TestTarget{
+        .{ .name = "first", .url = "https://first.example" },
+        .{ .name = "second", .url = "https://second.example" },
+        .{ .name = "third", .url = "https://third.example" },
+    };
+    var ctx = TestLatencyProbeContext{
+        .expected = targets.len,
+    };
+    var recorder = TestLatencyPrintRecorder{ .probe_ctx = &ctx };
+
+    const stats = try runLatencyTestsInCompletionOrder(
+        std.testing.allocator,
+        targets[0..],
+        "http://127.0.0.1:7890",
+        &ctx,
+        testConcurrentLatencyProbe,
+        &recorder,
+        recordLatencyResult,
+    );
+
+    try std.testing.expect(ctx.peak.load(.seq_cst) > 1);
+    try std.testing.expectEqual(@as(usize, targets.len), stats.attempted);
+    try std.testing.expectEqual(@as(usize, targets.len), stats.succeeded);
+    try std.testing.expectEqual(@as(usize, targets.len), recorder.count);
+    try std.testing.expectEqualStrings("third", recorder.names[0].?);
+    try std.testing.expectEqualStrings("second", recorder.names[1].?);
+    try std.testing.expectEqualStrings("first", recorder.names[2].?);
+}
+
+const TestLatencyProbeContext = struct {
+    expected: usize,
+    active: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    peak: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    release_step: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn testConcurrentLatencyProbe(ctx_ptr: *anyopaque, _: std.mem.Allocator, url: []const u8, _: []const u8) !LatencyResult {
+    const ctx: *TestLatencyProbeContext = @ptrCast(@alignCast(ctx_ptr));
+    const active = ctx.active.fetchAdd(1, .seq_cst) + 1;
+    recordPeak(&ctx.peak, active);
+    defer _ = ctx.active.fetchSub(1, .seq_cst);
+
+    var waits: usize = 0;
+    while (ctx.active.load(.seq_cst) < ctx.expected and waits < 10000) : (waits += 1) {
+        std.Thread.yield() catch {};
+    }
+
+    const step: u32 = if (std.mem.eql(u8, url, "https://third.example"))
+        0
+    else if (std.mem.eql(u8, url, "https://second.example"))
+        1
+    else if (std.mem.eql(u8, url, "https://first.example"))
+        2
+    else
+        return .{ .failed = .unknown };
+
+    while (ctx.release_step.load(.seq_cst) != step) {
+        std.Thread.yield() catch {};
+    }
+
+    if (std.mem.eql(u8, url, "https://first.example")) return .{ .ok = 10 };
+    if (std.mem.eql(u8, url, "https://second.example")) return .{ .ok = 20 };
+    if (std.mem.eql(u8, url, "https://third.example")) return .{ .ok = 30 };
+    return .{ .failed = .unknown };
+}
+
+const TestLatencyPrintRecorder = struct {
+    probe_ctx: *TestLatencyProbeContext,
+    names: [3]?[]const u8 = .{ null, null, null },
+    count: usize = 0,
+};
+
+fn recordLatencyResult(ctx_ptr: *anyopaque, target: TestTarget, latency: LatencyResult) !void {
+    const recorder: *TestLatencyPrintRecorder = @ptrCast(@alignCast(ctx_ptr));
+    try std.testing.expect(recorder.count < recorder.names.len);
+    switch (latency) {
+        .ok => {},
+        .failed => return error.UnexpectedFailure,
+    }
+    recorder.names[recorder.count] = target.name;
+    recorder.count += 1;
+    _ = recorder.probe_ctx.release_step.fetchAdd(1, .seq_cst);
+}
+
+fn recordPeak(peak: *std.atomic.Value(u32), value: u32) void {
+    var current = peak.load(.seq_cst);
+    while (value > current) {
+        if (peak.cmpxchgWeak(current, value, .seq_cst, .seq_cst)) |actual| {
+            current = actual;
+        } else {
+            return;
+        }
+    }
 }
