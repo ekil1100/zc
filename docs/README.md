@@ -2,6 +2,8 @@
 
 This directory is the public documentation entry for the current zc v1.0 release work.
 
+For a first read, start with the root [`README.md`](../README.md). It contains the project overview, status, install-from-source flow, quick start, and the current zc project mark.
+
 ## Current status
 
 zc is in **v1.0 release-candidate cleanup**, not final GA. The current release plan is code-first:
@@ -26,6 +28,10 @@ See [`roadmap/v1.0.md`](roadmap/v1.0.md) for the public v1.0 roadmap.
 | API | [`api/README.md`](api/README.md) | Minimal API endpoints currently implemented. |
 | Reliability | [`reliability/soak-guide.md`](reliability/soak-guide.md) | Soak runner usage and release-gate evidence. |
 | Perf reports | [`perf/reports/README.md`](perf/reports/README.md) | Perf report storage used by scripts. |
+
+## Project assets
+
+The current project mark lives at [`assets/zc-mark.svg`](assets/zc-mark.svg). It is an original cat-inspired routing mark for zc and is used by the root README.
 
 ## Archived docs
 
