@@ -31,7 +31,10 @@ See [`roadmap/v1.0.md`](roadmap/v1.0.md) for the public v1.0 roadmap.
 
 ## Project assets
 
-The current project mark lives at [`assets/zc-mark.svg`](assets/zc-mark.svg). It is an original cat-inspired routing mark for zc and is used by the root README.
+The current project mark has two PNG variants:
+
+- [`assets/zc-mark-dark.png`](assets/zc-mark-dark.png) for dark framed usage and the root README.
+- [`assets/zc-mark-light.png`](assets/zc-mark-light.png) for light background usage.
 
 ## Archived docs
 
