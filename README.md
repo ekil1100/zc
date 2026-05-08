@@ -54,6 +54,7 @@ The remaining v1.0 work is tracked in [`docs/roadmap/v1.0.md`](docs/roadmap/v1.0
 - Zig `0.16.0+`
 - Linux or another POSIX-like development environment for the current scripts
 - `bash` for repository validation scripts
+- `just` for the local install shortcut
 
 CI and local development target Zig `0.16.0`.
 
@@ -65,8 +66,7 @@ Public release artifacts are intentionally not documented until the release work
 git clone https://github.com/ekil1100/zc.git
 cd zc
 
-zig build -Doptimize=ReleaseFast
-bash scripts/install/local-dev-install.sh --source zig-out/bin/zc --target-dir "$HOME/.local/bin"
+just install
 
 zc --help
 ```

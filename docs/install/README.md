@@ -6,7 +6,15 @@ This page documents the current v1.0 install scripts that exist in this reposito
 
 ## Local install flow
 
-The maintained install workflow is script-based:
+The shortest local install flow is:
+
+```bash
+just install
+```
+
+This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`.
+
+The underlying maintained install workflow is script-based:
 
 ```bash
 # Install a local shim/marker into a target directory
