@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/zc-mark-dark.png" width="176" alt="zc project mark">
+  <img src="docs/assets/zc-mark-transparent.png" width="176" alt="zc project mark">
 </p>
 
 <h1 align="center">zc</h1>
