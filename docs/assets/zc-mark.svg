@@ -1,10 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
   <title id="title">zc project mark</title>
-  <desc id="desc">A simple routing mark for the zc proxy runtime.</desc>
+  <desc id="desc">A simple cat-inspired routing mark for the zc proxy runtime.</desc>
   <rect width="256" height="256" rx="56" fill="#0f1720"/>
-  <circle cx="128" cy="128" r="72" fill="none" stroke="#2dd4bf" stroke-width="18"/>
-  <path d="M78 116h94" fill="none" stroke="#f8fafc" stroke-width="18" stroke-linecap="round"/>
-  <path d="m146 82 36 34-36 34" fill="none" stroke="#f8fafc" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M178 140H84" fill="none" stroke="#2dd4bf" stroke-width="16" stroke-linecap="round"/>
-  <path d="m110 106-34 34 34 34" fill="none" stroke="#2dd4bf" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M58 123 77 65c2-7 11-9 16-3l26 30h18l26-30c5-6 14-4 16 3l19 58c8 13 12 29 12 46 0 43-32 65-82 65s-82-22-82-65c0-17 4-33 12-46Z" fill="#f8fafc"/>
+  <path d="M80 103 88 78l21 25H80Zm67 0 21-25 8 25h-29Z" fill="#2dd4bf"/>
+  <circle cx="101" cy="145" r="9" fill="#0f1720"/>
+  <circle cx="155" cy="145" r="9" fill="#0f1720"/>
+  <path d="M128 157 116 171h24l-12-14Z" fill="#0f1720"/>
+  <path d="M112 186c10 8 22 8 32 0" fill="none" stroke="#0f1720" stroke-width="7" stroke-linecap="round"/>
+  <path d="M79 187H57m120 0h22M82 202H62m112 0h20" fill="none" stroke="#0f1720" stroke-width="5" stroke-linecap="round" opacity=".7"/>
+  <path d="M78 119h94" fill="none" stroke="#2dd4bf" stroke-width="14" stroke-linecap="round"/>
+  <path d="m148 94 30 25-30 25" fill="none" stroke="#2dd4bf" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
