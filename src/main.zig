@@ -1384,12 +1384,22 @@ fn runtimeCommandName(command: RuntimeCommand) []const u8 {
     };
 }
 
+fn shouldPreflightRuntimePorts(command: RuntimeCommand, daemon_running: bool) bool {
+    return switch (command) {
+        .start => !daemon_running,
+        .restart => true,
+    };
+}
+
 fn preflightRuntimeCommand(
     allocator: std.mem.Allocator,
     command: RuntimeCommand,
     start_opts: StartCommandOptions,
     override_opts: *const override.CliOptions,
 ) !void {
+    const daemon_running = try daemon.isRunning(allocator);
+    if (!shouldPreflightRuntimePorts(command, daemon_running)) return;
+
     var cfg = try loadRuntimeConfig(allocator, start_opts.config_path, start_opts.port, override_opts, runtimeCommandName(command), false);
     defer cfg.deinit();
     try preflightPortCheck(&cfg, false);
@@ -2248,6 +2258,33 @@ test "runtimeCommandPreflightErrorInfo maps restart port conflicts" {
     try testing.expectEqualStrings("RESTART_PORT_IN_USE", info.code);
     try testing.expectEqualStrings("restart target port is already in use", info.message);
     try testing.expect(std.mem.indexOf(u8, info.hint, "zc restart") != null);
+}
+
+test "start skips port preflight when daemon is already running" {
+    const testing = std.testing;
+
+    try testing.expect(!shouldPreflightRuntimePorts(.start, true));
+    try testing.expect(shouldPreflightRuntimePorts(.start, false));
+    try testing.expect(shouldPreflightRuntimePorts(.restart, true));
+}
+
+test "runtime command preflight consults daemon state before port check" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/main.zig", 1024 * 1024);
+    defer allocator.free(content);
+
+    const fn_pos = std.mem.indexOf(u8, content, "fn preflightRuntimeCommand(") orelse return error.TestUnexpectedResult;
+    const next_fn_pos = std.mem.indexOfPos(u8, content, fn_pos, "fn runRestartCommand(") orelse return error.TestUnexpectedResult;
+    const fn_body = content[fn_pos..next_fn_pos];
+
+    const daemon_pos = std.mem.indexOf(u8, fn_body, "daemon.isRunning") orelse return error.TestUnexpectedResult;
+    const skip_pos = std.mem.indexOf(u8, fn_body, "shouldPreflightRuntimePorts") orelse return error.TestUnexpectedResult;
+    const port_pos = std.mem.indexOf(u8, fn_body, "preflightPortCheck") orelse return error.TestUnexpectedResult;
+
+    try testing.expect(daemon_pos < port_pos);
+    try testing.expect(skip_pos < port_pos);
 }
 
 test "restart command preflights ports before spawning a new daemon" {

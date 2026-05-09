@@ -8,7 +8,7 @@ This document describes the command surface implemented by `src/main.zig` for th
 | --- | --- | --- |
 | `zc help` / `zc --help` | implemented | Prints global help. |
 | `zc help <topic>` | implemented | Prints group help for `config`, `proxy`, `profile`, `diag`, or `doctor`. |
-| `zc start [-c <config>] [--port <port>] [--json]` | implemented | Starts daemon; `--port` overrides mixed-port for this run. |
+| `zc start [-c <config>] [--port <port>] [--json]` | implemented | Starts daemon; if a tracked daemon is already running, reports `already_running` instead of treating its port as a conflict. `--port` overrides mixed-port for this run. |
 | `zc stop [--json]` | implemented | Stops tracked daemon. |
 | `zc restart [-c <config>] [--json]` | implemented | Restarts daemon after preflight. |
 | `zc status [--json]` | implemented | 输出运行状态、运行时路径，以及 select 代理组当前节点；无持久化选择时显示该组默认首个节点。 |

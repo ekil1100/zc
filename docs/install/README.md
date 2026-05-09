@@ -12,7 +12,7 @@ The shortest local install flow is:
 just install
 ```
 
-This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`.
+This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`. It replaces the local binary only; it does not stop or restart an already running daemon.
 
 The underlying maintained install workflow is script-based:
 
