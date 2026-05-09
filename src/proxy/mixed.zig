@@ -21,6 +21,7 @@ const connection_task_stack_size: usize = 512 * 1024;
 // the old 30s timeout that broke long-lived tunnels/WebSockets.
 const relay_poll_timeout_ms: i32 = 30 * 1000;
 const relay_idle_reap_ms: i64 = 15 * 60 * 1000;
+const accept_retry_backoff_ms: u64 = 200;
 
 /// 混合端口（HTTP + SOCKS5）
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
@@ -34,7 +35,14 @@ pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, 
     std.debug.print("Mixed proxy (HTTP+SOCKS5) listening on port {}\n", .{port});
 
     while (true) {
-        const conn = try server.accept();
+        const conn = server.accept() catch |err| {
+            if (shouldRetryAcceptError(err)) {
+                std.debug.print("Mixed accept resource pressure: {}, retrying\n", .{err});
+                compat.sleepNs(accept_retry_backoff_ms * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
         socket_options.configureConnectedStream(conn.stream) catch |err| {
             std.debug.print("Mixed accepted socket setup error: {}\n", .{err});
             conn.stream.close();
@@ -618,7 +626,7 @@ fn handleHttpsForwardRequest(
     errdefer target_stream.close();
 
     var tls_stream: HttpsForwardStream = undefined;
-    tls_stream.init(allocator, target_stream, forward.host) catch |err| {
+    tls_stream.init(allocator, target_stream.move(), forward.host) catch |err| {
         std.debug.print("[Mixed] HTTPS forward failed: stage=tls_init target={s}:{d} proxy={s} err={}\n", .{
             forward.host,
             forward.port,
@@ -1083,8 +1091,22 @@ fn shouldReapIdleRelay(now_ms: i64, last_activity_ms: i64, idle_reap_ms: i64) bo
     return now_ms - last_activity_ms >= idle_reap_ms;
 }
 
+fn shouldRetryAcceptError(err: anyerror) bool {
+    return switch (err) {
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => true,
+        else => false,
+    };
+}
+
 test "mixed connection worker uses bounded stack" {
     try std.testing.expect(connection_task_stack_size <= 1024 * 1024);
+}
+
+test "mixed accept retries transient fd exhaustion" {
+    try std.testing.expect(shouldRetryAcceptError(error.ProcessFdQuotaExceeded));
+    try std.testing.expect(!shouldRetryAcceptError(error.ConnectionRefused));
 }
 
 test "relay idle reap uses long finite timeout" {

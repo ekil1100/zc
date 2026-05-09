@@ -64,7 +64,7 @@ Parsed group types:
 - `load-balance`
 - `relay`
 
-运行时选择优先使用持久化的用户选择；没有持久化选择时，select 组使用第一个组成员作为默认节点。`zc status` 和 `zc test` 会显示同一套节点信息，JSON 字段为 `selected_proxies`。不要在没有场景测试证明前假设完整 mihomo 策略一致性。
+运行时选择优先使用持久化的用户选择；没有持久化选择时，select 组使用第一个组成员作为默认节点。`zc status` 和 `zc test` 会显示同一套节点信息，JSON 字段为 `selected_proxies`；`zc test --json` 还会通过 `daemon_state` 报告本机 daemon 状态。不要在没有场景测试证明前假设完整 mihomo 策略一致性。
 
 ## Rules
 

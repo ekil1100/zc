@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
+const daemon = @import("daemon.zig");
 const runtime_selection = @import("runtime_selection.zig");
 
 const TestTarget = struct {
@@ -31,6 +32,12 @@ const ProxyType = enum {
 const TestStats = struct {
     attempted: usize = 0,
     succeeded: usize = 0,
+};
+
+const DaemonState = enum {
+    running,
+    stopped,
+    unknown,
 };
 
 const EffectivePorts = struct {
@@ -72,13 +79,16 @@ const LatencyResultHandlerFn = *const fn (*anyopaque, TestTarget, LatencyResult)
 pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8, config_key: ?[]const u8) !void {
     _ = proxy_name;
     const effective = selectEffectivePorts(cfg);
+    const daemon_state = detectDaemonState(allocator);
     const selected_proxies = try runtime_selection.collectSelectedProxies(allocator, cfg, config_key);
     defer runtime_selection.deinitSelectedProxies(allocator, selected_proxies);
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
-    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{\"action\":\"proxy_test\",\"selected_proxies\":");
+    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{\"action\":\"proxy_test\",\"daemon_state\":\"");
+    try out.appendSlice(allocator, daemonStateText(daemon_state));
+    try out.appendSlice(allocator, "\",\"selected_proxies\":");
     try runtime_selection.appendSelectedProxiesJson(&out, allocator, selected_proxies);
     try out.appendSlice(allocator, ",\"ports\":[");
 
@@ -113,6 +123,7 @@ pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_
     std.debug.print("{s:-^60}\n", .{""});
 
     const effective = selectEffectivePorts(cfg);
+    const daemon_state = detectDaemonState(allocator);
     try printEffectivePortsSummary(effective);
     runtime_selection.printSelectedProxiesText(allocator, selected_proxies);
     var totals: TestStats = .{};
@@ -122,7 +133,7 @@ pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_
         if (try isLocalPortListening(allocator, mixed_port)) {
             totals = mergeStats(totals, try testViaProxy(allocator, mixed_port, .http));
         } else {
-            printPortNotListeningHint(mixed_port);
+            printPortNotListeningHint(mixed_port, daemon_state);
             return error.ProxyTestFailed;
         }
         std.debug.print("\n", .{});
@@ -135,7 +146,7 @@ pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_
         if (try isLocalPortListening(allocator, http_port)) {
             totals = mergeStats(totals, try testViaProxy(allocator, http_port, .http));
         } else {
-            printPortNotListeningHint(http_port);
+            printPortNotListeningHint(http_port, daemon_state);
         }
     }
 
@@ -144,7 +155,7 @@ pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_
         if (try isLocalPortListening(allocator, socks_port)) {
             totals = mergeStats(totals, try testViaProxy(allocator, socks_port, .socks5));
         } else {
-            printPortNotListeningHint(socks_port);
+            printPortNotListeningHint(socks_port, daemon_state);
         }
     }
 
@@ -188,13 +199,39 @@ fn printEffectivePortsSummary(effective: EffectivePorts) !void {
     }
 }
 
-fn printPortNotListeningHint(port: u16) void {
-    std.debug.print("  Proxy not listening on 127.0.0.1:{d}.\n", .{port});
-    std.debug.print("  Suggested fix: {s}\n", .{notListeningSuggestedCommand()});
+fn detectDaemonState(allocator: std.mem.Allocator) DaemonState {
+    const running = daemon.isRunning(allocator) catch return .unknown;
+    return if (running) .running else .stopped;
 }
 
-fn notListeningSuggestedCommand() []const u8 {
-    return "zc start -c <config>";
+fn daemonStateText(state: DaemonState) []const u8 {
+    return switch (state) {
+        .running => "running",
+        .stopped => "stopped",
+        .unknown => "unknown",
+    };
+}
+
+fn printPortNotListeningHint(port: u16, daemon_state: DaemonState) void {
+    std.debug.print("  Proxy not listening on 127.0.0.1:{d}.\n", .{port});
+    std.debug.print("{s}", .{notListeningDaemonLine(daemon_state)});
+    std.debug.print("  Suggested fix: {s}\n", .{notListeningSuggestedCommand(daemon_state)});
+}
+
+fn notListeningDaemonLine(daemon_state: DaemonState) []const u8 {
+    return switch (daemon_state) {
+        .running => "  zc daemon appears to be running, but this configured proxy port is not listening.\n",
+        .stopped => "  zc daemon is stopped.\n",
+        .unknown => "  zc daemon state is unknown; run `zc status` for details.\n",
+    };
+}
+
+fn notListeningSuggestedCommand(daemon_state: DaemonState) []const u8 {
+    return switch (daemon_state) {
+        .running => "zc status && zc log --no-follow",
+        .stopped => "zc start -c <config>",
+        .unknown => "zc status",
+    };
 }
 
 fn isLocalPortListening(allocator: std.mem.Allocator, port: u16) !bool {
@@ -598,8 +635,9 @@ test "curl probe timeouts separate liveness from latency" {
     try std.testing.expectEqualStrings("5", CURL_LATENCY_MAX_TIME_SECONDS);
 }
 
-test "not listening hint includes executable command" {
-    try std.testing.expectEqualStrings("zc start -c <config>", notListeningSuggestedCommand());
+test "not listening diagnostic reports stopped daemon" {
+    try std.testing.expectEqualStrings("  zc daemon is stopped.\n", notListeningDaemonLine(.stopped));
+    try std.testing.expectEqualStrings("zc start -c <config>", notListeningSuggestedCommand(.stopped));
 }
 
 test "latency probes print in completion order" {

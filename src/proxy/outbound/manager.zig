@@ -41,7 +41,18 @@ pub const ProxyStream = struct {
         };
     }
 
+    pub fn move(self: *ProxyStream) ProxyStream {
+        const moved = self.*;
+        self.base_stream = .{ .handle = -1 };
+        self.allocator = null;
+        self.owned_ss_client = null;
+        self.owned_trojan_client = null;
+        self.is_closed = true;
+        return moved;
+    }
+
     pub fn write(self: *ProxyStream, data: []const u8) !void {
+        if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             try client.write(data);
         } else if (self.owned_trojan_client) |client| {
@@ -52,6 +63,7 @@ pub const ProxyStream = struct {
     }
 
     pub fn read(self: *ProxyStream, buf: []u8) !usize {
+        if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             return try client.read(buf);
         } else if (self.owned_trojan_client) |client| {
@@ -66,21 +78,22 @@ pub const ProxyStream = struct {
         self.is_closed = true;
 
         if (self.owned_ss_client) |client| {
+            self.owned_ss_client = null;
             client.deinit();
             self.allocator.?.destroy(client);
-            self.owned_ss_client = null;
             return;
         }
         if (self.owned_trojan_client) |client| {
+            self.owned_trojan_client = null;
             client.deinit();
             self.allocator.?.destroy(client);
-            self.owned_trojan_client = null;
             return;
         }
         self.base_stream.close();
     }
 
     pub fn hasPendingRead(self: *const ProxyStream) bool {
+        if (self.is_closed) return false;
         if (self.owned_ss_client) |client| {
             return client.hasPendingRead();
         }
@@ -91,6 +104,7 @@ pub const ProxyStream = struct {
     }
 
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
+        if (self.is_closed) return -1;
         return self.base_stream.handle;
     }
 };
@@ -102,6 +116,7 @@ pub const OutboundManager = struct {
 
     /// 每个代理组的当前选择（group_name → proxy_name）
     group_selections: std.StringHashMap([]const u8),
+    group_selections_mutex: std.Io.Mutex = .init,
 
     /// 当前配置 key（用于持久化 selections 到 meta.json）
     config_key: ?[]const u8 = null,
@@ -123,6 +138,8 @@ pub const OutboundManager = struct {
     }
 
     pub fn deinit(self: *OutboundManager) void {
+        self.lockSelections();
+        defer self.unlockSelections();
         self.group_selections.deinit();
         if (self.config_key) |k| self.allocator.free(k);
     }
@@ -134,6 +151,9 @@ pub const OutboundManager = struct {
     }
 
     fn selectProxyInternal(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8, persist: bool) void {
+        self.lockSelections();
+        defer self.unlockSelections();
+
         for (self.config.proxy_groups.items) |grp| {
             if (std.mem.eql(u8, grp.name, group_name)) {
                 for (grp.proxies.items) |pname| {
@@ -367,9 +387,12 @@ pub const OutboundManager = struct {
         for (self.config.proxy_groups.items) |grp| {
             if (std.mem.eql(u8, grp.name, group_name)) {
                 // 优先使用用户选择的代理
-                if (self.group_selections.get(group_name)) |selected| {
-                    std.debug.print("[Manager] Proxy group {s} -> {s} (selected)\n", .{ group_name, selected });
-                    return selected;
+                self.lockSelections();
+                const selected = self.group_selections.get(group_name);
+                self.unlockSelections();
+                if (selected) |value| {
+                    std.debug.print("[Manager] Proxy group {s} -> {s} (selected)\n", .{ group_name, value });
+                    return value;
                 }
                 // 否则使用第一个
                 if (grp.proxies.items.len > 0) {
@@ -380,6 +403,14 @@ pub const OutboundManager = struct {
             }
         }
         return null;
+    }
+
+    fn lockSelections(self: *OutboundManager) void {
+        std.Io.Threaded.mutexLock(&self.group_selections_mutex);
+    }
+
+    fn unlockSelections(self: *OutboundManager) void {
+        std.Io.Threaded.mutexUnlock(&self.group_selections_mutex);
     }
 
     fn findProxy(self: *OutboundManager, name: []const u8) ?*const Proxy {
@@ -469,6 +500,32 @@ test "makeShadowsocksClient returns isolated instances" {
     try std.testing.expect(c1 != c2);
     try std.testing.expect(c1.stream == null);
     try std.testing.expect(c2.stream == null);
+}
+
+test "ProxyStream move transfers shadowsocks ownership" {
+    const allocator = std.testing.allocator;
+
+    const ss_client = try allocator.create(ss.ShadowsocksClient);
+    errdefer allocator.destroy(ss_client);
+    ss_client.* = try ss.ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+
+    var source = ProxyStream.initShadowsocks(allocator, .{ .handle = -1 }, ss_client);
+    var moved = source.move();
+    defer moved.close();
+    source.close();
+
+    try std.testing.expect(source.is_closed);
+    try std.testing.expect(source.owned_ss_client == null);
+    try std.testing.expect(moved.owned_ss_client == ss_client);
+}
+
+test "ProxyStream write rejects closed stream" {
+    var stream = ProxyStream{
+        .base_stream = .{ .handle = -1 },
+        .is_closed = true,
+    };
+
+    try std.testing.expectError(error.StreamClosed, stream.write("x"));
 }
 
 test "selectProxyInternal with persist=false skips persist" {
