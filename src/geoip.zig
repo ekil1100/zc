@@ -407,23 +407,11 @@ pub const SimpleGeoIp = struct {
 
     /// 查询 IP 对应的国家代码
     pub fn lookup(ip: u32) ?[]const u8 {
-        // 二分查找
-        var low: usize = 0;
-        var high: usize = entries.len;
-
-        while (low < high) {
-            const mid = (low + high) / 2;
-            const entry = entries[mid];
-
-            if (ip < entry.start) {
-                high = mid;
-            } else if (ip > entry.end) {
-                low = mid + 1;
-            } else {
+        for (entries) |entry| {
+            if (ip >= entry.start and ip <= entry.end) {
                 return entry.country;
             }
         }
-
         return null;
     }
 

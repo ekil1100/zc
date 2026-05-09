@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/test_runner.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -49,6 +49,15 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+    const prepare_test_home = b.addSystemCommand(&.{
+        "mkdir",
+        "-p",
+        b.pathFromRoot(".zig-cache/zc-test-home/.config"),
+        b.pathFromRoot(".zig-cache/zc-test-run"),
+    });
+    run_exe_unit_tests.step.dependOn(&prepare_test_home.step);
+    run_exe_unit_tests.setEnvironmentVariable("HOME", b.pathFromRoot(".zig-cache/zc-test-home"));
+    run_exe_unit_tests.setEnvironmentVariable("XDG_RUNTIME_DIR", b.pathFromRoot(".zig-cache/zc-test-run"));
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 

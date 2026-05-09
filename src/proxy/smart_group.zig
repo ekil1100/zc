@@ -52,7 +52,7 @@ pub const SmartGroup = struct {
             .allocator = allocator,
             .name = try allocator.dupe(u8, name),
             .selector_type = selector_type,
-            .proxies = std.ArrayList([]const u8).init(allocator),
+            .proxies = std.ArrayList([]const u8).empty,
             .url = try allocator.dupe(u8, "http://www.gstatic.com/generate_204"),
             .interval = 300,    // 5 分钟
             .timeout = 5000,    // 5 秒
@@ -64,7 +64,7 @@ pub const SmartGroup = struct {
         };
 
         for (proxies) |proxy| {
-            try group.proxies.append(try allocator.dupe(u8, proxy));
+            try group.proxies.append(allocator, try allocator.dupe(u8, proxy));
         }
 
         return group;
@@ -77,7 +77,7 @@ pub const SmartGroup = struct {
         for (self.proxies.items) |proxy| {
             self.allocator.free(proxy);
         }
-        self.proxies.deinit();
+        self.proxies.deinit(self.allocator);
 
         var iter = self.health_results.valueIterator();
         while (iter.next()) |result| {

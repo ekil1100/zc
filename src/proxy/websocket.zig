@@ -248,7 +248,7 @@ pub fn connectWs(allocator: std.mem.Allocator, host: []const u8, port: u16, path
 
     if (use_tls) {
         // TLS 连接
-        var tls_stream = try TlsStream.init(allocator, stream, ws_host orelse host);
+        const tls_stream = try TlsStream.init(allocator, stream, ws_host orelse host);
         ws = WebSocket.init(allocator, .{ .tls = tls_stream });
     } else {
         // 普通 TCP 连接
@@ -258,5 +258,3 @@ pub fn connectWs(allocator: std.mem.Allocator, host: []const u8, port: u16, path
     try ws.connect(host, port, path, ws_host);
     return ws;
 }
-
-const net = compat.net;

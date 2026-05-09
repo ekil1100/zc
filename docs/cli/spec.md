@@ -62,6 +62,9 @@ All proxy/profile subcommands accept `help`, `--help`, or `-h` after the subcomm
 - `test --json`
 - `proxy test --json`
 
+JSON success payloads are emitted on stdout so they can be piped directly into JSON tooling.
+Diagnostics and human-readable progress may use stderr on legacy paths until each command is fully aligned.
+
 ## Error output direction
 
 v1.0 should use actionable errors with:

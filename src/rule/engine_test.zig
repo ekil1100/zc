@@ -28,7 +28,7 @@ test "Engine match domain" {
     defer rules.deinit(allocator);
 
     // Add a domain rule
-    try rules.append(.{
+    try rules.append(allocator, .{
         .rule_type = .domain,
         .payload = try allocator.dupe(u8, "google.com"),
         .target = try allocator.dupe(u8, "PROXY"),
@@ -53,7 +53,7 @@ test "Engine match domain suffix" {
     var rules = std.ArrayList(Rule).empty;
     defer rules.deinit(allocator);
 
-    try rules.append(.{
+    try rules.append(allocator, .{
         .rule_type = .domain_suffix,
         .payload = try allocator.dupe(u8, "google.com"),
         .target = try allocator.dupe(u8, "PROXY"),
@@ -78,7 +78,7 @@ test "Engine match domain keyword" {
     var rules = std.ArrayList(Rule).empty;
     defer rules.deinit(allocator);
 
-    try rules.append(.{
+    try rules.append(allocator, .{
         .rule_type = .domain_keyword,
         .payload = try allocator.dupe(u8, "google"),
         .target = try allocator.dupe(u8, "PROXY"),
@@ -103,7 +103,7 @@ test "Engine match final" {
     var rules = std.ArrayList(Rule).empty;
     defer rules.deinit(allocator);
 
-    try rules.append(.{
+    try rules.append(allocator, .{
         .rule_type = .final,
         .payload = try allocator.dupe(u8, ""),
         .target = try allocator.dupe(u8, "DIRECT"),

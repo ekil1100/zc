@@ -380,7 +380,7 @@ pub const Client = struct {
 };
 
 /// 解析 UUID 字符串 (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
-fn parseUuid(str: []const u8, out: *[16]u8) !void {
+pub fn parseUuid(str: []const u8, out: *[16]u8) !void {
     if (str.len != 36) return error.InvalidUuid;
 
     var idx: usize = 0;
@@ -401,7 +401,7 @@ fn parseUuid(str: []const u8, out: *[16]u8) !void {
     }
 }
 
-fn hexDigit(c: u8) !u8 {
+pub fn hexDigit(c: u8) !u8 {
     return switch (c) {
         '0'...'9' => c - '0',
         'a'...'f' => c - 'a' + 10,
@@ -411,7 +411,7 @@ fn hexDigit(c: u8) !u8 {
 }
 
 /// 解析 IPv4 地址
-fn parseIpv4(str: []const u8, out: *[4]u8) bool {
+pub fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     var parts: [4]u8 = undefined;
     var part_idx: usize = 0;
     var current: u8 = 0;

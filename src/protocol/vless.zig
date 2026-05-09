@@ -128,12 +128,12 @@ fn hexDigit(c: u8) !u8 {
 fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     var parts: [4]u8 = undefined;
     var part_idx: usize = 0;
-    var current: u8 = 0;
+    var current: u16 = 0;
 
     for (str) |c| {
         if (c == '.') {
             if (part_idx >= 4) return false;
-            parts[part_idx] = current;
+            parts[part_idx] = @intCast(current);
             part_idx += 1;
             current = 0;
         } else if (c >= '0' and c <= '9') {
@@ -145,7 +145,7 @@ fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     }
 
     if (part_idx != 3) return false;
-    parts[3] = current;
+    parts[3] = @intCast(current);
 
     @memcpy(out, &parts);
     return true;
@@ -262,7 +262,7 @@ test "VLESS parseIpv6 ipv4-mapped" {
 
 test "VLESS encodeAddress IPv6" {
     const allocator = std.testing.allocator;
-    const client = try Client.init(allocator, .{
+    var client = try Client.init(allocator, .{
         .id = "123e4567-e89b-12d3-a456-426614174000",
         .address = "127.0.0.1",
         .port = 443,
@@ -307,7 +307,7 @@ test "VLESS rejects invalid uuid" {
 test "VLESS encodeAddress IPv4" {
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client = try Client.init(allocator, .{
         .id = "123e4567-e89b-12d3-a456-426614174000",
         .address = "127.0.0.1",
         .port = 443,
@@ -328,7 +328,7 @@ test "VLESS encodeAddress IPv4" {
 test "VLESS encodeAddress domain" {
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client = try Client.init(allocator, .{
         .id = "123e4567-e89b-12d3-a456-426614174000",
         .address = "127.0.0.1",
         .port = 443,

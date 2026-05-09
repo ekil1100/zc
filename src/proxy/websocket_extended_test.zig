@@ -103,7 +103,7 @@ test "WebSocket upgrade request format" {
     const host = "example.com";
     const path = "/ws";
     
-    var key_b64: [24]u8 = .{'A'} ** 24;
+    const key_b64: [24]u8 = .{'A'} ** 24;
     
     var request: [512]u8 = undefined;
     const written = try std.fmt.bufPrint(

@@ -28,7 +28,7 @@ test "JSON response format" {
     try json.appendSlice(allocator, "{\"name\":\"Proxy1\",\"type\":\"Shadowsocks\"}");
     try json.appendSlice(allocator, "]}");
 
-    const result = try json.toOwnedSlice();
+    const result = try json.toOwnedSlice(allocator);
     defer allocator.free(result);
 
     try testing.expect(std.mem.indexOf(u8, result, "\"proxies\"") != null);

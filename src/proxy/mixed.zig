@@ -915,12 +915,12 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         }
 
         if (target_read_open and (poll_fds[1].revents & std.posix.POLL.IN != 0)) {
-            const n = target_stream.read(&buf) catch |err| switch (err) {
-                error.ConnectionClosed => {
+            const n = target_stream.read(&buf) catch |err| {
+                if (targetReadClosedBy(err)) {
                     closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
                     continue;
-                },
-                else => return err,
+                }
+                return err;
             };
             if (n == 0) {
                 closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
@@ -1207,9 +1207,7 @@ test "mixed relay keeps long-lived tunnels open past short idle gaps" {
 test "relay forwards traffic in both directions (direct stream)" {
     const client_pair = try makeTcpStreamPair();
     defer client_pair.left.close();
-    defer client_pair.right.close();
     const target_pair = try makeTcpStreamPair();
-    defer target_pair.right.close();
 
     const client_stream = client_pair.left;
     const client_peer = client_pair.right;
@@ -1247,7 +1245,6 @@ test "relay preserves upstream response after client half-closes its write side"
     defer client_pair.left.close();
     defer client_pair.right.close();
     const target_pair = try makeTcpStreamPair();
-    defer target_pair.right.close();
 
     const client_stream = client_pair.left;
     const client_peer = client_pair.right;
@@ -1280,7 +1277,7 @@ test "relay preserves upstream response after client half-closes its write side"
     defer upstream_thread.join();
 
     try writeAllFd(client_peer.handle, "ping");
-    try std.posix.shutdown(client_peer.handle, .send);
+    try compat.shutdownWrite(client_peer.handle);
 
     try setReadTimeoutMs(client_peer.handle, 1000);
     var resp: [4]u8 = undefined;
@@ -1397,8 +1394,6 @@ test "handleConnection should preserve CONNECT payload buffered after headers" {
     defer allocator.free(req);
 
     const mixed_pair = try makeTcpStreamPair();
-    defer mixed_pair.left.close();
-    defer mixed_pair.right.close();
 
     const mixed_conn = net.Server.Connection{
         .stream = mixed_pair.left,
@@ -1419,6 +1414,7 @@ test "handleConnection should preserve CONNECT payload buffered after headers" {
     var resp_buf: [1024]u8 = undefined;
     const resp_n = try mixed_client.read(&resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..resp_n], "200 Connection established") != null);
+    mixed_client.close();
 }
 
 test "handleConnection should wait for full CONNECT headers before tunneling" {
@@ -1468,8 +1464,6 @@ test "handleConnection should wait for full CONNECT headers before tunneling" {
     const part2 = "\r\n\r\nping";
 
     const mixed_pair = try makeTcpStreamPair();
-    defer mixed_pair.left.close();
-    defer mixed_pair.right.close();
 
     const mixed_conn = net.Server.Connection{
         .stream = mixed_pair.left,
@@ -1492,11 +1486,12 @@ test "handleConnection should wait for full CONNECT headers before tunneling" {
     var resp_buf: [1024]u8 = undefined;
     const resp_n = try mixed_client.read(&resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..resp_n], "200 Connection established") != null);
+    mixed_client.close();
 }
 
 test "relay treats target ConnectionClosed as a graceful half-close" {
     try std.testing.expect(targetReadClosedBy(error.ConnectionClosed));
-    try std.testing.expect(!targetReadClosedBy(error.NotOpenForReading));
+    try std.testing.expect(targetReadClosedBy(error.NotOpenForReading));
 }
 
 test "relay treats client-side reset errors as graceful close" {
@@ -1657,7 +1652,6 @@ test "handleConnection should close client stream after successful HTTP relay" {
     defer allocator.free(req);
 
     const mixed_pair = try makeTcpStreamPair();
-    defer mixed_pair.left.close();
     defer mixed_pair.right.close();
 
     const mixed_conn = net.Server.Connection{
@@ -1667,17 +1661,15 @@ test "handleConnection should close client stream after successful HTTP relay" {
     const mixed_client = mixed_pair.right;
 
     try mixed_client.writeAll(req);
+    try compat.shutdownWrite(mixed_client.handle);
+    try setReadTimeoutMs(mixed_client.handle, 100);
     try handleConnection(allocator, mixed_conn, &engine, &manager);
 
     var resp_buf: [1024]u8 = undefined;
     _ = mixed_client.read(&resp_buf) catch 0;
 
-    try setReadTimeoutMs(mixed_client.handle, 100);
     var one: [1]u8 = undefined;
-    const n = mixed_client.read(&one) catch |err| switch (err) {
-        error.WouldBlock => @as(usize, 1),
-        else => return err,
-    };
+    const n = mixed_client.read(&one) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
 }
 

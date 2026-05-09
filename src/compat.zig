@@ -52,16 +52,42 @@ pub fn randomBytes(buffer: []u8) void {
     io().random(buffer);
 }
 
+pub fn writeStdoutAll(bytes: []const u8) !void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io(), &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll(bytes);
+    try stdout.flush();
+}
+
 pub fn posixRead(fd: std.posix.fd_t, buffer: []u8) !usize {
     const rc = std.c.read(fd, buffer.ptr, buffer.len);
-    if (rc < 0) return error.InputOutput;
+    if (rc < 0) return posixReadError(rc);
     return @intCast(rc);
 }
 
 pub fn posixWrite(fd: std.posix.fd_t, buffer: []const u8) !usize {
     const rc = std.c.write(fd, buffer.ptr, buffer.len);
-    if (rc < 0) return error.InputOutput;
+    if (rc < 0) return posixWriteError(rc);
     return @intCast(rc);
+}
+
+fn posixReadError(rc: isize) anyerror {
+    return switch (std.c.errno(rc)) {
+        .CONNRESET => error.ConnectionResetByPeer,
+        .PIPE => error.BrokenPipe,
+        .BADF => error.NotOpenForReading,
+        else => error.InputOutput,
+    };
+}
+
+fn posixWriteError(rc: isize) anyerror {
+    return switch (std.c.errno(rc)) {
+        .CONNRESET => error.ConnectionResetByPeer,
+        .PIPE => error.BrokenPipe,
+        .BADF => error.NotOpenForWriting,
+        else => error.InputOutput,
+    };
 }
 
 pub fn posixClose(fd: std.posix.fd_t) void {

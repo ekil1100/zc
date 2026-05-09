@@ -51,12 +51,18 @@ test "SOCKS5 reply codes" {
     
     try testing.expectEqual(@as(u8, 0x00), SUCCESS);
     try testing.expectEqual(@as(u8, 0x01), GEN_FAILURE);
+    try testing.expectEqual(@as(u8, 0x02), NOT_ALLOWED);
+    try testing.expectEqual(@as(u8, 0x03), NET_UNREACHABLE);
+    try testing.expectEqual(@as(u8, 0x04), HOST_UNREACHABLE);
+    try testing.expectEqual(@as(u8, 0x05), CONN_REFUSED);
+    try testing.expectEqual(@as(u8, 0x06), TTL_EXPIRED);
+    try testing.expectEqual(@as(u8, 0x07), CMD_NOT_SUPPORTED);
     try testing.expectEqual(@as(u8, 0x08), ADDR_NOT_SUPPORTED);
 }
 
 test "SOCKS5 greeting packet structure" {
     // [VER, NMETHODS, METHODS...]
-    var greeting = [_]u8{ 0x05, 0x02, 0x00, 0x02 };
+    const greeting = [_]u8{ 0x05, 0x02, 0x00, 0x02 };
     
     try testing.expectEqual(@as(u8, 0x05), greeting[0]); // SOCKS5
     try testing.expectEqual(@as(u8, 0x02), greeting[1]); // 2 methods
@@ -66,7 +72,7 @@ test "SOCKS5 greeting packet structure" {
 
 test "SOCKS5 connect request structure" {
     // [VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT]
-    var request = [_]u8{
+    const request = [_]u8{
         0x05, // VER
         0x01, // CMD=CONNECT
         0x00, // RSV

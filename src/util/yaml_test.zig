@@ -48,9 +48,9 @@ test "YAML parse array" {
     const allocator = testing.allocator;
 
     const content =
-        \\u0026- item1
-        \- item2
-        \- item3
+        \\- item1
+        \\- item2
+        \\- item3
     ;
 
     var doc = try yaml.parse(allocator, content);
@@ -65,9 +65,9 @@ test "YAML parse nested map" {
     const allocator = testing.allocator;
 
     const content =
-        \\u0026server:
-        \  host: localhost
-        \  port: 8080
+        \\server:
+        \\  host: localhost
+        \\  port: 8080
     ;
 
     var doc = try yaml.parse(allocator, content);

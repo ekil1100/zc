@@ -111,7 +111,7 @@ pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, pr
     }
 
     try out.appendSlice(allocator, "]}}\n");
-    std.debug.print("{s}", .{out.items});
+    try compat.writeStdoutAll(out.items);
 }
 
 pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8, config_key: ?[]const u8) !void {

@@ -204,7 +204,7 @@ pub const Message = struct {
 };
 
 /// 解码域名（处理压缩指针）
-fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) ![]u8 {
+pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) ![]u8 {
     var name_parts = std.ArrayList([]const u8).empty;
     defer name_parts.deinit(allocator);
 
@@ -273,7 +273,7 @@ fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) ![]u8
 }
 
 /// 编码域名
-fn encodeName(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8) !void {
+pub fn encodeName(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, ".")) {
         try buf.append(allocator, 0);
         return;

@@ -9,6 +9,7 @@ test "ProxyType enum values" {
     try testing.expectEqual(ProxyType.socks5, ProxyType.socks5);
     try testing.expectEqual(ProxyType.ss, ProxyType.ss);
     try testing.expectEqual(ProxyType.vmess, ProxyType.vmess);
+    try testing.expectEqual(ProxyType.vless, ProxyType.vless);
     try testing.expectEqual(ProxyType.trojan, ProxyType.trojan);
 }
 
@@ -22,6 +23,7 @@ test "ProxyType switch" {
         .socks5 => "SOCKS5",
         .ss => "Shadowsocks",
         .vmess => "VMess",
+        .vless => "VLESS",
         .trojan => "Trojan",
     };
     

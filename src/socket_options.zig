@@ -24,12 +24,14 @@ test "configureConnectedSocket enables SO_NOSIGPIPE on macOS" {
     try configureConnectedSocket(pair.left.handle);
 
     var value: c_int = 0;
-    try std.posix.getsockopt(
+    var len: std.c.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(
         pair.left.handle,
         std.posix.SOL.SOCKET,
         std.c.SO.NOSIGPIPE,
-        std.mem.asBytes(&value),
-    );
+        std.mem.asBytes(&value).ptr,
+        &len,
+    ) < 0) return error.InputOutput;
     try std.testing.expectEqual(@as(c_int, 1), value);
 }
 
