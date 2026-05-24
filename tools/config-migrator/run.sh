@@ -97,7 +97,7 @@ collect_issues() {
   fi
 
   # R28: UNSUPPORTED_PROXY_TYPE_CHECK
-  local supported_types="direct|reject|ss|ss-plugin|vmess|trojan|vless|http|socks5|socks"
+  local supported_types="direct|reject|ss|ss-plugin|vmess|trojan|vless|anytls|http|socks5|socks"
   while IFS= read -r line; do
     local t=$(echo "$line" | sed -E 's/^[[:space:]]*type:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
     if [[ -n "$t" ]] && ! echo "$t" | grep -Eq "^($supported_types)$"; then

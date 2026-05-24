@@ -150,7 +150,7 @@ Current v1.0 documentation tracks implemented behavior for:
 - mixed inbound runtime;
 - core rule matching and rule-provider expansion;
 - select, url-test, fallback, load-balance, and relay proxy groups;
-- direct, reject, Shadowsocks, VMess, Trojan, and VLESS outbound runtime paths;
+- direct、reject、Shadowsocks、VMess、Trojan、VLESS 和 AnyTLS 出站运行路径;
 - minimal REST control endpoints.
 
 Known gaps include full mihomo DNS behavior, transparent proxying through TUN/redir/tproxy, full REST API v1, WebSocket event streams, complete VMess/VLESS transport matrices, and third-party dashboard compatibility.

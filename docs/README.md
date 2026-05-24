@@ -49,6 +49,7 @@ Included:
 
 - daemon lifecycle through CLI: `start`, `stop`, `restart`, `status`, `log`, `doctor`;
 - default mixed inbound runtime;
+- AnyTLS TCP 出站;
 - non-production explicit port override via `zc start --port <port>`;
 - core rule matching and rule-provider expansion;
 - minimal REST API for version/proxies/rules/proxy selection;

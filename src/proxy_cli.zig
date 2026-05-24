@@ -13,6 +13,7 @@ fn proxyTypeString(pt: config.ProxyType) []const u8 {
         .vmess => "VMess",
         .trojan => "Trojan",
         .vless => "VLESS",
+        .anytls => "AnyTLS",
     };
 }
 

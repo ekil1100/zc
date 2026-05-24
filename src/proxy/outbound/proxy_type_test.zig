@@ -11,11 +11,12 @@ test "ProxyType enum values" {
     try testing.expectEqual(ProxyType.vmess, ProxyType.vmess);
     try testing.expectEqual(ProxyType.vless, ProxyType.vless);
     try testing.expectEqual(ProxyType.trojan, ProxyType.trojan);
+    try testing.expectEqual(ProxyType.anytls, ProxyType.anytls);
 }
 
 test "ProxyType switch" {
     const proxy_type = ProxyType.ss;
-    
+
     const name = switch (proxy_type) {
         .direct => "Direct",
         .reject => "Reject",
@@ -25,7 +26,8 @@ test "ProxyType switch" {
         .vmess => "VMess",
         .vless => "VLESS",
         .trojan => "Trojan",
+        .anytls => "AnyTLS",
     };
-    
+
     try testing.expectEqualStrings("Shadowsocks", name);
 }

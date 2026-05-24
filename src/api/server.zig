@@ -118,6 +118,7 @@ pub const ApiServer = struct {
                 .vmess => "Vmess",
                 .trojan => "Trojan",
                 .vless => "Vless",
+                .anytls => "AnyTLS",
             };
 
             try json.print(self.allocator, "{{\"name\":\"{s}\",\"type\":\"{s}\",\"server\":\"{s}\",\"port\":{d}}}", .{ proxy.name, type_str, proxy.server, proxy.port });

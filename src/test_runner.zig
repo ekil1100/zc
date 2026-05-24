@@ -21,6 +21,7 @@ test "include zc test modules" {
     _ = @import("dns/protocol.zig");
     _ = @import("dns/protocol_test.zig");
     _ = @import("protocol/trojan.zig");
+    _ = @import("protocol/anytls.zig");
     _ = @import("protocol/vless.zig");
     _ = @import("protocol/vmess.zig");
     _ = @import("protocol/vmess_test.zig");

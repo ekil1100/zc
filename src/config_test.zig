@@ -5,6 +5,7 @@ const Proxy = @import("config.zig").Proxy;
 const ProxyType = @import("config.zig").ProxyType;
 const Rule = @import("config.zig").Rule;
 const RuleType = @import("config.zig").RuleType;
+const parseConfig = @import("config.zig").parse;
 const fetchConfig = @import("config.zig").fetchConfig;
 const DownloadResult = @import("config.zig").DownloadResult;
 
@@ -29,10 +30,10 @@ test "fetchConfig function is exported" {
 
 test "ProxyType enum variants" {
     const types = [_]ProxyType{
-        .direct, .reject, .http, .socks5, .ss, .vmess, .trojan,
+        .direct, .reject, .http, .socks5, .ss, .vmess, .trojan, .vless, .anytls,
     };
 
-    try testing.expectEqual(@as(usize, 7), types.len);
+    try testing.expectEqual(@as(usize, 9), types.len);
 }
 
 test "RuleType enum variants" {
@@ -85,6 +86,35 @@ test "Proxy with all fields" {
     try testing.expect(proxy.tls);
     try testing.expect(proxy.ws);
     try testing.expectEqualStrings("/ws", proxy.ws_path.?);
+}
+
+test "parse AnyTLS proxy" {
+    const allocator = testing.allocator;
+    const yaml =
+        \\proxies:
+        \\  - name: anytls-main
+        \\    type: anytls
+        \\    server: anytls.example.com
+        \\    port: 443
+        \\    password: "secret"
+        \\    sni: edge.example.com
+        \\    skip-cert-verify: true
+        \\rules:
+        \\  - MATCH,anytls-main
+    ;
+
+    var config = try parseConfig(allocator, yaml);
+    defer config.deinit();
+
+    try testing.expectEqual(@as(usize, 1), config.proxies.items.len);
+    const proxy = config.proxies.items[0];
+    try testing.expectEqual(ProxyType.anytls, proxy.proxy_type);
+    try testing.expectEqualStrings("anytls-main", proxy.name);
+    try testing.expectEqualStrings("anytls.example.com", proxy.server);
+    try testing.expectEqual(@as(u16, 443), proxy.port);
+    try testing.expectEqualStrings("secret", proxy.password.?);
+    try testing.expectEqualStrings("edge.example.com", proxy.sni.?);
+    try testing.expect(proxy.skip_cert_verify);
 }
 
 test "Rule struct" {

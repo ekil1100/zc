@@ -1,6 +1,6 @@
 # 全代理类型复杂配置样本
 # 用于回归测试覆盖率提升（P20-1B）
-# 包含所有支持的代理类型：direct, reject, http, socks5, ss, vmess, trojan, vless
+# 包含所有支持的代理类型：direct, reject, http, socks5, ss, vmess, trojan, vless, anytls
 
 port: 7890
 socks-port: 7891
@@ -112,6 +112,15 @@ proxies:
     tls: true
     sni: "vless2.example.com"
 
+  # AnyTLS
+  - name: anytls-main
+    type: anytls
+    server: anytls.example.com
+    port: 443
+    password: "anytls-password"
+    sni: "anytls.example.com"
+    skip-cert-verify: false
+
 proxy-groups:
   # 手动选择
   - name: "首选节点"
@@ -121,6 +130,7 @@ proxy-groups:
       - ss-chacha
       - vmess-tls
       - trojan-simple
+      - anytls-main
       - DIRECT
   
   # 自动测速
@@ -132,6 +142,7 @@ proxy-groups:
       - vmess-tls
       - trojan-simple
       - vless-tls
+      - anytls-main
     url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 100
@@ -142,6 +153,7 @@ proxy-groups:
     proxies:
       - vmess-tls
       - trojan-simple
+      - anytls-main
       - ss-aes
       - DIRECT
     url: http://www.gstatic.com/generate_204

@@ -251,6 +251,17 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                     try result.addError("VLESS proxy '{s}': invalid uuid format", .{proxy.name});
                 }
             },
+            .anytls => {
+                if (proxy.server.len == 0) {
+                    try result.addError("AnyTLS proxy '{s}': server cannot be empty", .{proxy.name});
+                }
+                if (!isValidPort(proxy.port)) {
+                    try result.addError("AnyTLS proxy '{s}': invalid port {d}", .{ proxy.name, proxy.port });
+                }
+                if (proxy.password == null or proxy.password.?.len == 0) {
+                    try result.addError("AnyTLS proxy '{s}': password is required", .{proxy.name});
+                }
+            },
         }
     }
 }

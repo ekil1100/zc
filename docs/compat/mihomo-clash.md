@@ -51,6 +51,7 @@ Runtime outbound support currently includes:
 | `vmess` | minimal | TCP-only style implementation; transport options are not fully wired. |
 | `trojan` | minimal | TLS + CONNECT style implementation. |
 | `vless` | minimal | TCP-only implementation. |
+| `anytls` | minimal | 基于 TLS 的 TCP stream 支持。已接入 `password`、`server`、`port`、`sni`、`skip-cert-verify`；暂不支持 UDP-over-TCP 和 Reality。 |
 | `http` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
 | `socks5` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
 

@@ -6,6 +6,7 @@ const Proxy = @import("../../config.zig").Proxy;
 const ProxyType = @import("../../config.zig").ProxyType;
 const meta = @import("../../meta.zig");
 const ss = @import("shadowsocks.zig");
+const anytls = @import("../../protocol/anytls.zig");
 const vmess = @import("../../protocol/vmess.zig");
 const trojan = @import("../../protocol/trojan.zig");
 const vless = @import("../../protocol/vless.zig");
@@ -16,6 +17,7 @@ pub const ProxyStream = struct {
     base_stream: net.Stream,
     allocator: ?std.mem.Allocator = null,
     owned_ss_client: ?*ss.ShadowsocksClient = null,
+    owned_anytls_client: ?*anytls.Client = null,
     owned_trojan_client: ?*trojan.Client = null,
     is_closed: bool = false,
 
@@ -41,11 +43,20 @@ pub const ProxyStream = struct {
         };
     }
 
+    pub fn initAnyTls(allocator: std.mem.Allocator, stream: net.Stream, client: *anytls.Client) ProxyStream {
+        return .{
+            .base_stream = stream,
+            .allocator = allocator,
+            .owned_anytls_client = client,
+        };
+    }
+
     pub fn move(self: *ProxyStream) ProxyStream {
         const moved = self.*;
         self.base_stream = .{ .handle = -1 };
         self.allocator = null;
         self.owned_ss_client = null;
+        self.owned_anytls_client = null;
         self.owned_trojan_client = null;
         self.is_closed = true;
         return moved;
@@ -54,6 +65,8 @@ pub const ProxyStream = struct {
     pub fn write(self: *ProxyStream, data: []const u8) !void {
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
+            try client.write(data);
+        } else if (self.owned_anytls_client) |client| {
             try client.write(data);
         } else if (self.owned_trojan_client) |client| {
             try client.write(data);
@@ -65,6 +78,8 @@ pub const ProxyStream = struct {
     pub fn read(self: *ProxyStream, buf: []u8) !usize {
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
+            return try client.read(buf);
+        } else if (self.owned_anytls_client) |client| {
             return try client.read(buf);
         } else if (self.owned_trojan_client) |client| {
             return try client.read(buf);
@@ -83,6 +98,12 @@ pub const ProxyStream = struct {
             self.allocator.?.destroy(client);
             return;
         }
+        if (self.owned_anytls_client) |client| {
+            self.owned_anytls_client = null;
+            client.deinit();
+            self.allocator.?.destroy(client);
+            return;
+        }
         if (self.owned_trojan_client) |client| {
             self.owned_trojan_client = null;
             client.deinit();
@@ -95,6 +116,9 @@ pub const ProxyStream = struct {
     pub fn hasPendingRead(self: *const ProxyStream) bool {
         if (self.is_closed) return false;
         if (self.owned_ss_client) |client| {
+            return client.hasPendingRead();
+        }
+        if (self.owned_anytls_client) |client| {
             return client.hasPendingRead();
         }
         if (self.owned_trojan_client) |client| {
@@ -289,6 +313,20 @@ pub const OutboundManager = struct {
                 };
                 const stream = try client.connect(addr);
                 return ProxyStream.initShadowsocks(self.allocator, stream, client);
+            },
+            .anytls => {
+                const client = try self.allocator.create(anytls.Client);
+                errdefer self.allocator.destroy(client);
+                client.* = try anytls.Client.init(self.allocator, .{
+                    .password = proxy.password orelse return error.MissingPassword,
+                    .address = proxy.server,
+                    .port = proxy.port,
+                    .sni = proxy.sni,
+                    .skip_cert_verify = proxy.skip_cert_verify,
+                });
+                errdefer client.deinit();
+                const stream = try client.connect(target, port);
+                return ProxyStream.initAnyTls(self.allocator, stream, client);
             },
             .vmess => {
                 var client = try vmess.Client.init(self.allocator, .{
@@ -517,6 +555,27 @@ test "ProxyStream move transfers shadowsocks ownership" {
     try std.testing.expect(source.is_closed);
     try std.testing.expect(source.owned_ss_client == null);
     try std.testing.expect(moved.owned_ss_client == ss_client);
+}
+
+test "ProxyStream move transfers AnyTLS ownership" {
+    const allocator = std.testing.allocator;
+
+    const anytls_client = try allocator.create(anytls.Client);
+    errdefer allocator.destroy(anytls_client);
+    anytls_client.* = try anytls.Client.init(allocator, .{
+        .password = "password",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+
+    var source = ProxyStream.initAnyTls(allocator, .{ .handle = -1 }, anytls_client);
+    var moved = source.move();
+    defer moved.close();
+    source.close();
+
+    try std.testing.expect(source.is_closed);
+    try std.testing.expect(source.owned_anytls_client == null);
+    try std.testing.expect(moved.owned_anytls_client == anytls_client);
 }
 
 test "ProxyStream write rejects closed stream" {

@@ -12,6 +12,7 @@ pub const ProxyType = enum {
     vmess, // VMess
     trojan, // Trojan
     vless, // VLESS
+    anytls, // AnyTLS
 };
 
 pub const Proxy = struct {
@@ -571,6 +572,7 @@ fn parseProxyType(s: []const u8) ?ProxyType {
     if (std.mem.eql(u8, s, "vmess")) return .vmess;
     if (std.mem.eql(u8, s, "trojan")) return .trojan;
     if (std.mem.eql(u8, s, "vless")) return .vless;
+    if (std.mem.eql(u8, s, "anytls")) return .anytls;
     return null;
 }
 

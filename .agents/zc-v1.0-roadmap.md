@@ -11,7 +11,7 @@
 
 当前代码**仍不应直接 GA tag**。本轮 cleanup 已完成 Zig 0.16.0 工具链对齐、TUI de-scope、旧根目录 roadmap/tasks 移除和主要文档重整；剩余阻塞项集中在：
 
-1. **配置层声明支持的部分代理类型未实现出站连接**：`http` / `socks5` 可被 parser 和 validator 接受，但 `OutboundManager.connectToProxy()` 对它们走 `NotImplemented`。
+1. **配置层声明支持的部分代理类型未实现出站连接**：`http` / `socks5` 可被 parser 和 validator 接受，但 `OutboundManager.connectToProxy()` 对它们走 `NotImplemented`。`anytls` 已接入最小 TCP 出站路径。
 2. **CLI `test --json` 不生效**：入口识别 `--json`，但仍调用文本输出的 `test_cli.testProxy()`。
 3. **API v1 仍是最小 REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
@@ -154,6 +154,7 @@ bash scripts/run-full-validation.sh
 - `vmess`
 - `trojan`
 - `vless`
+- `anytls`
 
 实际支持的 proxy group type：
 
@@ -208,6 +209,7 @@ bash scripts/run-full-validation.sh
 - `vmess`
 - `trojan`
 - `vless`
+- `anytls`
 
 实际未实现但可被配置接受：
 
