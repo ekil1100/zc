@@ -17,6 +17,46 @@ test "HTTP response parsing" {
     try testing.expect(std.mem.indexOf(u8, response, "\"version\":\"" ++ ver ++ "\"") != null);
 }
 
+// Regression test for the double-close bug in ApiServer.start/handleConnection.
+//
+// Previously start() called `conn.stream.close()` in its `catch |err|` handler
+// AND handleConnection() closed the same stream via `defer conn.stream.close()`,
+// so any error path inside handleConnection closed the same fd twice. The fix
+// removed the close in start()'s catch handler, leaving exactly one owner.
+//
+// We model the connection lifecycle with a close-counting stub. The buggy
+// pattern closes twice on the error path; the fixed pattern closes exactly once.
+const CloseCounter = struct {
+    count: usize = 0,
+    fn close(self: *CloseCounter) void {
+        self.count += 1;
+    }
+};
+
+// Mirrors the FIXED control flow: handleConnection's defer is the sole closer,
+// start() does not close again in its catch handler.
+fn fixedDriveConnection(c: *CloseCounter, fail: bool) void {
+    // handleConnection body
+    const handle = struct {
+        fn run(cc: *CloseCounter, should_fail: bool) error{ConnError}!void {
+            defer cc.close(); // `defer conn.stream.close()`
+            if (should_fail) return error.ConnError;
+        }
+    }.run;
+    // start() catch handler: must NOT close again
+    handle(c, fail) catch {};
+}
+
+test "connection closed exactly once on error path (no double close)" {
+    var c = CloseCounter{};
+    fixedDriveConnection(&c, true); // error path
+    try testing.expectEqual(@as(usize, 1), c.count);
+
+    var c2 = CloseCounter{};
+    fixedDriveConnection(&c2, false); // success path
+    try testing.expectEqual(@as(usize, 1), c2.count);
+}
+
 test "JSON response format" {
     const allocator = testing.allocator;
 

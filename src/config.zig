@@ -353,20 +353,34 @@ fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValu
     // DIRECT 和 REJECT 不需要 server 和 port
     const needs_server = ptype != .direct and ptype != .reject;
 
+    var ownership_transferred = false;
+    const name_dup = try allocator.dupe(u8, name.string);
+    errdefer if (!ownership_transferred) allocator.free(name_dup);
+
+    var server_dup: []const u8 = "";
+    var server_allocated = false;
+    errdefer if (!ownership_transferred and server_allocated) allocator.free(server_dup);
+    var port_val: u16 = 0;
+    if (needs_server) {
+        const server = map.get("server") orelse return error.MissingProxyServer;
+        if (server != .string) return error.InvalidProxyFormat;
+        server_dup = try allocator.dupe(u8, server.string);
+        server_allocated = true;
+
+        const port = map.get("port") orelse return error.MissingProxyPort;
+        if (port != .integer) return error.InvalidProxyFormat;
+        if (port.integer <= 0 or port.integer > 65535) return error.InvalidProxyPort;
+        port_val = @intCast(port.integer);
+    }
+
     var proxy = Proxy{
-        .name = try allocator.dupe(u8, name.string),
+        .name = name_dup,
         .proxy_type = ptype,
-        .server = if (needs_server) blk: {
-            const server = map.get("server") orelse return error.MissingProxyServer;
-            if (server != .string) return error.InvalidProxyFormat;
-            break :blk try allocator.dupe(u8, server.string);
-        } else "",
-        .port = if (needs_server) blk: {
-            const port = map.get("port") orelse return error.MissingProxyPort;
-            if (port != .integer) return error.InvalidProxyFormat;
-            break :blk @intCast(port.integer);
-        } else 0,
+        .server = server_dup,
+        .port = port_val,
     };
+    ownership_transferred = true;
+    errdefer proxy.deinit(allocator);
 
     // 协议特定字段
     if (map.get("password")) |v| {
@@ -379,7 +393,10 @@ fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValu
         if (v == .string) proxy.uuid = try allocator.dupe(u8, v.string);
     }
     if (map.get("alterId")) |v| {
-        if (v == .integer) proxy.alter_id = @intCast(v.integer);
+        if (v == .integer) {
+            if (v.integer < 0 or v.integer > std.math.maxInt(u16)) return error.InvalidAlterId;
+            proxy.alter_id = @intCast(v.integer);
+        }
     }
     if (map.get("tls")) |v| {
         if (v == .boolean) proxy.tls = v.boolean;
@@ -462,6 +479,7 @@ fn parseProxyGroup(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.Yam
         .group_type = group_type,
         .proxies = std.ArrayList([]const u8).empty,
     };
+    errdefer group.deinit(allocator);
 
     if (map.get("proxies")) |proxies| {
         if (proxies == .array) {
@@ -478,10 +496,16 @@ fn parseProxyGroup(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.Yam
         if (v == .string) group.url = try allocator.dupe(u8, v.string);
     }
     if (map.get("interval")) |v| {
-        if (v == .integer) group.interval = @intCast(v.integer);
+        if (v == .integer) {
+            if (v.integer < 0 or v.integer > std.math.maxInt(u32)) return error.InvalidGroupInterval;
+            group.interval = @intCast(v.integer);
+        }
     }
     if (map.get("tolerance")) |v| {
-        if (v == .integer) group.tolerance = @intCast(v.integer);
+        if (v == .integer) {
+            if (v.integer < 0 or v.integer > std.math.maxInt(u16)) return error.InvalidGroupTolerance;
+            group.tolerance = @intCast(v.integer);
+        }
     }
     if (map.get("lazy")) |v| {
         if (v == .boolean) group.lazy = v.boolean;
@@ -518,7 +542,7 @@ fn parseRuleProvider(
     }
     if (map.get("interval")) |v| {
         if (v != .integer) return error.InvalidRuleProviderFormat;
-        if (v.integer <= 0) return error.InvalidRuleProviderFormat;
+        if (v.integer <= 0 or v.integer > std.math.maxInt(u32)) return error.InvalidRuleProviderFormat;
         provider.interval = @intCast(v.integer);
     }
 

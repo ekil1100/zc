@@ -152,7 +152,11 @@ pub const AeadStream = struct {
         try self.cipher.decrypt(self.dec_nonce, enc_len[0..2], enc_len[2 .. 2 + tag_len], &len_bytes);
         incrementNonce(&self.dec_nonce);
 
-        return (@as(u16, len_bytes[0]) << 8) | len_bytes[1];
+        const payload_len = (@as(u16, len_bytes[0]) << 8) | len_bytes[1];
+        // Shadowsocks AEAD spec caps a single chunk payload at 0x3FFF (16383) bytes.
+        // Reject larger declared lengths to prevent an upstream from amplifying memory.
+        if (payload_len > 0x3FFF) return error.ChunkTooLarge;
+        return payload_len;
     }
 
     /// 解密 payload
@@ -235,6 +239,7 @@ pub const Address = struct {
         } else |_| {}
 
         // Domain
+        if (self.host.len > 255) return error.DomainTooLong;
         buf[0] = 0x03;
         buf[1] = @intCast(self.host.len);
         @memcpy(buf[2 .. 2 + self.host.len], self.host);
@@ -272,4 +277,47 @@ test "chacha20-poly1305 encrypt/decrypt" {
     try stream.decryptPayload(enc_payload, &decrypted);
 
     try std.testing.expectEqualStrings(plaintext, decrypted[0..payload_len]);
+}
+
+test "Address.encode rejects overlong domain instead of overflowing buffer" {
+    // A host longer than 255 bytes must be rejected; previously this would
+    // @intCast-panic on the u8 length and/or @memcpy past the caller buffer.
+    var long_host: [300]u8 = undefined;
+    @memset(&long_host, 'a');
+    const addr = Address{ .host = &long_host, .port = 443 };
+
+    var buf: [260]u8 = undefined;
+    try std.testing.expectError(error.DomainTooLong, addr.encode(&buf));
+}
+
+test "Address.encode still encodes a max-length (255) domain" {
+    var host: [255]u8 = undefined;
+    @memset(&host, 'b');
+    const addr = Address{ .host = &host, .port = 80 };
+
+    var buf: [260]u8 = undefined;
+    const n = try addr.encode(&buf);
+    try std.testing.expectEqual(@as(usize, 0x03), buf[0]);
+    try std.testing.expectEqual(@as(u8, 255), buf[1]);
+    try std.testing.expectEqual(@as(usize, 2 + 255 + 2), n);
+}
+
+test "decryptLen rejects chunk length above Shadowsocks 0x3FFF cap" {
+    const password = "C7a6kndb";
+    var salt: [32]u8 = undefined;
+    compat.randomBytes(&salt);
+
+    // Build an encrypted length header declaring 0x4000 (> 0x3FFF) using the
+    // same nonce/key the decryptor will use on its first chunk.
+    var enc = try AeadStream.init(.chacha20_poly1305, password, &salt);
+    var dec = try AeadStream.init(.chacha20_poly1305, password, &salt);
+
+    const tag_len = enc.cipher.tagLen();
+    const declared: u16 = 0x4000;
+    const len_bytes = [2]u8{ @intCast(declared >> 8), @intCast(declared & 0xFF) };
+
+    var hdr: [2 + 16]u8 = undefined;
+    enc.cipher.encrypt(enc.enc_nonce, &len_bytes, hdr[0..2], hdr[2 .. 2 + tag_len]);
+
+    try std.testing.expectError(error.ChunkTooLarge, dec.decryptLen(hdr[0 .. 2 + tag_len]));
 }

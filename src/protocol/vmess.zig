@@ -168,6 +168,7 @@ pub const Client = struct {
         }
 
         // Domain
+        if (host.len > 255) return error.DomainTooLong;
         try buf.append(self.allocator, @intFromEnum(AddressType.domain));
         try buf.append(self.allocator, @intCast(host.len));
         try buf.appendSlice(self.allocator, host);
@@ -392,6 +393,7 @@ pub fn parseUuid(str: []const u8, out: *[16]u8) !void {
             continue;
         }
 
+        if (idx + 1 >= str.len) return error.InvalidUuid;
         const high = try hexDigit(str[idx]);
         const low = try hexDigit(str[idx + 1]);
         out[out_idx] = (high << 4) | low;
@@ -399,6 +401,8 @@ pub fn parseUuid(str: []const u8, out: *[16]u8) !void {
         idx += 2;
         out_idx += 1;
     }
+
+    if (out_idx != 16) return error.InvalidUuid;
 }
 
 pub fn hexDigit(c: u8) !u8 {
@@ -414,12 +418,12 @@ pub fn hexDigit(c: u8) !u8 {
 pub fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     var parts: [4]u8 = undefined;
     var part_idx: usize = 0;
-    var current: u8 = 0;
+    var current: u16 = 0;
 
     for (str) |c| {
         if (c == '.') {
             if (part_idx >= 4) return false;
-            parts[part_idx] = current;
+            parts[part_idx] = @intCast(current);
             part_idx += 1;
             current = 0;
         } else if (c >= '0' and c <= '9') {
@@ -431,7 +435,7 @@ pub fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     }
 
     if (part_idx != 3) return false;
-    parts[3] = current;
+    parts[3] = @intCast(current);
 
     @memcpy(out, &parts);
     return true;

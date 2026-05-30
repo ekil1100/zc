@@ -156,7 +156,10 @@ const Parser = struct {
             }
 
             const key = try self.parseKey();
-            if (key.len == 0) break;
+            if (key.len == 0) {
+                self.allocator.free(key);
+                break;
+            }
 
             while (self.pos < self.source.len and
                 (self.source[self.pos] == ' ' or self.source[self.pos] == '\t')) self.pos += 1;
@@ -186,7 +189,14 @@ const Parser = struct {
                 val = try self.parseScalar();
                 self.skipLine();
             }
-            try m.put(key, val);
+            const gop = try m.getOrPut(key);
+            if (gop.found_existing) {
+                // Duplicate key: free the newly-duped key and the previously
+                // stored value before overwriting, to avoid leaking them.
+                self.allocator.free(key);
+                gop.value_ptr.deinit(self.allocator);
+            }
+            gop.value_ptr.* = val;
             first = false;
         }
         return YamlValue{ .map = m };

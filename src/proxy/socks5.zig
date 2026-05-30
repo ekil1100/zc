@@ -131,8 +131,9 @@ fn handleConnection(_allocator: std.mem.Allocator, conn: net.Server.Connection, 
             target_port = (@as(u16, buf[8]) << 8) | buf[9];
         },
         AddressType.Domain => {
-            const domain_len = buf[4];
-            if (req_n < 5 + domain_len + 2) return error.InvalidRequest;
+            const domain_len: usize = buf[4];
+            // Compute required length in usize to avoid u8 overflow when domain_len >= 249.
+            if (!domainRequestFits(req_n, domain_len)) return error.InvalidRequest;
             target_host = buf[5 .. 5 + domain_len];
             target_port = (@as(u16, buf[5 + domain_len]) << 8) | buf[5 + domain_len + 1];
         },
@@ -218,6 +219,15 @@ fn relaySocks5(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     }
 }
 
+/// Returns true if a SOCKS5 domain request of the given total bytes (`req_n`)
+/// is long enough to hold the domain (`domain_len`) plus its 2-byte port.
+/// The arithmetic must be done in a wide type: with `domain_len` as a u8,
+/// `5 + domain_len + 2` overflows once domain_len >= 249 (panic in safe
+/// builds, wraparound -> OOB read in ReleaseFast).
+fn domainRequestFits(req_n: usize, domain_len: usize) bool {
+    return req_n >= 5 + domain_len + 2;
+}
+
 fn mapConnectErrorToReply(err: anyerror) u8 {
     return switch (err) {
         error.ConnectionRejected => Reply.ConnectionRefused,
@@ -244,4 +254,19 @@ test "mapConnectErrorToReply maps connect errors to connection refused" {
 
 test "mapConnectErrorToReply maps unknown errors to general failure" {
     try std.testing.expectEqual(@as(u8, Reply.GeneralFailure), mapConnectErrorToReply(error.NotImplemented));
+}
+
+test "domainRequestFits does not overflow for large domain lengths" {
+    // domain_len drawn from an attacker-controlled u8 (0..255). With the old
+    // u8 arithmetic, `5 + domain_len + 2` overflowed/wrapped for domain_len >= 249.
+    // A maximal-length domain (255) needs 5 + 255 + 2 = 262 bytes total; a short
+    // 6-byte request must NOT be accepted (the wraparound bug made it pass).
+    const domain_len: u8 = 255;
+    try std.testing.expect(!domainRequestFits(6, domain_len));
+    try std.testing.expect(!domainRequestFits(261, domain_len));
+    try std.testing.expect(domainRequestFits(262, domain_len));
+
+    // Boundary just below the old overflow threshold still behaves correctly.
+    try std.testing.expect(!domainRequestFits(255, @as(u8, 249)));
+    try std.testing.expect(domainRequestFits(256, @as(u8, 249)));
 }

@@ -86,6 +86,7 @@ pub const Client = struct {
             return;
         }
 
+        if (host.len > 255) return error.DomainTooLong;
         try buf.append(self.allocator, 0x02); // Domain
         try buf.append(self.allocator, @intCast(host.len));
         try buf.appendSlice(self.allocator, host);
@@ -342,4 +343,20 @@ test "VLESS encodeAddress domain" {
     try testing.expectEqual(@as(u8, 0x02), buf.items[0]);
     try testing.expectEqual(@as(u8, 11), buf.items[1]);
     try testing.expectEqualStrings("example.com", buf.items[2..]);
+}
+
+test "VLESS encodeAddress rejects domain longer than 255 bytes" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .id = "123e4567-e89b-12d3-a456-426614174000",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    const long_host = "a" ** 256;
+    try testing.expectError(error.DomainTooLong, client.encodeAddress(&buf, long_host));
 }

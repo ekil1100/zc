@@ -41,9 +41,12 @@ pub const ApiServer = struct {
                 conn.stream.close();
                 continue;
             };
+            // handleConnection owns the connection and closes it via its own
+            // `defer conn.stream.close()` on every return path (success or
+            // error). Do NOT close it again here, or the fd would be closed
+            // twice — racing with concurrent fd allocation in other threads.
             self.handleConnection(conn) catch |err| {
                 std.debug.print("API connection error: {}\n", .{err});
-                conn.stream.close();
             };
         }
     }

@@ -258,6 +258,7 @@ pub const Client = struct {
         }
 
         // Domain
+        if (host.len > 255) return error.DomainTooLong;
         try buf.append(self.allocator, 0x03); // Domain
         try buf.append(self.allocator, @intCast(host.len));
         try buf.appendSlice(self.allocator, host);
@@ -268,12 +269,12 @@ pub const Client = struct {
 fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     var parts: [4]u8 = undefined;
     var part_idx: usize = 0;
-    var current: u8 = 0;
+    var current: u16 = 0;
 
     for (str) |c| {
         if (c == '.') {
             if (part_idx >= 4) return false;
-            parts[part_idx] = current;
+            parts[part_idx] = @intCast(current);
             part_idx += 1;
             current = 0;
         } else if (c >= '0' and c <= '9') {
@@ -285,7 +286,7 @@ fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     }
 
     if (part_idx != 3) return false;
-    parts[3] = current;
+    parts[3] = @intCast(current);
 
     @memcpy(out, &parts);
     return true;
@@ -501,4 +502,39 @@ test "Trojan read uses TLS buffered short-read semantics" {
     const read_body = content[read_pos..pending_pos];
     try testing.expect(std.mem.indexOf(u8, read_body, "readTlsApplicationData") != null);
     try testing.expect(std.mem.indexOf(u8, read_body, "readSliceShort") == null);
+}
+
+test "Trojan parseIpv4 rejects overflowing octet without panic" {
+    var out: [4]u8 = undefined;
+    // Octet > 255 must be rejected, not overflow a u8 accumulator.
+    try testing.expect(!parseIpv4("256.0.0.1", &out));
+    try testing.expect(!parseIpv4("999.1.1.1", &out));
+    // Valid address still parses correctly.
+    try testing.expect(parseIpv4("10.0.0.255", &out));
+    try testing.expectEqual(@as(u8, 10), out[0]);
+    try testing.expectEqual(@as(u8, 255), out[3]);
+}
+
+test "Trojan encodeAddress rejects over-long domain" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    const long_host = "a" ** 256;
+    try testing.expectError(error.DomainTooLong, client.encodeAddress(&buf, long_host));
+
+    // A 255-byte domain is still accepted and length-prefixed correctly.
+    var buf2 = std.ArrayList(u8).empty;
+    defer buf2.deinit(allocator);
+    const max_host = "b" ** 255;
+    try client.encodeAddress(&buf2, max_host);
+    try testing.expectEqual(@as(u8, 0x03), buf2.items[0]);
+    try testing.expectEqual(@as(u8, 255), buf2.items[1]);
 }

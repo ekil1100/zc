@@ -97,6 +97,83 @@ test "Engine match domain keyword" {
     try testing.expectEqualStrings("PROXY", result.?);
 }
 
+test "Engine match IP-CIDR prefix /8" {
+    const allocator = testing.allocator;
+
+    var rules = std.ArrayList(Rule).empty;
+    defer rules.deinit(allocator);
+
+    try rules.append(allocator, .{
+        .rule_type = .ip_cidr,
+        .payload = try allocator.dupe(u8, "10.0.0.0/8"),
+        .target = try allocator.dupe(u8, "DIRECT"),
+    });
+
+    var engine = try Engine.init(allocator, &rules);
+    defer {
+        for (rules.items) |*rule| {
+            rule.deinit(allocator);
+        }
+        engine.deinit();
+    }
+
+    // With the old buggy mask (always 0xFFFFFFFF) this only matched the exact
+    // network address 10.0.0.0 and failed for any other host inside the /8.
+    const result = engine.match("10.20.30.40", false);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("DIRECT", result.?);
+}
+
+test "Engine IP-CIDR /8 does not match outside the network" {
+    const allocator = testing.allocator;
+
+    var rules = std.ArrayList(Rule).empty;
+    defer rules.deinit(allocator);
+
+    try rules.append(allocator, .{
+        .rule_type = .ip_cidr,
+        .payload = try allocator.dupe(u8, "10.0.0.0/8"),
+        .target = try allocator.dupe(u8, "DIRECT"),
+    });
+
+    var engine = try Engine.init(allocator, &rules);
+    defer {
+        for (rules.items) |*rule| {
+            rule.deinit(allocator);
+        }
+        engine.deinit();
+    }
+
+    // 11.0.0.1 is outside 10.0.0.0/8 and must not match (guards against an
+    // over-broad / zero mask).
+    const result = engine.match("11.0.0.1", false);
+    try testing.expect(result == null);
+}
+
+test "Engine match IP-CIDR prefix /16" {
+    const allocator = testing.allocator;
+
+    var rules = std.ArrayList(Rule).empty;
+    defer rules.deinit(allocator);
+
+    try rules.append(allocator, .{
+        .rule_type = .ip_cidr,
+        .payload = try allocator.dupe(u8, "192.168.0.0/16"),
+        .target = try allocator.dupe(u8, "DIRECT"),
+    });
+
+    var engine = try Engine.init(allocator, &rules);
+    defer {
+        for (rules.items) |*rule| {
+            rule.deinit(allocator);
+        }
+        engine.deinit();
+    }
+
+    try testing.expect(engine.match("192.168.5.7", false) != null);
+    try testing.expect(engine.match("192.169.0.1", false) == null);
+}
+
 test "Engine match final" {
     const allocator = testing.allocator;
 

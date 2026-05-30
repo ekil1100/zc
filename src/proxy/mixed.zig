@@ -143,7 +143,7 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
             break :blk try std.fmt.bufPrint(&host_buf, "{}.{}.{}.{}", .{ buf[4], buf[5], buf[6], buf[7] });
         },
         0x03 => blk: { // Domain
-            const domain_len = buf[4];
+            const domain_len: usize = buf[4];
             if (req_n < 5 + domain_len + 2) return error.InvalidRequest;
             target_port = (@as(u16, buf[5 + domain_len]) << 8) | buf[5 + domain_len + 1];
             break :blk buf[5 .. 5 + domain_len];

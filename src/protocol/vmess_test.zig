@@ -53,6 +53,24 @@ test "VMess parseIpv4 invalid" {
     try testing.expect(!result);
 }
 
+test "VMess parseIpv4 octet overflow rejected" {
+    var ip: [4]u8 = undefined;
+    // Octet > 255 whose running accumulation overflows a u8 must be rejected,
+    // not panic or wrap around.
+    try testing.expect(!vmess.parseIpv4("256.0.0.1", &ip));
+    try testing.expect(!vmess.parseIpv4("999.1.1.1", &ip));
+    try testing.expect(!vmess.parseIpv4("1.2.3.300", &ip));
+}
+
+test "VMess parseUuid no out-of-bounds read" {
+    var uuid: [16]u8 = undefined;
+    // 36-char string: 30 hex digits (0-29), dashes (30-34), one hex at 35.
+    // The trailing lone hex digit would make the old code read str[36].
+    const malicious = "000000000000000000000000000000-----a";
+    try testing.expectEqual(@as(usize, 36), malicious.len);
+    try testing.expectError(error.InvalidUuid, vmess.parseUuid(malicious, &uuid));
+}
+
 test "VMess hexDigit" {
     try testing.expectEqual(@as(u8, 0), try vmess.hexDigit('0'));
     try testing.expectEqual(@as(u8, 9), try vmess.hexDigit('9'));

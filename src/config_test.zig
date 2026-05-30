@@ -188,3 +188,90 @@ test "Config with external controller" {
 
     try testing.expectEqualStrings("127.0.0.1:9090", config.external_controller.?);
 }
+
+// Regression: parseProxy must reject out-of-range proxy port instead of
+// panicking on an unchecked @intCast of the i64 YAML value to u16.
+test "parseProxy rejects out-of-range port" {
+    const allocator = testing.allocator;
+    const yaml =
+        \\proxies:
+        \\  - name: bad
+        \\    type: ss
+        \\    server: 127.0.0.1
+        \\    port: 70000
+        \\    cipher: aes-128-gcm
+        \\    password: pw
+    ;
+    try testing.expectError(error.InvalidProxyPort, parseConfig(allocator, yaml));
+}
+
+test "parseProxy rejects negative port" {
+    const allocator = testing.allocator;
+    const yaml =
+        \\proxies:
+        \\  - name: bad
+        \\    type: ss
+        \\    server: 127.0.0.1
+        \\    port: -1
+        \\    cipher: aes-128-gcm
+        \\    password: pw
+    ;
+    try testing.expectError(error.InvalidProxyPort, parseConfig(allocator, yaml));
+}
+
+// Regression: alterId beyond u16 must be rejected, not @intCast-truncated/panicked.
+test "parseProxy rejects out-of-range alterId" {
+    const allocator = testing.allocator;
+    const yaml =
+        \\proxies:
+        \\  - name: bad
+        \\    type: vmess
+        \\    server: 127.0.0.1
+        \\    port: 443
+        \\    uuid: 00000000-0000-0000-0000-000000000000
+        \\    alterId: 70000
+    ;
+    try testing.expectError(error.InvalidAlterId, parseConfig(allocator, yaml));
+}
+
+// Regression: proxy-group interval beyond u32 must be rejected.
+test "parseProxyGroup rejects out-of-range interval" {
+    const allocator = testing.allocator;
+    const yaml =
+        \\proxies:
+        \\  - name: a
+        \\    type: ss
+        \\    server: 127.0.0.1
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: pw
+        \\proxy-groups:
+        \\  - name: g
+        \\    type: url-test
+        \\    proxies:
+        \\      - a
+        \\    interval: 99999999999
+    ;
+    try testing.expectError(error.InvalidGroupInterval, parseConfig(allocator, yaml));
+}
+
+// Regression: proxy-group tolerance beyond u16 must be rejected.
+test "parseProxyGroup rejects out-of-range tolerance" {
+    const allocator = testing.allocator;
+    const yaml =
+        \\proxies:
+        \\  - name: a
+        \\    type: ss
+        \\    server: 127.0.0.1
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: pw
+        \\proxy-groups:
+        \\  - name: g
+        \\    type: url-test
+        \\    proxies:
+        \\      - a
+        \\    tolerance: 70000
+    ;
+    try testing.expectError(error.InvalidGroupTolerance, parseConfig(allocator, yaml));
+}

@@ -52,9 +52,10 @@ pub const DnsClient = struct {
     }
 
     pub fn deinit(self: *DnsClient) void {
-        var iter = self.cache.valueIterator();
+        var iter = self.cache.iterator();
         while (iter.next()) |entry| {
-            entry.addresses.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.addresses.deinit(self.allocator);
         }
         self.cache.deinit();
     }
@@ -122,6 +123,30 @@ pub const DnsClient = struct {
         }
     }
 
+    /// 读取确切数量的字节（处理短读取）
+    fn readFull(sock: std.posix.fd_t, buf: []u8) !void {
+        var read: usize = 0;
+        while (read < buf.len) {
+            const n = try compat.posixRead(sock, buf[read..]);
+            if (n == 0) return error.UnexpectedEof;
+            read += n;
+        }
+    }
+
+    /// 校验 DNS 响应是否与查询匹配，防止缓存投毒
+    fn validateResponse(query: *const protocol.Message, response: *const protocol.Message, domain: []const u8) !void {
+        // 必须是响应消息
+        if (!response.isResponse()) return error.NotAResponse;
+        // 事务 ID 必须匹配（防止离/在路径欺骗）
+        if (response.id != query.id) return error.DnsIdMismatch;
+        // 问题段必须回显我们询问的名称与类型
+        if (response.questions.items.len == 0) return error.DnsQuestionMismatch;
+        if (query.questions.items.len == 0) return error.DnsQuestionMismatch;
+        const q = response.questions.items[0];
+        if (q.qtype != query.questions.items[0].qtype) return error.DnsQuestionMismatch;
+        if (!std.ascii.eqlIgnoreCase(q.name, domain)) return error.DnsQuestionMismatch;
+    }
+
     /// UDP DNS 查询
     fn queryUdp(self: *DnsClient, server: []const u8, domain: []const u8) ![]net.Address {
         var addrs = try net.getAddressList(self.allocator, server, self.config.port);
@@ -162,6 +187,9 @@ pub const DnsClient = struct {
         var response = protocol.Message.init(self.allocator);
         defer response.deinit();
         try response.decode(resp_buf[0..recv_len]);
+
+        // Validate response matches our query (anti cache-poisoning)
+        try validateResponse(&query, &response, domain);
 
         // Check response
         if (response.getResponseCode() != .no_error) {
@@ -215,20 +243,23 @@ pub const DnsClient = struct {
         _ = try compat.posixWrite(sock, &len_bytes);
         _ = try compat.posixWrite(sock, query_data);
 
-        // Read length
+        // Read length (fully, handling short reads)
         var len_buf: [2]u8 = undefined;
-        _ = try compat.posixRead(sock, &len_buf);
+        try readFull(sock, &len_buf);
         const resp_len = (@as(u16, len_buf[0]) << 8) | len_buf[1];
 
-        // Read response
+        // Read response (fully, handling short reads)
         const resp_data = try self.allocator.alloc(u8, resp_len);
         defer self.allocator.free(resp_data);
-        _ = try compat.posixRead(sock, resp_data);
+        try readFull(sock, resp_data);
 
         // Parse response
         var response = protocol.Message.init(self.allocator);
         defer response.deinit();
         try response.decode(resp_data);
+
+        // Validate response matches our query (anti cache-poisoning)
+        try validateResponse(&query, &response, domain);
 
         if (response.getResponseCode() != .no_error) {
             return error.DnsError;
@@ -269,19 +300,143 @@ pub const DnsClient = struct {
         const now = compat.timestamp();
         var iter = self.cache.iterator();
         var to_remove = std.ArrayList([]const u8).empty;
-        defer to_remove.deinit();
+        defer to_remove.deinit(self.allocator);
 
         while (iter.next()) |entry| {
             if (entry.value_ptr.expires_at <= now) {
-                try to_remove.append(entry.key_ptr.*);
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
         for (to_remove.items) |key| {
             if (self.cache.fetchRemove(key)) |kv| {
                 self.allocator.free(kv.key);
-                kv.value.addresses.deinit(self.allocator);
+                var value = kv.value;
+                value.addresses.deinit(self.allocator);
             }
         }
     }
 };
+
+const testing = std.testing;
+
+/// 构造一个用于测试的 DNS 响应消息
+fn makeTestResponse(
+    allocator: std.mem.Allocator,
+    id: u16,
+    flags: u16,
+    qname: ?[]const u8,
+    qtype: protocol.QueryType,
+) !protocol.Message {
+    var msg = protocol.Message.init(allocator);
+    errdefer msg.deinit();
+    msg.id = id;
+    msg.flags = flags;
+    if (qname) |n| {
+        const name = try allocator.dupe(u8, n);
+        try msg.questions.append(allocator, .{ .name = name, .qtype = qtype });
+    }
+    return msg;
+}
+
+test "validateResponse accepts matching response" {
+    const allocator = testing.allocator;
+    var query = try protocol.createAQuery(allocator, "example.com");
+    defer query.deinit();
+
+    var response = try makeTestResponse(allocator, query.id, 0x8180, "example.com", .a);
+    defer response.deinit();
+
+    try DnsClient.validateResponse(&query, &response, "example.com");
+}
+
+test "validateResponse rejects mismatched transaction ID (spoofing)" {
+    const allocator = testing.allocator;
+    var query = try protocol.createAQuery(allocator, "example.com");
+    defer query.deinit();
+
+    // Attacker-injected response with a different/forged ID
+    var response = try makeTestResponse(allocator, query.id +% 1, 0x8180, "example.com", .a);
+    defer response.deinit();
+
+    try testing.expectError(error.DnsIdMismatch, DnsClient.validateResponse(&query, &response, "example.com"));
+}
+
+test "validateResponse rejects non-response (QR bit clear)" {
+    const allocator = testing.allocator;
+    var query = try protocol.createAQuery(allocator, "example.com");
+    defer query.deinit();
+
+    // flags without the 0x8000 QR bit
+    var response = try makeTestResponse(allocator, query.id, 0x0100, "example.com", .a);
+    defer response.deinit();
+
+    try testing.expectError(error.NotAResponse, DnsClient.validateResponse(&query, &response, "example.com"));
+}
+
+test "validateResponse rejects wrong question name" {
+    const allocator = testing.allocator;
+    var query = try protocol.createAQuery(allocator, "example.com");
+    defer query.deinit();
+
+    var response = try makeTestResponse(allocator, query.id, 0x8180, "evil.com", .a);
+    defer response.deinit();
+
+    try testing.expectError(error.DnsQuestionMismatch, DnsClient.validateResponse(&query, &response, "example.com"));
+}
+
+test "validateResponse rejects missing question section" {
+    const allocator = testing.allocator;
+    var query = try protocol.createAQuery(allocator, "example.com");
+    defer query.deinit();
+
+    var response = try makeTestResponse(allocator, query.id, 0x8180, null, .a);
+    defer response.deinit();
+
+    try testing.expectError(error.DnsQuestionMismatch, DnsClient.validateResponse(&query, &response, "example.com"));
+}
+
+test "validateResponse matches question name case-insensitively" {
+    const allocator = testing.allocator;
+    var query = try protocol.createAQuery(allocator, "Example.COM");
+    defer query.deinit();
+
+    var response = try makeTestResponse(allocator, query.id, 0x8180, "example.com", .a);
+    defer response.deinit();
+
+    try DnsClient.validateResponse(&query, &response, "Example.COM");
+}
+
+test "cleanupCache evicts expired entries and frees memory" {
+    const allocator = testing.allocator;
+    var client = DnsClient.init(allocator, .{ .enable_cache = true });
+    defer client.deinit();
+
+    // Insert an already-expired entry.
+    var entry = CacheEntry{
+        .addresses = std.ArrayList(net.Address).empty,
+        .expires_at = compat.timestamp() - 1000,
+    };
+    try entry.addresses.append(allocator, net.Address{ .in = .{ .sa = .{
+        .family = std.posix.AF.INET,
+        .port = 0,
+        .addr = 0x0100007f,
+        .zero = undefined,
+    } } });
+    try client.cache.put(try allocator.dupe(u8, "expired.example"), entry);
+
+    // Insert a still-valid entry.
+    const entry2 = CacheEntry{
+        .addresses = std.ArrayList(net.Address).empty,
+        .expires_at = compat.timestamp() + 1000,
+    };
+    try client.cache.put(try allocator.dupe(u8, "fresh.example"), entry2);
+
+    try testing.expectEqual(@as(usize, 2), client.cache.count());
+
+    client.cleanupCache();
+
+    try testing.expectEqual(@as(usize, 1), client.cache.count());
+    try testing.expect(client.cache.get("fresh.example") != null);
+    try testing.expect(client.cache.get("expired.example") == null);
+}

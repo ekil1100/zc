@@ -14,6 +14,10 @@ pub const QueryType = enum(u16) {
     aaaa = 28,
     srv = 33,
     any = 255,
+    // Non-exhaustive: the question section is echoed from the wire and may
+    // contain any of the 65536 possible qtype values (e.g. SVCB=64, HTTPS=65),
+    // so @enumFromInt must accept arbitrary values without illegal behavior.
+    _,
 };
 
 /// DNS 响应码
@@ -24,6 +28,9 @@ pub const ResponseCode = enum(u4) {
     name_error = 3,
     not_implemented = 4,
     refused = 5,
+    // Non-exhaustive: rcodes 6..15 are valid wire values (YXDOMAIN=6,
+    // NXRRSET=8, NOTAUTH=9, ...), so @enumFromInt must accept them.
+    _,
 };
 
 /// DNS 问题结构
@@ -207,9 +214,19 @@ pub const Message = struct {
 pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) ![]u8 {
     var name_parts = std.ArrayList([]const u8).empty;
     defer name_parts.deinit(allocator);
+    // Free any duped labels if we bail out with an error before joining them.
+    errdefer for (name_parts.items) |label| allocator.free(label);
 
-    const start_pos = pos.*;
     var jumped = false;
+    // Position the caller should resume from. For a name that ends in a
+    // compression pointer, this is the byte right after the (first) 2-byte
+    // pointer; the pointer may be preceded by real labels, so we cannot
+    // assume it sits at the start of the name.
+    var resume_pos: usize = 0;
+    // Guard against pointer loops (self-reference or cycles). A name cannot
+    // legitimately reference more labels than the message has bytes, so cap
+    // the number of jumps at data.len.
+    var jumps: usize = 0;
 
     while (true) {
         if (pos.* >= data.len) return error.InvalidMessage;
@@ -221,9 +238,15 @@ pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) !
             if (pos.* + 2 > data.len) return error.InvalidMessage;
             const offset = ((@as(usize, len & 0x3F)) << 8) | data[pos.* + 1];
             if (!jumped) {
-                pos.* += 2;
+                resume_pos = pos.* + 2;
                 jumped = true;
             }
+            // A pointer must point strictly backward; combined with the jump
+            // cap this prevents self-loops and forward/backward cycles that
+            // would otherwise hang the decoder (DNS decompression DoS).
+            if (offset >= pos.*) return error.InvalidMessage;
+            jumps += 1;
+            if (jumps > data.len) return error.InvalidMessage;
             pos.* = offset;
             continue;
         }
@@ -239,10 +262,8 @@ pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) !
         pos.* += len;
     }
 
-    if (!jumped) {
-        // Update pos to after this name
-    } else {
-        pos.* = start_pos + 2; // Return to after compression pointer
+    if (jumped) {
+        pos.* = resume_pos; // Resume right after the compression pointer
     }
 
     // Join labels with dots

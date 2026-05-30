@@ -61,6 +61,65 @@ test "YAML parse array" {
     try testing.expectEqualStrings("item1", doc.array.items[0].string);
 }
 
+test "YAML duplicate key does not leak" {
+    // testing.allocator fails the test if any allocation leaks.
+    // The earlier key string and value must be freed when overwritten.
+    const allocator = testing.allocator;
+
+    const content =
+        \\port: 7890
+        \\port: 1080
+        \\name: first-name
+        \\name: second-name
+    ;
+
+    var doc = try yaml.parse(allocator, content);
+    defer doc.deinit(allocator);
+
+    // Last value wins.
+    try testing.expectEqual(@as(i64, 1080), doc.map.get("port").?.integer);
+    try testing.expectEqualStrings("second-name", doc.map.get("name").?.string);
+}
+
+test "YAML duplicate key with nested map value does not leak" {
+    // The previously stored value may itself own nested allocations
+    // (string/array/map) that must be released on overwrite.
+    const allocator = testing.allocator;
+
+    const content =
+        \\dup:
+        \\  host: localhost
+        \\  tags:
+        \\    - a
+        \\    - b
+        \\dup:
+        \\  host: remote
+    ;
+
+    var doc = try yaml.parse(allocator, content);
+    defer doc.deinit(allocator);
+
+    const dup = doc.map.get("dup").?;
+    try testing.expect(dup == .map);
+    try testing.expectEqualStrings("remote", dup.map.get("host").?.string);
+}
+
+test "YAML empty key does not leak" {
+    // A line beginning with ':' yields a zero-length key; the duped empty
+    // string must be freed on the break path rather than leaked.
+    const allocator = testing.allocator;
+
+    const content =
+        \\name: value
+        \\: orphan
+    ;
+
+    var doc = try yaml.parse(allocator, content);
+    defer doc.deinit(allocator);
+
+    try testing.expectEqualStrings("value", doc.map.get("name").?.string);
+}
+
 test "YAML parse nested map" {
     const allocator = testing.allocator;
 

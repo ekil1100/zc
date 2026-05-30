@@ -164,15 +164,35 @@ pub const WebSocket = struct {
         try self.stream.writeAll(frame.items);
     }
 
-    /// 接收帧
-    pub fn recv(self: *WebSocket, buf: []u8) !usize {
-        if (!self.connected) return error.NotConnected;
+    /// 解码 64 位扩展长度（127 形式）。
+    /// 所有 8 个字节都参与计算，若高位超出 usize 可表示范围则返回错误。
+    pub fn decodeExtended64(ext: [8]u8) !usize {
+        var len: u64 = 0;
+        for (ext) |b| {
+            len = (len << 8) | b;
+        }
+        // 最高位必须为 0（协议要求），且不得超过本平台 usize 上限。
+        if (len > std.math.maxInt(usize)) return error.FrameTooLarge;
+        return @intCast(len);
+    }
 
+    /// 解析后的帧元信息。
+    pub const FrameInfo = struct {
+        opcode: u8,
+        payload_len: usize,
+    };
+
+    /// 从任意拥有 `readAll([]u8) !void` 方法的 reader 读取一个完整帧到 buf。
+    ///
+    /// 关键点：
+    ///  - 当 payload 超出 buf 时，仍然把整个 payload（以及前面的掩码）从流中
+    ///    消费掉再返回 error.BufferTooSmall，避免后续帧错位。
+    ///  - 64 位扩展长度的全部 8 个字节都参与解析（见 decodeExtended64）。
+    pub fn readFrame(reader: anytype, buf: []u8) !FrameInfo {
         // 读取帧头
         var header: [2]u8 = undefined;
-        _ = try self.stream.readAll(&header);
+        try reader.readAll(&header);
 
-        const fin = (header[0] >> 7) == 1;
         const opcode = header[0] & 0x0F;
         const masked = (header[1] >> 7) == 1;
         var payload_len: usize = @intCast(header[1] & 0x7F);
@@ -180,27 +200,34 @@ pub const WebSocket = struct {
         // 扩展长度
         if (payload_len == 126) {
             var ext: [2]u8 = undefined;
-            _ = try self.stream.readAll(&ext);
+            try reader.readAll(&ext);
             payload_len = (@as(usize, ext[0]) << 8) | ext[1];
         } else if (payload_len == 127) {
             var ext: [8]u8 = undefined;
-            _ = try self.stream.readAll(&ext);
-            payload_len = (@as(usize, ext[4]) << 24) | (@as(usize, ext[5]) << 16) |
-                         (@as(usize, ext[6]) << 8) | ext[7];
+            try reader.readAll(&ext);
+            payload_len = try decodeExtended64(ext);
         }
 
         // 读取 masking key (如果服务器发送了)
         var mask: [4]u8 = undefined;
         if (masked) {
-            _ = try self.stream.readAll(&mask);
+            try reader.readAll(&mask);
         }
 
-        // 读取 payload
+        // 若 payload 超出 buf，仍需把 payload 从流中读完并丢弃，
+        // 否则后续 recv 会把残留的 payload 当作新帧头解析（帧错位）。
         if (payload_len > buf.len) {
+            var discard: [512]u8 = undefined;
+            var remaining = payload_len;
+            while (remaining > 0) {
+                const chunk = @min(remaining, discard.len);
+                try reader.readAll(discard[0..chunk]);
+                remaining -= chunk;
+            }
             return error.BufferTooSmall;
         }
 
-        _ = try self.stream.readAll(buf[0..payload_len]);
+        try reader.readAll(buf[0..payload_len]);
 
         // Unmask
         if (masked) {
@@ -209,18 +236,26 @@ pub const WebSocket = struct {
             }
         }
 
+        return .{ .opcode = opcode, .payload_len = payload_len };
+    }
+
+    /// 接收帧
+    pub fn recv(self: *WebSocket, buf: []u8) !usize {
+        if (!self.connected) return error.NotConnected;
+
+        const frame = try readFrame(&self.stream, buf);
+
         // 处理控制帧
-        if (opcode == 0x08) { // Close
+        if (frame.opcode == 0x08) { // Close
             self.connected = false;
             return error.ConnectionClosed;
-        } else if (opcode == 0x09) { // Ping
+        } else if (frame.opcode == 0x09) { // Ping
             // 发送 Pong
-            try self.sendPong(buf[0..payload_len]);
+            try self.sendPong(buf[0..frame.payload_len]);
             return self.recv(buf); // 继续接收
         }
 
-        _ = fin;
-        return payload_len;
+        return frame.payload_len;
     }
 
     fn sendPong(self: *WebSocket, data: []const u8) !void {

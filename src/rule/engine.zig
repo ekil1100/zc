@@ -472,7 +472,16 @@ fn parseCidr(s: []const u8) !IpCidr {
 
     if (prefix_len > 32) return error.InvalidPrefix;
 
-    const mask: u32 = if (prefix_len == 0) 0 else if (prefix_len == 32) 0xFFFFFFFF else ~(@as(u32, 0) >> @intCast(prefix_len));
+    // `ip` is in network byte order (big-endian). Build the host-bit mask in
+    // logical (big-endian) order, then convert to the native representation so
+    // that masking `ip & mask` operates on the correct (high-order) bits.
+    const host_order_mask: u32 = if (prefix_len == 0)
+        0
+    else if (prefix_len == 32)
+        0xFFFFFFFF
+    else
+        @as(u32, 0xFFFFFFFF) << @intCast(32 - prefix_len);
+    const mask: u32 = std.mem.nativeToBig(u32, host_order_mask);
 
     return IpCidr{
         .prefix = ip & mask,

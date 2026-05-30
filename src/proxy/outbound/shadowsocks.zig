@@ -79,6 +79,10 @@ pub const ShadowsocksClient = struct {
 
         // 2. TCP connect (with retry/backoff)
         var stream = try self.connectUpstreamWithRetry(upstream_addr);
+        // Close the freshly-opened socket if any handshake step below fails;
+        // ownership transfers to self.stream only on the success path.
+        var handshake_ok = false;
+        errdefer if (!handshake_ok) stream.close();
         std.debug.print("[SS] TCP connected\n", .{});
 
         // 3. Generate client salt (size = key length per SS AEAD spec)
@@ -120,6 +124,7 @@ pub const ShadowsocksClient = struct {
         std.debug.print("[SS] Handshake sent, target: {s}:{d}\n", .{ target.host, target.port });
 
         self.stream = stream;
+        handshake_ok = true;
         // dec_ctx will be initialized lazily on first read (needs server salt)
         self.dec_ctx = null;
         self.read_leftover = null;
@@ -282,33 +287,48 @@ pub const ShadowsocksClient = struct {
         var ctx = &self.dec_ctx.?;
         const tag_len = ctx.cipher.tagLen();
 
-        // Read length header (2 + 16 = 18 bytes)
-        var len_hdr: [18]u8 = undefined;
-        try self.readExactBuffered(stream, &len_hdr);
+        // Read and decrypt chunks until we get a non-empty payload. A zero-length
+        // AEAD chunk is still a valid (authenticated) chunk on the wire, but it
+        // carries no data; returning 0 here would be misread as EOF by relay
+        // loops, letting an upstream prematurely truncate the connection. We must
+        // still consume and verify the chunk's tag, then read the next one.
+        while (true) {
+            // Read length header (2 + 16 = 18 bytes)
+            var len_hdr: [18]u8 = undefined;
+            try self.readExactBuffered(stream, &len_hdr);
 
-        const payload_len = try ctx.decryptLen(&len_hdr);
+            // decryptLen enforces the Shadowsocks AEAD 0x3FFF payload cap.
+            const payload_len = try ctx.decryptLen(&len_hdr);
 
-        // Read encrypted payload + tag
-        const enc_payload_len = payload_len + tag_len;
-        const enc_payload = try self.allocator.alloc(u8, enc_payload_len);
-        defer self.allocator.free(enc_payload);
+            // Read encrypted payload + tag (always present, even for empty payloads)
+            const enc_payload_len = payload_len + tag_len;
+            const enc_payload = try self.allocator.alloc(u8, enc_payload_len);
+            defer self.allocator.free(enc_payload);
 
-        try self.readExactBuffered(stream, enc_payload);
+            try self.readExactBuffered(stream, enc_payload);
 
-        if (payload_len <= buf.len) {
-            // Fast path: caller buffer is large enough
-            try ctx.decryptPayload(enc_payload, buf[0..payload_len]);
-            return payload_len;
-        } else {
-            // Oversized chunk: decrypt into temp buffer, return partial, save rest
-            const tmp = try self.allocator.alloc(u8, payload_len);
-            defer self.allocator.free(tmp);
+            if (payload_len == 0) {
+                // Verify the empty chunk's authentication tag, then continue to
+                // the next chunk instead of signalling EOF.
+                try ctx.decryptPayload(enc_payload, buf[0..0]);
+                continue;
+            }
 
-            try ctx.decryptPayload(enc_payload, tmp);
+            if (payload_len <= buf.len) {
+                // Fast path: caller buffer is large enough
+                try ctx.decryptPayload(enc_payload, buf[0..payload_len]);
+                return payload_len;
+            } else {
+                // Oversized chunk: decrypt into temp buffer, return partial, save rest
+                const tmp = try self.allocator.alloc(u8, payload_len);
+                defer self.allocator.free(tmp);
 
-            @memcpy(buf, tmp[0..buf.len]);
-            self.read_payload_leftover = try self.allocator.dupe(u8, tmp[buf.len..]);
-            return buf.len;
+                try ctx.decryptPayload(enc_payload, tmp);
+
+                @memcpy(buf, tmp[0..buf.len]);
+                self.read_payload_leftover = try self.allocator.dupe(u8, tmp[buf.len..]);
+                return buf.len;
+            }
         }
     }
 
@@ -451,4 +471,41 @@ test "hasPendingRead should be true when encrypted leftover contains a full chun
     client.read_leftover = try allocator.dupe(u8, encrypted[0..enc_len]);
 
     try std.testing.expect(client.hasPendingRead());
+}
+
+test "read skips a zero-length AEAD chunk instead of reporting false EOF" {
+    const allocator = std.testing.allocator;
+    var client = try ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    defer client.deinit();
+
+    const salt = [_]u8{0} ** 16;
+    var enc_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    client.dec_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+
+    // Build wire bytes: an empty chunk followed by a real "hello" chunk.
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(allocator);
+
+    var enc_empty: [64]u8 = undefined;
+    const empty_len = try enc_ctx.encryptChunk("", &enc_empty);
+    try wire.appendSlice(allocator, enc_empty[0..empty_len]);
+
+    var enc_hello: [64]u8 = undefined;
+    const hello_len = try enc_ctx.encryptChunk("hello", &enc_hello);
+    try wire.appendSlice(allocator, enc_hello[0..hello_len]);
+
+    // Feed the full wire via the buffered-leftover path so read() never touches a socket.
+    client.read_leftover = try allocator.dupe(u8, wire.items);
+    // read() requires a non-null stream handle; it is never actually read here
+    // because all bytes are satisfied from read_leftover.
+    client.stream = net.Stream{ .handle = 0 };
+    defer client.stream = null; // avoid deinit closing fd 0
+
+    var out: [32]u8 = undefined;
+    const n = try client.read(&out);
+
+    // With the bug, read() returns 0 (false EOF) after the empty chunk.
+    // With the fix, the empty chunk is skipped and "hello" is returned.
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("hello", out[0..n]);
 }
