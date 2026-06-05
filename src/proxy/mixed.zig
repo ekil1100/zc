@@ -27,9 +27,9 @@ const accept_retry_backoff_ms: u64 = 200;
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
     const listen_ip = if (std.mem.eql(u8, bind_address, "*")) "0.0.0.0" else bind_address;
     const address = try net.Address.parseIp4(listen_ip, port);
-    var server = try address.listen(.{
-        .reuse_address = false,
-    });
+    // SO_REUSEADDR-only: lets restart rebind past TIME_WAIT while still rejecting
+    // a second active listener (no SO_REUSEPORT). See compat.net.listenReuseAddr.
+    var server = try net.listenReuseAddr(address);
     defer server.deinit();
 
     std.debug.print("Mixed proxy (HTTP+SOCKS5) listening on port {}\n", .{port});

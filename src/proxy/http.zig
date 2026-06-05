@@ -10,9 +10,9 @@ const socket_options = @import("../socket_options.zig");
 pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
     const listen_ip = if (std.mem.eql(u8, bind_address, "*")) "0.0.0.0" else bind_address;
     const address = try net.Address.parseIp4(listen_ip, port);
-    var server = try address.listen(.{
-        .reuse_address = false,
-    });
+    // SO_REUSEADDR-only (see compat.net.listenReuseAddr): rebind past TIME_WAIT
+    // on restart, but a second active listener still fails (no SO_REUSEPORT).
+    var server = try net.listenReuseAddr(address);
     defer server.deinit();
 
     std.debug.print("HTTP proxy listening on port {}\n", .{port});

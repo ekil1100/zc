@@ -27,9 +27,9 @@ pub const ApiServer = struct {
 
     pub fn start(self: *ApiServer) !void {
         const address = try net.Address.parseIp4("127.0.0.1", self.port);
-        var server = try address.listen(.{
-            .reuse_address = false,
-        });
+        // SO_REUSEADDR-only (see compat.net.listenReuseAddr): rebind past
+        // TIME_WAIT on restart, but a 2nd active listener still fails.
+        var server = try net.listenReuseAddr(address);
         defer server.deinit();
 
         std.debug.print("REST API listening on port {}\n", .{self.port});

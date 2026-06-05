@@ -1678,7 +1678,9 @@ fn preflightPortCheck(cfg: *config.Config, emit_errors: bool) !void {
 
 fn isPortAvailable(ip: []const u8, port: u16) bool {
     const address = compat.net.Address.parseIp4(ip, port) catch return false;
-    var server = address.listen(.{ .reuse_address = false }) catch return false;
+    // Mirror the real listeners (SO_REUSEADDR-only) so this probe predicts the
+    // actual bind: a TIME_WAIT remnant is available, an active listener is not.
+    var server = compat.net.listenReuseAddr(address) catch return false;
     server.deinit();
     return true;
 }
@@ -1689,7 +1691,11 @@ fn checkPortAvailable(ip: []const u8, port: u16, emit_errors: bool) !void {
         return error.InvalidBindAddress;
     };
 
-    var server = address.listen(.{ .reuse_address = false }) catch {
+    // Mirror the real listeners (SO_REUSEADDR-only) so the preflight predicts
+    // the bind: a TIME_WAIT remnant (e.g. right after `zc restart` stops the old
+    // daemon) is treated as available, while a genuine active listener on the
+    // port still fails -> PortAlreadyInUse.
+    var server = compat.net.listenReuseAddr(address) catch {
         if (emit_errors) std.debug.print("Port precheck failed: {s}:{d} is already in use\n", .{ ip, port });
         return error.PortAlreadyInUse;
     };
@@ -2249,6 +2255,23 @@ test "preflightPortCheck rejects mixed-port conflicts without fallback" {
     try testing.expectError(error.PortConflict, preflightPortCheck(&cfg, false));
     try testing.expectEqual(@as(u16, 7901), cfg.mixed_port);
     try testing.expectEqualStrings("127.0.0.1:7901", cfg.external_controller.?);
+}
+
+test "SO_REUSEADDR-only listener rejects a second active listener" {
+    const testing = std.testing;
+    // Bind a real active listener via the SO_REUSEADDR-only helper used by the
+    // proxy. Because SO_REUSEPORT is deliberately NOT set, a second active bind
+    // to the same port must fail -> checkPortAvailable reports the conflict. This
+    // is the guard that keeps the restart fix from ever permitting two daemons on
+    // one port (the failure mode of Zig's bundled reuse_address=true).
+    const addr = try compat.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try compat.net.listenReuseAddr(addr);
+    defer listener.deinit();
+    const port = listener.listen_address.getPort();
+
+    try testing.expectError(error.PortAlreadyInUse, checkPortAvailable("127.0.0.1", port, false));
+    // And a TIME_WAIT-free fresh ephemeral port is reported available.
+    try testing.expect(isPortAvailable("127.0.0.1", 0));
 }
 
 test "runtimeCommandPreflightErrorInfo maps restart port conflicts" {

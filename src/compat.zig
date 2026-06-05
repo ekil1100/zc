@@ -394,6 +394,72 @@ pub const net = struct {
         }
     };
 
+    /// A TCP listener created with SO_REUSEADDR but deliberately WITHOUT
+    /// SO_REUSEPORT. SO_REUSEADDR lets `zc restart` rebind the port immediately
+    /// while the previous instance's connections linger in TIME_WAIT; omitting
+    /// SO_REUSEPORT means a second *active* listener still fails with EADDRINUSE,
+    /// so two daemons can never silently bind the same port. The high-level
+    /// `Address.listen(.{ .reuse_address = true })` sets BOTH options (see
+    /// std/Io/Threaded.zig), which on macOS permits duplicate listeners — hence
+    /// this hand-rolled libc variant.
+    pub const ReuseAddrListener = struct {
+        fd: std.posix.fd_t,
+        listen_address: Address,
+
+        pub fn accept(self: *ReuseAddrListener) !Server.Connection {
+            var sa: std.c.sockaddr.in = undefined;
+            var sa_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+            const cfd = std.c.accept(self.fd, @ptrCast(&sa), &sa_len);
+            if (cfd < 0) return error.AcceptFailed;
+            setCloexec(cfd);
+            return .{
+                .stream = Stream{ .handle = cfd },
+                .address = .{ .in = .{ .sa = sa } },
+            };
+        }
+
+        pub fn deinit(self: *ReuseAddrListener) void {
+            _ = std.c.close(self.fd);
+        }
+    };
+
+    /// FD_CLOEXEC == 1 on every POSIX target. Best-effort, mirrors the CLOEXEC
+    /// default of the high-level std listener so the fd does not leak into child
+    /// processes the daemon spawns.
+    fn setCloexec(fd: std.posix.fd_t) void {
+        _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, 1));
+    }
+
+    /// Bind + listen an IPv4 TCP address with SO_REUSEADDR-only (see
+    /// `ReuseAddrListener`). Returns error.AddressInUse when an active listener
+    /// already holds the port.
+    pub fn listenReuseAddr(address: Address) !ReuseAddrListener {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
+        if (fd < 0) return error.SocketSetupFailed;
+        errdefer _ = std.c.close(fd);
+        setCloexec(fd);
+
+        var one: c_int = 1;
+        if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int)) != 0)
+            return error.SocketSetupFailed;
+
+        const sa = address.in.sa;
+        const brc = std.c.bind(fd, @ptrCast(&sa), @sizeOf(std.c.sockaddr.in));
+        if (brc != 0) {
+            return switch (std.c.errno(brc)) {
+                .ADDRINUSE => error.AddressInUse,
+                else => error.BindFailed,
+            };
+        }
+        if (std.c.listen(fd, 128) != 0) return error.ListenFailed;
+
+        // Reflect the actually-bound address (resolves an ephemeral port-0 bind).
+        var bound: std.c.sockaddr.in = sa;
+        var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        _ = std.c.getsockname(fd, @ptrCast(&bound), &bound_len);
+        return .{ .fd = fd, .listen_address = .{ .in = .{ .sa = bound } } };
+    }
+
     pub const AddressList = struct {
         addrs: []Address,
         allocator: std.mem.Allocator,
