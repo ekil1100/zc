@@ -77,6 +77,10 @@ fn posixReadError(rc: isize) anyerror {
         .CONNRESET => error.ConnectionResetByPeer,
         .PIPE => error.BrokenPipe,
         .BADF => error.NotOpenForReading,
+        // EAGAIN/EWOULDBLOCK (e.g. SO_RCVTIMEO firing) is a transient "no data
+        // yet", not a fatal I/O error. Surface it distinctly so callers can wait
+        // instead of tearing the connection down.
+        .AGAIN => error.WouldBlock,
         else => error.InputOutput,
     };
 }

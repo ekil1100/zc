@@ -7,6 +7,13 @@ pub const Address = aead.Address;
 pub const connect_retry_attempts: usize = 3;
 const retry_backoff_ms = [_]u64{ 200, 500, 1000 };
 
+/// Max consecutive SO_RCVTIMEO timeouts tolerated while assembling one AEAD
+/// frame before giving up. A committed frame can straddle TCP segments; a
+/// benign timeout while the rest is in flight must not tear the tunnel down
+/// (that was the SSE-download stall). Bounded so a dead upstream still fails
+/// (~read_max_consecutive_timeouts × the 15s SO_RCVTIMEO) instead of hanging.
+const read_max_consecutive_timeouts: usize = 4;
+
 /// Shadowsocks Obfs configuration
 pub const ObfsConfig = struct {
     mode: []const u8, // "http" or "tls"
@@ -429,10 +436,24 @@ pub const ShadowsocksClient = struct {
         }
 
         // Read the rest from stream
+        var timeouts: usize = 0;
         while (offset < buf.len) {
-            const n = try stream.read(buf[offset..]);
+            const n = stream.read(buf[offset..]) catch |err| {
+                // SO_RCVTIMEO surfaces as WouldBlock. Once we have started (or
+                // committed to) a frame, the remaining bytes are in flight — keep
+                // waiting through benign timeouts instead of returning, which
+                // would lose the bytes already read into `buf` and desync the
+                // AEAD stream. Bounded so a genuinely dead upstream still fails.
+                if (err == error.WouldBlock) {
+                    timeouts += 1;
+                    if (timeouts > read_max_consecutive_timeouts) return error.ConnectionClosed;
+                    continue;
+                }
+                return err;
+            };
             if (n == 0) return error.ConnectionClosed;
             offset += n;
+            timeouts = 0; // forward progress refills the timeout budget
         }
     }
 };

@@ -8,6 +8,13 @@ pub fn configureConnectedSocket(fd: std.posix.fd_t) !void {
         var enabled: c_int = 1;
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, std.mem.asBytes(&enabled));
     }
+    // Disable Nagle on every relayed socket. The relay forwards each decrypted
+    // AEAD chunk as its own write(2); with Nagle on, those small writes deadlock
+    // against the peer's delayed-ACK and stall streaming (SSE) downloads
+    // ("Codex SSE response headers timed out"). Applies to both the client-facing
+    // accept socket and the upstream proxy socket, which share this helper.
+    var nodelay: c_int = 1;
+    try std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&nodelay));
 }
 
 pub fn configureConnectedStream(stream: net.Stream) !void {
