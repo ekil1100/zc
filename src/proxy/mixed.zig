@@ -916,6 +916,10 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
 
         if (target_read_open and (poll_fds[1].revents & std.posix.POLL.IN != 0)) {
             const n = target_stream.read(&buf) catch |err| {
+                // A buffered protocol (e.g. shadowsocks) returns WouldBlock when
+                // only part of a frame is in yet. Don't tear down — go back to
+                // poll() so the other direction keeps flowing.
+                if (err == error.WouldBlock) continue;
                 if (targetReadClosedBy(err)) {
                     closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
                     continue;
@@ -1013,6 +1017,9 @@ fn drainTargetPending(
 ) !void {
     while (target_stream.hasPendingRead()) {
         const n = target_stream.read(buf) catch |err| {
+            // Partial frame buffered (e.g. shadowsocks): stop draining and let
+            // the poll loop wait for the rest instead of tearing down.
+            if (err == error.WouldBlock) return;
             if (targetReadClosedBy(err)) {
                 closeTargetReadSide(target_read_open, client_stream, client_write_shutdown);
                 return;

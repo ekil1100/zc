@@ -7,12 +7,10 @@ pub const Address = aead.Address;
 pub const connect_retry_attempts: usize = 3;
 const retry_backoff_ms = [_]u64{ 200, 500, 1000 };
 
-/// Max consecutive SO_RCVTIMEO timeouts tolerated while assembling one AEAD
-/// frame before giving up. A committed frame can straddle TCP segments; a
-/// benign timeout while the rest is in flight must not tear the tunnel down
-/// (that was the SSE-download stall). Bounded so a dead upstream still fails
-/// (~read_max_consecutive_timeouts × the 15s SO_RCVTIMEO) instead of hanging.
-const read_max_consecutive_timeouts: usize = 4;
+/// Scratch size for a single upstream socket read. One read pulls up to this
+/// many ciphertext bytes into the reassembly buffer; large enough to usually
+/// capture a whole 0x3FFF-payload AEAD frame (~16 KB + tags) in one syscall.
+const socket_read_chunk: usize = 32 * 1024;
 
 /// Shadowsocks Obfs configuration
 pub const ObfsConfig = struct {
@@ -294,49 +292,107 @@ pub const ShadowsocksClient = struct {
         var ctx = &self.dec_ctx.?;
         const tag_len = ctx.cipher.tagLen();
 
-        // Read and decrypt chunks until we get a non-empty payload. A zero-length
-        // AEAD chunk is still a valid (authenticated) chunk on the wire, but it
-        // carries no data; returning 0 here would be misread as EOF by relay
-        // loops, letting an upstream prematurely truncate the connection. We must
-        // still consume and verify the chunk's tag, then read the next one.
+        // Assemble AEAD frames from buffered ciphertext, doing AT MOST ONE socket
+        // read per call. If a complete frame is not yet buffered after that read,
+        // return error.WouldBlock so the single-threaded poll relay can service
+        // the other direction instead of blocking here waiting for the rest of a
+        // frame that straddles TCP segments — that head-of-line block was the
+        // SSE/large-download stall. Partial frame bytes survive in read_leftover
+        // until the next readable event re-enters this function.
+        //
+        // A zero-length AEAD chunk is a valid authenticated chunk carrying no
+        // data; returning 0 would be misread as EOF by the relay, so we consume
+        // and verify its tag, then continue to the next chunk.
+        var did_socket_read = false;
         while (true) {
-            // Read length header (2 + 16 = 18 bytes)
-            var len_hdr: [18]u8 = undefined;
-            try self.readExactBuffered(stream, &len_hdr);
-
-            // decryptLen enforces the Shadowsocks AEAD 0x3FFF payload cap.
-            const payload_len = try ctx.decryptLen(&len_hdr);
-
-            // Read encrypted payload + tag (always present, even for empty payloads)
-            const enc_payload_len = payload_len + tag_len;
-            const enc_payload = try self.allocator.alloc(u8, enc_payload_len);
-            defer self.allocator.free(enc_payload);
-
-            try self.readExactBuffered(stream, enc_payload);
-
-            if (payload_len == 0) {
-                // Verify the empty chunk's authentication tag, then continue to
-                // the next chunk instead of signalling EOF.
-                try ctx.decryptPayload(enc_payload, buf[0..0]);
-                continue;
+            if (try self.takeBufferedFrame(ctx, tag_len, buf)) |n| {
+                if (n == 0) continue; // empty chunk consumed; not EOF
+                return n;
             }
 
-            if (payload_len <= buf.len) {
-                // Fast path: caller buffer is large enough
-                try ctx.decryptPayload(enc_payload, buf[0..payload_len]);
-                return payload_len;
-            } else {
-                // Oversized chunk: decrypt into temp buffer, return partial, save rest
-                const tmp = try self.allocator.alloc(u8, payload_len);
-                defer self.allocator.free(tmp);
+            // No complete frame buffered. Read once, then retry assembly; if it
+            // is still incomplete, yield to the poll loop rather than blocking.
+            if (did_socket_read) return error.WouldBlock;
 
-                try ctx.decryptPayload(enc_payload, tmp);
-
-                @memcpy(buf, tmp[0..buf.len]);
-                self.read_payload_leftover = try self.allocator.dupe(u8, tmp[buf.len..]);
-                return buf.len;
-            }
+            var scratch: [socket_read_chunk]u8 = undefined;
+            const got = stream.read(&scratch) catch |err| {
+                // SO_RCVTIMEO surfaces as WouldBlock: no data right now. Any
+                // bytes already buffered stay put; yield to the poll loop.
+                if (err == error.WouldBlock) return error.WouldBlock;
+                return err;
+            };
+            if (got == 0) return error.ConnectionClosed; // upstream EOF
+            try self.appendLeftover(scratch[0..got]);
+            did_socket_read = true;
         }
+    }
+
+    /// Try to extract one complete AEAD frame from the buffered ciphertext.
+    /// Returns null if a full frame is not yet buffered (caller must read more),
+    /// 0 if an authenticated empty chunk was consumed (skip it, not EOF), or the
+    /// number of plaintext bytes written into `buf`. Surplus plaintext from an
+    /// oversized chunk is stashed in read_payload_leftover.
+    fn takeBufferedFrame(self: *ShadowsocksClient, ctx: *aead.AeadStream, tag_len: usize, buf: []u8) !?usize {
+        const leftover = self.read_leftover orelse return null;
+        const len_hdr_len = 2 + tag_len;
+        if (leftover.len < len_hdr_len) return null;
+
+        // Peek the length on a COPY so a partial frame does not advance the real
+        // decrypt nonce (which would desync the AEAD stream).
+        var preview = ctx.*;
+        const payload_len = try preview.decryptLen(leftover[0..len_hdr_len]);
+        const frame_len = len_hdr_len + @as(usize, payload_len) + tag_len;
+        if (leftover.len < frame_len) return null; // whole frame not here yet
+
+        // Commit: advance the real context and decrypt this frame.
+        _ = try ctx.decryptLen(leftover[0..len_hdr_len]);
+        const enc_payload = leftover[len_hdr_len..frame_len];
+
+        var result: usize = undefined;
+        if (payload_len == 0) {
+            try ctx.decryptPayload(enc_payload, buf[0..0]);
+            result = 0;
+        } else if (payload_len <= buf.len) {
+            try ctx.decryptPayload(enc_payload, buf[0..payload_len]);
+            result = payload_len;
+        } else {
+            // Oversized chunk: decrypt into temp, return a prefix, save the rest.
+            const tmp = try self.allocator.alloc(u8, payload_len);
+            defer self.allocator.free(tmp);
+            try ctx.decryptPayload(enc_payload, tmp);
+            @memcpy(buf, tmp[0..buf.len]);
+            self.read_payload_leftover = try self.allocator.dupe(u8, tmp[buf.len..]);
+            result = buf.len;
+        }
+
+        try self.consumeLeftoverFront(frame_len);
+        return result;
+    }
+
+    /// Append freshly-read ciphertext to the reassembly buffer.
+    fn appendLeftover(self: *ShadowsocksClient, data: []const u8) !void {
+        if (self.read_leftover) |old| {
+            const combined = try self.allocator.alloc(u8, old.len + data.len);
+            @memcpy(combined[0..old.len], old);
+            @memcpy(combined[old.len..], data);
+            self.allocator.free(old);
+            self.read_leftover = combined;
+        } else {
+            self.read_leftover = try self.allocator.dupe(u8, data);
+        }
+    }
+
+    /// Drop the first `n` bytes of the reassembly buffer (a consumed frame).
+    fn consumeLeftoverFront(self: *ShadowsocksClient, n: usize) !void {
+        const leftover = self.read_leftover orelse return;
+        if (n >= leftover.len) {
+            self.allocator.free(leftover);
+            self.read_leftover = null;
+            return;
+        }
+        const remaining = try self.allocator.dupe(u8, leftover[n..]);
+        self.allocator.free(leftover);
+        self.read_leftover = remaining;
     }
 
     pub fn hasPendingRead(self: *const ShadowsocksClient) bool {
@@ -415,47 +471,6 @@ pub const ShadowsocksClient = struct {
         }
     }
 
-    /// Read exactly `buf.len` bytes, consuming leftover data first, then from stream
-    fn readExactBuffered(self: *ShadowsocksClient, stream: net.Stream, buf: []u8) !void {
-        var offset: usize = 0;
-
-        // Consume from leftover first
-        if (self.read_leftover) |leftover| {
-            const copy_len = @min(leftover.len, buf.len);
-            @memcpy(buf[0..copy_len], leftover[0..copy_len]);
-            offset = copy_len;
-
-            if (copy_len < leftover.len) {
-                const remaining = try self.allocator.dupe(u8, leftover[copy_len..]);
-                self.allocator.free(leftover);
-                self.read_leftover = remaining;
-            } else {
-                self.allocator.free(leftover);
-                self.read_leftover = null;
-            }
-        }
-
-        // Read the rest from stream
-        var timeouts: usize = 0;
-        while (offset < buf.len) {
-            const n = stream.read(buf[offset..]) catch |err| {
-                // SO_RCVTIMEO surfaces as WouldBlock. Once we have started (or
-                // committed to) a frame, the remaining bytes are in flight — keep
-                // waiting through benign timeouts instead of returning, which
-                // would lose the bytes already read into `buf` and desync the
-                // AEAD stream. Bounded so a genuinely dead upstream still fails.
-                if (err == error.WouldBlock) {
-                    timeouts += 1;
-                    if (timeouts > read_max_consecutive_timeouts) return error.ConnectionClosed;
-                    continue;
-                }
-                return err;
-            };
-            if (n == 0) return error.ConnectionClosed;
-            offset += n;
-            timeouts = 0; // forward progress refills the timeout budget
-        }
-    }
 };
 
 fn sleepBeforeRetry(attempt_index: usize, max_attempts: usize) void {
@@ -529,4 +544,91 @@ test "read skips a zero-length AEAD chunk instead of reporting false EOF" {
     // With the fix, the empty chunk is skipped and "hello" is returned.
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqualStrings("hello", out[0..n]);
+}
+
+fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
+    var off: usize = 0;
+    while (off < data.len) off += try compat.posixWrite(fd, data[off..]);
+}
+
+fn makeSocketPair() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    const rc = std.c.socketpair(
+        @as(c_uint, @intCast(std.posix.AF.UNIX)),
+        @as(c_uint, @intCast(std.posix.SOCK.STREAM)),
+        0,
+        &fds,
+    );
+    if (rc != 0) return error.SocketPairFailed;
+    return fds;
+}
+
+test "read yields WouldBlock on a partial frame, then assembles it across reads" {
+    // Regression: a download frame straddling TCP segments must NOT block the
+    // single-threaded relay. read() does one socket read; if the frame is still
+    // incomplete it returns WouldBlock (relay re-polls) and resumes next call.
+    const allocator = std.testing.allocator;
+    const fds = try makeSocketPair();
+    defer _ = std.c.close(fds[1]); // fds[0] is owned/closed by client.deinit()
+
+    var client = try ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    defer client.deinit();
+
+    const salt = [_]u8{0} ** 16;
+    var enc_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    client.dec_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    client.stream = net.Stream{ .handle = fds[0] };
+    // Short SO_RCVTIMEO so a read with no data surfaces WouldBlock promptly.
+    try ShadowsocksClient.setSocketTimeouts(fds[0], 100);
+
+    var frame: [64]u8 = undefined;
+    const flen = try enc_ctx.encryptChunk("hello", &frame);
+
+    // Feed only a partial length header first (10 < 18-byte header).
+    try writeAllFd(fds[1], frame[0..10]);
+
+    var out: [64]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, client.read(&out));
+
+    // Feed the rest; the frame now completes and decrypts.
+    try writeAllFd(fds[1], frame[10..flen]);
+    const n = try client.read(&out);
+    try std.testing.expectEqualStrings("hello", out[0..n]);
+}
+
+test "read drains multiple frames buffered from one socket read" {
+    // Regression: one socket read can pull more than one AEAD frame; the extra
+    // frame must be reported via hasPendingRead and returned without waiting for
+    // another socket-readable event (else it would stall behind poll).
+    const allocator = std.testing.allocator;
+    const fds = try makeSocketPair();
+    defer _ = std.c.close(fds[1]);
+
+    var client = try ShadowsocksClient.init(allocator, "127.0.0.1", 8388, "password", "aes-128-gcm");
+    defer client.deinit();
+
+    const salt = [_]u8{0} ** 16;
+    var enc_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    client.dec_ctx = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    client.stream = net.Stream{ .handle = fds[0] };
+    try ShadowsocksClient.setSocketTimeouts(fds[0], 100);
+
+    var f1: [64]u8 = undefined;
+    var f2: [64]u8 = undefined;
+    const l1 = try enc_ctx.encryptChunk("hello", &f1);
+    const l2 = try enc_ctx.encryptChunk("world", &f2);
+
+    var both = std.ArrayList(u8).empty;
+    defer both.deinit(allocator);
+    try both.appendSlice(allocator, f1[0..l1]);
+    try both.appendSlice(allocator, f2[0..l2]);
+    try writeAllFd(fds[1], both.items);
+
+    var out: [64]u8 = undefined;
+    const n1 = try client.read(&out);
+    try std.testing.expectEqualStrings("hello", out[0..n1]);
+
+    try std.testing.expect(client.hasPendingRead());
+    const n2 = try client.read(&out);
+    try std.testing.expectEqualStrings("world", out[0..n2]);
 }

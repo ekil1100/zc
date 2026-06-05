@@ -144,6 +144,19 @@ fn relayHttp(client_stream: net.Stream, target_stream: *ProxyStream) !void {
     var buf: [8192]u8 = undefined;
 
     while (true) {
+        // A single outbound socket read may buffer more than one frame (e.g.
+        // shadowsocks); drain what's already decryptable before polling so a
+        // buffered frame never waits for the next socket-readable event.
+        while (target_stream.hasPendingRead()) {
+            const n = target_stream.read(&buf) catch |err| {
+                if (err == error.WouldBlock) break;
+                return err;
+            };
+            if (n == 0) return;
+            var w: usize = 0;
+            while (w < n) w += try compat.posixWrite(client_stream.handle, buf[w..n]);
+        }
+
         _ = try std.posix.poll(&poll_fds, -1);
 
         if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
@@ -153,7 +166,11 @@ fn relayHttp(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         }
 
         if (poll_fds[1].revents & std.posix.POLL.IN != 0) {
-            const n = try target_stream.read(&buf);
+            const n = target_stream.read(&buf) catch |err| {
+                // Partial frame buffered: re-poll instead of tearing down.
+                if (err == error.WouldBlock) continue;
+                return err;
+            };
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
