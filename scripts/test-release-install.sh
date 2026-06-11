@@ -126,14 +126,14 @@ main() {
     echo ""
     echo "🧪 === 基础功能测试 ==="
     
-    # 1. help 命令
+    # 1. help 命令（帮助输出在 stdout，exit 0）
     echo "📖 测试: zc --help"
-    "${ZC}" --help > /dev/null
+    "${ZC}" --help | grep -q "Usage"
     echo "✅ help 命令正常"
-    
-    # 2. version 信息
-    echo "📋 测试: zc --help | head -3"
-    "${ZC}" --help | head -3
+
+    # 2. version 信息（zc --version 输出在 stdout，exit 0）
+    echo "📋 测试: zc --version"
+    "${ZC}" --version
     echo ""
     
     # 3. status（未启动时应显示未运行）

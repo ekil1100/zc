@@ -1,76 +1,119 @@
-# zc CLI spec — v1.0 current contract
+# zc CLI spec — v1.0 contract
 
-This document describes the command surface implemented by `src/main.zig` for the v1.0 cleanup line.
+This document describes the command surface and output contract implemented by
+`src/main.zig`, driven by the declarative command table in
+`src/cli/commands.zig` and the output layer in `src/cli/output.zig`.
+Help text is generated from the same table, so help can never drift from what
+the binary accepts.
+
+验收标准与决策记录见 [`ux-workflow.md`](ux-workflow.md)；错误码字典见
+[`../api/error-codes.md`](../api/error-codes.md)。
 
 ## Global commands
 
-| Command | Status | Notes |
+| Command | Aliases | Notes |
 | --- | --- | --- |
-| `zc help` / `zc --help` | implemented | Prints global help. |
-| `zc help <topic>` | implemented | Prints group help for `config`, `proxy`, `profile`, `diag`, or `doctor`. |
-| `zc start [-c <config>] [--port <port>] [--json]` | implemented | Starts daemon; if a tracked daemon is already running, reports `already_running` instead of treating its port as a conflict. `--port` overrides mixed-port for this run. |
-| `zc stop [--json]` | implemented | Stops tracked daemon. |
-| `zc restart [-c <config>] [--json]` | implemented | Restarts daemon after preflight. |
-| `zc status [--json]` | implemented | 输出运行状态、运行时路径，以及 select 代理组当前节点；无持久化选择时显示该组默认首个节点。 |
-| `zc log [-n <lines>] [-f|--no-follow]` | implemented | Tails daemon log. |
-| `zc test [-c <config>] [--json]` | implemented | 文本和 JSON 输出都会包含 select 代理组当前节点；端口未监听时文本输出会报告 daemon 状态；JSON 输出包含 `daemon_state`。JSON 模式只做本地监听探测，不执行外部连通性探测。 |
-| `zc doctor [-c <config>] [--json]` | implemented | 轻量配置/服务诊断；文本输出固定为 `Config`、`Daemon`、`PID`、`Port`、`Connection`；普通模式不刷新或展开远程 rule-provider。 |
-| `zc diag doctor [-c <config>] [--json]` | implemented | `doctor` 别名，端口输出和轻量诊断语义一致。 |
+| `zc help [command]` / `zc --help` / `zc -h` | | Global help; `zc help start`、`zc help config download`、`zc help config` 均可。Unknown topic ⇒ `HELP_TOPIC_UNKNOWN`, exit 2. |
+| `zc version` | `zc --version` | Prints version on stdout, exit 0; supports `--json`. |
+| `zc start [-c <config>] [--port <port>] [--foreground] [--json]` | `zc up` | Fork-and-exit daemon start. `--foreground` runs without forking (containers/systemd). Already-running daemon is reported as success (`detail:"already_running"`), exit 0. `--port` overrides mixed-port for this run. Override flags (`--override-script`/`--override-arg`/`--override-timeout-ms`) accepted. |
+| `zc stop [--json]` | `zc down` | Stops the tracked daemon. Already stopped ⇒ success (`detail:"already_stopped"`), exit 0. |
+| `zc restart [-c <config>] [--port <port>] [--json]` | | Restart after preflight; keeps the old daemon's `-c`/`--port` unless overridden. JSON 模式只输出**一个**最终 envelope（中间步骤文本走 stderr）。`--foreground` is rejected (exit 2). |
+| `zc reload [--json]` | | Hot-reloads the current config into the running daemon (`reloadOrRestart`, restart 兜底)。Daemon not running ⇒ `RELOAD_FAILED`, exit 1. Supervised foreground daemon（systemd/容器）拒绝并提示走 supervisor。 |
+| `zc status [--json]` | | Daemon state, uptime, runtime paths, and current node of each select group. Stopped daemon is **still exit 0**（状态在 `data.state`，决策 D5）。 |
+| `zc log [-n <lines>] [-f\|--no-follow] [--json]` | | Follows by default in text mode. `--json` = JSON Lines（每行一个 `{"line":"…"}` 事件），implies `--no-follow` unless `-f`. Default `-n` is 50 when not following. |
+| `zc test [-c <config>] [--port <port>] [--json]` | | Connectivity probes through the configured proxy。文本与 JSON **跑相同探测**；any failed check ⇒ `error.code=CHECKS_FAILED` + per-check `data`, exit 1（决策 D3）。JSON 含 `daemon_state`、`selected_proxies`、`ports`、`checks`、`targets`。 |
+| `zc doctor [-c <config>] [--json]` | | Config/daemon/port/connectivity diagnostics。文本标签冻结为 `Config:`、`Daemon:`、`PID:`、`Port:`、`Connection:`（健康输出含 `OK`/`valid`）。Failed checks ⇒ `CHECKS_FAILED` + `data.checks`, exit 1。JSON 含 `proxy_reachable`、`network_ok`、`config_ok` 等。 |
 
-The TUI command is intentionally excluded from v1.0 and is not present in help/dispatch.
+Lifecycle commands enforce 决策 D11 like every other tree: unknown flags,
+stray positional arguments, and missing/invalid flag values (`-c`, `--port`,
+`log -n`) are usage errors — envelope/error block + exit 2, never silently
+ignored. `restart` shares `start`'s argument parser and therefore emits the
+frozen `START_*` argument-error codes (messages/hints rendered for restart);
+`stop`/`status`/`reload`/`log` use `<CMD>_ARGUMENT_INVALID`, and
+`doctor`/`diag doctor` share `DIAG_DOCTOR_ARGUMENT_INVALID`.
 
-## Config commands
+The TUI command is excluded from v1.0 and is not present in help/dispatch.
+`zc --daemon-run` is an internal mode used by `zc start` and is intentionally
+undocumented in help.
 
-All config subcommands accept `help`, `--help`, or `-h` after the subcommand, for example `zc config download --help`.
+## Command groups
 
-| Command | Status |
+Bare group commands (`zc config`, `zc proxy`, `zc profile`, `zc diag`) print
+group help on stdout, exit 0. Every subcommand accepts `help`, `--help`, or
+`-h` after the subcommand, e.g. `zc config download --help`.
+
+### config
+
+| Command | Notes |
 | --- | --- |
-| `zc config help` / `zc config --help` / `zc config -h` | implemented |
-| `zc config list` / `zc config ls` | implemented |
-| `zc config download <url> [-n <name>]` | implemented |
-| `zc config update [<name>] [--apply <auto|hot|restart>]` | implemented |
-| `zc config use <name>` | implemented |
-| `zc config dump [-c <config>] [--no-override] [--json]` | implemented |
-| `zc config override [<script>|--clear]` | implemented |
+| `zc config list [--json]` | Alias `zc config ls`. Lists configs + active one (`data.configs`, `data.active`). |
+| `zc config download <url> [-n <name>] [-d] [--json]` | `-d` sets the downloaded config as default. Missing `<url>` ⇒ `CONFIG_DOWNLOAD_URL_REQUIRED`, exit 2. |
+| `zc config update [name] [--apply auto\|hot\|restart] [--json]` | Re-downloads a previously downloaded config; applies to a running daemon per `--apply`（默认 auto）。JSON 单 envelope：`data.applied` / `data.apply_result`。 |
+| `zc config use <name> [--json]` | Switches the active config. **绝不自动 apply**（决策 D8）：文本模式提示 `zc reload`；JSON `data.applied:false`。 |
+| `zc config dump [-c <config>] [--no-override] [--json]` | Prints the merged config as a **bare document** — YAML in text mode, bare JSON object with `--json`（唯一 envelope 例外，决策 D2）。可直接 `\| yq` / `\| jq`。Failures still use the envelope/error block。 |
+| `zc config override [<script>\|--clear] [--json]` | Bind/show/clear the persisted override for the current config; applies to a running daemon. |
 
-## Proxy/profile commands
+### proxy / profile
 
-All proxy/profile subcommands accept `help`, `--help`, or `-h` after the subcommand, for example `zc proxy select --help`.
+`profile` is an alias group for `proxy`（决策 D10）：same handler, messages and
+hints rendered per command path. Shared select errors keep the frozen `PROXY_*`
+codes on both paths; only the `*_ARGUMENT_INVALID` / `*_SUBCOMMAND_UNKNOWN`
+codes carry the family prefix (`PROXY_…` / `PROFILE_…`).
 
-| Command | Status |
+| Command | Notes |
 | --- | --- |
-| `zc proxy help` / `zc proxy --help` / `zc proxy -h` | implemented |
-| `zc proxy list` / `zc proxy ls` | implemented; supports `--json` |
-| `zc proxy select [-g <group>] [-p <proxy>]` | implemented |
-| `zc proxy test` | implemented；输出当前节点信息 |
-| `zc profile help` / `zc profile --help` / `zc profile -h` | implemented |
-| `zc profile list` / `zc profile ls` | implemented |
-| `zc profile select` | implemented |
-| `zc profile test` | implemented |
-| `zc diag help` / `zc diag --help` / `zc diag -h` | implemented |
-| `zc diag doctor --help` | implemented |
+| `zc proxy list [-c <config>] [--json]` | Alias `zc proxy ls`. Groups + members + current selection（`data.groups[].now`），all names escaped via `std.json`。 |
+| `zc proxy select [-g <group>] [-p <proxy>] [-c <config>] [--json]` | `-g` 只匹配 select 类型组（命中非 select 组 ⇒ `PROXY_GROUP_NOT_SELECTABLE`）。With `-p`: applies the selection and notifies a running daemon（`data.applied` 反映是否真的通知到 daemon）。Interactive picker only when stdin is a TTY; non-TTY without `-p` ⇒ `PROXY_SELECT_NOT_INTERACTIVE`, exit 2（绝不静默选第一个节点）。JSON without `-p`: read-only listing of `data.choices`. Picker cancel (q/Esc) ⇒ no output, exit 0. |
+| `zc proxy test [-c <config>] [--port <port>] [--json]` | Same probe path and `CHECKS_FAILED` semantics as `zc test`. |
+| `zc profile list / select / test` | Same as the `proxy` equivalents. |
 
-## JSON contract
+### diag
 
-已实现并经过 smoke 验证：
+| Command | Notes |
+| --- | --- |
+| `zc diag doctor [-c <config>] [--json]` | Alias of `zc doctor`. |
+| `zc diag` (bare) | Group help, exit 0. Flags without a subcommand ⇒ `DIAG_SUBCOMMAND_MISSING`; unknown subcommand ⇒ `DIAG_SUBCOMMAND_UNKNOWN`; both exit 2. |
 
-- `status --json`
-- `start --json`
-- `stop --json`
-- `doctor --json`
-- `proxy list --json`
-- `test --json`
-- `proxy test --json`
+## JSON contract（`--json`，全命令支持）
 
-JSON success payloads are emitted on stdout so they can be piped directly into JSON tooling.
-Diagnostics and human-readable progress may use stderr on legacy paths until each command is fully aligned.
+- Success: `{"ok":true,"command":"<path>","data":{...}}` — one line, **stdout**, exit 0.
+- Failure: `{"ok":false,"command":"<path>","error":{"code":"…","message":"…","hint":"…"}}` — one line, **stdout**, exit ≠ 0. 诊断类命令（`test`/`doctor`/`proxy test`）失败时附带 `"data"`（逐项检查结果）。
+- `command` is the canonical command path (aliases resolved), e.g. `"config list"`, `"proxy select"`.
+- Exactly **one** JSON document per invocation on stdout. Streaming exception: `zc log --json` emits JSON Lines (one event object per line, no envelope).
+- Bare-document exception: `zc config dump --json` prints the merged config as a bare JSON object (no envelope); text mode prints bare YAML.
+- All JSON is serialized via `std.json`（真实转义，禁止手拼字符串）；`null` optional fields are omitted.
 
-## Error output direction
+## Stream rules
 
-v1.0 should use actionable errors with:
+- Payload（人类主输出 / JSON envelope / JSON Lines / dump 文档）→ **stdout**.
+- Diagnostics and progress（校验警告、下载进度、restart 中间步骤、错误块）→ **stderr**.
+- Text-mode errors render as an actionable block on stderr: `error: <message>` / `hint: …` / `code: …`.
+- Color: ANSI only when the stream is a TTY and neither `NO_COLOR` (env) nor `--no-color` (flag) is set.
+- Interactive UI（`proxy select` picker）只在 stdin 为 TTY 时进入。
 
-- stable `code`;
-- human-readable `message`;
-- next-step `hint`.
+## Exit codes
 
-Some API and older CLI paths still need alignment; do not advertise full consistency until tested.
+| Code | Meaning | Examples |
+| --- | --- | --- |
+| 0 | Success | `zc status`（含 stopped 状态）、`already_running`/`already_stopped`、help/version、picker cancel |
+| 1 | Runtime failure | start/stop/reload failures, download/network errors, `CHECKS_FAILED`（test/doctor 探测失败）, config load failures, `COMMAND_UNKNOWN` |
+| 2 | Usage error | bare `zc`, unknown subcommand, unknown/extra argument, missing flag value, `HELP_TOPIC_UNKNOWN`, non-TTY `select` without `-p`, `restart --foreground` |
+
+JSON mode and text mode always share the same exit code. Failure paths never
+print Zig stack traces.
+
+## Help behavior
+
+- `zc --help` / `zc -h` / `zc help` print global help to **stdout**, exit 0.
+- `zc help <command>`、`zc help <group>`、`zc help <group> <subcommand>` print specific help; unknown topics ⇒ `HELP_TOPIC_UNKNOWN`, exit 2.
+- `zc <command> --help` (and `-h`, or `help` as the first argument after the command) prints help and **never executes the command** — `zc start --help` must not start a daemon.
+- 裸 `help` 词只在命令词后的**第一个**参数位识别（值恰好为 "help" 的后续参数不会被吞掉成帮助请求）；`-h`/`--help` 在任意位置生效。
+- Bare `zc` prints a short usage line to **stderr**, exit 2.
+- All help text is generated from `src/cli/commands.zig`（含 `Usage:` 字样、别名、Options、Examples）。
+
+## Error output
+
+Every failure carries a stable `code` (frozen vocabulary, see
+[`../api/error-codes.md`](../api/error-codes.md)), a human-readable `message`,
+and a next-step `hint` — identical content in JSON envelope and text error
+block.

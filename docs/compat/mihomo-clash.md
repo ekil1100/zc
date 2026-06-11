@@ -101,12 +101,16 @@ Not supported in v1.0:
 - third-party dashboard parity;
 - built-in TUI.
 
-Use CLI diagnostics instead:
+Use CLI diagnostics instead — every zc command supports `--json` (single
+`{"ok","command","data"|"error"}` envelope on stdout; see
+[`../cli/spec.md`](../cli/spec.md)). The most useful ones:
 
 ```bash
-zc status --json
-zc doctor --json
-zc proxy list --json
+zc status --json     # data.state / data.selected_proxies / data.paths
+zc doctor --json     # data.proxy_reachable / data.checks
+zc test --json       # data.daemon_state / data.checks
+zc proxy list --json # data.groups (group type + current node)
+zc log --json        # JSON Lines, one {"line":"..."} event per line
 ```
 
 ## Migrator rules

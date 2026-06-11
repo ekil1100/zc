@@ -47,7 +47,7 @@ The TUI documentation has been archived because TUI is removed from the v1.0 rel
 
 Included:
 
-- daemon lifecycle through CLI: `start`, `stop`, `restart`, `status`, `log`, `doctor`;
+- daemon lifecycle through CLI: `start` (`up`), `stop` (`down`), `restart`, `reload`, `status`, `log`, `doctor`, with a uniform `--json` envelope on stdout and uniform exit codes (see [`cli/spec.md`](cli/spec.md));
 - default mixed inbound runtime;
 - AnyTLS TCP 出站;
 - non-production explicit port override via `zc start --port <port>`;

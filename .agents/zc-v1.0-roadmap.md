@@ -12,11 +12,11 @@
 当前代码**仍不应直接 GA tag**。本轮 cleanup 已完成 Zig 0.16.0 工具链对齐、TUI de-scope、旧根目录 roadmap/tasks 移除和主要文档重整；剩余阻塞项集中在：
 
 1. **配置层声明支持的部分代理类型未实现出站连接**：`http` / `socks5` 可被 parser 和 validator 接受，但 `OutboundManager.connectToProxy()` 对它们走 `NotImplemented`。`anytls` 已接入最小 TCP 出站路径。
-2. **CLI `test --json` 不生效**：入口识别 `--json`，但仍调用文本输出的 `test_cli.testProxy()`。
+2. ~~**CLI `test --json` 不生效**~~（已解决：全 CLI 输出契约对齐落地，`test --json` 走统一 envelope + `CHECKS_FAILED` 语义，见 `docs/cli/spec.md`）。
 3. **API v1 仍是最小 REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
 
-因此，v1.0 roadmap 现在应聚焦：**关闭 HTTP/SOCKS5 outbound 策略与 `zc test --json` 两个 P0，再做最终 smoke gate 和 GA tag 判断。**
+因此，v1.0 roadmap 现在应聚焦：**关闭 HTTP/SOCKS5 outbound 策略这一 P0（`zc test --json` 契约已随全 CLI 输出对齐关闭），再做最终 smoke gate 和 GA tag 判断。**
 
 ---
 
@@ -119,7 +119,7 @@ bash scripts/run-full-validation.sh
 事实判断：
 
 - `start/status/stop/doctor/proxy list` 的 JSON 路径存在且本机 smoke 可用。
-- `test --json` 目前不符合 JSON 契约。
+- `test --json` 已符合 JSON 契约（统一 envelope、stdout、`CHECKS_FAILED` + 非零退出）。
 - `status --json` 在刚启动 daemon 后 `uptime_seconds` 和 `active_config` 仍可能为 `null`，需要决定这是允许语义还是缺陷。
 
 ### 2.2 配置解析与校验
@@ -399,7 +399,7 @@ B. parser / validator / docs / migrator 明确把 HTTP / SOCKS5 outbound 标为 
 - 文本输出保持原行为。
 - 新增 CLI 行为测试。
 
-后续扩展：全 CLI 输出契约对齐（stdout、统一 `--json` envelope、退出码、生成式帮助）在 `feat/cli-ux-json` 进行，验收标准见 `docs/cli/ux-workflow.md`，事实基线见 `.agents/cli-ux-baseline.md`。
+后续扩展（已完成）：全 CLI 输出契约对齐已落地 —— 全命令 stdout 统一 `{"ok","command","data"|"error"}` envelope、退出码 0/1/2 统一、生成式帮助、`zc reload`/`up`/`down`/`version`/`--foreground`/`--no-color`、`test`/`doctor` 失败 `CHECKS_FAILED` + 非零退出、移除 ps/pgrep 全局 daemon 发现（D12）。契约见 `docs/cli/spec.md`，验收记录见 `docs/cli/ux-workflow.md`，事实基线见 `.agents/cli-ux-baseline.md`。该项不解除其余 GA gate（P0-2 outbound 策略与最终 smoke gate 仍未关闭）。
 
 ### P0-4：TUI de-scope 与代码清理
 
@@ -634,7 +634,7 @@ git push origin v1.0.0
 按风险排序：
 
 1. **决定 HTTP/SOCKS5 outbound 策略**：实现还是标 unsupported；建议先标 unsupported，并同步 validator / doctor / migrator / README。
-2. **补 `zc test --json`**：这是 CLI 契约破口，范围相对小。
+2. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 3. **复跑最终 smoke gate**：确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
 4. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。
 
@@ -652,9 +652,9 @@ git push origin v1.0.0
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
 - ❌ 部分配置可接受但运行时未实现
-- ❌ `zc test --json` 不符合 JSON 契约
+- ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档
 
 结论：
 
-> **暂不建议立即打 `v1.0.0` tag。先关闭 HTTP/SOCKS5 outbound 策略与 `zc test --json` 两个 P0，再进入最终 GA gate。**
+> **暂不建议立即打 `v1.0.0` tag。CLI JSON 契约（含 `zc test --json`）已关闭；先关闭 HTTP/SOCKS5 outbound 策略这一 P0，再进入最终 GA gate。**

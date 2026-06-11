@@ -1,21 +1,26 @@
-# API Error Codes（P2-2 初稿）
+# CLI/API Error Codes
 
 ## 1) 目标
 
-为 zc API 提供稳定、可机器识别、可人类操作的错误码体系。
+为 zc CLI（及最小 API）提供稳定、可机器识别、可人类操作的错误码体系。
 
-统一错误响应信封：
+统一错误响应信封（CLI `--json` 模式，stdout 单行；`command` 为规范命令路径）：
 
 ```json
 {
   "ok": false,
+  "command": "config use",
   "error": {
     "code": "CONFIG_NOT_FOUND",
-    "message": "config file not found",
-    "hint": "run `zc profile list` and choose a valid profile"
+    "message": "config not found",
+    "hint": "run `zc config list` and pick an existing config name"
   }
 }
 ```
+
+文本模式输出等价的错误块到 stderr（`error:` / `hint:` / `code:`）。
+诊断类失败（`CHECKS_FAILED`）会在 envelope 中附带 `"data"`（逐项检查结果）。
+退出码约定见 [`../cli/spec.md`](../cli/spec.md)：用法错误 exit 2，运行时失败 exit 1。
 
 ---
 
@@ -25,81 +30,128 @@
 - 建议结构：`<LAYER>_<ACTION>_<DETAIL>`
 - 避免把动态信息写进 `code`（动态信息放 `message`）
 - 同类语义错误只保留一个主 code，避免重复
-
-示例：
-- `CONFIG_NOT_FOUND`
-- `NETWORK_DNS_FAILED`
-- `PROVIDER_UNREACHABLE`
-- `VALIDATION_RULE_INVALID`
-- `AUTH_PERMISSION_DENIED`
+- 用法错误统一以 `*_ARGUMENT_INVALID` / `*_REQUIRED` / `*_SUBCOMMAND_UNKNOWN` / `*_SUBCOMMAND_MISSING` 收尾
 
 ---
 
-## 3) 分层体系（至少 5 类）
+## 3) 已实现 CLI 错误码（与 `src/` 实际发射点一致）
 
-## A. 配置类（CONFIG_*)
+### A. 全局（dispatch / help / version）
 
 | code | message 示例 | hint 示例 |
 |---|---|---|
-| `CONFIG_NOT_FOUND` | config file not found | run `zc profile list` and select a valid profile |
-| `CONFIG_PARSE_FAILED` | failed to parse config yaml | check yaml syntax and run `zc profile validate <file>` |
+| `COMMAND_UNKNOWN` | unknown command: nope | use `zc help` to list supported commands |
+| `HELP_TOPIC_UNKNOWN` | unknown help topic | run `zc help` to list commands |
+| `VERSION_ARGUMENT_INVALID` | unknown or unexpected argument for `version` | use `zc version [--json]` |
+
+### B. 生命周期（start / stop / restart / reload / status / log）
+
+| code | message 示例 | hint 示例 |
+|---|---|---|
+| `START_FAILED` | daemon exited during startup | check `zc log --no-follow` for details |
+| `START_ARGS_INVALID` | unknown or unexpected argument for `start` | use `zc start [-c <config>] [--port <port>] [--foreground] [--json]` |
+| `START_PORT_REQUIRED` | missing value for `--port` | use `zc start --port <port>` |
+| `START_PORT_INVALID` | invalid `--port` value | use an integer between 1 and 65535 |
+| `START_CONFIG_PATH_REQUIRED` | missing value for `-c` | use `zc start -c <config>` |
+| `START_PORT_IN_USE` | requested start port is already in use | retry with `zc start --port <free-port>` |
+| `START_PORT_CONFLICT` | requested start port conflicts with another runtime listener | change the port or fix the conflicting runtime config |
+| `START_BIND_ADDRESS_INVALID` | invalid bind address for start preflight | fix `bind-address` in config and retry |
+| `START_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | fix `external-controller` to `host:port` format |
+| `START_PREFLIGHT_FAILED` | failed to validate daemon start ports | check config and retry |
+| `STOP_FAILED` | failed to stop daemon | verify process permissions and retry `zc stop` |
+| `RESTART_FAILED` | failed to restart daemon | check logs and retry `zc restart -c <config>` |
+| `RESTART_PORT_IN_USE` | restart target port is already in use | free the occupied port, then retry `zc restart` |
+| `RESTART_PORT_CONFLICT` | restart target port conflicts with another runtime listener | fix the conflicting runtime config before retrying `zc restart` |
+| `RESTART_BIND_ADDRESS_INVALID` | invalid bind address for restart preflight | fix `bind-address` in config and retry `zc restart` |
+| `RESTART_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | fix `external-controller` to `host:port` format before retrying `zc restart` |
+| `RESTART_PREFLIGHT_FAILED` | failed to validate daemon restart ports | check config and retry `zc restart` |
+| `RELOAD_FAILED` | daemon is not running | start it first with `zc start` |
+| `RELOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `reload` | use `zc reload [--json]` |
+| `STOP_ARGUMENT_INVALID` | unknown or unexpected argument for `stop` | use `zc stop [--json]` |
+| `STATUS_FAILED` | failed to read daemon status | check pid file permissions and retry `zc status` |
+| `STATUS_ARGUMENT_INVALID` | unknown or unexpected argument for `status` | use `zc status [--json]` |
+| `LOG_FAILED` | failed to read daemon log | check log file permissions; `zc status` shows the log path |
+| `LOG_ARGUMENT_INVALID` | invalid `-n` value (use a non-negative integer) | use `zc log [-n <lines>] [-f\|--no-follow] [--json]` |
+
+`zc restart` 与 `zc start` 共用同一参数解析器，因此 restart 的参数用法错误
+（未知/多余参数、缺值 `-c`/`--port`、非法端口）发射同一组冻结码
+（`START_ARGS_INVALID` / `START_CONFIG_PATH_REQUIRED` / `START_PORT_REQUIRED` /
+`START_PORT_INVALID`），message/hint 按 `restart` 渲染。以上 `*_REQUIRED` /
+`*_INVALID` 参数错误均为用法错误，exit 2。
+
+### C. 配置类（CONFIG_*）
+
+| code | message 示例 | hint 示例 |
+|---|---|---|
+| `CONFIG_LIST_FAILED` | failed to list configs | ensure the config directory exists and is readable |
+| `CONFIG_LIST_ARGUMENT_INVALID` | unknown or unexpected argument for `config list` | use `zc config list [--json]` |
+| `CONFIG_DOWNLOAD_URL_REQUIRED` | missing <url> for config download | use `zc config download <url> [-n <name>] [-d]` |
+| `CONFIG_DOWNLOAD_NAME_REQUIRED` | missing value for `-n` | use `zc config download <url> -n <name>` |
+| `CONFIG_DOWNLOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `config download` | use `zc config download <url> [-n <name>] [-d]` |
+| `CONFIG_DOWNLOAD_FAILED` | failed to download config | check the url/network and retry |
+| `CONFIG_UPDATE_APPLY_INVALID` | invalid `--apply` value | use `--apply auto\|hot\|restart` |
+| `CONFIG_UPDATE_ARGUMENT_INVALID` | unknown or unexpected argument for `config update` | use `zc config update [name] [--apply auto\|hot\|restart]` |
+| `CONFIG_UPDATE_NAME_REQUIRED` | no config name given and no active config | use `zc config update <name>`, or `zc config use <name>` first |
+| `CONFIG_UPDATE_NO_SUBSCRIPTION` | no subscription url recorded for this config | use `zc config download <url>` to (re)create it |
+| `CONFIG_UPDATE_FAILED` | failed to update config | check subscription url/network and retry |
+| `CONFIG_UPDATE_APPLY_FAILED` | config updated but failed to apply to running daemon | check `zc log --no-follow`, then run `zc restart` |
+| `CONFIG_USE_NAME_REQUIRED` | missing <name> for config use | use `zc config use <name>`; run `zc config list` to see candidates |
+| `CONFIG_USE_ARGUMENT_INVALID` | unknown or unexpected argument for `config use` | use `zc config use <name>` |
+| `CONFIG_NOT_FOUND` | config not found | run `zc config list` and pick an existing config name |
 | `CONFIG_SWITCH_FAILED` | failed to switch active config | verify file permission and retry |
+| `CONFIG_DUMP_ARGUMENT_INVALID` | unknown or unexpected argument for `config dump` | use `zc config dump [-c <config>] [--no-override]` |
+| `CONFIG_DUMP_FAILED` | failed to dump merged config | check config path/override script and retry |
+| `CONFIG_OVERRIDE_ARGUMENT_INVALID` | invalid config override arguments | use `zc config override <script.lua>` / `--clear` |
+| `CONFIG_OVERRIDE_NO_ACTIVE` | no active config found for override | run `zc config use <name>` first |
+| `CONFIG_OVERRIDE_SCRIPT_NOT_FOUND` | override script file not found | check script path and retry |
+| `CONFIG_OVERRIDE_FAILED` | failed to update persisted config override | check config state and retry |
+| `CONFIG_OVERRIDE_APPLY_FAILED` | override persisted but failed to apply running daemon | check logs and run `zc restart` |
+| `CONFIG_SUBCOMMAND_UNKNOWN` | unknown config subcommand | use `zc config --help` to list config subcommands |
 
-## B. 网络类（NETWORK_*)
+### D. proxy / profile 家族
 
-| code | message 示例 | hint 示例 |
-|---|---|---|
-| `NETWORK_DNS_FAILED` | dns resolve failed for target | verify dns setting and upstream availability |
-| `NETWORK_CONNECT_TIMEOUT` | tcp connect timeout | check proxy node health and network route |
-| `NETWORK_PORT_IN_USE` | required local port is already in use | free the port or change config port |
-
-## C. 提供商/上游类（PROVIDER_*)
-
-| code | message 示例 | hint 示例 |
-|---|---|---|
-| `PROVIDER_UNREACHABLE` | upstream provider is unreachable | check provider endpoint/network/proxy chain |
-| `PROVIDER_AUTH_FAILED` | provider authentication failed | verify token/credential and retry |
-| `PROVIDER_RESPONSE_INVALID` | provider response format invalid | check provider compatibility and version |
-
-## D. 校验类（VALIDATION_*)
+`profile` 与 `proxy` 共用同一 handler：共享的 select/load 错误保持冻结的
+`PROXY_*` 码（两条路径相同），仅参数与子命令错误按家族携带
+`PROXY_…` / `PROFILE_…` 前缀。
 
 | code | message 示例 | hint 示例 |
 |---|---|---|
-| `VALIDATION_RULE_INVALID` | rule format is invalid | use supported rule format and rerun validate |
-| `VALIDATION_PROXY_INVALID` | proxy definition is invalid | check required proxy fields |
-| `VALIDATION_PORT_CONFLICT` | config has port conflict | adjust mixed/http/socks port settings |
-
-## E. 权限类（AUTH_*)
-
-| code | message 示例 | hint 示例 |
-|---|---|---|
-| `AUTH_PERMISSION_DENIED` | permission denied for requested action | check role/token scope |
-| `AUTH_TOKEN_MISSING` | auth token is missing | provide valid token in request |
-| `AUTH_TOKEN_INVALID` | auth token is invalid | refresh token and retry |
-
-## F. 资源路径对齐类（PROFILE_ / PROXY_ / DIAG_）
-
-> 用于 profile/proxy/diag 资源路径的参数与流程错误，确保实现路径与字典一致。
-
-| code | message 示例 | hint 示例 |
-|---|---|---|
-| `PROFILE_LIST_FAILED` | failed to list profiles | ensure config directory exists and is readable |
-| `PROFILE_SUBCOMMAND_MISSING` | profile subcommand is required | use `zc profile list|use|import|validate` |
-| `PROFILE_SUBCOMMAND_UNKNOWN` | unknown profile subcommand | use `zc profile list|use|import|validate` |
-| `PROFILE_NAME_REQUIRED` | profile name is required | use `zc profile use <name>` |
-| `PROFILE_NOT_FOUND` | profile not found | run `zc profile list` and confirm profile name |
-| `PROFILE_USE_FAILED` | failed to switch profile | verify file permission and retry |
-| `PROFILE_SOURCE_REQUIRED` | profile import source is required | use `zc profile import <url_or_path> [-n name]` |
-| `PROFILE_IMPORT_FAILED` | failed to import profile | check source url/path and retry |
-| `PROFILE_VALIDATE_FAILED` | failed to validate profile | run `zc profile validate <name_or_path>` |
-| `PROXY_CONFIG_LOAD_FAILED` | failed to load config for proxy action | verify `-c` path and config validity |
+| `PROXY_CONFIG_LOAD_FAILED` | failed to load/validate config for proxy list | check config path and retry with `-c <config>` |
 | `PROXY_GROUP_NOT_FOUND` | proxy group not found | run `zc proxy list --json` to inspect groups |
-| `PROXY_NOT_FOUND` | proxy not found in group | run `zc proxy select -g <group> --json` |
-| `PROXY_SELECT_GROUP_MISSING` | no select-type proxy group found | check proxy-group type in profile |
+| `PROXY_GROUP_NOT_SELECTABLE` | group is not a select-type proxy group | only select-type groups support manual selection; run `zc proxy list` to see group types |
+| `PROXY_NOT_FOUND` | proxy not found in group | run `zc proxy select -g <group> --json` to inspect choices |
+| `PROXY_SELECT_GROUP_MISSING` | no select-type proxy group found | check profile proxy-groups config |
+| `PROXY_SELECT_NOT_INTERACTIVE` | interactive selection requires a TTY on stdin | stdin is not a TTY; use `zc proxy select -g <group> -p <proxy>` |
 | `PROXY_SELECT_FAILED` | failed to select proxy | retry with valid group/proxy arguments |
-| `PROXY_SUBCOMMAND_UNKNOWN` | unknown proxy subcommand | use `zc proxy list|select|test` |
-| `DIAG_DOCTOR_FAILED` | failed to run doctor diagnostics | retry with valid config and inspect logs |
+| `PROXY_TEST_FAILED` | failed to run connectivity test | retry; `zc status` and `zc log --no-follow` show daemon state |
+| `PROXY_LIST_ARGUMENT_INVALID` | unknown or unexpected argument for `proxy list` | use `zc proxy list [-c <config>] [--json]` |
+| `PROXY_SELECT_ARGUMENT_INVALID` | unknown or unexpected argument for `proxy select` | use `zc proxy select [-g <group>] [-p <proxy>] [-c <config>] [--json]` |
+| `PROXY_TEST_ARGUMENT_INVALID` | unknown or unexpected argument for `proxy test` | use `zc proxy test [-c <config>] [--port <port>] [--json]` |
+| `PROXY_SUBCOMMAND_UNKNOWN` | unknown proxy subcommand | use `zc proxy --help` or `zc help proxy` |
+| `PROFILE_LIST_ARGUMENT_INVALID` | unknown or unexpected argument for `profile list` | use `zc profile list [-c <config>] [--json]` |
+| `PROFILE_SELECT_ARGUMENT_INVALID` | unknown or unexpected argument for `profile select` | use `zc profile select [-g <group>] [-p <proxy>] [-c <config>] [--json]` |
+| `PROFILE_TEST_ARGUMENT_INVALID` | unknown or unexpected argument for `profile test` | use `zc profile test [-c <config>] [--port <port>] [--json]` |
+| `PROFILE_SUBCOMMAND_UNKNOWN` | unknown profile subcommand | use `zc profile --help` or `zc help profile` |
+
+### E. test / doctor / diag
+
+| code | message 示例 | hint 示例 |
+|---|---|---|
+| `CHECKS_FAILED` | 2 connectivity check(s) failed / 1 doctor check(s) failed | inspect the failed entries in data.checks; `zc status` and `zc log --no-follow` show daemon details |
+| `TEST_ARGUMENT_INVALID` | unknown or unexpected argument for `test` | use `zc test [-c <config>] [--port <port>] [--json]` |
+| `DIAG_DOCTOR_FAILED` | failed to run doctor diagnostics | check config path/permissions and retry `zc doctor` |
+| `DIAG_DOCTOR_ARGUMENT_INVALID` | unknown or unexpected argument for `doctor` | use `zc doctor [-c <config>] [--json]` |
+| `DIAG_SUBCOMMAND_MISSING` | missing diag subcommand | use `zc diag doctor [-c <config>] [--json]` |
 | `DIAG_SUBCOMMAND_UNKNOWN` | unknown diag subcommand | use `zc diag doctor [-c <config>] [--json]` |
+
+`CHECKS_FAILED` 是诊断类命令（`test` / `proxy test` / `profile test` /
+`doctor` / `diag doctor`）的统一失败码：envelope 附带 `data`（逐项
+`checks`），exit 1（决策 D3）。
+
+### F. override / rule-provider
+
+| code | message 示例 | hint 示例 |
+|---|---|---|
 | `OVERRIDE_SCRIPT_NOT_FOUND` | override script or runtime not found | check `--override-script` path and lua availability |
 | `OVERRIDE_SCRIPT_EXEC_FAILED` | override script execution failed | ensure script exits 0 and outputs valid override |
 | `OVERRIDE_SCRIPT_TIMEOUT` | override script timed out | increase `--override-timeout-ms` or simplify script |
@@ -108,31 +160,47 @@
 | `OVERRIDE_OPTION_DEPRECATED` | `--override-dump-yaml/json` has been removed | use `zc config dump [-c <config>]` |
 | `RULE_PROVIDER_DOWNLOAD_FAILED` | failed to download rule-provider files | check provider url/network and retry |
 | `RULE_PROVIDER_FILE_NOT_FOUND` | rule-provider file not found | check `rule-providers.<name>.path` or provider url |
-| `CONFIG_OVERRIDE_ARGUMENT_INVALID` | invalid config override arguments | use `zc config override <script.lua>` / `--clear` |
-| `CONFIG_OVERRIDE_NO_ACTIVE` | no active config found for override | run `zc config use <name>` first |
-| `CONFIG_OVERRIDE_SCRIPT_NOT_FOUND` | override script file not found | check script path and retry |
-| `CONFIG_OVERRIDE_FAILED` | failed to update persisted config override | check config state and retry |
-| `CONFIG_OVERRIDE_APPLY_FAILED` | override persisted but failed to apply running daemon | check logs and run `zc restart` |
-| `CONFIG_DUMP_FAILED` | failed to dump merged config | check config path/override script and retry |
+
+override flag 本身的解析错误（`--override-script`/`--override-arg` 缺值、
+`--override-timeout-ms` 非法值、已废弃的 `--override-dump-*`）在 dispatch 前
+统一报错：复用上表的 `OVERRIDE_*` 码，但作为用法错误 exit 2；脚本的运行期
+失败（执行/超时/输出非法）仍为 exit 1。
 
 ---
 
-## 4) 设计原则
+## 4) 预留分层（API 侧，尚未在代码中发射）
 
-1. `code` 稳定：供前端/脚本分支判断。
+以下分类为 API 错误码体系预留，当前代码尚未发射，**不得**在文档/脚本中
+当作已实现行为断言：
+
+- 网络类 `NETWORK_*`（如 `NETWORK_DNS_FAILED`、`NETWORK_CONNECT_TIMEOUT`）
+- 提供商类 `PROVIDER_*`（如 `PROVIDER_UNREACHABLE`、`PROVIDER_AUTH_FAILED`）
+- 校验类 `VALIDATION_*`（如 `VALIDATION_RULE_INVALID`）
+- 权限类 `AUTH_*`（如 `AUTH_PERMISSION_DENIED`）
+
+已移除的历史错误码（不再发射，勿再断言）：`PROFILE_SUBCOMMAND_MISSING`、
+`PROFILE_LIST_FAILED`、`PROFILE_NAME_REQUIRED`、`PROFILE_NOT_FOUND`、
+`PROFILE_USE_FAILED`、`PROFILE_SOURCE_REQUIRED`、`PROFILE_IMPORT_FAILED`、
+`PROFILE_VALIDATE_FAILED`、`CONFIG_PARSE_FAILED`。
+
+---
+
+## 5) 设计原则
+
+1. `code` 稳定：供前端/脚本分支判断（冻结词汇，见 `docs/cli/ux-workflow.md` 第 3 节）。
 2. `message` 可读：一句话说清发生了什么。
 3. `hint` 可执行：给用户下一步动作。
-4. 尽量避免返回裸异常名（例如 `FileNotFound`）给最终用户。
+4. 尽量避免返回裸异常名（例如 `FileNotFound`）给最终用户；CLI 在 envelope 之外可经 stderr 附加真实错误名作诊断。
 
 ---
 
-## 5) API 文档对齐
+## 6) API 文档对齐
 
 - 当前 v1.0 active API 文档入口是 `docs/api/README.md`。
 - 旧 OpenAPI 草案已归档到 `docs/archive/api/openapi.yaml`，不再作为当前契约。
 - 新增错误码时，必须同步更新本字典，并在对应 CLI/API 文档中说明可触发场景。
 
-## 6) 后续落地
+## 7) 后续落地
 
-1. CLI/API 逐步替换零散错误文本为标准错误码。
-2. 为高频 code 增加集成测试断言（至少覆盖 profile/proxy/diag 路径）。
+1. API 路径（`src/api/server.zig`）错误响应仍为 `{"error":"…"}` 简单格式，尚未对齐本字典的 envelope。
+2. 为高频 code 增加集成测试断言（已覆盖 PROXY / PROFILE / DIAG / CHECKS_FAILED 路径，见 `src/integration_error_test.zig`）。

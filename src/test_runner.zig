@@ -10,6 +10,7 @@ test "include zc test modules" {
     _ = @import("daemon.zig");
     _ = @import("doctor_cli.zig");
     _ = @import("geoip.zig");
+    _ = @import("integration_error_test.zig");
     _ = @import("meta.zig");
     _ = @import("mixed_repro_test.zig");
     _ = @import("override.zig");

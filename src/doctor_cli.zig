@@ -4,6 +4,7 @@ const config = @import("config.zig");
 const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
 const daemon = @import("daemon.zig");
+const cli_output = @import("cli/output.zig");
 
 const network_probe_host = "1.1.1.1";
 const network_probe_port: u16 = 443;
@@ -47,93 +48,109 @@ pub const DoctorData = struct {
     }
 };
 
-pub fn runDoctorJson(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
-    var data = try collectDoctorData(allocator, config_path, null);
-    defer data.deinit(allocator);
-    try emitDoctorJson(allocator, &data);
+/// 单项 doctor 检查结果（CHECKS_FAILED 的 data.checks 元素）。
+pub const Check = struct {
+    name: []const u8,
+    ok: bool,
+    detail: []const u8,
+};
+
+/// D3 CHECKS_FAILED 语义的判定来源。两个 gating 检查：
+/// - "config"：配置必须解析且通过校验；
+/// - "connection"：仅当 daemon 在运行却没有任何配置端口可达时判失败。
+///   daemon 停止是合法状态（与 D5 对齐），不算检查失败 —— e2e 在没有
+///   daemon 的容器里以 exit 0 验证有效配置依赖这一点。
+/// network_ok（外网 1.1.1.1:443 探测）与 proxy_reachable 都如实记录在
+/// data 中；network_ok 在沙箱/离线环境会合法失败，因此只记录、不 gating。
+pub fn doctorChecks(data: *const DoctorData) [2]Check {
+    const connection_ok = !data.daemon_running or data.proxy_reachable;
+    return .{
+        .{
+            .name = "config",
+            .ok = data.config_ok,
+            .detail = if (data.config_ok) "config parsed and validated" else "config invalid (see config_errors)",
+        },
+        .{
+            .name = "connection",
+            .ok = connection_ok,
+            .detail = if (!data.daemon_running)
+                "daemon stopped; connection check not gating"
+            else if (data.proxy_reachable)
+                "proxy port reachable"
+            else
+                "daemon running but no configured proxy port is listening",
+        },
+    };
 }
 
-pub fn runDoctorJsonWithConfig(allocator: std.mem.Allocator, cfg: *config.Config, config_path: ?[]const u8) !void {
+/// 收集 + 输出 doctor 结果（两种模式跑同一套探测，含 1.1.1.1:443 网络探测）。
+/// 返回 true = 全部检查通过（调用方 exit 0），false = CHECKS_FAILED 已输出
+/// （调用方负责非零退出）。
+pub fn runDoctorWithConfig(
+    allocator: std.mem.Allocator,
+    cfg: *config.Config,
+    config_path: ?[]const u8,
+    out: *cli_output.Output,
+) !bool {
     var data = try collectDoctorData(allocator, config_path, cfg);
     defer data.deinit(allocator);
-    try emitDoctorJson(allocator, &data);
+    return emitDoctorResult(allocator, &data, out);
 }
 
-pub fn runDoctor(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
-    var data = try collectDoctorData(allocator, config_path, null);
-    defer data.deinit(allocator);
-    const report = try formatDoctorReport(allocator, &data);
-    defer allocator.free(report);
-    std.debug.print("{s}", .{report});
-}
-
-pub fn runDoctorWithConfig(allocator: std.mem.Allocator, cfg: *config.Config, config_path: ?[]const u8) !void {
-    var data = try collectDoctorData(allocator, config_path, cfg);
-    defer data.deinit(allocator);
-    const report = try formatDoctorReport(allocator, &data);
-    defer allocator.free(report);
-    std.debug.print("{s}", .{report});
-}
-
-fn emitDoctorJson(allocator: std.mem.Allocator, data: *const DoctorData) !void {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    try out.print(allocator, "{{\"ok\":true,\"data\":{{\"action\":\"doctor\",\"version\":\"{s}\",\"config_path\":\"{s}\",\"config_ok\":{s},\"config_source\":\"{s}\",\"daemon_running\":{s},\"network_ok\":{s},\"daemon_pid\":", .{
-        data.version,
-        data.config_path,
-        if (data.config_ok) "true" else "false",
-        data.config_source,
-        if (data.daemon_running) "true" else "false",
-        if (data.network_ok) "true" else "false",
-    });
-
-    if (data.daemon_pid) |pid| {
-        try out.print(allocator, "{d}", .{pid});
-    } else {
-        try out.appendSlice(allocator, "null");
+/// 输出 seam（单元测试直接喂合成 DoctorData）。
+/// JSON：单个 envelope（成功 ok:true / 失败 ok:false + error.code=CHECKS_FAILED
+/// + data 逐项结果）；文本：冻结标签报告走 stdout，失败时错误块走 stderr。
+/// 全部字符串经 std.json 转义（终结手拼 JSON）。
+pub fn emitDoctorResult(allocator: std.mem.Allocator, data: *const DoctorData, out: *cli_output.Output) !bool {
+    const checks = doctorChecks(data);
+    var failed: usize = 0;
+    for (checks) |check| {
+        if (!check.ok) failed += 1;
     }
 
-    try out.appendSlice(allocator, ",\"ports\":[");
-    var i: usize = 0;
-    while (i < data.port_count) : (i += 1) {
-        if (i > 0) try out.appendSlice(allocator, ",");
-        const p = data.ports[i];
-        try out.print(allocator, "{{\"label\":\"{s}\",\"port\":{d},\"listening\":{s}}}", .{ p.label, p.port, if (p.listening) "true" else "false" });
-    }
-    try out.appendSlice(allocator, "],\"proxy_reachable\":");
-    try out.appendSlice(allocator, if (data.proxy_reachable) "true" else "false");
+    // data 字段对两种结果（成功/CHECKS_FAILED）保持同构，消费者
+    // （run-soak-real.sh 的 proxy_reachable grep）在两种结果下都能读到事实。
+    const view = .{
+        .action = "doctor",
+        .version = data.version,
+        .config_path = data.config_path,
+        .config_ok = data.config_ok,
+        .config_source = data.config_source,
+        .daemon_running = data.daemon_running,
+        .network_ok = data.network_ok,
+        .daemon_pid = data.daemon_pid,
+        .ports = data.ports[0..data.port_count],
+        .proxy_reachable = data.proxy_reachable,
+        .config_errors = data.config_errors,
+        .config_warnings = data.config_warnings,
+        .migration_hints = data.migration_hints,
+        .daemon_uptime_seconds = data.daemon_uptime_seconds,
+        .checks = checks[0..],
+    };
 
-    // config_errors array
-    try out.appendSlice(allocator, ",\"config_errors\":[");
-    for (data.config_errors, 0..) |err, idx| {
-        if (idx > 0) try out.appendSlice(allocator, ",");
-        try out.appendSlice(allocator, "\"");
-        try out.appendSlice(allocator, err);
-        try out.appendSlice(allocator, "\"");
-    }
-    try out.appendSlice(allocator, "],\"config_warnings\":[");
-    for (data.config_warnings, 0..) |w, idx| {
-        if (idx > 0) try out.appendSlice(allocator, ",");
-        try out.appendSlice(allocator, "\"");
-        try out.appendSlice(allocator, w);
-        try out.appendSlice(allocator, "\"");
-    }
-    try out.appendSlice(allocator, "],\"migration_hints\":[");
-    for (data.migration_hints, 0..) |h, idx| {
-        if (idx > 0) try out.appendSlice(allocator, ",");
-        try out.appendSlice(allocator, "\"");
-        try out.appendSlice(allocator, h);
-        try out.appendSlice(allocator, "\"");
-    }
-    try out.appendSlice(allocator, "],\"daemon_uptime_seconds\":");
-    if (data.daemon_uptime_seconds) |uptime| {
-        try out.print(allocator, "{d}}}}}\n", .{uptime});
-    } else {
-        try out.appendSlice(allocator, "null}}}\n");
+    if (out.mode == .text) {
+        // 冻结标签（Config:/Daemon:/PID:/Port:/Connection:，含 OK/valid
+        // token）—— e2e 脚本 grep 依赖。
+        const report = try formatDoctorReport(allocator, data);
+        defer allocator.free(report);
+        try out.print("{s}", .{report});
+        try out.flush();
     }
 
-    std.debug.print("{s}", .{out.items});
+    if (failed == 0) {
+        try out.success(view);
+        return true;
+    }
+
+    var msg_buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "{d} doctor check(s) failed", .{failed}) catch "doctor checks failed";
+    try out.failWithData(
+        "CHECKS_FAILED",
+        msg,
+        "inspect the failed entries in data.checks; `zc status` and `zc log --no-follow` show daemon details",
+        view,
+    );
+    return false;
 }
 
 fn collectDoctorData(allocator: std.mem.Allocator, config_path: ?[]const u8, provided_cfg: ?*config.Config) !DoctorData {
@@ -432,6 +449,153 @@ test "formatDoctorReport basic output" {
     try std.testing.expect(std.mem.indexOf(u8, report, "PID: -") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "Port: 7890") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "Connection: FAILED") != null);
+}
+
+test "doctorChecks: stopped daemon with valid config passes (connection not gating)" {
+    var data = DoctorData{
+        .config_ok = true,
+        .config_source = "default",
+        .daemon_running = false,
+        .daemon_pid = null,
+        .ports = undefined,
+        .port_count = 0,
+    };
+    const checks = doctorChecks(&data);
+    try std.testing.expectEqualStrings("config", checks[0].name);
+    try std.testing.expect(checks[0].ok);
+    try std.testing.expectEqualStrings("connection", checks[1].name);
+    try std.testing.expect(checks[1].ok);
+}
+
+test "doctorChecks: running daemon without reachable port fails connection" {
+    var data = DoctorData{
+        .config_ok = true,
+        .config_source = "default",
+        .daemon_running = true,
+        .daemon_pid = 123,
+        .ports = undefined,
+        .port_count = 0,
+        .proxy_reachable = false,
+    };
+    const checks = doctorChecks(&data);
+    try std.testing.expect(checks[0].ok);
+    try std.testing.expect(!checks[1].ok);
+}
+
+test "doctorChecks: invalid config fails config check even with reachable proxy" {
+    var data = DoctorData{
+        .config_ok = false,
+        .config_source = "custom",
+        .daemon_running = true,
+        .daemon_pid = 123,
+        .ports = undefined,
+        .port_count = 0,
+        .proxy_reachable = true,
+    };
+    const checks = doctorChecks(&data);
+    try std.testing.expect(!checks[0].ok);
+    try std.testing.expect(checks[1].ok);
+}
+
+test "emitDoctorResult json success: one envelope, escaped strings, proxy_reachable present" {
+    const allocator = std.testing.allocator;
+
+    var data = DoctorData{
+        .config_ok = true,
+        .config_source = "custom",
+        .config_path = "/tmp/we\"ird\npath.yaml",
+        .daemon_running = false,
+        .daemon_pid = null,
+        .ports = undefined,
+        .port_count = 1,
+    };
+    data.ports[0] = .{ .label = "mixed", .port = 7890, .listening = false };
+
+    var out_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer out_alloc.deinit();
+    var err_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer err_alloc.deinit();
+    var out = cli_output.Output.init(.json, "doctor", false, &out_alloc.writer, &err_alloc.writer);
+
+    try std.testing.expect(try emitDoctorResult(allocator, &data, &out));
+
+    const written = out_alloc.written();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\n"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, written, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("ok").?.bool);
+    try std.testing.expectEqualStrings("doctor", root.get("command").?.string);
+    const json_data = root.get("data").?.object;
+    // 手拼 JSON 时代会把这个路径写成非法 JSON —— std.json 转义后必须还原。
+    try std.testing.expectEqualStrings("/tmp/we\"ird\npath.yaml", json_data.get("config_path").?.string);
+    try std.testing.expect(json_data.get("proxy_reachable") != null);
+    try std.testing.expect(json_data.get("network_ok") != null);
+    try std.testing.expectEqual(@as(usize, 2), json_data.get("checks").?.array.items.len);
+    try std.testing.expectEqualStrings("", err_alloc.written());
+}
+
+test "emitDoctorResult json failure: CHECKS_FAILED envelope carries data" {
+    const allocator = std.testing.allocator;
+
+    var data = DoctorData{
+        .config_ok = false,
+        .config_source = "custom",
+        .daemon_running = true,
+        .daemon_pid = 42,
+        .ports = undefined,
+        .port_count = 1,
+        .proxy_reachable = false,
+    };
+    data.ports[0] = .{ .label = "mixed", .port = 7890, .listening = false };
+
+    var out_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer out_alloc.deinit();
+    var err_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer err_alloc.deinit();
+    var out = cli_output.Output.init(.json, "doctor", false, &out_alloc.writer, &err_alloc.writer);
+
+    try std.testing.expect(!try emitDoctorResult(allocator, &data, &out));
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out_alloc.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(!root.get("ok").?.bool);
+    try std.testing.expectEqualStrings("CHECKS_FAILED", root.get("error").?.object.get("code").?.string);
+    try std.testing.expect(root.get("error").?.object.get("hint").?.string.len != 0);
+    const json_data = root.get("data").?.object;
+    try std.testing.expect(json_data.get("proxy_reachable").?.bool == false);
+    const checks = json_data.get("checks").?.array.items;
+    try std.testing.expect(!checks[0].object.get("ok").?.bool);
+    try std.testing.expect(!checks[1].object.get("ok").?.bool);
+}
+
+test "emitDoctorResult text failure: frozen-label report on stdout, error block on stderr" {
+    const allocator = std.testing.allocator;
+
+    var data = DoctorData{
+        .config_ok = false,
+        .config_source = "default",
+        .daemon_running = false,
+        .daemon_pid = null,
+        .ports = undefined,
+        .port_count = 1,
+    };
+    data.ports[0] = .{ .label = "mixed", .port = 7890, .listening = false };
+
+    var out_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer out_alloc.deinit();
+    var err_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer err_alloc.deinit();
+    var out = cli_output.Output.init(.text, "doctor", false, &out_alloc.writer, &err_alloc.writer);
+
+    try std.testing.expect(!try emitDoctorResult(allocator, &data, &out));
+
+    const stdout_text = out_alloc.written();
+    try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Config: FAILED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Daemon: stopped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Connection:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "CHECKS_FAILED") != null);
 }
 
 test "parseRuntimePortOverrideFromCommand reads daemon port flag" {

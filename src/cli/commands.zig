@@ -29,6 +29,7 @@ pub const Group = struct {
 
 const json_flag: Flag = .{ .spec = "--json", .help = "Machine-readable envelope on stdout" };
 const config_flag: Flag = .{ .spec = "-c <config>", .help = "Use specific config file" };
+const probe_port_flag: Flag = .{ .spec = "--port <port>", .help = "Probe this port instead of the default runtime port" };
 const override_flags = [_]Flag{
     .{ .spec = "--override-script <path>", .help = "Run override script (lua table or executable printing YAML)" },
     .{ .spec = "--override-arg <k=v>", .help = "Pass key/value to override script (repeatable)" },
@@ -104,8 +105,8 @@ pub const table = [_]Command{
     .{
         .path = "test",
         .summary = "Test network connectivity through the proxy",
-        .flags = &.{ config_flag, json_flag },
-        .examples = &.{"zc test"},
+        .flags = &.{ config_flag, probe_port_flag, json_flag },
+        .examples = &.{ "zc test", "zc test --json" },
     },
     .{
         .path = "doctor",
@@ -191,7 +192,7 @@ pub const table = [_]Command{
     .{
         .path = "proxy test",
         .summary = "Test configured proxy connectivity",
-        .flags = &.{ config_flag, json_flag },
+        .flags = &.{ config_flag, probe_port_flag, json_flag },
         .examples = &.{"zc proxy test"},
     },
     .{
@@ -213,7 +214,7 @@ pub const table = [_]Command{
     .{
         .path = "profile test",
         .summary = "Test configured proxy connectivity",
-        .flags = &.{ config_flag, json_flag },
+        .flags = &.{ config_flag, probe_port_flag, json_flag },
     },
     .{
         .path = "diag doctor",

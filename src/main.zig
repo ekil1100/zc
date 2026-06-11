@@ -101,15 +101,16 @@ pub fn main(init: std.process.Init) !void {
     setCliCommand(cmd, args);
 
     var override_opts = override.parseCliOptions(allocator, args) catch |err| {
+        // override flag 缺值/非法值是用法错误（spec.md 退出码表：exit 2）。
         printOverrideOptionError(json_output, err);
-        std.process.exit(cli_output.exit_failure);
+        std.process.exit(cli_output.exit_usage);
     };
     defer override_opts.deinit(allocator);
 
     // 处理 daemon 运行模式（内部使用）
     if (std.mem.eql(u8, cmd, "--daemon-run")) {
-        const start_opts = parseStartCommandOptions(args, 2) catch |err| {
-            printStartCommandOptionError(json_output, err);
+        const start_opts = parseStartCommandOptions(args, 2, .forwarded) catch |err| {
+            printStartCommandOptionError(json_output, err, .start);
             std.process.exit(cli_output.exit_failure);
         };
         daemon.writePid(allocator, std.c.getpid()) catch {};
@@ -132,6 +133,10 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 version
     if (std.mem.eql(u8, cmd, "version")) {
+        if (hasUnexpectedArgs(args, 2)) {
+            printCliError(json_output, "VERSION_ARGUMENT_INVALID", "unknown or unexpected argument for `version`", "use `zc version [--json]`");
+            std.process.exit(cli_output.exit_usage);
+        }
         try printVersion(json_output);
         return;
     }
@@ -147,9 +152,10 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 start 命令
     if (std.mem.eql(u8, cmd, "start")) {
-        const start_opts = parseStartCommandOptions(args, 2) catch |err| {
-            printStartCommandOptionError(json_output, err);
-            std.process.exit(cli_output.exit_failure);
+        // 决策 D11 + spec.md 退出码表：参数用法错误（未知/缺值 flag）exit 2。
+        const start_opts = parseStartCommandOptions(args, 2, .strict) catch |err| {
+            printStartCommandOptionError(json_output, err, .start);
+            std.process.exit(cli_output.exit_usage);
         };
 
         // 决策 D1：--foreground 不 fork，自己持锁 + 写 pid（容器/systemd）。
@@ -221,6 +227,11 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 stop 命令
     if (std.mem.eql(u8, cmd, "stop")) {
+        // 决策 D11：stop 不接受任何位置参数/私有 flag。
+        if (hasUnexpectedArgs(args, 2)) {
+            printCliError(json_output, "STOP_ARGUMENT_INVALID", "unknown or unexpected argument for `stop`", "use `zc stop [--json]`");
+            std.process.exit(cli_output.exit_usage);
+        }
         const outcome = daemon.stopDaemon(allocator) catch |err| {
             switch (err) {
                 error.DaemonPidUntracked => printCliError(json_output, "STOP_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc stop`"),
@@ -245,9 +256,9 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 restart 命令
     if (std.mem.eql(u8, cmd, "restart")) {
-        const start_opts = parseStartCommandOptions(args, 2) catch |err| {
-            printStartCommandOptionError(json_output, err);
-            std.process.exit(cli_output.exit_failure);
+        const start_opts = parseStartCommandOptions(args, 2, .strict) catch |err| {
+            printStartCommandOptionError(json_output, err, .restart);
+            std.process.exit(cli_output.exit_usage);
         };
         if (start_opts.foreground) {
             printCliError(json_output, "RESTART_FAILED", "`--foreground` is not supported by restart", "use `zc stop` then `zc start --foreground`");
@@ -275,6 +286,10 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 reload 命令（决策 D9：热重载当前配置，不重新下载任何内容）
     if (std.mem.eql(u8, cmd, "reload")) {
+        if (hasUnexpectedArgs(args, 2)) {
+            printCliError(json_output, "RELOAD_ARGUMENT_INVALID", "unknown or unexpected argument for `reload`", "use `zc reload [--json]`");
+            std.process.exit(cli_output.exit_usage);
+        }
         const running = daemon.isRunning(allocator) catch false;
         if (!running) {
             printCliError(json_output, "RELOAD_FAILED", "daemon is not running", "start it first with `zc start`");
@@ -312,6 +327,10 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 status 命令
     if (std.mem.eql(u8, cmd, "status")) {
+        if (hasUnexpectedArgs(args, 2)) {
+            printCliError(json_output, "STATUS_ARGUMENT_INVALID", "unknown or unexpected argument for `status`", "use `zc status [--json]`");
+            std.process.exit(cli_output.exit_usage);
+        }
         var streams = StdStreams{};
         var out = streams.output(json_output);
         daemon.getStatus(allocator, &out) catch {
@@ -323,25 +342,14 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 log 命令
     if (std.mem.eql(u8, cmd, "log")) {
-        var lines: ?usize = null;
-        var follow = true; // 默认持续刷新
-        var follow_explicit = false;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "-n")) {
-                if (i + 1 < args.len) {
-                    lines = std.fmt.parseInt(usize, args[i + 1], 10) catch 50;
-                    i += 1;
-                }
-            } else if (std.mem.eql(u8, args[i], "-f")) {
-                follow = true;
-                follow_explicit = true;
-            } else if (std.mem.eql(u8, args[i], "--no-follow")) {
-                follow = false;
-            }
-        }
+        const log_args = parseLogCommandArgs(args, 2) catch |err| {
+            printLogCommandArgError(json_output, err);
+            std.process.exit(cli_output.exit_usage);
+        };
+        var lines = log_args.lines;
+        var follow = log_args.follow;
         // --json 默认输出一次后退出（JSON Lines），除非显式 -f。
-        if (json_output and !follow_explicit) {
+        if (json_output and !log_args.follow_explicit) {
             follow = false;
         }
         // 如果没有指定 -n，默认显示 50 行
@@ -375,88 +383,48 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // 处理 test 命令
+    // 处理 test 命令（Batch 5：与 proxy/profile test 同一探测路径，决策 D3）
     if (std.mem.eql(u8, cmd, "test")) {
-        const config_path = parseConfigPathArg(args, 2);
-
-        var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "test") catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            return err;
-        };
-        defer cfg.deinit();
-        const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
-        defer if (config_key) |key| allocator.free(key);
-
-        if (json_output) {
-            try test_cli.testProxyJson(allocator, &cfg, null, config_key);
-        } else {
-            try test_cli.testProxy(allocator, &cfg, null, config_key);
-        }
+        try runStandaloneTestCommand(allocator, args, json_output, &override_opts);
         return;
     }
 
-    // 处理 doctor 命令
+    // 处理 doctor 命令（Batch 5：CHECKS_FAILED 语义 + 两种模式同行为）
     if (std.mem.eql(u8, cmd, "doctor")) {
-        const config_path = parseConfigPathArg(args, 2);
-        var cfg_check = loadRuntimeConfig(allocator, config_path, null, &override_opts, "doctor", false) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            if (json_output) {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
-            }
-            return err;
+        // 决策 D11：只接受 `-c <config>`（外加全局/override flags）。
+        const parsed = parseProxyFamilyArgs(args, 2, .{}) catch |err| {
+            printDoctorArgError(json_output, err, "doctor");
+            std.process.exit(cli_output.exit_usage);
         };
-        defer cfg_check.deinit();
-
-        if (json_output) {
-            doctor_cli.runDoctorJsonWithConfig(allocator, &cfg_check, config_path) catch |err| {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc doctor --json`");
-                return err;
-            };
-        } else {
-            try doctor_cli.runDoctorWithConfig(allocator, &cfg_check, config_path);
-        }
+        try runDoctorCommand(allocator, parsed.config_path, json_output, &override_opts, "doctor");
         return;
     }
 
-    // 处理 diag 子命令（doctor 别名）
+    // 处理 diag 子命令组（doctor 别名）。区分缺子命令（DIAG_SUBCOMMAND_MISSING，
+    // 新）与未知子命令（DIAG_SUBCOMMAND_UNKNOWN，冻结），均 exit_usage；
+    // 裸 `zc diag` 与其他组对齐：组帮助 stdout、exit 0。
     if (std.mem.eql(u8, cmd, "diag")) {
-        if (args.len < 3) {
-            if (json_output) {
-                printCliError(json_output, "DIAG_SUBCOMMAND_UNKNOWN", "unknown diag subcommand", "use `zc diag --help` or `zc diag doctor [-c <config>] [--json]`");
-            } else {
-                try printDiagHelp();
-            }
-            return;
-        }
-        if (args.len >= 3 and isHelpArg(args[2])) {
-            try printDiagHelp();
-            return;
-        }
-        if (!std.mem.eql(u8, args[2], "doctor")) {
-            printCliError(json_output, "DIAG_SUBCOMMAND_UNKNOWN", "unknown diag subcommand", "use `zc diag doctor [-c <config>] [--json]`");
-            return;
-        }
-        if (containsHelpArg(args, 3)) {
-            try printDiagDoctorHelp();
-            return;
-        }
-        const config_path = parseConfigPathArg(args, 3);
-        var cfg_check = loadRuntimeConfig(allocator, config_path, null, &override_opts, "diag.doctor", false) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            if (json_output) {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
-            }
-            return err;
-        };
-        defer cfg_check.deinit();
-
-        if (json_output) {
-            doctor_cli.runDoctorJsonWithConfig(allocator, &cfg_check, config_path) catch |err| {
-                printCliError(true, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config and retry `zc diag doctor --json`");
-                return err;
-            };
-        } else {
-            try doctor_cli.runDoctorWithConfig(allocator, &cfg_check, config_path);
+        switch (resolveDiagSubcommand(args)) {
+            .bare, .help => try printDiagHelp(),
+            .missing => {
+                printCliError(json_output, "DIAG_SUBCOMMAND_MISSING", "missing diag subcommand", "use `zc diag doctor [-c <config>] [--json]`");
+                std.process.exit(cli_output.exit_usage);
+            },
+            .unknown => {
+                printCliError(json_output, "DIAG_SUBCOMMAND_UNKNOWN", "unknown diag subcommand", "use `zc diag doctor [-c <config>] [--json]`");
+                std.process.exit(cli_output.exit_usage);
+            },
+            .doctor => |idx| {
+                if (containsHelpArg(args, idx + 1)) {
+                    try printDiagDoctorHelp();
+                    return;
+                }
+                const parsed = parseProxyFamilyArgs(args, idx + 1, .{}) catch |err| {
+                    printDoctorArgError(json_output, err, "diag doctor");
+                    std.process.exit(cli_output.exit_usage);
+                };
+                try runDoctorCommand(allocator, parsed.config_path, json_output, &override_opts, "diag.doctor");
+            },
         }
         return;
     }
@@ -621,7 +589,11 @@ const StdStreams = struct {
 
 fn setCliCommand(canonical_top: []const u8, args: []const []const u8) void {
     for (&cli_commands.groups) |*group| {
-        if (std.mem.eql(u8, group.name, canonical_top) and args.len >= 3) {
+        // flag（`-...`）不是子命令：`zc diag -c x` 的 command 是 "diag"，
+        // 不能拼成 "diag -c"。
+        if (std.mem.eql(u8, group.name, canonical_top) and args.len >= 3 and
+            args[2].len > 0 and args[2][0] != '-')
+        {
             const joined = std.fmt.bufPrint(&g_cmd_buf, "{s} {s}", .{ canonical_top, args[2] }) catch {
                 g_cli_command = canonical_top;
                 return;
@@ -778,6 +750,47 @@ fn hasUnexpectedArgs(args: []const []const u8, start_index: usize) bool {
         if (!isGlobalCliFlag(args[i])) return true;
     }
     return false;
+}
+
+const LogCommandArgs = struct {
+    lines: ?usize = null,
+    /// 文本模式默认持续刷新。
+    follow: bool = true,
+    follow_explicit: bool = false,
+};
+
+/// `zc log [-n <lines>] [-f|--no-follow]`。
+/// 决策 D11：未知 flag / 多余位置参数 / 缺值或非整数 `-n` -> 用法错误
+/// （终结 `-n abc` 静默回退 50 行的行为）。
+fn parseLogCommandArgs(args: []const []const u8, start_index: usize) !LogCommandArgs {
+    var parsed = LogCommandArgs{};
+    var i = start_index;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isGlobalCliFlag(arg)) continue;
+        if (std.mem.eql(u8, arg, "-n")) {
+            if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingLinesValue;
+            parsed.lines = std.fmt.parseInt(usize, args[i + 1], 10) catch return error.InvalidLinesValue;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "-f")) {
+            parsed.follow = true;
+            parsed.follow_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--no-follow")) {
+            parsed.follow = false;
+        } else {
+            return error.UnexpectedArgument;
+        }
+    }
+    return parsed;
+}
+
+fn printLogCommandArgError(json_output: bool, err: anyerror) void {
+    const message = switch (err) {
+        error.MissingLinesValue => "missing value for `-n`",
+        error.InvalidLinesValue => "invalid `-n` value (use a non-negative integer)",
+        else => "unknown or unexpected argument for `log`",
+    };
+    printCliError(json_output, "LOG_ARGUMENT_INVALID", message, "use `zc log [-n <lines>] [-f|--no-follow] [--json]`");
 }
 
 /// `zc config download <url> [-n <name>] [-d]`：url 必须是第一个位置参数。
@@ -1271,7 +1284,7 @@ fn proxyFamilyText(comptime family: []const u8, comptime code_prefix: []const u8
         .test_arg_msg = "unknown or unexpected argument for `" ++ family ++ " test`",
         .list_usage_hint = "use `zc " ++ family ++ " list [-c <config>] [--json]`",
         .select_usage_hint = "use `zc " ++ family ++ " select [-g <group>] [-p <proxy>] [-c <config>] [--json]`",
-        .test_usage_hint = "use `zc " ++ family ++ " test [-c <config>] [--json]`",
+        .test_usage_hint = "use `zc " ++ family ++ " test [-c <config>] [--port <port>] [--json]`",
         // 冻结错误码（integration tests / docs/api/error-codes.md 断言）。
         .sub_unknown_code = code_prefix ++ "_SUBCOMMAND_UNKNOWN",
         .sub_unknown_msg = "unknown " ++ family ++ " subcommand",
@@ -1292,12 +1305,21 @@ const ProxyFamilyArgs = struct {
     group: ?[]const u8 = null,
     proxy: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    /// test 系命令：`--port <n>` 覆盖本次探测的端口（与 `zc start --port`
+    /// 对称；也让沙箱环境能用本地 listener 验证探测/退出码行为）。
+    port: ?u16 = null,
 };
 
-/// list/test 只接受 `-c`；select 额外接受 `-g`/`-p`。override flags 由
-/// override.parseCliOptions 全局解析（含缺值校验），这里跳过 flag 及其值。
+const ProxyFamilyParseOptions = struct {
+    allow_select_flags: bool = false,
+    allow_port: bool = false,
+};
+
+/// list 只接受 `-c`；select 额外接受 `-g`/`-p`；test 额外接受 `--port`。
+/// override flags 由 override.parseCliOptions 全局解析（含缺值校验），
+/// 这里跳过 flag 及其值。
 /// 决策 D11：其余未知 flag / 缺值 flag / 多余位置参数 -> 用法错误。
-fn parseProxyFamilyArgs(args: []const []const u8, start_index: usize, allow_select_flags: bool) !ProxyFamilyArgs {
+fn parseProxyFamilyArgs(args: []const []const u8, start_index: usize, opts: ProxyFamilyParseOptions) !ProxyFamilyArgs {
     var parsed = ProxyFamilyArgs{};
     var i = start_index;
     while (i < args.len) : (i += 1) {
@@ -1308,14 +1330,20 @@ fn parseProxyFamilyArgs(args: []const []const u8, start_index: usize, allow_sele
             if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingConfigPathValue;
             parsed.config_path = args[i + 1];
             i += 1;
-        } else if (allow_select_flags and std.mem.eql(u8, arg, "-g")) {
+        } else if (opts.allow_select_flags and std.mem.eql(u8, arg, "-g")) {
             if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingGroupValue;
             parsed.group = args[i + 1];
             i += 1;
-        } else if (allow_select_flags and std.mem.eql(u8, arg, "-p")) {
+        } else if (opts.allow_select_flags and std.mem.eql(u8, arg, "-p")) {
             if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingProxyValue;
             parsed.proxy = args[i + 1];
             i += 1;
+        } else if (opts.allow_port and std.mem.eql(u8, arg, "--port")) {
+            if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingPortValue;
+            parsed.port = try parseStartPortValue(args[i + 1]);
+            i += 1;
+        } else if (opts.allow_port and std.mem.startsWith(u8, arg, "--port=")) {
+            parsed.port = try parseStartPortValue(arg["--port=".len..]);
         } else if (std.mem.eql(u8, arg, "--override-script") or
             std.mem.eql(u8, arg, "--override-timeout-ms") or
             std.mem.eql(u8, arg, "--override-arg"))
@@ -1338,6 +1366,8 @@ fn proxyArgsErrorMessage(err: anyerror, unexpected_msg: []const u8) []const u8 {
         error.MissingConfigPathValue => "missing value for `-c`",
         error.MissingGroupValue => "missing value for `-g`",
         error.MissingProxyValue => "missing value for `-p`",
+        error.MissingPortValue => "missing value for `--port`",
+        error.InvalidStartPort => "invalid `--port` value (use an integer between 1 and 65535)",
         else => unexpected_msg,
     };
 }
@@ -1362,12 +1392,13 @@ fn exitProxySelectError(json_output: bool, err: anyerror, text: *const ProxyFami
 fn loadProxyFamilyConfig(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
+    mixed_port_override: ?u16,
     json_output: bool,
     override_opts: *const override.CliOptions,
     command_name: []const u8,
     load_msg: []const u8,
 ) config.Config {
-    return loadAndValidateConfig(allocator, config_path, null, !json_output, override_opts, command_name) catch |err| {
+    return loadAndValidateConfig(allocator, config_path, mixed_port_override, !json_output, override_opts, command_name) catch |err| {
         if (!printOverrideRuntimeError(json_output, err)) {
             printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", load_msg, proxy_config_load_hint);
         }
@@ -1399,12 +1430,12 @@ fn runProxyFamilyCommand(
             _ = try printTopicHelpStdout(&.{ text.family, "list" });
             return;
         }
-        const parsed = parseProxyFamilyArgs(args, 3, false) catch |err| {
+        const parsed = parseProxyFamilyArgs(args, 3, .{}) catch |err| {
             printCliError(json_output, text.list_arg_code, proxyArgsErrorMessage(err, text.list_arg_msg), text.list_usage_hint);
             std.process.exit(cli_output.exit_usage);
         };
 
-        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, json_output, override_opts, text.list_cmd_name, text.load_list_msg);
+        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, null, json_output, override_opts, text.list_cmd_name, text.load_list_msg);
         defer cfg.deinit();
 
         // 当前选择用于文本标记 / JSON 的 `now` 字段；拿不到不阻塞 list。
@@ -1430,12 +1461,12 @@ fn runProxyFamilyCommand(
             _ = try printTopicHelpStdout(&.{ text.family, "select" });
             return;
         }
-        const parsed = parseProxyFamilyArgs(args, 3, true) catch |err| {
+        const parsed = parseProxyFamilyArgs(args, 3, .{ .allow_select_flags = true }) catch |err| {
             printCliError(json_output, text.select_arg_code, proxyArgsErrorMessage(err, text.select_arg_msg), text.select_usage_hint);
             std.process.exit(cli_output.exit_usage);
         };
 
-        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, json_output, override_opts, text.select_cmd_name, text.load_select_msg);
+        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, null, json_output, override_opts, text.select_cmd_name, text.load_select_msg);
         defer cfg.deinit();
 
         var streams = StdStreams{};
@@ -1481,29 +1512,143 @@ fn runProxyFamilyCommand(
             _ = try printTopicHelpStdout(&.{ text.family, "test" });
             return;
         }
-        const parsed = parseProxyFamilyArgs(args, 3, false) catch |err| {
+        const parsed = parseProxyFamilyArgs(args, 3, .{ .allow_port = true }) catch |err| {
             printCliError(json_output, text.test_arg_code, proxyArgsErrorMessage(err, text.test_arg_msg), text.test_usage_hint);
             std.process.exit(cli_output.exit_usage);
         };
 
-        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, json_output, override_opts, text.test_cmd_name, text.load_test_msg);
+        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, parsed.port, json_output, override_opts, text.test_cmd_name, text.load_test_msg);
         defer cfg.deinit();
         const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
         defer if (config_key) |key| allocator.free(key);
 
-        // 真实探测语义不变（CHECKS_FAILED 语义属下一批次）；失败时文本模式
-        // 已输出逐项诊断，这里只保证非零退出且不再抛 Zig stack trace。
-        if (json_output) {
-            test_cli.testProxyJson(allocator, &cfg, null, config_key) catch std.process.exit(cli_output.exit_failure);
-        } else {
-            test_cli.testProxy(allocator, &cfg, null, config_key) catch std.process.exit(cli_output.exit_failure);
-        }
+        // 决策 D3：两种模式跑相同探测；检查失败 -> CHECKS_FAILED + exit 1。
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        runConnectivityTestOrExit(allocator, &cfg, config_key, &out, json_output);
         return;
     }
 
     // 未知子命令：两种模式同语义（envelope/error block）+ exit_usage。
     printCliError(json_output, text.sub_unknown_code, text.sub_unknown_msg, text.sub_unknown_hint);
     std.process.exit(cli_output.exit_usage);
+}
+
+// ---------------------------------------------------------------------------
+// test / doctor / diag（Batch 5）
+// ---------------------------------------------------------------------------
+
+/// `zc test`：与 proxy/profile test 完全同一条探测路径（决策 D3）。
+/// 配置加载失败在两种模式都输出 envelope/错误块（修复 JSON 模式静默 exit 1）。
+fn runStandaloneTestCommand(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    json_output: bool,
+    override_opts: *const override.CliOptions,
+) !void {
+    const parsed = parseProxyFamilyArgs(args, 2, .{ .allow_port = true }) catch |err| {
+        printCliError(
+            json_output,
+            "TEST_ARGUMENT_INVALID",
+            proxyArgsErrorMessage(err, "unknown or unexpected argument for `test`"),
+            "use `zc test [-c <config>] [--port <port>] [--json]`",
+        );
+        std.process.exit(cli_output.exit_usage);
+    };
+
+    var cfg = loadAndValidateConfig(allocator, parsed.config_path, parsed.port, !json_output, override_opts, "test") catch |err| {
+        if (!printOverrideRuntimeError(json_output, err)) {
+            printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for test", proxy_config_load_hint);
+        }
+        std.process.exit(cli_output.exit_failure);
+    };
+    defer cfg.deinit();
+    const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
+    defer if (config_key) |key| allocator.free(key);
+
+    var streams = StdStreams{};
+    var out = streams.output(json_output);
+    runConnectivityTestOrExit(allocator, &cfg, config_key, &out, json_output);
+}
+
+/// test 系命令共用出口：检查失败 -> exit 1（envelope/错误块已由
+/// runConnectivityTest 输出）；内部错误 -> 单独 envelope + exit 1。
+fn runConnectivityTestOrExit(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    config_key: ?[]const u8,
+    out: *cli_output.Output,
+    json_output: bool,
+) void {
+    const passed = test_cli.runConnectivityTest(allocator, cfg, config_key, out) catch {
+        printCliError(json_output, "PROXY_TEST_FAILED", "failed to run connectivity test", "retry; `zc status` and `zc log --no-follow` show daemon state");
+        std.process.exit(cli_output.exit_failure);
+    };
+    if (!passed) std.process.exit(cli_output.exit_failure);
+}
+
+/// doctor / diag doctor 共用参数用法错误（决策 D11）：与 DIAG_DOCTOR_FAILED
+/// 一致，两条路径共用同一错误码；调用方以 exit_usage 退出。
+fn printDoctorArgError(json_output: bool, err: anyerror, command_label: []const u8) void {
+    var msg_buf: [96]u8 = undefined;
+    const fallback = std.fmt.bufPrint(&msg_buf, "unknown or unexpected argument for `{s}`", .{command_label}) catch "unknown or unexpected argument";
+    const hint = if (std.mem.eql(u8, command_label, "diag doctor"))
+        "use `zc diag doctor [-c <config>] [--json]`"
+    else
+        "use `zc doctor [-c <config>] [--json]`";
+    printCliError(json_output, "DIAG_DOCTOR_ARGUMENT_INVALID", proxyArgsErrorMessage(err, fallback), hint);
+}
+
+/// doctor / diag doctor 共用：配置加载失败在两种模式都输出 envelope/错误块
+/// （修复 text 模式被 json-only guard 吞错后裸抛 Zig trace 的问题），检查
+/// 失败 -> CHECKS_FAILED + exit 1（决策 D3）。
+fn runDoctorCommand(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    json_output: bool,
+    override_opts: *const override.CliOptions,
+    command_name: []const u8,
+) !void {
+    var cfg_check = loadRuntimeConfig(allocator, config_path, null, override_opts, command_name, false) catch |err| {
+        if (!printOverrideRuntimeError(json_output, err)) {
+            printCliError(json_output, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config path/permissions and retry `zc doctor`");
+        }
+        std.process.exit(cli_output.exit_failure);
+    };
+    defer cfg_check.deinit();
+
+    var streams = StdStreams{};
+    var out = streams.output(json_output);
+    const healthy = doctor_cli.runDoctorWithConfig(allocator, &cfg_check, config_path, &out) catch {
+        printCliError(json_output, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config path/permissions and retry `zc doctor`");
+        std.process.exit(cli_output.exit_failure);
+    };
+    if (!healthy) std.process.exit(cli_output.exit_failure);
+}
+
+const DiagResolution = union(enum) {
+    /// 裸 `zc diag`（或只带全局 flag）：组帮助，exit 0。
+    bare,
+    help,
+    /// 只有 flag、没有子命令词（如 `zc diag -c x`）：DIAG_SUBCOMMAND_MISSING。
+    missing,
+    /// `zc diag doctor ...`：值为 "doctor" 在 args 中的索引。
+    doctor: usize,
+    /// 位置词不是已知子命令：DIAG_SUBCOMMAND_UNKNOWN（冻结错误码）。
+    unknown: usize,
+};
+
+fn resolveDiagSubcommand(args: []const []const u8) DiagResolution {
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isGlobalCliFlag(arg)) continue;
+        if (isHelpArg(arg)) return .help;
+        if (arg.len > 0 and arg[0] == '-') return .missing;
+        if (std.mem.eql(u8, arg, "doctor")) return .{ .doctor = i };
+        return .{ .unknown = i };
+    }
+    return .bare;
 }
 
 fn validateOverrideAndPrepareRuleProviders(allocator: std.mem.Allocator, script_path: []const u8) !void {
@@ -1528,16 +1673,6 @@ fn hasFlag(args: []const []const u8, flag: []const u8) bool {
         if (std.mem.eql(u8, arg, flag)) return true;
     }
     return false;
-}
-
-fn parseConfigPathArg(args: []const []const u8, start_index: usize) ?[]const u8 {
-    var i: usize = start_index;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "-c") and i + 1 < args.len) {
-            return args[i + 1];
-        }
-    }
-    return null;
 }
 
 fn parseConfigOverrideAction(args: []const []const u8, start_index: usize) !ConfigOverrideAction {
@@ -1640,30 +1775,60 @@ fn parseStartPortValue(text: []const u8) !u16 {
     return port;
 }
 
-fn parseStartCommandOptions(args: []const []const u8, start_index: usize) !StartCommandOptions {
+const StartParseMode = enum {
+    /// 用户命令（start/restart）。决策 D11：未知 flag / 多余位置参数 ->
+    /// error.UnexpectedArgument，绝不静默忽略后照常执行。
+    strict,
+    /// 内部 `--daemon-run`：argv 由 zc 自己拼装转发（daemon.startDaemon），
+    /// 保持宽松以兼容转发参数的前向演进。
+    forwarded,
+};
+
+fn parseStartCommandOptions(args: []const []const u8, start_index: usize, mode: StartParseMode) !StartCommandOptions {
     var opts = StartCommandOptions{};
     var i = start_index;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "-c")) {
-            if (i + 1 >= args.len) return error.MissingConfigPath;
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-c")) {
+            // 紧跟全局 flag 视为缺值（`-c --json` 不能把 flag 吃成路径）。
+            if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingConfigPath;
             opts.config_path = args[i + 1];
             i += 1;
             continue;
         }
-        if (std.mem.eql(u8, args[i], "--port")) {
-            if (i + 1 >= args.len) return error.MissingPortValue;
+        if (std.mem.eql(u8, arg, "--port")) {
+            if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingPortValue;
             opts.port = try parseStartPortValue(args[i + 1]);
             i += 1;
             continue;
         }
-        if (std.mem.startsWith(u8, args[i], "--port=")) {
-            opts.port = try parseStartPortValue(args[i]["--port=".len..]);
+        if (std.mem.startsWith(u8, arg, "--port=")) {
+            opts.port = try parseStartPortValue(arg["--port=".len..]);
             continue;
         }
-        if (std.mem.eql(u8, args[i], "--foreground")) {
+        if (std.mem.eql(u8, arg, "--foreground")) {
             opts.foreground = true;
             continue;
         }
+        if (mode == .forwarded) continue;
+        if (isGlobalCliFlag(arg)) continue;
+        if (std.mem.eql(u8, arg, "--override-script") or
+            std.mem.eql(u8, arg, "--override-timeout-ms") or
+            std.mem.eql(u8, arg, "--override-arg"))
+        {
+            // 值的存在性/合法性由 override.parseCliOptions 负责（缺值在
+            // dispatch 前就已报错），这里跳过 flag 及其值。
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--override-script=") or
+            std.mem.startsWith(u8, arg, "--override-timeout-ms=") or
+            std.mem.startsWith(u8, arg, "--override-arg="))
+        {
+            // `=` 形式自带值，整体跳过。
+            continue;
+        }
+        return error.UnexpectedArgument;
     }
 
     return opts;
@@ -1679,12 +1844,22 @@ fn appendStartForwardArgs(
     }
 }
 
-fn printStartCommandOptionError(json_output: bool, err: anyerror) void {
+/// start/restart 共用同一参数解析器，因此 restart 也发射冻结的 START_* 码
+/// （error-codes.md 有注记）；message/hint 按命令路径渲染。
+/// 这些都是用法错误：调用方以 exit_usage 退出（spec.md 退出码表）。
+fn printStartCommandOptionError(json_output: bool, err: anyerror, command: RuntimeCommand) void {
+    const restart = command == .restart;
     switch (err) {
-        error.MissingConfigPath => printCliError(json_output, "START_CONFIG_PATH_REQUIRED", "missing value for `-c`", "use `zc start -c <config>`"),
-        error.MissingPortValue => printCliError(json_output, "START_PORT_REQUIRED", "missing value for `--port`", "use `zc start --port <1-65535>`"),
+        error.MissingConfigPath => printCliError(json_output, "START_CONFIG_PATH_REQUIRED", "missing value for `-c`", if (restart) "use `zc restart -c <config>`" else "use `zc start -c <config>`"),
+        error.MissingPortValue => printCliError(json_output, "START_PORT_REQUIRED", "missing value for `--port`", if (restart) "use `zc restart --port <1-65535>`" else "use `zc start --port <1-65535>`"),
         error.InvalidStartPort => printCliError(json_output, "START_PORT_INVALID", "invalid `--port` value", "use an integer between 1 and 65535"),
-        else => printCliError(json_output, "START_ARGS_INVALID", "invalid start arguments", "check `zc help`"),
+        error.UnexpectedArgument => printCliError(
+            json_output,
+            "START_ARGS_INVALID",
+            if (restart) "unknown or unexpected argument for `restart`" else "unknown or unexpected argument for `start`",
+            if (restart) "use `zc restart [-c <config>] [--port <port>] [--json]`" else "use `zc start [-c <config>] [--port <port>] [--foreground] [--json]`",
+        ),
+        else => printCliError(json_output, "START_ARGS_INVALID", if (restart) "invalid restart arguments" else "invalid start arguments", "check `zc help`"),
     }
 }
 
@@ -2191,14 +2366,53 @@ test "containsHelpArg scans after subcommand" {
     try testing.expect(!containsHelpArg(args2[0..], 3));
 }
 
-test "parseConfigPathArg handles -c" {
+test "parseStartCommandOptions strict mode rejects unknown args, skips global/override flags" {
     const testing = std.testing;
 
-    const args = [_][]const u8{ "zc", "test", "-c", "./x.yaml" };
-    try testing.expectEqualStrings("./x.yaml", parseConfigPathArg(args[0..], 2).?);
+    const ok_args = [_][]const u8{ "zc", "start", "-c", "./x.yaml", "--port", "7899", "--json", "--override-script", "o.lua", "--override-arg=k=v" };
+    const parsed = try parseStartCommandOptions(ok_args[0..], 2, .strict);
+    try testing.expectEqualStrings("./x.yaml", parsed.config_path.?);
+    try testing.expectEqual(@as(?u16, 7899), parsed.port);
 
-    const args2 = [_][]const u8{ "zc", "test" };
-    try testing.expect(parseConfigPathArg(args2[0..], 2) == null);
+    const bogus = [_][]const u8{ "zc", "start", "--bogus" };
+    try testing.expectError(error.UnexpectedArgument, parseStartCommandOptions(bogus[0..], 2, .strict));
+
+    const stray = [_][]const u8{ "zc", "restart", "extra" };
+    try testing.expectError(error.UnexpectedArgument, parseStartCommandOptions(stray[0..], 2, .strict));
+
+    // `-c --json` 不能把全局 flag 吃成路径。
+    const missing_c = [_][]const u8{ "zc", "start", "-c", "--json" };
+    try testing.expectError(error.MissingConfigPath, parseStartCommandOptions(missing_c[0..], 2, .strict));
+
+    const missing_port = [_][]const u8{ "zc", "restart", "--port" };
+    try testing.expectError(error.MissingPortValue, parseStartCommandOptions(missing_port[0..], 2, .strict));
+
+    // 内部 --daemon-run 转发模式保持宽松。
+    const forwarded = [_][]const u8{ "zc", "--daemon-run", "-c", "./x.yaml", "--port=7899", "--future-flag" };
+    const lenient = try parseStartCommandOptions(forwarded[0..], 2, .forwarded);
+    try testing.expectEqual(@as(?u16, 7899), lenient.port);
+}
+
+test "parseLogCommandArgs validates -n and rejects unknown args" {
+    const testing = std.testing;
+
+    const ok_args = [_][]const u8{ "zc", "log", "-n", "20", "--no-follow", "--json" };
+    const parsed = try parseLogCommandArgs(ok_args[0..], 2);
+    try testing.expectEqual(@as(?usize, 20), parsed.lines);
+    try testing.expect(!parsed.follow);
+
+    const follow_args = [_][]const u8{ "zc", "log", "-f" };
+    const followed = try parseLogCommandArgs(follow_args[0..], 2);
+    try testing.expect(followed.follow and followed.follow_explicit);
+
+    const missing_n = [_][]const u8{ "zc", "log", "-n" };
+    try testing.expectError(error.MissingLinesValue, parseLogCommandArgs(missing_n[0..], 2));
+
+    const bad_n = [_][]const u8{ "zc", "log", "-n", "abc" };
+    try testing.expectError(error.InvalidLinesValue, parseLogCommandArgs(bad_n[0..], 2));
+
+    const bogus = [_][]const u8{ "zc", "log", "--bogus" };
+    try testing.expectError(error.UnexpectedArgument, parseLogCommandArgs(bogus[0..], 2));
 }
 
 test "parseConfigOverrideAction supports show set clear" {
@@ -2245,38 +2459,86 @@ test "parseProxyFamilyArgs parses -c and select flags, rejects strays (D11)" {
     const testing = std.testing;
 
     const list_args = [_][]const u8{ "zc", "proxy", "list", "-c", "./x.yaml", "--json" };
-    const parsed = try parseProxyFamilyArgs(list_args[0..], 3, false);
+    const parsed = try parseProxyFamilyArgs(list_args[0..], 3, .{});
     try testing.expectEqualStrings("./x.yaml", parsed.config_path.?);
     try testing.expect(parsed.group == null);
 
     const select_args = [_][]const u8{ "zc", "proxy", "select", "-g", "Proxy", "-p", "HK", "--no-color" };
-    const parsed2 = try parseProxyFamilyArgs(select_args[0..], 3, true);
+    const parsed2 = try parseProxyFamilyArgs(select_args[0..], 3, .{ .allow_select_flags = true });
     try testing.expectEqualStrings("Proxy", parsed2.group.?);
     try testing.expectEqualStrings("HK", parsed2.proxy.?);
 
     // list/test 不接受 -g/-p
-    try testing.expectError(error.UnexpectedArgument, parseProxyFamilyArgs(select_args[0..], 3, false));
+    try testing.expectError(error.UnexpectedArgument, parseProxyFamilyArgs(select_args[0..], 3, .{}));
 
     const missing_c = [_][]const u8{ "zc", "proxy", "list", "-c" };
-    try testing.expectError(error.MissingConfigPathValue, parseProxyFamilyArgs(missing_c[0..], 3, false));
+    try testing.expectError(error.MissingConfigPathValue, parseProxyFamilyArgs(missing_c[0..], 3, .{}));
 
     const missing_g = [_][]const u8{ "zc", "proxy", "select", "-g" };
-    try testing.expectError(error.MissingGroupValue, parseProxyFamilyArgs(missing_g[0..], 3, true));
+    try testing.expectError(error.MissingGroupValue, parseProxyFamilyArgs(missing_g[0..], 3, .{ .allow_select_flags = true }));
 
     // `-g --json` 不能把全局 flag 吃成组名
     const flag_as_value = [_][]const u8{ "zc", "proxy", "select", "-g", "--json" };
-    try testing.expectError(error.MissingGroupValue, parseProxyFamilyArgs(flag_as_value[0..], 3, true));
+    try testing.expectError(error.MissingGroupValue, parseProxyFamilyArgs(flag_as_value[0..], 3, .{ .allow_select_flags = true }));
 
     const missing_p = [_][]const u8{ "zc", "proxy", "select", "-p" };
-    try testing.expectError(error.MissingProxyValue, parseProxyFamilyArgs(missing_p[0..], 3, true));
+    try testing.expectError(error.MissingProxyValue, parseProxyFamilyArgs(missing_p[0..], 3, .{ .allow_select_flags = true }));
 
     const stray = [_][]const u8{ "zc", "proxy", "list", "extra" };
-    try testing.expectError(error.UnexpectedArgument, parseProxyFamilyArgs(stray[0..], 3, false));
+    try testing.expectError(error.UnexpectedArgument, parseProxyFamilyArgs(stray[0..], 3, .{}));
 
     // override flags 由全局解析负责，这里跳过（含值）
     const with_override = [_][]const u8{ "zc", "proxy", "test", "--override-script", "./s.lua", "--override-arg=k=v" };
-    const parsed3 = try parseProxyFamilyArgs(with_override[0..], 3, false);
+    const parsed3 = try parseProxyFamilyArgs(with_override[0..], 3, .{ .allow_port = true });
     try testing.expect(parsed3.config_path == null);
+    try testing.expect(parsed3.port == null);
+}
+
+test "parseProxyFamilyArgs --port only for test commands, validated (Batch 5)" {
+    const testing = std.testing;
+
+    const with_port = [_][]const u8{ "zc", "test", "--port", "29123", "--json" };
+    const parsed = try parseProxyFamilyArgs(with_port[0..], 2, .{ .allow_port = true });
+    try testing.expectEqual(@as(?u16, 29123), parsed.port);
+
+    const eq_form = [_][]const u8{ "zc", "proxy", "test", "--port=29124" };
+    const parsed2 = try parseProxyFamilyArgs(eq_form[0..], 3, .{ .allow_port = true });
+    try testing.expectEqual(@as(?u16, 29124), parsed2.port);
+
+    const missing_value = [_][]const u8{ "zc", "test", "--port" };
+    try testing.expectError(error.MissingPortValue, parseProxyFamilyArgs(missing_value[0..], 2, .{ .allow_port = true }));
+
+    const invalid_value = [_][]const u8{ "zc", "test", "--port", "abc" };
+    try testing.expectError(error.InvalidStartPort, parseProxyFamilyArgs(invalid_value[0..], 2, .{ .allow_port = true }));
+
+    // list/select 不接受 --port
+    const on_list = [_][]const u8{ "zc", "proxy", "list", "--port", "29123" };
+    try testing.expectError(error.UnexpectedArgument, parseProxyFamilyArgs(on_list[0..], 3, .{}));
+}
+
+test "resolveDiagSubcommand distinguishes bare/help/missing/doctor/unknown" {
+    const testing = std.testing;
+
+    const bare = [_][]const u8{ "zc", "diag" };
+    try testing.expect(resolveDiagSubcommand(bare[0..]) == .bare);
+
+    // 只带全局 flag 等同裸命令（与 proxy/config 组对齐）
+    const bare_json = [_][]const u8{ "zc", "diag", "--json" };
+    try testing.expect(resolveDiagSubcommand(bare_json[0..]) == .bare);
+
+    const help = [_][]const u8{ "zc", "diag", "--help" };
+    try testing.expect(resolveDiagSubcommand(help[0..]) == .help);
+
+    const missing = [_][]const u8{ "zc", "diag", "-c", "x.yaml" };
+    try testing.expect(resolveDiagSubcommand(missing[0..]) == .missing);
+
+    const doctor = [_][]const u8{ "zc", "diag", "--json", "doctor", "-c", "x.yaml" };
+    const res = resolveDiagSubcommand(doctor[0..]);
+    try testing.expect(res == .doctor);
+    try testing.expectEqual(@as(usize, 3), res.doctor);
+
+    const unknown = [_][]const u8{ "zc", "diag", "nope" };
+    try testing.expect(resolveDiagSubcommand(unknown[0..]) == .unknown);
 }
 
 test "proxyFamilyText renders per-path wording without proxy leakage (D10)" {
@@ -2465,12 +2727,12 @@ test "parseStartCommandOptions supports config path and explicit port" {
     const testing = std.testing;
 
     const args = [_][]const u8{ "zc", "start", "-c", "./x.yaml", "--port", "7901", "--json" };
-    const opts = try parseStartCommandOptions(args[0..], 2);
+    const opts = try parseStartCommandOptions(args[0..], 2, .strict);
     try testing.expectEqualStrings("./x.yaml", opts.config_path.?);
     try testing.expectEqual(@as(?u16, 7901), opts.port);
 
     const args2 = [_][]const u8{ "zc", "start", "--port=7902" };
-    const opts2 = try parseStartCommandOptions(args2[0..], 2);
+    const opts2 = try parseStartCommandOptions(args2[0..], 2, .strict);
     try testing.expect(opts2.config_path == null);
     try testing.expectEqual(@as(?u16, 7902), opts2.port);
 }
@@ -2479,12 +2741,12 @@ test "parseStartCommandOptions supports --foreground (D1)" {
     const testing = std.testing;
 
     const args = [_][]const u8{ "zc", "start", "--foreground", "-c", "./x.yaml" };
-    const opts = try parseStartCommandOptions(args[0..], 2);
+    const opts = try parseStartCommandOptions(args[0..], 2, .strict);
     try testing.expect(opts.foreground);
     try testing.expectEqualStrings("./x.yaml", opts.config_path.?);
 
     const args2 = [_][]const u8{ "zc", "start" };
-    const opts2 = try parseStartCommandOptions(args2[0..], 2);
+    const opts2 = try parseStartCommandOptions(args2[0..], 2, .strict);
     try testing.expect(!opts2.foreground);
 }
 
@@ -2492,13 +2754,13 @@ test "parseStartCommandOptions rejects missing or invalid port values" {
     const testing = std.testing;
 
     const missing_port = [_][]const u8{ "zc", "start", "--port" };
-    try testing.expectError(error.MissingPortValue, parseStartCommandOptions(missing_port[0..], 2));
+    try testing.expectError(error.MissingPortValue, parseStartCommandOptions(missing_port[0..], 2, .strict));
 
     const invalid_port = [_][]const u8{ "zc", "start", "--port", "abc" };
-    try testing.expectError(error.InvalidStartPort, parseStartCommandOptions(invalid_port[0..], 2));
+    try testing.expectError(error.InvalidStartPort, parseStartCommandOptions(invalid_port[0..], 2, .strict));
 
     const zero_port = [_][]const u8{ "zc", "start", "--port=0" };
-    try testing.expectError(error.InvalidStartPort, parseStartCommandOptions(zero_port[0..], 2));
+    try testing.expectError(error.InvalidStartPort, parseStartCommandOptions(zero_port[0..], 2, .strict));
 }
 
 test "appendStartForwardArgs forwards explicit port override" {

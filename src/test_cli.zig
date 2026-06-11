@@ -3,6 +3,7 @@ const compat = @import("compat.zig");
 const config = @import("config.zig");
 const daemon = @import("daemon.zig");
 const runtime_selection = @import("runtime_selection.zig");
+const cli_output = @import("cli/output.zig");
 
 const TestTarget = struct {
     name: []const u8,
@@ -75,92 +76,170 @@ const LatencyWorkerSlot = struct {
 
 const LatencyResultHandlerFn = *const fn (*anyopaque, TestTarget, LatencyResult) anyerror!void;
 
-/// 网络连接性测试
-pub fn testProxyJson(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8, config_key: ?[]const u8) !void {
-    _ = proxy_name;
+/// 单项检查结果（CHECKS_FAILED 的 data.checks 元素）。
+pub const Check = struct {
+    name: []const u8,
+    ok: bool,
+    detail: []const u8,
+};
+
+/// data.ports 元素（冻结字段名 label/port/listening）。
+pub const PortStatus = struct {
+    label: []const u8,
+    port: u16,
+    listening: bool,
+};
+
+/// data.targets 元素：单个连通性探测目标的结果。
+/// emit_null_optional_fields=false：latency_ms/reason/ip 仅在有值时出现。
+pub const TargetResult = struct {
+    name: []const u8,
+    ok: bool,
+    latency_ms: ?u64 = null,
+    reason: ?[]const u8 = null,
+    ip: ?[]const u8 = null,
+};
+
+/// 探测过程的统一收集器：JSON/text 跑完全相同的探测（决策 D3），
+/// text 模式边收集边渲染（payload 走 stdout），JSON 模式静默收集、
+/// 最后输出单个 envelope。
+const ProbeSink = struct {
+    out: *cli_output.Output,
+    arena: std.mem.Allocator,
+    targets: std.ArrayList(TargetResult) = std.ArrayList(TargetResult).empty,
+
+    fn record(self: *ProbeSink, result: TargetResult) !void {
+        try self.targets.append(self.arena, result);
+    }
+};
+
+/// 网络连接性测试（`zc test` / `zc proxy test` / `zc profile test` 共用）。
+/// 决策 D3：两种模式跑相同探测；任何检查失败 -> error.code=CHECKS_FAILED
+/// + data 携带逐项结果（JSON）/ stderr 错误块（text），返回 false，
+/// 由调用方以非零码退出。返回 true = 全部检查通过（已输出成功 envelope）。
+pub fn runConnectivityTest(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    config_key: ?[]const u8,
+    out: *cli_output.Output,
+) !bool {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     const effective = selectEffectivePorts(cfg);
     const daemon_state = detectDaemonState(allocator);
     const selected_proxies = try runtime_selection.collectSelectedProxies(allocator, cfg, config_key);
     defer runtime_selection.deinitSelectedProxies(allocator, selected_proxies);
 
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
+    const text_mode = out.mode == .text;
+    if (text_mode) {
+        try out.print("Network Connectivity Test\n", .{});
+        try out.print("{s:-^60}\n", .{""});
+        try printEffectivePortsSummary(out, effective);
+        try printSelectedProxiesText(out, allocator, selected_proxies);
+    }
 
-    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{\"action\":\"proxy_test\",\"daemon_state\":\"");
-    try out.appendSlice(allocator, daemonStateText(daemon_state));
-    try out.appendSlice(allocator, "\",\"selected_proxies\":");
-    try runtime_selection.appendSelectedProxiesJson(&out, allocator, selected_proxies);
-    try out.appendSlice(allocator, ",\"ports\":[");
-
-    var first = true;
+    // 端口检查：每个生效端口一项（冻结 data 字段 ports 仍保留原始事实）。
+    var ports = std.ArrayList(PortStatus).empty;
+    var checks = std.ArrayList(Check).empty;
+    const PortPlan = struct { label: []const u8, port: u16, proxy_type: ProxyType };
+    var plan_buf: [2]PortPlan = undefined;
+    var plan_len: usize = 0;
     if (effective.mixed) |p| {
-        const listening = try isLocalPortListening(allocator, p);
-        try out.print(allocator, "{{\"label\":\"mixed\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
-        first = false;
-    }
-    if (effective.http) |p| {
-        if (!first) try out.appendSlice(allocator, ",");
-        const listening = try isLocalPortListening(allocator, p);
-        try out.print(allocator, "{{\"label\":\"http\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
-        first = false;
-    }
-    if (effective.socks) |p| {
-        if (!first) try out.appendSlice(allocator, ",");
-        const listening = try isLocalPortListening(allocator, p);
-        try out.print(allocator, "{{\"label\":\"socks\",\"port\":{d},\"listening\":{s}}}", .{ p, if (listening) "true" else "false" });
+        plan_buf[plan_len] = .{ .label = "mixed", .port = p, .proxy_type = .http };
+        plan_len += 1;
+    } else {
+        if (effective.http) |p| {
+            plan_buf[plan_len] = .{ .label = "http", .port = p, .proxy_type = .http };
+            plan_len += 1;
+        }
+        if (effective.socks) |p| {
+            plan_buf[plan_len] = .{ .label = "socks", .port = p, .proxy_type = .socks5 };
+            plan_len += 1;
+        }
     }
 
-    try out.appendSlice(allocator, "]}}\n");
-    try compat.writeStdoutAll(out.items);
+    var sink = ProbeSink{ .out = out, .arena = arena };
+    var totals: TestStats = .{};
+    var any_listening = false;
+
+    if (plan_len == 0) {
+        try checks.append(arena, .{ .name = "ports", .ok = false, .detail = "no proxy ports configured" });
+    }
+
+    for (plan_buf[0..plan_len]) |entry| {
+        const listening = try isLocalPortListening(allocator, entry.port);
+        try ports.append(arena, .{ .label = entry.label, .port = entry.port, .listening = listening });
+        try checks.append(arena, .{
+            .name = try std.fmt.allocPrint(arena, "port:{s}", .{entry.label}),
+            .ok = listening,
+            .detail = try std.fmt.allocPrint(arena, "127.0.0.1:{d} {s}", .{
+                entry.port,
+                if (listening) "listening" else "not listening",
+            }),
+        });
+
+        if (text_mode) {
+            try out.print("\nTesting via {s} Proxy (127.0.0.1:{d}):\n", .{ proxyLabelTitle(entry.label), entry.port });
+        }
+        if (!listening) {
+            if (text_mode) printPortNotListeningHint(out, entry.port, daemon_state);
+            continue;
+        }
+        any_listening = true;
+        totals = mergeStats(totals, try testViaProxy(allocator, entry.port, entry.proxy_type, &sink));
+    }
+
+    // 连通性检查：只有在至少一个端口可用时才有意义（同 text 旧语义：
+    // attempted=0 也是失败）。
+    if (any_listening) {
+        try checks.append(arena, .{
+            .name = "connectivity",
+            .ok = connectivitySucceeded(totals),
+            .detail = try std.fmt.allocPrint(arena, "{d}/{d} targets reachable", .{ totals.succeeded, totals.attempted }),
+        });
+    }
+
+    var failed: usize = 0;
+    for (checks.items) |check| {
+        if (!check.ok) failed += 1;
+    }
+
+    // 冻结字段：action=proxy_test、daemon_state、ports、selected_proxies。
+    const data = .{
+        .action = "proxy_test",
+        .daemon_state = daemonStateText(daemon_state),
+        .selected_proxies = selected_proxies,
+        .ports = ports.items,
+        .checks = checks.items,
+        .targets = sink.targets.items,
+    };
+
+    if (text_mode) try out.print("\n", .{});
+    // 文本报告（stdout）必须在 success/fail 之前落盘：text 模式的 fail 只
+    // flush stderr，不 flush 会把整份报告留在缓冲里丢掉。
+    try out.flush();
+
+    if (failed == 0) {
+        try out.success(data);
+        return true;
+    }
+
+    var msg_buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "{d} connectivity check(s) failed", .{failed}) catch "connectivity checks failed";
+    var hint_buf: [128]u8 = undefined;
+    const hint = std.fmt.bufPrint(&hint_buf, "check selected proxy, route rules, or upstream availability; suggested: {s}", .{
+        notListeningSuggestedCommand(daemon_state),
+    }) catch "run `zc status` and `zc log --no-follow`";
+    try out.failWithData("CHECKS_FAILED", msg, hint, data);
+    return false;
 }
 
-pub fn testProxy(allocator: std.mem.Allocator, cfg: *const config.Config, proxy_name: ?[]const u8, config_key: ?[]const u8) !void {
-    _ = proxy_name;
-    const selected_proxies = try runtime_selection.collectSelectedProxies(allocator, cfg, config_key);
-    defer runtime_selection.deinitSelectedProxies(allocator, selected_proxies);
-
-    std.debug.print("Network Connectivity Test\n", .{});
-    std.debug.print("{s:-^60}\n", .{""});
-
-    const effective = selectEffectivePorts(cfg);
-    const daemon_state = detectDaemonState(allocator);
-    try printEffectivePortsSummary(effective);
-    runtime_selection.printSelectedProxiesText(allocator, selected_proxies);
-    var totals: TestStats = .{};
-
-    if (effective.mixed) |mixed_port| {
-        std.debug.print("\nTesting via Mixed Proxy (127.0.0.1:{d}):\n", .{mixed_port});
-        if (try isLocalPortListening(allocator, mixed_port)) {
-            totals = mergeStats(totals, try testViaProxy(allocator, mixed_port, .http));
-        } else {
-            printPortNotListeningHint(mixed_port, daemon_state);
-            return error.ProxyTestFailed;
-        }
-        std.debug.print("\n", .{});
-        try ensureConnectivitySucceeded(totals);
-        return;
-    }
-
-    if (effective.http) |http_port| {
-        std.debug.print("\nTesting via HTTP Proxy (127.0.0.1:{d}):\n", .{http_port});
-        if (try isLocalPortListening(allocator, http_port)) {
-            totals = mergeStats(totals, try testViaProxy(allocator, http_port, .http));
-        } else {
-            printPortNotListeningHint(http_port, daemon_state);
-        }
-    }
-
-    if (effective.socks) |socks_port| {
-        std.debug.print("\nTesting via SOCKS5 Proxy (127.0.0.1:{d}):\n", .{socks_port});
-        if (try isLocalPortListening(allocator, socks_port)) {
-            totals = mergeStats(totals, try testViaProxy(allocator, socks_port, .socks5));
-        } else {
-            printPortNotListeningHint(socks_port, daemon_state);
-        }
-    }
-
-    std.debug.print("\n", .{});
-    try ensureConnectivitySucceeded(totals);
+fn proxyLabelTitle(label: []const u8) []const u8 {
+    if (std.mem.eql(u8, label, "mixed")) return "Mixed";
+    if (std.mem.eql(u8, label, "http")) return "HTTP";
+    return "SOCKS5";
 }
 
 fn selectEffectivePorts(cfg: *const config.Config) EffectivePorts {
@@ -175,28 +254,39 @@ fn selectEffectivePorts(cfg: *const config.Config) EffectivePorts {
     };
 }
 
-fn printEffectivePortsSummary(effective: EffectivePorts) !void {
-    std.debug.print("Effective ports: ", .{});
+fn printEffectivePortsSummary(out: *cli_output.Output, effective: EffectivePorts) !void {
+    try out.print("Effective ports: ", .{});
     if (effective.mixed) |p| {
-        std.debug.print("mixed=127.0.0.1:{d}\n", .{p});
+        try out.print("mixed=127.0.0.1:{d}\n", .{p});
         return;
     }
 
     var printed = false;
     if (effective.http) |p| {
-        std.debug.print("http=127.0.0.1:{d}", .{p});
+        try out.print("http=127.0.0.1:{d}", .{p});
         printed = true;
     }
     if (effective.socks) |p| {
-        if (printed) std.debug.print(", ", .{});
-        std.debug.print("socks=127.0.0.1:{d}", .{p});
+        if (printed) try out.print(", ", .{});
+        try out.print("socks=127.0.0.1:{d}", .{p});
         printed = true;
     }
     if (!printed) {
-        std.debug.print("none\n", .{});
+        try out.print("none\n", .{});
     } else {
-        std.debug.print("\n", .{});
+        try out.print("\n", .{});
     }
+}
+
+fn printSelectedProxiesText(
+    out: *cli_output.Output,
+    allocator: std.mem.Allocator,
+    selections: []const runtime_selection.SelectedProxy,
+) !void {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try runtime_selection.appendSelectedProxiesText(&buf, allocator, selections);
+    try out.print("{s}", .{buf.items});
 }
 
 fn detectDaemonState(allocator: std.mem.Allocator) DaemonState {
@@ -212,10 +302,10 @@ fn daemonStateText(state: DaemonState) []const u8 {
     };
 }
 
-fn printPortNotListeningHint(port: u16, daemon_state: DaemonState) void {
-    std.debug.print("  Proxy not listening on 127.0.0.1:{d}.\n", .{port});
-    std.debug.print("{s}", .{notListeningDaemonLine(daemon_state)});
-    std.debug.print("  Suggested fix: {s}\n", .{notListeningSuggestedCommand(daemon_state)});
+fn printPortNotListeningHint(out: *cli_output.Output, port: u16, daemon_state: DaemonState) void {
+    out.print("  Proxy not listening on 127.0.0.1:{d}.\n", .{port}) catch {};
+    out.print("{s}", .{notListeningDaemonLine(daemon_state)}) catch {};
+    out.print("  Suggested fix: {s}\n", .{notListeningSuggestedCommand(daemon_state)}) catch {};
 }
 
 fn notListeningDaemonLine(daemon_state: DaemonState) []const u8 {
@@ -240,15 +330,17 @@ fn isLocalPortListening(allocator: std.mem.Allocator, port: u16) !bool {
     return true;
 }
 
-/// 通过代理测试连接
-fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) !TestStats {
+/// 通过代理测试连接：geo 探测 + 并发延迟探测，结果统一进 sink
+/// （text 模式同时渲染，JSON 模式只收集 —— 两种模式探测完全一致）。
+fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType, sink: *ProbeSink) !TestStats {
     const proxy_url = switch (proxy_type) {
         .http => try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port}),
         .socks5 => try std.fmt.allocPrint(allocator, "socks5://127.0.0.1:{d}", .{port}),
     };
     defer allocator.free(proxy_url);
 
-    std.debug.print("  Current IP/Location: ", .{});
+    const text_mode = sink.out.mode == .text;
+    if (text_mode) try sink.out.print("  Current IP/Location: ", .{});
     const ip_geo = try getIpGeoInfo(allocator, proxy_url);
     defer if (ip_geo) |info| {
         allocator.free(info.ip);
@@ -262,36 +354,45 @@ fn testViaProxy(allocator: std.mem.Allocator, port: u16, proxy_type: ProxyType) 
     stats.attempted += 1;
 
     if (ip_geo) |info| {
-        std.debug.print("{s}", .{info.ip});
-        if (info.city) |city| {
-            std.debug.print(" ({s}", .{city});
-            if (info.region) |region| {
-                std.debug.print(", {s}", .{region});
+        try sink.record(.{
+            .name = TEST_TARGETS[0].name,
+            .ok = true,
+            .ip = try sink.arena.dupe(u8, info.ip),
+        });
+        if (text_mode) {
+            try sink.out.print("{s}", .{info.ip});
+            if (info.city) |city| {
+                try sink.out.print(" ({s}", .{city});
+                if (info.region) |region| {
+                    try sink.out.print(", {s}", .{region});
+                }
+                if (info.country) |country| {
+                    try sink.out.print(", {s}", .{country});
+                }
+                try sink.out.print(")", .{});
             }
-            if (info.country) |country| {
-                std.debug.print(", {s}", .{country});
-            }
-            std.debug.print(")", .{});
+            try sink.out.print("\n", .{});
         }
-        std.debug.print("\n", .{});
         stats.succeeded += 1;
     } else {
-        std.debug.print("Failed to get IP/Location\n", .{});
+        try sink.record(.{ .name = TEST_TARGETS[0].name, .ok = false, .reason = "no response" });
+        if (text_mode) try sink.out.print("Failed to get IP/Location\n", .{});
     }
 
-    std.debug.print("\n  Latency Test:\n", .{});
-    std.debug.print("  {s:-^50}\n", .{""});
+    if (text_mode) {
+        try sink.out.print("\n  Latency Test:\n", .{});
+        try sink.out.print("  {s:-^50}\n", .{""});
+    }
 
     var probe_ctx: u8 = 0;
-    var print_ctx: u8 = 0;
     stats = mergeStats(stats, try runLatencyTestsInCompletionOrder(
         allocator,
         TEST_TARGETS[1..],
         proxy_url,
         &probe_ctx,
         defaultLatencyProbe,
-        &print_ctx,
-        printLatencyResult,
+        sink,
+        sinkLatencyResult,
     ));
 
     return stats;
@@ -302,13 +403,6 @@ fn mergeStats(a: TestStats, b: TestStats) TestStats {
         .attempted = a.attempted + b.attempted,
         .succeeded = a.succeeded + b.succeeded,
     };
-}
-
-fn ensureConnectivitySucceeded(stats: TestStats) !void {
-    if (!connectivitySucceeded(stats)) {
-        std.debug.print("  No connectivity target succeeded; check selected proxy, route rules, or upstream availability.\n", .{});
-        return error.ProxyTestFailed;
-    }
 }
 
 fn connectivitySucceeded(stats: TestStats) bool {
@@ -467,16 +561,30 @@ fn defaultLatencyProbe(_: *anyopaque, allocator: std.mem.Allocator, url: []const
     return testUrlLatency(allocator, url, proxy_url);
 }
 
-fn printLatencyResult(_: *anyopaque, target: TestTarget, latency: LatencyResult) !void {
-    std.debug.print("  {s:12} ", .{target.name});
+/// 完成顺序回调：记录结果，text 模式同时渲染一行。
+fn sinkLatencyResult(ctx_ptr: *anyopaque, target: TestTarget, latency: LatencyResult) !void {
+    const sink: *ProbeSink = @ptrCast(@alignCast(ctx_ptr));
 
     switch (latency) {
+        .ok => |ms| try sink.record(.{ .name = target.name, .ok = true, .latency_ms = ms }),
+        .failed => |reason| try sink.record(.{ .name = target.name, .ok = false, .reason = failureReasonText(reason) }),
+    }
+
+    if (sink.out.mode != .text) return;
+    try sink.out.print("  {s:12} ", .{target.name});
+    switch (latency) {
         .ok => |ms| {
-            const color = if (ms < 100) "🟢" else if (ms < 300) "🟡" else "🔴";
-            std.debug.print("{s} {d}ms\n", .{ color, ms });
+            // 状态标记：emoji 只在启用色彩（TTY 且未禁色）时输出；管道/
+            // 重定向场景退回纯 ASCII，避免污染脚本消费（工作项 5 的判断）。
+            const marker = if (sink.out.color_enabled)
+                (if (ms < 100) "🟢" else if (ms < 300) "🟡" else "🔴")
+            else
+                (if (ms < 300) "OK  " else "SLOW");
+            try sink.out.print("{s} {d}ms\n", .{ marker, ms });
         },
         .failed => |reason| {
-            std.debug.print("⚫ {s}\n", .{failureReasonText(reason)});
+            const marker = if (sink.out.color_enabled) "⚫" else "FAIL";
+            try sink.out.print("{s} {s}\n", .{ marker, failureReasonText(reason) });
         },
     }
 }
@@ -638,6 +746,109 @@ test "curl probe timeouts separate liveness from latency" {
 test "not listening diagnostic reports stopped daemon" {
     try std.testing.expectEqualStrings("  zc daemon is stopped.\n", notListeningDaemonLine(.stopped));
     try std.testing.expectEqualStrings("zc start -c <config>", notListeningSuggestedCommand(.stopped));
+}
+
+fn makeNoPortConfig(allocator: std.mem.Allocator) !config.Config {
+    return config.Config{
+        .allocator = allocator,
+        .port = 0,
+        .socks_port = 0,
+        .mixed_port = 0,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "127.0.0.1"),
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+}
+
+test "runConnectivityTest json: no configured ports -> CHECKS_FAILED envelope with data" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeNoPortConfig(allocator);
+    defer cfg.deinit();
+
+    var out_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer out_alloc.deinit();
+    var err_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer err_alloc.deinit();
+    var out = cli_output.Output.init(.json, "test", false, &out_alloc.writer, &err_alloc.writer);
+
+    try std.testing.expect(!try runConnectivityTest(allocator, &cfg, null, &out));
+
+    const written = out_alloc.written();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\n"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, written, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(!root.get("ok").?.bool);
+    try std.testing.expectEqualStrings("test", root.get("command").?.string);
+    try std.testing.expectEqualStrings("CHECKS_FAILED", root.get("error").?.object.get("code").?.string);
+    const data = root.get("data").?.object;
+    try std.testing.expectEqualStrings("proxy_test", data.get("action").?.string);
+    try std.testing.expect(data.get("daemon_state") != null);
+    try std.testing.expectEqual(@as(usize, 0), data.get("ports").?.array.items.len);
+    const checks = data.get("checks").?.array.items;
+    try std.testing.expectEqualStrings("ports", checks[0].object.get("name").?.string);
+    try std.testing.expect(!checks[0].object.get("ok").?.bool);
+    // text 模式产物绝不能混进 JSON 模式的 stdout/stderr。
+    try std.testing.expectEqualStrings("", err_alloc.written());
+}
+
+test "runConnectivityTest text: report on stdout, CHECKS_FAILED block on stderr" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeNoPortConfig(allocator);
+    defer cfg.deinit();
+
+    var out_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer out_alloc.deinit();
+    var err_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer err_alloc.deinit();
+    var out = cli_output.Output.init(.text, "test", false, &out_alloc.writer, &err_alloc.writer);
+
+    // 不手动 flush：runConnectivityTest 自己必须保证报告落盘。
+    try std.testing.expect(!try runConnectivityTest(allocator, &cfg, null, &out));
+
+    const stdout_text = out_alloc.written();
+    try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Network Connectivity Test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Effective ports: none") != null);
+    const stderr_text = err_alloc.written();
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "CHECKS_FAILED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "hint:") != null);
+}
+
+test "runConnectivityTest json: not-listening port fails port check without external probes" {
+    const allocator = std.testing.allocator;
+
+    // 绑定再立刻释放一个临时端口，拿到一个几乎必然无人监听的端口号。
+    const addr = try compat.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try compat.net.listenReuseAddr(addr);
+    const free_port = listener.listen_address.getPort();
+    listener.deinit();
+
+    var cfg = try makeNoPortConfig(allocator);
+    defer cfg.deinit();
+    cfg.mixed_port = free_port;
+
+    var out_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer out_alloc.deinit();
+    var err_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer err_alloc.deinit();
+    var out = cli_output.Output.init(.json, "proxy test", false, &out_alloc.writer, &err_alloc.writer);
+
+    try std.testing.expect(!try runConnectivityTest(allocator, &cfg, null, &out));
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out_alloc.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("CHECKS_FAILED", root.get("error").?.object.get("code").?.string);
+    const data = root.get("data").?.object;
+    const ports = data.get("ports").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), ports.len);
+    try std.testing.expectEqualStrings("mixed", ports[0].object.get("label").?.string);
+    try std.testing.expect(!ports[0].object.get("listening").?.bool);
+    // 端口都不通时不应跑外网探测：targets 为空。
+    try std.testing.expectEqual(@as(usize, 0), data.get("targets").?.array.items.len);
 }
 
 test "latency probes print in completion order" {

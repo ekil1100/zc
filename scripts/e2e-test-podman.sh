@@ -166,21 +166,24 @@ else
     fail "服务停止失败"
 fi
 
-# 测试 9: 配置重载（热重载）- 如果支持的话
+# 测试 9: 配置重载（zc reload，必须成功）
+# 注意：reload 对 --foreground（受监管 PID 1）daemon 会刻意拒绝并指向
+# supervisor，所以这里用默认 fork-and-exit 的 zc start 启动 daemon，
+# 由 sleep infinity 保持容器存活。
 info "测试 9: 配置重载测试..."
 podman run -d --name "${CONTAINER_NAME}-reload" \
     -v "${ZC_ROOT}/testdata/config/minimal.yaml:/etc/zc/config.yaml:ro" \
     "${IMAGE_NAME}" \
-    zc start --foreground -c /etc/zc/config.yaml 2>&1
+    sh -c 'zc start -c /etc/zc/config.yaml && sleep infinity' 2>&1
 
 sleep 3
 
-# 尝试重载
-if podman exec "${CONTAINER_NAME}-reload" zc reload 2>/dev/null; then
+# zc reload 已实现：断言成功（热重载不可用时回退 restart，仍应 exit 0）
+if podman exec "${CONTAINER_NAME}-reload" zc reload; then
     pass "配置重载成功"
 else
-    warn "配置重载可能不支持或失败（非阻塞）"
-    ((PASSED++))
+    fail "配置重载失败"
+    podman logs "${CONTAINER_NAME}-reload" 2>&1 || true
 fi
 
 podman rm -f "${CONTAINER_NAME}-reload" 2>/dev/null || true

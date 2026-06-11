@@ -41,8 +41,9 @@ The remaining v1.0 work is tracked in [`docs/roadmap/v1.0.md`](docs/roadmap/v1.0
 
 ## Features
 
-- **CLI-first operation**: `zc start`, `zc stop`, `zc restart`, `zc status`, `zc log`, `zc doctor`, `zc test`, `zc config`, `zc proxy`, and `zc profile`.
-- **Daemon lifecycle**: explicit process tracking, JSON status output, log inspection, and diagnostics.
+- **CLI-first operation**: `zc start`/`zc up`, `zc stop`/`zc down`, `zc restart`, `zc reload`, `zc status`, `zc log`, `zc doctor`, `zc test`, `zc config`, `zc proxy`, and `zc profile`, with generated help (`zc help <command>`).
+- **Agent-friendly output contract**: every command supports `--json` (one `{"ok","command","data"|"error"}` envelope per run on stdout, `zc log --json` as JSON Lines), diagnostics go to stderr, exit codes are uniform (0 success / 1 failure / 2 usage error), and color respects `NO_COLOR` / `--no-color`.
+- **Daemon lifecycle**: explicit process tracking, fork-and-exit start plus `zc start --foreground` for containers/systemd, hot reload via `zc reload`, JSON status output, log inspection, and diagnostics.
 - **Default mixed inbound**: one local listener for HTTP and SOCKS5-style client traffic.
 - **Config compatibility work**: parser and validator coverage for common clash-style fields, rule providers, proxy groups, and rule matching.
 - **Proxy selection**: list and switch select groups through `zc proxy` or `PUT /proxies/<group>`.
@@ -78,12 +79,18 @@ Make sure `"$HOME/.local/bin"` is on your `PATH`.
 Use an explicit non-production port during local development. Port `7899` is reserved for production use in this project.
 
 ```bash
-zc start --port 7901 -c testdata/config/minimal.yaml --json
-zc status --json
-zc proxy list --json
-zc doctor --json
-zc stop --json
+zc up --port 7901 -c testdata/config/minimal.yaml --json
+zc status --json | jq -r .data.state
+zc proxy list --json | jq .data.groups
+zc doctor --json | jq .data.proxy_reachable
+zc reload --json
+zc down --json
 ```
+
+`zc up`/`zc down` are aliases of `zc start`/`zc stop`. JSON envelopes are
+emitted on stdout, so they pipe directly into `jq`; human diagnostics stay on
+stderr. Set `NO_COLOR=1` or pass `--no-color` to disable ANSI colors. In
+containers or under systemd, run the daemon with `zc start --foreground`.
 
 The same binary can be run without installing:
 

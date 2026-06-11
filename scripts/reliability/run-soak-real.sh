@@ -63,8 +63,10 @@ if [[ ! -x "$ROOT_DIR/zig-out/bin/zc" ]]; then
   (cd "$ROOT_DIR" && zig build) || { echo "SOAK_RESULT=FAIL"; echo "SOAK_FAILED_STEP=build"; exit 1; }
 fi
 
-# Start zc in background
-"$ROOT_DIR/zig-out/bin/zc" start -c "$CONFIG_PATH" >> "$SOAK_LOG" 2>&1 &
+# Start zc in background. --foreground keeps the daemon as this shell's
+# child so the kill -0 "$ZCLASH_PID" liveness/crash checks below track the
+# real daemon (default `zc start` is fork-and-exit: $! would die immediately).
+"$ROOT_DIR/zig-out/bin/zc" start --foreground -c "$CONFIG_PATH" >> "$SOAK_LOG" 2>&1 &
 ZCLASH_PID=$!
 echo "zc started (PID: $ZCLASH_PID)"
 sleep 2
@@ -101,13 +103,16 @@ while [[ $elapsed -lt $DURATION_SEC ]]; do
     crash_count=$((crash_count + 1))
     echo "{\"ts\":\"$sample_ts\",\"elapsed_s\":$elapsed,\"alive\":false,\"crash_count\":$crash_count}" >> "$METRICS_LOG"
     echo "[$sample_ts] CRASH detected (count: $crash_count), restarting..."
-    "$ROOT_DIR/zig-out/bin/zc" start -c "$CONFIG_PATH" >> "$SOAK_LOG" 2>&1 &
+    "$ROOT_DIR/zig-out/bin/zc" start --foreground -c "$CONFIG_PATH" >> "$SOAK_LOG" 2>&1 &
     ZCLASH_PID=$!
     sleep 2
     continue
   fi
 
-  # Check port listening (basic health)
+  # Check port listening (basic health).
+  # `doctor --json` emits its envelope on stdout (one line); diagnostics go to
+  # stderr and are discarded. The data payload (incl. "proxy_reachable") is
+  # present on both the ok:true and CHECKS_FAILED envelopes.
   port_ok=false
   if "$ROOT_DIR/zig-out/bin/zc" doctor -c "$CONFIG_PATH" --json 2>/dev/null | grep -q '"proxy_reachable":true'; then
     port_ok=true

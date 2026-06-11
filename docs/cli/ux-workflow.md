@@ -1,9 +1,10 @@
 # CLI UX 对齐工作流 — 验收标准
 
-> 生成时间：2026-06-11
-> 状态：进行中（分支 `feat/cli-ux-json`）
+> 生成时间：2026-06-11；完成：2026-06-12
+> 状态：**全部批次（1-5）完成**，代码已落地；本文件保留为决策/验收记录
 > 事实基线：[`.agents/cli-ux-baseline.md`](../../.agents/cli-ux-baseline.md)（全命令契约矩阵、缺口清单、消费者清单）
 > 目标：CLI 直觉、错误可操作、`--json` 对 agent 友好 —— 对齐 AGENTS.md 的产品原则。
+> 实现后的对外契约见 [`spec.md`](spec.md)。
 
 ## 1. 目标契约（Target contract）
 
@@ -64,7 +65,9 @@
 
 每批保持 `zig build test` 全绿、独立 commit（Conventional Commits）、同 commit 更新受影响测试与文档。消费者影响明细见基线报告第 3 节。
 
-### Batch 1 — 输出基础设施 + 全局表面
+### Batch 1 — 输出基础设施 + 全局表面 ✅ 完成
+
+> 结果：`src/cli/output.zig` + `src/cli/commands.zig` 落地；帮助 stdout/exit 0、`zc --version`、未知命令非零、`up`/`down` 别名全部生效。
 
 新建 `src/cli/output.zig`（TDD）与命令表骨架；接入 `zc`（裸）、`help`、`--version`、未知命令路径、`up`/`down` 别名；删除死代码 `printProfileListJson`。
 
@@ -75,7 +78,10 @@
 - `zc nope`：用法 stderr，exit ≠ 0；`zc nope --json | jq -e '.ok==false'` 在 stdout 可解析；
 - `zc up --help` 显示 start 帮助，不启动 daemon。
 
-### Batch 2 — 生命周期：start/stop/restart/status/log/reload
+### Batch 2 — 生命周期：start/stop/restart/status/log/reload ✅ 完成
+
+> 结果：生命周期全量走 Output（payload stdout）；双重打印修复；`--foreground`/`reload` 新增；`restart` 单 envelope；`log --json` = JSON Lines；D12 移除 ps/pgrep 全局 daemon 发现。
+> 收尾补强（最终批次）：生命周期命令补齐 D11 —— start/restart 参数错误从 exit 1 改为 exit 2，start/restart/stop/status/reload/log/doctor 不再静默忽略未知/多余参数（新增 `STOP/STATUS/RELOAD/LOG_ARGUMENT_INVALID`、`DIAG_DOCTOR_ARGUMENT_INVALID`）。
 
 经 Output 重路由；修双重打印；`start --foreground`；`restart` 单 envelope；`log --json` = JSON Lines、`log --help` 生效；新增 `reload`；`runtime_selection.zig` 改 `std.json`。
 
@@ -86,7 +92,9 @@
 - `just install` 全程可用（Justfile 改 `| jq -r .data.state`，删除 `2>&1` workaround 注释）；
 - `zclash.service` / `build-deb.sh` / podman e2e 改用 `--foreground` 后通过。
 
-### Batch 3 — config 树
+### Batch 3 — config 树 ✅ 完成
+
+> 结果：config 全子命令统一 envelope/帮助/退出码；用法错误 exit 2；`dump` 裸文档走 stdout 可管道（D2）；`use` 不自动 apply 并提示 `zc reload`（D8）。
 
 list/download/update/use/dump/override + 裸/未知路径全量 `--json`、统一 `--help`、用法错误 exit ≠ 0、修 `-d` flag、`std.json` 化；`dump` 走裸文档且 stdout 可管道。
 
@@ -95,7 +103,9 @@ list/download/update/use/dump/override + 裸/未知路径全量 `--json`、统�
 - `zc config nope` exit ≠ 0；`zc config list --json | jq -e '.ok'` 通过；
 - `config update` 不再混排文本与嵌套 JSON。
 
-### Batch 4 — proxy/profile：list/select/test 去重
+### Batch 4 — proxy/profile：list/select/test 去重 ✅ 完成
+
+> 结果：proxy/profile 共享 handler（D10）；JSON select 真正通知 daemon（`data.applied`）；非 TTY 无 `-p` 报 `PROXY_SELECT_NOT_INTERACTIVE`；`-g` 只匹配 select 组；名称全量 `std.json` 转义。
 
 共享 handler；JSON 模式 select 真正调用 `notifyDaemon`（修无操作假成功）；统一 `-g` 匹配语义；非 TTY 无参 select 报错；JSON 错误 exit ≠ 0；全部名称转义；修 type 回退 bug。
 
@@ -105,7 +115,9 @@ list/download/update/use/dump/override + 裸/未知路径全量 `--json`、统�
 - `echo | zc proxy select` 不再改写 daemon 选择；
 - select 后 `zc status --json` 反映新节点（JSON/文本行为一致）。
 
-### Batch 5 — test/doctor/diag + 文档/脚本收尾
+### Batch 5 — test/doctor/diag + 文档/脚本收尾 ✅ 完成
+
+> 结果：`CHECKS_FAILED` + `data.checks` 语义落地（test/doctor/diag doctor，两种模式同探测、失败 exit 1）；`DIAG_SUBCOMMAND_MISSING`/`UNKNOWN` 区分；doctor 字符串转义；spec/error-codes/README/compat/roadmap/脚本全部同步。
 
 `CHECKS_FAILED` 语义（D3）；两种模式探测一致；config-load 失败两种模式都有 envelope/报错；doctor 字符串转义；`diag` 缺参/未知子命令区分错误码；同步 `docs/cli/spec.md`、`docs/api/error-codes.md`、`docs/compat/mihomo-clash.md`、`README.md`、roadmap、`run-soak-real.sh`、podman e2e。
 
@@ -117,3 +129,8 @@ list/download/update/use/dump/override + 裸/未知路径全量 `--json`、统�
 ## 5. 完成定义
 
 全部批次合入 `main`、`docs/cli/spec.md` 重写为新契约、基线报告中"消费者破坏清单"逐项勾销、`scripts/run-full-validation.sh` 与 e2e-podman 全绿。
+
+## 6. 已知 follow-up（不在本工作流范围内）
+
+- **API server 手拼 JSON / 转义缺口**：`PUT /proxies/<group>` 的 body 解析已改用 `std.json`（修复旧 `extractJsonString` 扫到第一个 `"` 字节截断转义名的 bug），但 `src/api/server.zig` 的 `GET /proxies` / `GET /rules` 响应仍手拼 JSON 且不转义名称 —— 含 `"`/`\` 的节点/规则名会产生非法 JSON；URL path 中的组名也未做百分号解码（含空格/特殊字符的组名无法经 API 选择）。CLI 侧（`zc proxy select` 的 PUT body）已全量 `std.json` 序列化，不受影响。
+- API 错误响应仍为 `{"error":"…"}` 简单格式，未对齐 CLI 的 `{ok,command,error}` envelope（见 `docs/api/error-codes.md` 第 7 节）。
