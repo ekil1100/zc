@@ -399,6 +399,8 @@ B. parser / validator / docs / migrator 明确把 HTTP / SOCKS5 outbound 标为 
 - 文本输出保持原行为。
 - 新增 CLI 行为测试。
 
+后续扩展：全 CLI 输出契约对齐（stdout、统一 `--json` envelope、退出码、生成式帮助）在 `feat/cli-ux-json` 进行，验收标准见 `docs/cli/ux-workflow.md`，事实基线见 `.agents/cli-ux-baseline.md`。
+
 ### P0-4：TUI de-scope 与代码清理
 
 决策：v1.0 砍掉 TUI，不发布 `zc tui`。
