@@ -35,6 +35,8 @@ const RuntimeCommand = enum {
 const StartCommandOptions = struct {
     config_path: ?[]const u8 = null,
     port: ?u16 = null,
+    /// 决策 D1：`zc start --foreground` 不 fork，在前台运行（容器/systemd）。
+    foreground: bool = false,
 };
 
 // 全局配置路径，用于重载
@@ -99,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
 
     var override_opts = override.parseCliOptions(allocator, args) catch |err| {
         printOverrideOptionError(json_output, err);
-        return err;
+        std.process.exit(cli_output.exit_failure);
     };
     defer override_opts.deinit(allocator);
 
@@ -107,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "--daemon-run")) {
         const start_opts = parseStartCommandOptions(args, 2) catch |err| {
             printStartCommandOptionError(json_output, err);
-            return err;
+            std.process.exit(cli_output.exit_failure);
         };
         daemon.writePid(allocator, std.c.getpid()) catch {};
         try runProxy(allocator, start_opts.config_path, start_opts.port, &override_opts, "daemon-run");
@@ -146,12 +148,35 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "start")) {
         const start_opts = parseStartCommandOptions(args, 2) catch |err| {
             printStartCommandOptionError(json_output, err);
-            return err;
+            std.process.exit(cli_output.exit_failure);
         };
+
+        // 决策 D1：--foreground 不 fork，自己持锁 + 写 pid（容器/systemd）。
+        if (start_opts.foreground) {
+            const lock_file = daemon.acquireForegroundLock(allocator) catch |err| {
+                if (err == error.DaemonAlreadyRunning) {
+                    printCliError(json_output, "START_FAILED", "daemon already running", "stop it with `zc stop` before `zc start --foreground`");
+                } else {
+                    printCliError(json_output, "START_FAILED", "failed to acquire daemon lock", "check runtime directory permissions and retry");
+                }
+                std.process.exit(cli_output.exit_failure);
+            };
+            _ = lock_file; // 锁的 fd 故意持有到进程退出
+            daemon.writePid(allocator, std.c.getpid()) catch {};
+            runProxy(allocator, start_opts.config_path, start_opts.port, &override_opts, "start") catch |err| {
+                if (!printOverrideRuntimeError(json_output, err)) {
+                    printCliError(json_output, "START_FAILED", "failed to start proxy in foreground", "check config path and `zc log --no-follow`");
+                }
+                std.process.exit(cli_output.exit_failure);
+            };
+            return;
+        }
+
         preflightRuntimeCommand(allocator, .start, start_opts, &override_opts) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            printRuntimeCommandPreflightError(.start, json_output, err);
-            return err;
+            if (!printOverrideRuntimeError(json_output, err)) {
+                printRuntimeCommandPreflightError(.start, json_output, err);
+            }
+            std.process.exit(cli_output.exit_failure);
         };
 
         // 后台启动
@@ -163,53 +188,134 @@ pub fn main(init: std.process.Init) !void {
         try appendStartForwardArgs(allocator, &forward_args, start_opts);
         try override_opts.appendForwardArgs(allocator, &forward_args);
 
-        daemon.startDaemon(allocator, start_opts.config_path, json_output, forward_args.items) catch |err| {
-            printCliError(json_output, "START_FAILED", "failed to start daemon", "check config path and logs via `zc log --no-follow`");
-            return err;
+        const outcome = daemon.startDaemon(allocator, start_opts.config_path, forward_args.items) catch |err| {
+            switch (err) {
+                error.StartFailed => printCliError(json_output, "START_FAILED", "daemon exited during startup", "check `zc log --no-follow` for details"),
+                else => printCliError(json_output, "START_FAILED", "failed to start daemon", "check config path and logs via `zc log --no-follow`"),
+            }
+            std.process.exit(cli_output.exit_failure);
         };
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        if (json_output) {
+            out.success(.{ .action = "start", .state = "running", .detail = outcome.detail, .pid = outcome.pid }) catch {};
+        } else if (outcome.detail != null) {
+            if (outcome.pid) |p| {
+                out.print("zc daemon already running (pid: {d})\n", .{p}) catch {};
+            } else {
+                out.print("zc daemon already running or startup is in progress\n", .{}) catch {};
+            }
+            out.flush() catch {};
+        } else {
+            out.print("zc daemon started (pid: {d})\n", .{outcome.pid.?}) catch {};
+            daemon.printStartupInfo(allocator, start_opts.config_path, forward_args.items, &out);
+            const log_path = daemon.getLogFilePath(allocator) catch null;
+            defer if (log_path) |p| allocator.free(p);
+            if (log_path) |lp| out.print("  log:         {s}\n", .{lp}) catch {};
+            out.flush() catch {};
+        }
         return;
     }
 
     // 处理 stop 命令
     if (std.mem.eql(u8, cmd, "stop")) {
-        daemon.stopDaemon(allocator, json_output) catch |err| {
-            printCliError(json_output, "STOP_FAILED", "failed to stop daemon", "verify process permissions and retry `zc stop`");
-            return err;
+        const outcome = daemon.stopDaemon(allocator) catch |err| {
+            switch (err) {
+                error.DaemonPidUntracked => printCliError(json_output, "STOP_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc stop`"),
+                else => printCliError(json_output, "STOP_FAILED", "failed to stop daemon", "verify process permissions and retry `zc stop`"),
+            }
+            std.process.exit(cli_output.exit_failure);
         };
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        if (json_output) {
+            out.success(.{ .action = "stop", .state = "stopped", .detail = outcome.detail, .pid = outcome.pid }) catch {};
+        } else if (outcome.pid) |p| {
+            out.print("zc daemon stopped (pid: {d})\n", .{p}) catch {};
+            out.flush() catch {};
+        } else {
+            out.print("zc daemon already stopped\n", .{}) catch {};
+            out.flush() catch {};
+        }
         return;
     }
 
     // 处理 restart 命令
     if (std.mem.eql(u8, cmd, "restart")) {
-        const config_path = parseConfigPathArg(args, 2);
-        var forward_args = std.ArrayList([]const u8).empty;
-        defer {
-            for (forward_args.items) |item| allocator.free(item);
-            forward_args.deinit(allocator);
-        }
-        try override_opts.appendForwardArgs(allocator, &forward_args);
-
-        runRestartCommand(allocator, config_path, json_output, &override_opts, forward_args.items) catch |err| {
-            if (printOverrideRuntimeError(json_output, err)) return err;
-            switch (err) {
-                error.PortAlreadyInUse, error.PortConflict, error.InvalidBindAddress, error.InvalidExternalController => {
-                    printRuntimeCommandPreflightError(.restart, json_output, err);
-                },
-                error.StartFailed, error.DaemonPidUntracked => {},
-                else => {
-                    printCliError(json_output, "RESTART_FAILED", "failed to restart daemon", "check logs and retry `zc restart -c <config>`");
-                },
-            }
-            return err;
+        const start_opts = parseStartCommandOptions(args, 2) catch |err| {
+            printStartCommandOptionError(json_output, err);
+            std.process.exit(cli_output.exit_failure);
         };
+        if (start_opts.foreground) {
+            printCliError(json_output, "RESTART_FAILED", "`--foreground` is not supported by restart", "use `zc stop` then `zc start --foreground`");
+            std.process.exit(cli_output.exit_usage);
+        }
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        runRestartCommand(allocator, start_opts, &out, &override_opts) catch |err| {
+            if (!printOverrideRuntimeError(json_output, err)) {
+                switch (err) {
+                    error.PortAlreadyInUse, error.PortConflict, error.InvalidBindAddress, error.InvalidExternalController => {
+                        printRuntimeCommandPreflightError(.restart, json_output, err);
+                    },
+                    error.ForegroundDaemonSupervised => printCliError(json_output, "RESTART_FAILED", "daemon is running in the foreground (likely under a supervisor)", "restart it via the supervisor (e.g. `systemctl restart`), or `zc stop` then `zc start --foreground`"),
+                    error.StartFailed => printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details"),
+                    error.DaemonPidUntracked => printCliError(json_output, "RESTART_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc restart`"),
+                    else => printCliError(json_output, "RESTART_FAILED", "failed to restart daemon", "check logs and retry `zc restart -c <config>`"),
+                }
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        return;
+    }
+
+    // 处理 reload 命令（决策 D9：热重载当前配置，不重新下载任何内容）
+    if (std.mem.eql(u8, cmd, "reload")) {
+        const running = daemon.isRunning(allocator) catch false;
+        if (!running) {
+            printCliError(json_output, "RELOAD_FAILED", "daemon is not running", "start it first with `zc start`");
+            std.process.exit(cli_output.exit_failure);
+        }
+        const result = daemon.reloadOrRestart(allocator, null, .auto) catch |err| {
+            switch (err) {
+                // 受监管的前台 daemon（systemd/容器）：restart 兜底会杀掉 MainPID
+                // 并逃逸监管，拒绝并把用户引向监管者。
+                error.ForegroundDaemonSupervised => printCliError(json_output, "RELOAD_FAILED", "daemon is running in the foreground (likely under a supervisor)", "restart it via the supervisor (e.g. `systemctl restart`) instead of `zc reload`"),
+                else => printCliError(json_output, "RELOAD_FAILED", "failed to reload daemon config", "check `zc log --no-follow`, then retry or run `zc restart`"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        if (json_output) {
+            const applied = switch (result) {
+                .hot_applied => "hot",
+                .restart_applied => "restart",
+                .restart_fallback => "restart_fallback",
+            };
+            out.success(.{ .action = "reload", .state = "running", .applied = applied }) catch {};
+        } else {
+            switch (result) {
+                .hot_applied => out.print("Config applied via hot reload\n", .{}) catch {},
+                .restart_applied => out.print("Config applied via restart\n", .{}) catch {},
+                .restart_fallback => out.print("Config hot reload unavailable, fell back to restart\n", .{}) catch {},
+            }
+            out.flush() catch {};
+        }
         return;
     }
 
     // 处理 status 命令
     if (std.mem.eql(u8, cmd, "status")) {
-        daemon.getStatus(allocator, json_output) catch |err| {
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        daemon.getStatus(allocator, &out) catch {
             printCliError(json_output, "STATUS_FAILED", "failed to read daemon status", "check pid file permissions and retry `zc status`");
-            return err;
+            std.process.exit(cli_output.exit_failure);
         };
         return;
     }
@@ -218,6 +324,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "log")) {
         var lines: ?usize = null;
         var follow = true; // 默认持续刷新
+        var follow_explicit = false;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "-n")) {
@@ -227,15 +334,26 @@ pub fn main(init: std.process.Init) !void {
                 }
             } else if (std.mem.eql(u8, args[i], "-f")) {
                 follow = true;
+                follow_explicit = true;
             } else if (std.mem.eql(u8, args[i], "--no-follow")) {
                 follow = false;
             }
+        }
+        // --json 默认输出一次后退出（JSON Lines），除非显式 -f。
+        if (json_output and !follow_explicit) {
+            follow = false;
         }
         // 如果没有指定 -n，默认显示 50 行
         if (lines == null and !follow) {
             lines = 50;
         }
-        try daemon.viewLog(allocator, lines, follow);
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        daemon.viewLog(allocator, lines, follow, &out) catch {
+            printCliError(json_output, "LOG_FAILED", "failed to read daemon log", "check log file permissions; `zc status` shows the log path");
+            std.process.exit(cli_output.exit_failure);
+        };
         return;
     }
 
@@ -339,7 +457,7 @@ pub fn main(init: std.process.Init) !void {
             if (filename != null) {
                 // 应用策略：auto(默认)/hot/restart
                 if (try daemon.isRunning(allocator)) {
-                    const result = daemon.reloadOrRestart(allocator, null, json_output, apply_mode) catch |err| {
+                    const result = daemon.reloadOrRestart(allocator, null, apply_mode) catch |err| {
                         std.debug.print("Failed to apply updated config: {s}\n", .{@errorName(err)});
                         return err;
                     };
@@ -455,7 +573,7 @@ pub fn main(init: std.process.Init) !void {
                         return err;
                     };
 
-                    applyConfigOverrideToRunningDaemon(allocator, json_output) catch |err| {
+                    applyConfigOverrideToRunningDaemon(allocator) catch |err| {
                         printConfigOverrideApplyError(json_output, err);
                         return err;
                     };
@@ -477,7 +595,7 @@ pub fn main(init: std.process.Init) !void {
                     };
 
                     if (had_override) {
-                        applyConfigOverrideToRunningDaemon(allocator, json_output) catch |err| {
+                        applyConfigOverrideToRunningDaemon(allocator) catch |err| {
                             printConfigOverrideApplyError(json_output, err);
                             return err;
                         };
@@ -1031,6 +1149,28 @@ fn stderrColorEnabled() bool {
     return cli_output.shouldUseColor(is_tty, g_no_color, no_color_env);
 }
 
+/// 生命周期命令共用的 stdout/stderr Output 构造器。
+/// 用法：`var streams = StdStreams{}; var out = streams.output(json_output);`
+/// streams 必须比返回的 Output 活得久（两者都放在同一栈帧即可）。
+const StdStreams = struct {
+    out_buf: [4096]u8 = undefined,
+    err_buf: [2048]u8 = undefined,
+    stdout_writer: std.Io.File.Writer = undefined,
+    stderr_writer: std.Io.File.Writer = undefined,
+
+    fn output(self: *StdStreams, json_output: bool) cli_output.Output {
+        self.stdout_writer = std.Io.File.stdout().writer(compat.io(), &self.out_buf);
+        self.stderr_writer = std.Io.File.stderr().writer(compat.io(), &self.err_buf);
+        return cli_output.Output.init(
+            if (json_output) .json else .text,
+            g_cli_command,
+            stderrColorEnabled(),
+            &self.stdout_writer.interface,
+            &self.stderr_writer.interface,
+        );
+    }
+};
+
 fn setCliCommand(canonical_top: []const u8, args: []const []const u8) void {
     for (&cli_commands.groups) |*group| {
         if (std.mem.eql(u8, group.name, canonical_top) and args.len >= 3) {
@@ -1096,47 +1236,6 @@ fn wantsCommandHelp(args: []const []const u8) bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
     }
     return false;
-}
-
-fn printCliOk(json_output: bool, action: []const u8, state: []const u8, detail: ?[]const u8, pid: ?i32) void {
-    if (json_output) {
-        if (detail) |d| {
-            if (pid) |p| {
-                std.debug.print(
-                    "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"detail\":\"{s}\",\"pid\":{d}}}}}\n",
-                    .{ action, state, d, p },
-                );
-            } else {
-                std.debug.print(
-                    "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"detail\":\"{s}\"}}}}\n",
-                    .{ action, state, d },
-                );
-            }
-        } else if (pid) |p| {
-            std.debug.print(
-                "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"pid\":{d}}}}}\n",
-                .{ action, state, p },
-            );
-        } else {
-            std.debug.print(
-                "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\"}}}}\n",
-                .{ action, state },
-            );
-        }
-        return;
-    }
-
-    if (detail) |d| {
-        if (pid) |p| {
-            std.debug.print("ok action={s} state={s} detail={s} pid={d}\n", .{ action, state, d, p });
-        } else {
-            std.debug.print("ok action={s} state={s} detail={s}\n", .{ action, state, d });
-        }
-    } else if (pid) |p| {
-        std.debug.print("ok action={s} state={s} pid={d}\n", .{ action, state, p });
-    } else {
-        std.debug.print("ok action={s} state={s}\n", .{ action, state });
-    }
 }
 
 fn printOverrideOptionError(json_output: bool, err: anyerror) void {
@@ -1219,9 +1318,9 @@ fn validateOverrideAndPrepareRuleProviders(allocator: std.mem.Allocator, script_
     try config.prepareRuleProvidersForRuntime(allocator, &cfg, null);
 }
 
-fn applyConfigOverrideToRunningDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
+fn applyConfigOverrideToRunningDaemon(allocator: std.mem.Allocator) !void {
     if (!try daemon.isRunning(allocator)) return;
-    _ = try daemon.reloadOrRestart(allocator, null, json_output, .auto);
+    _ = try daemon.reloadOrRestart(allocator, null, .auto);
 }
 
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
@@ -1361,6 +1460,10 @@ fn parseStartCommandOptions(args: []const []const u8, start_index: usize) !Start
             opts.port = try parseStartPortValue(args[i]["--port=".len..]);
             continue;
         }
+        if (std.mem.eql(u8, args[i], "--foreground")) {
+            opts.foreground = true;
+            continue;
+        }
     }
 
     return opts;
@@ -1445,29 +1548,70 @@ fn preflightRuntimeCommand(
 
 fn runRestartCommand(
     allocator: std.mem.Allocator,
-    config_path: ?[]const u8,
-    json_output: bool,
+    start_opts: StartCommandOptions,
+    out: *cli_output.Output,
     override_opts: *const override.CliOptions,
-    extra_args: []const []const u8,
 ) !void {
     const was_running = try daemon.isRunning(allocator);
 
+    // restart 语义 = 同一个 daemon 换个进程：未显式覆盖时保留旧 daemon 的
+    // `-c`/`--port` 启动参数，而不是悄悄退回默认配置/默认 mixed-port。
+    var preserved: ?daemon.TrackedInvocation = null;
+    defer if (preserved) |*inv| inv.deinit(allocator);
     if (was_running) {
-        try daemon.stopDaemon(allocator, json_output);
+        preserved = daemon.captureTrackedInvocation(allocator) catch null;
+        if (preserved) |inv| {
+            // 受监管的前台 daemon（systemd/容器 PID 1）：杀掉它会触发监管者
+            // respawn/锁竞争循环，拒绝并把用户引向监管者。
+            if (inv.foreground) return error.ForegroundDaemonSupervised;
+        }
     }
 
-    try preflightRuntimeCommand(allocator, .restart, .{ .config_path = config_path }, override_opts);
+    const config_path: ?[]const u8 = start_opts.config_path orelse
+        (if (preserved) |inv| inv.config_path else null);
+    const port: ?u16 = start_opts.port orelse
+        (if (preserved) |inv| inv.port else null);
 
-    if (!was_running) {
-        printCliOk(json_output, "restart", "stopped", "service_was_stopped", null);
+    // 预检在 stop 之前：注定失败的 restart 不能先杀掉健康的 daemon。
+    // 旧 daemon 自己监听的端口会随 stop 释放，预检时视为可用。
+    {
+        var cfg = try loadRuntimeConfig(allocator, config_path, port, override_opts, "restart", false);
+        defer cfg.deinit();
+        const old_daemon_port: ?u16 = if (!was_running)
+            null
+        else if (preserved) |inv|
+            (inv.port orelse constants.MIXED_PORT)
+        else
+            constants.MIXED_PORT;
+        try preflightPortCheckAllowing(&cfg, false, old_daemon_port);
     }
 
-    try daemon.startDaemon(allocator, config_path, json_output, extra_args);
-    const pid = try daemon.readPid(allocator) orelse {
-        printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details");
-        return error.StartFailed;
-    };
-    printCliOk(json_output, "restart", "running", null, pid);
+    // 决策 D6：restart 整体只输出一个最终 envelope；中间进度文本走 stderr。
+    if (was_running) {
+        try out.note("stopping daemon...\n", .{});
+        _ = try daemon.stopDaemon(allocator);
+    } else {
+        try out.note("daemon was not running; starting fresh\n", .{});
+    }
+
+    var forward_args = std.ArrayList([]const u8).empty;
+    defer {
+        for (forward_args.items) |item| allocator.free(item);
+        forward_args.deinit(allocator);
+    }
+    try appendStartForwardArgs(allocator, &forward_args, .{ .config_path = config_path, .port = port });
+    try override_opts.appendForwardArgs(allocator, &forward_args);
+
+    try out.note("starting daemon...\n", .{});
+    const outcome = try daemon.startDaemon(allocator, config_path, forward_args.items);
+    const pid = outcome.pid orelse (try daemon.readPid(allocator)) orelse return error.StartFailed;
+
+    if (out.mode == .json) {
+        try out.success(.{ .action = "restart", .state = "running", .pid = pid });
+    } else {
+        try out.print("zc daemon restarted (pid: {d})\n", .{pid});
+        try out.flush();
+    }
 }
 
 fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) void {
@@ -1666,6 +1810,12 @@ fn hasInProcessPortConflict(cfg: *const config.Config) !bool {
 }
 
 fn preflightPortCheck(cfg: *config.Config, emit_errors: bool) !void {
+    return preflightPortCheckAllowing(cfg, emit_errors, null);
+}
+
+/// 同 preflightPortCheck，但允许跳过 `allowed_port` 的占用检查：restart 在
+/// stop 之前预检，旧 daemon 自己监听的端口会随 stop 释放，不算冲突。
+fn preflightPortCheckAllowing(cfg: *config.Config, emit_errors: bool, allowed_port: ?u16) !void {
     const bind_ip = effectiveBindAddress(cfg);
 
     // 进程内端口冲突检查
@@ -1676,7 +1826,9 @@ fn preflightPortCheck(cfg: *config.Config, emit_errors: bool) !void {
 
     // 系统端口占用检查
     if (cfg.mixed_port > 0) {
-        try checkPortAvailable(bind_ip, cfg.mixed_port, emit_errors);
+        if (allowed_port == null or allowed_port.? != cfg.mixed_port) {
+            try checkPortAvailable(bind_ip, cfg.mixed_port, emit_errors);
+        }
     } else {
         if (cfg.port > 0) try checkPortAvailable(bind_ip, cfg.port, emit_errors);
         if (cfg.socks_port > 0) try checkPortAvailable(bind_ip, cfg.socks_port, emit_errors);
@@ -1969,6 +2121,19 @@ test "parseStartCommandOptions supports config path and explicit port" {
     try testing.expectEqual(@as(?u16, 7902), opts2.port);
 }
 
+test "parseStartCommandOptions supports --foreground (D1)" {
+    const testing = std.testing;
+
+    const args = [_][]const u8{ "zc", "start", "--foreground", "-c", "./x.yaml" };
+    const opts = try parseStartCommandOptions(args[0..], 2);
+    try testing.expect(opts.foreground);
+    try testing.expectEqualStrings("./x.yaml", opts.config_path.?);
+
+    const args2 = [_][]const u8{ "zc", "start" };
+    const opts2 = try parseStartCommandOptions(args2[0..], 2);
+    try testing.expect(!opts2.foreground);
+}
+
 test "parseStartCommandOptions rejects missing or invalid port values" {
     const testing = std.testing;
 
@@ -2114,7 +2279,7 @@ test "runtime command preflight consults daemon state before port check" {
     try testing.expect(skip_pos < port_pos);
 }
 
-test "restart command preflights ports before spawning a new daemon" {
+test "restart command preflights ports before stopping the old daemon" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
@@ -2125,9 +2290,13 @@ test "restart command preflights ports before spawning a new daemon" {
     const next_fn_pos = std.mem.indexOfPos(u8, content, fn_pos, "fn applyRuntimePortSelection(") orelse return error.TestUnexpectedResult;
     const fn_body = content[fn_pos..next_fn_pos];
 
-    const preflight_pos = std.mem.indexOf(u8, fn_body, "preflightRuntimeCommand(allocator, .restart") orelse return error.TestUnexpectedResult;
+    // 预检必须发生在 stopDaemon 之前（注定失败的 restart 不能先杀掉健康
+    // daemon），stopDaemon 在 startDaemon 之前。
+    const preflight_pos = std.mem.indexOf(u8, fn_body, "preflightPortCheckAllowing(") orelse return error.TestUnexpectedResult;
+    const stop_pos = std.mem.indexOf(u8, fn_body, "daemon.stopDaemon(") orelse return error.TestUnexpectedResult;
     const start_pos = std.mem.indexOf(u8, fn_body, "daemon.startDaemon(") orelse return error.TestUnexpectedResult;
-    try testing.expect(preflight_pos < start_pos);
+    try testing.expect(preflight_pos < stop_pos);
+    try testing.expect(stop_pos < start_pos);
 }
 
 test "mixed handler should explicitly close client stream on success path" {

@@ -48,8 +48,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/zc start
-ExecReload=/usr/bin/zc restart
+ExecStart=/usr/bin/zc start --foreground
+# No ExecReload: \`zc reload\` falls back to a full restart, which would kill
+# the supervised --foreground MainPID. Use \`systemctl restart zc\` instead.
 ExecStop=/usr/bin/zc stop
 Restart=on-failure
 

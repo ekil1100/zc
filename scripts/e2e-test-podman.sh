@@ -122,7 +122,7 @@ podman run -d --name "${CONTAINER_NAME}" \
     -p 19090:9090 \
     -v "${ZC_ROOT}/testdata/config/minimal.yaml:/etc/zc/config.yaml:ro" \
     "${IMAGE_NAME}" \
-    zc start -c /etc/zc/config.yaml 2>&1
+    zc start --foreground -c /etc/zc/config.yaml 2>&1
 
 # 等待服务启动
 info "等待服务启动 (5s)..."
@@ -171,7 +171,7 @@ info "测试 9: 配置重载测试..."
 podman run -d --name "${CONTAINER_NAME}-reload" \
     -v "${ZC_ROOT}/testdata/config/minimal.yaml:/etc/zc/config.yaml:ro" \
     "${IMAGE_NAME}" \
-    zc start -c /etc/zc/config.yaml 2>&1
+    zc start --foreground -c /etc/zc/config.yaml 2>&1
 
 sleep 3
 

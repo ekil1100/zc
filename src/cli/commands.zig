@@ -56,9 +56,10 @@ pub const table = [_]Command{
         .flags = &([_]Flag{
             config_flag,
             .{ .spec = "--port <port>", .help = "Override mixed-port for this run" },
+            .{ .spec = "--foreground", .help = "Run in the foreground without forking (containers/systemd)" },
             json_flag,
         } ++ override_flags),
-        .examples = &.{ "zc start", "zc start -c config.yaml --port 7901" },
+        .examples = &.{ "zc start", "zc start -c config.yaml --port 7901", "zc start --foreground" },
     },
     .{
         .path = "stop",
@@ -69,9 +70,19 @@ pub const table = [_]Command{
     },
     .{
         .path = "restart",
-        .summary = "Restart proxy daemon",
-        .flags = &([_]Flag{ config_flag, json_flag } ++ override_flags),
-        .examples = &.{"zc restart -c config.yaml"},
+        .summary = "Restart proxy daemon (keeps the old daemon's -c/--port unless overridden)",
+        .flags = &([_]Flag{
+            config_flag,
+            .{ .spec = "--port <port>", .help = "Override mixed-port for the restarted daemon" },
+            json_flag,
+        } ++ override_flags),
+        .examples = &.{ "zc restart", "zc restart -c config.yaml --port 7901" },
+    },
+    .{
+        .path = "reload",
+        .summary = "Hot-reload current config into the running daemon",
+        .flags = &.{json_flag},
+        .examples = &.{ "zc reload", "zc reload --json" },
     },
     .{
         .path = "status",
@@ -84,9 +95,11 @@ pub const table = [_]Command{
         .summary = "View daemon logs (follows by default)",
         .flags = &.{
             .{ .spec = "-n <lines>", .help = "Number of lines to show (default: 50)" },
+            .{ .spec = "-f", .help = "Keep following (default in text mode; opt-in with --json)" },
             .{ .spec = "--no-follow", .help = "Print once and exit" },
+            .{ .spec = "--json", .help = "JSON Lines on stdout (implies --no-follow unless -f)" },
         },
-        .examples = &.{ "zc log", "zc log -n 100 --no-follow" },
+        .examples = &.{ "zc log", "zc log -n 100 --no-follow", "zc log --json | jq -r .line" },
     },
     .{
         .path = "test",

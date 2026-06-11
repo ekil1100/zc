@@ -5,8 +5,10 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/zclash start
-ExecReload=/usr/local/bin/zclash restart
+ExecStart=/usr/local/bin/zclash start --foreground
+# No ExecReload: `zclash reload` falls back to a full restart, which would kill
+# the supervised --foreground MainPID and escape systemd. Use
+# `systemctl restart zclash` to apply config changes.
 ExecStop=/usr/local/bin/zclash stop
 Restart=on-failure
 RestartSec=5

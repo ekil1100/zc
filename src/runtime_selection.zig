@@ -16,6 +16,19 @@ pub const SelectedProxy = struct {
         allocator.free(self.group_name);
         if (self.proxy_name) |name| allocator.free(name);
     }
+
+    /// std.json 序列化钩子：保持冻结的字段名 group/proxy/source
+    /// （docs/cli/ux-workflow.md 第 3 节）。
+    pub fn jsonStringify(self: SelectedProxy, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("group");
+        try jws.write(self.group_name);
+        try jws.objectField("proxy");
+        try jws.write(self.proxy_name);
+        try jws.objectField("source");
+        try jws.write(sourceString(self.source));
+        try jws.endObject();
+    }
 };
 
 pub fn sourceString(source: SelectionSource) []const u8 {
@@ -124,40 +137,16 @@ fn groupContainsProxy(group: *const config.ProxyGroup, proxy_name: []const u8) b
     return false;
 }
 
-pub fn appendJsonStringEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
-    try out.append(allocator, '"');
-    for (value) |ch| switch (ch) {
-        '\\' => try out.appendSlice(allocator, "\\\\"),
-        '"' => try out.appendSlice(allocator, "\\\""),
-        '\n' => try out.appendSlice(allocator, "\\n"),
-        '\r' => try out.appendSlice(allocator, "\\r"),
-        '\t' => try out.appendSlice(allocator, "\\t"),
-        else => try out.append(allocator, ch),
-    };
-    try out.append(allocator, '"');
-}
-
 pub fn appendSelectedProxiesJson(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     selections: []const SelectedProxy,
 ) !void {
-    try out.append(allocator, '[');
-    for (selections, 0..) |selection, i| {
-        if (i > 0) try out.append(allocator, ',');
-        try out.appendSlice(allocator, "{\"group\":");
-        try appendJsonStringEscaped(out, allocator, selection.group_name);
-        try out.appendSlice(allocator, ",\"proxy\":");
-        if (selection.proxy_name) |proxy_name| {
-            try appendJsonStringEscaped(out, allocator, proxy_name);
-        } else {
-            try out.appendSlice(allocator, "null");
-        }
-        try out.appendSlice(allocator, ",\"source\":");
-        try appendJsonStringEscaped(out, allocator, sourceString(selection.source));
-        try out.append(allocator, '}');
-    }
-    try out.append(allocator, ']');
+    // 经 std.json 序列化（真实转义），禁止手拼 JSON 字符串。
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(selections, .{ .whitespace = .minified }, &aw.writer);
+    try out.appendSlice(allocator, aw.written());
 }
 
 pub fn appendSelectedProxiesText(
@@ -247,19 +236,35 @@ test "collectSelectedProxies prefers valid persisted selection" {
     try std.testing.expectEqual(SelectionSource.persisted, selections[0].source);
 }
 
-test "appendSelectedProxiesJson writes node info" {
+test "appendSelectedProxiesJson writes node info with frozen keys" {
     const allocator = std.testing.allocator;
-    const selections = [_]SelectedProxy{.{
-        .group_name = "Proxy",
-        .proxy_name = "B",
-        .source = .persisted,
-    }};
+    const selections = [_]SelectedProxy{
+        .{
+            .group_name = "Pro\"xy\n",
+            .proxy_name = "B",
+            .source = .persisted,
+        },
+        .{
+            .group_name = "Auto",
+            .proxy_name = null,
+            .source = .default,
+        },
+    };
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
     try appendSelectedProxiesJson(&out, allocator, selections[0..]);
 
-    try std.testing.expectEqualStrings("[{\"group\":\"Proxy\",\"proxy\":\"B\",\"source\":\"persisted\"}]", out.items);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out.items, .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("Pro\"xy\n", items[0].object.get("group").?.string);
+    try std.testing.expectEqualStrings("B", items[0].object.get("proxy").?.string);
+    try std.testing.expectEqualStrings("persisted", items[0].object.get("source").?.string);
+    try std.testing.expectEqualStrings("Auto", items[1].object.get("group").?.string);
+    try std.testing.expect(items[1].object.get("proxy").? == .null);
+    try std.testing.expectEqualStrings("default", items[1].object.get("source").?.string);
 }
 
 test "appendSelectedProxiesText writes shared CLI node block" {

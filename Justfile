@@ -6,12 +6,11 @@ install:
     set -euo pipefail
     zig build -Doptimize=ReleaseFast
     # 安装前先记录 daemon 是否在运行，用于“按需重启”。
-    # 注意：`zc status --json` 无论运行/停止都退出 0，且输出走 STDERR，
-    # 所以必须 2>&1 重定向再解析 state 字段。
-    # 该 grep 处于 if 条件中：即使 zc status 读取失败（非零退出、无 JSON），
+    # `zc status --json` 把 envelope 输出到 STDOUT（运行/停止都退出 0），直接用 jq 解析。
+    # 该判断处于 if 条件中：即使 zc/jq 失败（非零退出、无 JSON），
     # 也只会判为 false（was_running=0），既不会中断安装，也不会误启 daemon。
     was_running=0
-    if zc status --json 2>&1 | grep -q '"state":"running"'; then
+    if [ "$(zc status --json | jq -r .data.state 2>/dev/null)" = "running" ]; then
         was_running=1
     fi
     # 原子替换二进制（staged temp + mv -f）；正在运行的旧 daemon 仍持有旧 inode，安全。

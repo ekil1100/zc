@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const constants = @import("constants.zig");
 const runtime_selection = @import("runtime_selection.zig");
+const cli_output = @import("cli/output.zig");
 
 // PID 文件路径
 const PID_FILE = "/tmp/zc.pid";
@@ -11,7 +12,6 @@ const LOCK_FILE = "/tmp/zc.lock";
 const LOG_FILE = "/tmp/zc.log";
 const startup_poll_interval_ms: u64 = 200;
 const startup_poll_attempts: usize = 10;
-const process_scan_max_output_bytes: usize = 16 * 1024 * 1024;
 const command_probe_max_output_bytes: usize = 16 * 1024;
 
 pub const ApplyMode = enum {
@@ -24,6 +24,14 @@ pub const ApplyResult = enum {
     hot_applied,
     restart_applied,
     restart_fallback,
+};
+
+/// start/stop 的结构化结果：daemon 层只返回事实，envelope 由 main.zig
+/// 经 cli/output.zig 恰好打印一次（修复双重打印，见 docs/cli/ux-workflow.md）。
+pub const LifecycleOutcome = struct {
+    /// 冻结 detail 词汇：already_running / already_stopped。
+    detail: ?[]const u8 = null,
+    pid: ?i32 = null,
 };
 
 const StatusSnapshot = struct {
@@ -60,7 +68,6 @@ const RuntimeState = struct {
 
 const RuntimeInspector = struct {
     pid_is_daemon: *const fn (std.mem.Allocator, i32) anyerror!bool,
-    discover_pid: *const fn (std.mem.Allocator) anyerror!?i32,
 };
 
 /// 获取 PID 文件路径
@@ -158,33 +165,44 @@ fn removePidFileAtPath(pid_file: []const u8) void {
 }
 
 fn isDaemonBinaryPath(argv0: []const u8) bool {
-    return std.mem.eql(u8, compat.fs.path.basename(argv0), "zc");
+    const base = compat.fs.path.basename(argv0);
+    // deb 包以 zclash 安装（scripts/build-deb.sh / zclash.service）。
+    return std.mem.eql(u8, base, "zc") or std.mem.eql(u8, base, "zclash");
+}
+
+/// 一个进程是“本体 daemon”当且仅当：argv0 是 zc/zclash，且要么带内部
+/// `--daemon-run` 标志，要么是 `start --foreground`（决策 D1 的受监管前台模式）。
+fn tokensLookLikeDaemon(parts: anytype) bool {
+    const argv0 = parts.next() orelse return false;
+    if (!isDaemonBinaryPath(argv0)) return false;
+
+    var first_word: ?[]const u8 = null;
+    var saw_foreground = false;
+    while (parts.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--daemon-run")) return true;
+        if (std.mem.eql(u8, arg, "--foreground")) saw_foreground = true;
+        if (first_word == null and arg.len > 0 and arg[0] != '-') first_word = arg;
+    }
+
+    if (saw_foreground) {
+        if (first_word) |word| {
+            return std.mem.eql(u8, word, "start") or std.mem.eql(u8, word, "up");
+        }
+    }
+
+    return false;
 }
 
 fn commandLineLooksLikeDaemon(command_line: []const u8) bool {
     var parts = std.mem.tokenizeAny(u8, std.mem.trim(u8, command_line, " \t\r\n"), " \t");
-    const argv0 = parts.next() orelse return false;
-    if (!isDaemonBinaryPath(argv0)) return false;
-
-    while (parts.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--daemon-run")) return true;
-    }
-
-    return false;
+    return tokensLookLikeDaemon(&parts);
 }
 
 fn cmdlineBufferLooksLikeDaemon(cmdline: []const u8) bool {
     if (cmdline.len == 0) return false;
 
     var parts = std.mem.tokenizeScalar(u8, cmdline, 0);
-    const argv0 = parts.next() orelse return false;
-    if (!isDaemonBinaryPath(argv0)) return false;
-
-    while (parts.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--daemon-run")) return true;
-    }
-
-    return false;
+    return tokensLookLikeDaemon(&parts);
 }
 
 fn linuxPidLooksLikeDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
@@ -221,70 +239,83 @@ fn pidMatchesRunningDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
     };
 }
 
-fn discoverDaemonPid(allocator: std.mem.Allocator) !?i32 {
-    const result = compat.childRun(allocator, &.{ "ps", "-ww", "-axo", "pid=,comm=,args=" }, process_scan_max_output_bytes) catch return null;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-    if (result.term.exited != 0) return null;
+/// 已被 stop/restart/reload 依赖的“当前 daemon 的启动参数”快照，
+/// 从 tracked pid 的命令行解析得到（-c / --port / --foreground）。
+pub const TrackedInvocation = struct {
+    pid: i32,
+    /// `zc start --foreground`：受 systemd/容器监管的前台 daemon。
+    foreground: bool = false,
+    config_path: ?[]u8 = null,
+    port: ?u16 = null,
 
-    if (parseDaemonPidCandidateFromPsOutput(result.stdout)) |pid| {
-        if (try pidMatchesRunningDaemon(allocator, pid)) return pid;
+    pub fn deinit(self: *TrackedInvocation, allocator: std.mem.Allocator) void {
+        if (self.config_path) |p| allocator.free(p);
+        self.config_path = null;
     }
+};
 
-    const pgrep_result = compat.childRun(allocator, &.{ "pgrep", "-f", "--", "--daemon-run" }, process_scan_max_output_bytes) catch return null;
-    defer {
-        allocator.free(pgrep_result.stdout);
-        allocator.free(pgrep_result.stderr);
+fn rawDaemonCommandLineAlloc(allocator: std.mem.Allocator, pid: i32) !?[]u8 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return null;
+            const file = compat.fs.openFileAbsolute(path, .{}) catch return null;
+            defer file.close(compat.io());
+            return compat.fileReadToEndAlloc(file, allocator, command_probe_max_output_bytes) catch null;
+        },
+        else => {
+            var pid_buf: [32]u8 = undefined;
+            const pid_text = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return null;
+            const result = compat.childRun(allocator, &.{ "ps", "-ww", "-o", "command=", "-p", pid_text }, command_probe_max_output_bytes) catch return null;
+            allocator.free(result.stderr);
+            if (result.term.exited != 0) {
+                allocator.free(result.stdout);
+                return null;
+            }
+            return result.stdout;
+        },
     }
-    if (pgrep_result.term.exited != 0) return null;
-
-    var lines = std.mem.tokenizeScalar(u8, pgrep_result.stdout, '\n');
-    while (lines.next()) |line| {
-        const pid = parsePidFirstToken(line) orelse continue;
-        if (pid == std.c.getpid()) continue;
-        if (try pidMatchesRunningDaemon(allocator, pid)) return pid;
-    }
-
-    return null;
 }
 
-fn parseDaemonPidCandidateFromPsOutput(output: []const u8) ?i32 {
-    var lines = std.mem.tokenizeScalar(u8, output, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) continue;
+fn parseTrackedInvocationFromCmdline(allocator: std.mem.Allocator, pid: i32, cmdline: []const u8) !TrackedInvocation {
+    var inv = TrackedInvocation{ .pid = pid };
+    errdefer inv.deinit(allocator);
 
-        var parts = std.mem.tokenizeAny(u8, trimmed, " \t");
-        const pid_text = parts.next() orelse continue;
-        const pid = std.fmt.parseInt(i32, pid_text, 10) catch continue;
-        if (pid == std.c.getpid()) continue;
-
-        const after_pid = std.mem.trimStart(u8, trimmed[pid_text.len..], " \t");
-        var after_pid_parts = std.mem.tokenizeAny(u8, after_pid, " \t");
-        const _comm_text = after_pid_parts.next() orelse continue;
-        const args = std.mem.trimStart(u8, after_pid[_comm_text.len..], " \t");
-        var arg_parts = std.mem.tokenizeAny(u8, args, " \t");
-        const argv0 = arg_parts.next() orelse continue;
-
-        if (!std.mem.eql(u8, compat.fs.path.basename(argv0), "zc")) continue;
-        if (std.mem.indexOf(u8, args, "--daemon-run") == null) continue;
-        return pid;
+    // /proc cmdline 是 NUL 分隔，ps 输出是空白分隔；统一按两者切词。
+    var parts = std.mem.tokenizeAny(u8, cmdline, " \t\r\n\x00");
+    _ = parts.next(); // argv0
+    while (parts.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--foreground")) {
+            inv.foreground = true;
+        } else if (std.mem.eql(u8, arg, "-c")) {
+            if (parts.next()) |value| {
+                if (inv.config_path) |old| allocator.free(old);
+                inv.config_path = try allocator.dupe(u8, value);
+            }
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            if (parts.next()) |value| {
+                inv.port = std.fmt.parseInt(u16, value, 10) catch inv.port;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
+            inv.port = std.fmt.parseInt(u16, arg["--port=".len..], 10) catch inv.port;
+        }
     }
-
-    return null;
+    return inv;
 }
 
-fn parsePidFirstToken(line: []const u8) ?i32 {
-    const trimmed = std.mem.trim(u8, line, " \t\r");
-    if (trimmed.len == 0) return null;
-
-    var parts = std.mem.tokenizeAny(u8, trimmed, " \t");
-    const pid_text = parts.next() orelse return null;
-    return std.fmt.parseInt(i32, pid_text, 10) catch null;
+/// 捕获 tracked daemon 的调用参数；daemon 不在运行（或命令行不可读）时返回 null。
+pub fn captureTrackedInvocation(allocator: std.mem.Allocator) !?TrackedInvocation {
+    const pid = (try readTrackedPid(allocator)) orelse return null;
+    const maybe_cmdline = rawDaemonCommandLineAlloc(allocator, pid) catch null;
+    const cmdline = maybe_cmdline orelse return null;
+    defer allocator.free(cmdline);
+    return try parseTrackedInvocationFromCmdline(allocator, pid, cmdline);
 }
 
+/// 运行时状态只信任本环境（XDG_RUNTIME_DIR）的 pid/lock 文件，绝不全局扫描
+/// 进程表：旧版的 ps/pgrep 全局发现会把其他 HOME/XDG 环境的 zc daemon 误认为
+/// 本环境的 —— status 会把别人的 pid 写进本地 pid 文件，stop 会杀掉别人的
+/// 进程。pid 文件丢失而锁仍被持有时，如实上报 `lock_held_pid_untracked`。
 fn inspectRuntimeAtPathsWithInspector(
     allocator: std.mem.Allocator,
     pid_file: []const u8,
@@ -304,14 +335,6 @@ fn inspectRuntimeAtPathsWithInspector(
         removePidFileAtPath(pid_file);
     }
 
-    if (try inspector.discover_pid(allocator)) |pid| {
-        writePidAtPath(pid_file, pid) catch {};
-        return .{
-            .pid = pid,
-            .lock_held = true,
-        };
-    }
-
     if (try isDaemonLockHeldAtPath(lock_file)) {
         return .{
             .detail = "lock_held_pid_untracked",
@@ -329,7 +352,6 @@ fn inspectRuntimeAtPathsWithInspector(
 fn inspectRuntimeAtPaths(allocator: std.mem.Allocator, pid_file: []const u8, lock_file: []const u8) !RuntimeState {
     return inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, .{
         .pid_is_daemon = pidMatchesRunningDaemon,
-        .discover_pid = discoverDaemonPid,
     });
 }
 
@@ -390,77 +412,15 @@ fn isDaemonLockHeldAtPath(lock_file_path: []const u8) !bool {
     return false;
 }
 
-fn printAlreadyRunning(json_output: bool, pid: ?i32) void {
-    if (json_output) {
-        printCliOk(json_output, "start", "running", "already_running", pid);
-        return;
-    }
-
-    if (pid) |p| {
-        std.debug.print("zc daemon already running (pid: {d})\n", .{p});
-    } else {
-        std.debug.print("zc daemon already running or startup is in progress\n", .{});
-    }
-}
-
 /// 检查进程是否正在运行
 pub fn isRunning(allocator: std.mem.Allocator) !bool {
     return (try inspectRuntime(allocator)).isRunning();
 }
 
-fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {
-    if (json_output) {
-        std.debug.print(
-            "{{\"ok\":false,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\",\"hint\":\"{s}\"}}}}\n",
-            .{ code, message, hint },
-        );
-        return;
-    }
-
-    std.debug.print("error.code={s}\n", .{code});
-    std.debug.print("error.message={s}\n", .{message});
-    std.debug.print("error.hint={s}\n", .{hint});
-}
-
-fn printCliOk(json_output: bool, action: []const u8, state: []const u8, detail: ?[]const u8, pid: ?i32) void {
-    if (json_output) {
-        if (detail) |d| {
-            if (pid) |p| {
-                std.debug.print(
-                    "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"detail\":\"{s}\",\"pid\":{d}}}}}\n",
-                    .{ action, state, d, p },
-                );
-            } else {
-                std.debug.print(
-                    "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"detail\":\"{s}\"}}}}\n",
-                    .{ action, state, d },
-                );
-            }
-        } else if (pid) |p| {
-            std.debug.print(
-                "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\",\"pid\":{d}}}}}\n",
-                .{ action, state, p },
-            );
-        } else {
-            std.debug.print(
-                "{{\"ok\":true,\"data\":{{\"action\":\"{s}\",\"state\":\"{s}\"}}}}\n",
-                .{ action, state },
-            );
-        }
-        return;
-    }
-
-    if (detail) |d| {
-        if (pid) |p| {
-            std.debug.print("ok action={s} state={s} detail={s} pid={d}\n", .{ action, state, d, p });
-        } else {
-            std.debug.print("ok action={s} state={s} detail={s}\n", .{ action, state, d });
-        }
-    } else if (pid) |p| {
-        std.debug.print("ok action={s} state={s} pid={d}\n", .{ action, state, p });
-    } else {
-        std.debug.print("ok action={s} state={s}\n", .{ action, state });
-    }
+/// `zc start --foreground`（决策 D1）：不 fork，由调用方持有 daemon 锁直到
+/// 进程退出，防止与后台 daemon 双实例并存。
+pub fn acquireForegroundLock(allocator: std.mem.Allocator) !compat.fs.File {
+    return try acquireDaemonLockFile(allocator);
 }
 
 fn getDaemonUptime(pid: ?i32) !?i64 {
@@ -582,88 +542,55 @@ fn collectStatusSnapshotAtPaths(
     };
 }
 
-fn appendJsonStringEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
-    try out.append(allocator, '"');
-    for (value) |ch| switch (ch) {
-        '\\' => try out.appendSlice(allocator, "\\\\"),
-        '"' => try out.appendSlice(allocator, "\\\""),
-        '\n' => try out.appendSlice(allocator, "\\n"),
-        '\r' => try out.appendSlice(allocator, "\\r"),
-        '\t' => try out.appendSlice(allocator, "\\t"),
-        else => try out.append(allocator, ch),
-    };
-    try out.append(allocator, '"');
-}
+/// 经 cli/output.zig 渲染 status：JSON envelope（stdout，std.json 序列化）
+/// 或人类可读文本（stdout）。字段名为冻结词汇（见 docs/cli/ux-workflow.md 第 3 节）。
+fn emitStatus(allocator: std.mem.Allocator, out: *cli_output.Output, snapshot: *const StatusSnapshot) !void {
+    if (out.mode == .json) {
+        try out.success(.{
+            .action = snapshot.action,
+            .state = snapshot.state,
+            .detail = snapshot.detail,
+            .pid = snapshot.pid,
+            .uptime_seconds = snapshot.uptime_seconds,
+            .active_config = snapshot.active_config,
+            .selected_proxies = snapshot.selected_proxies,
+            .paths = .{
+                .pid_file = snapshot.pid_file,
+                .lock_file = snapshot.lock_file,
+                .log_file = snapshot.log_file,
+            },
+        });
+        return;
+    }
 
-fn formatStatusJson(allocator: std.mem.Allocator, snapshot: *const StatusSnapshot) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
-    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{");
-    try out.appendSlice(allocator, "\"action\":\"status\"");
-    try out.print(allocator, ",\"state\":\"{s}\"", .{snapshot.state});
+    try out.print("zc status\n", .{});
+    try out.print("state: {s}\n", .{snapshot.state});
     if (snapshot.detail) |detail| {
-        try out.print(allocator, ",\"detail\":\"{s}\"", .{detail});
+        try out.print("detail: {s}\n", .{detail});
     }
     if (snapshot.pid) |pid| {
-        try out.print(allocator, ",\"pid\":{d}", .{pid});
+        try out.print("pid: {d}\n", .{pid});
+    } else {
+        try out.print("pid: (none)\n", .{});
     }
     if (snapshot.uptime_seconds) |uptime_seconds| {
-        try out.print(allocator, ",\"uptime_seconds\":{d}", .{uptime_seconds});
+        try out.print("uptime_seconds: {d}\n", .{uptime_seconds});
     } else {
-        try out.appendSlice(allocator, ",\"uptime_seconds\":null");
-    }
-    try out.appendSlice(allocator, ",\"active_config\":");
-    if (snapshot.active_config) |active_config| {
-        try appendJsonStringEscaped(&out, allocator, active_config);
-    } else {
-        try out.appendSlice(allocator, "null");
-    }
-    try out.appendSlice(allocator, ",\"selected_proxies\":");
-    try runtime_selection.appendSelectedProxiesJson(&out, allocator, snapshot.selected_proxies);
-    try out.appendSlice(allocator, ",\"paths\":{");
-    try out.appendSlice(allocator, "\"pid_file\":");
-    try appendJsonStringEscaped(&out, allocator, snapshot.pid_file);
-    try out.appendSlice(allocator, ",\"lock_file\":");
-    try appendJsonStringEscaped(&out, allocator, snapshot.lock_file);
-    try out.appendSlice(allocator, ",\"log_file\":");
-    try appendJsonStringEscaped(&out, allocator, snapshot.log_file);
-    try out.appendSlice(allocator, "}}}\n");
-
-    return out.toOwnedSlice(allocator);
-}
-
-fn emitStatusJson(allocator: std.mem.Allocator, snapshot: *const StatusSnapshot) !void {
-    const text = try formatStatusJson(allocator, snapshot);
-    defer allocator.free(text);
-    std.debug.print("{s}", .{text});
-}
-
-fn emitStatusText(allocator: std.mem.Allocator, snapshot: *const StatusSnapshot) void {
-    std.debug.print("zc status\n", .{});
-    std.debug.print("state: {s}\n", .{snapshot.state});
-    if (snapshot.detail) |detail| {
-        std.debug.print("detail: {s}\n", .{detail});
-    }
-    if (snapshot.pid) |pid| {
-        std.debug.print("pid: {d}\n", .{pid});
-    } else {
-        std.debug.print("pid: (none)\n", .{});
-    }
-    if (snapshot.uptime_seconds) |uptime_seconds| {
-        std.debug.print("uptime_seconds: {d}\n", .{uptime_seconds});
-    } else {
-        std.debug.print("uptime_seconds: (unknown)\n", .{});
+        try out.print("uptime_seconds: (unknown)\n", .{});
     }
     if (snapshot.active_config) |active_config| {
-        std.debug.print("active_config: {s}\n", .{active_config});
+        try out.print("active_config: {s}\n", .{active_config});
     } else {
-        std.debug.print("active_config: (none)\n", .{});
+        try out.print("active_config: (none)\n", .{});
     }
-    runtime_selection.printSelectedProxiesText(allocator, snapshot.selected_proxies);
-    std.debug.print("pid_file: {s}\n", .{snapshot.pid_file});
-    std.debug.print("lock_file: {s}\n", .{snapshot.lock_file});
-    std.debug.print("log_file: {s}\n", .{snapshot.log_file});
+    var selections_text = std.ArrayList(u8).empty;
+    defer selections_text.deinit(allocator);
+    try runtime_selection.appendSelectedProxiesText(&selections_text, allocator, snapshot.selected_proxies);
+    try out.print("{s}", .{selections_text.items});
+    try out.print("pid_file: {s}\n", .{snapshot.pid_file});
+    try out.print("lock_file: {s}\n", .{snapshot.lock_file});
+    try out.print("log_file: {s}\n", .{snapshot.log_file});
+    try out.flush();
 }
 
 /// 打印启动后的服务信息（mixed-proxy, api-server, mode, proxies, rules）
@@ -681,7 +608,7 @@ fn parseStartPortOverride(extra_args: []const []const u8) ?u16 {
     return null;
 }
 
-fn printStartupInfo(allocator: std.mem.Allocator, config_path: ?[]const u8, extra_args: []const []const u8) void {
+pub fn printStartupInfo(allocator: std.mem.Allocator, config_path: ?[]const u8, extra_args: []const []const u8, out: *cli_output.Output) void {
     var cfg = blk: {
         if (config_path) |path| {
             break :blk config.load(allocator, path) catch return;
@@ -698,22 +625,22 @@ fn printStartupInfo(allocator: std.mem.Allocator, config_path: ?[]const u8, extr
         cfg.bind_address;
 
     const mixed_port = parseStartPortOverride(extra_args) orelse constants.MIXED_PORT;
-    std.debug.print("  mixed-proxy: {s}:{d}\n", .{ bind, mixed_port });
+    out.print("  mixed-proxy: {s}:{d}\n", .{ bind, mixed_port }) catch return;
     if (cfg.external_controller) |ec| {
-        std.debug.print("  api-server:  {s}\n", .{ec});
+        out.print("  api-server:  {s}\n", .{ec}) catch return;
     }
-    std.debug.print("  mode:        {s}\n", .{cfg.mode});
-    std.debug.print("  proxies:     {d}\n", .{cfg.proxies.items.len});
-    std.debug.print("  rules:       {d}\n", .{cfg.rules.items.len});
+    out.print("  mode:        {s}\n", .{cfg.mode}) catch return;
+    out.print("  proxies:     {d}\n", .{cfg.proxies.items.len}) catch return;
+    out.print("  rules:       {d}\n", .{cfg.rules.items.len}) catch return;
 }
 
-/// 启动守护进程
-pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool, extra_args: []const []const u8) !void {
+/// 启动守护进程。只返回事实（LifecycleOutcome）或错误；envelope/文本由
+/// main.zig 经 cli/output.zig 恰好打印一次。
+pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, extra_args: []const []const u8) !LifecycleOutcome {
     var lock_file = acquireDaemonLockFile(allocator) catch |err| switch (err) {
         error.DaemonAlreadyRunning => {
             const existing_pid = try waitForTrackedRunningPid(allocator);
-            printAlreadyRunning(json_output, existing_pid);
-            return;
+            return .{ .detail = "already_running", .pid = existing_pid };
         },
         else => return err,
     };
@@ -722,23 +649,18 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
     // 兼容旧版本 daemon：即使没有 lock，也不要在已有可追踪 pid 存活时再启动一个实例。
     // 这里不能用 isRunning()，因为当前 start 进程自己已经拿到了 lock。
     if (try readTrackedPid(allocator)) |existing_pid| {
-        printAlreadyRunning(json_output, existing_pid);
-        return;
+        return .{ .detail = "already_running", .pid = existing_pid };
     }
 
     // Fork 子进程
     const fork_result = std.c.fork();
     if (fork_result < 0) {
-        std.debug.print("Failed to fork\n", .{});
         return error.Unexpected;
     }
     const pid: std.posix.pid_t = @intCast(fork_result);
 
     if (pid > 0) {
         // 父进程：轮询最多 2s，每 200ms 检查子进程是否存活
-        const log_path = getLogFilePath(allocator) catch null;
-        defer if (log_path) |p| allocator.free(p);
-
         var i: usize = 0;
         while (i < startup_poll_attempts) : (i += 1) { // 10 × 200ms = 2s
             compat.sleepNs(startup_poll_interval_ms * std.time.ns_per_ms);
@@ -746,17 +668,6 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
             // 检查子进程是否还活着
             std.posix.kill(pid, @enumFromInt(0)) catch {
                 // 子进程已退出，启动失败
-                if (json_output) {
-                    printCliError(json_output, "START_FAILED", "daemon exited during startup", "check `zc log --no-follow` for details");
-                } else {
-                    std.debug.print("zc daemon failed to start\n", .{});
-                    std.debug.print("  error: daemon exited during startup\n", .{});
-                    if (log_path) |lp| {
-                        std.debug.print("  hint:  check `zc log` or {s}\n", .{lp});
-                    } else {
-                        std.debug.print("  hint:  check `zc log --no-follow`\n", .{});
-                    }
-                }
                 removePidFile(allocator);
                 return error.StartFailed;
             };
@@ -765,20 +676,7 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
         // 子进程在 2s 后仍然存活，视为启动成功
         try writePid(allocator, pid);
         lock_file.close(compat.io());
-
-        if (json_output) {
-            printCliOk(json_output, "start", "running", null, pid);
-        } else {
-            std.debug.print("zc daemon started (pid: {d})\n", .{pid});
-
-            // 加载配置以显示服务信息
-            printStartupInfo(allocator, config_path, extra_args);
-
-            if (log_path) |lp| {
-                std.debug.print("  log:         {s}\n", .{lp});
-            }
-        }
-        return;
+        return .{ .pid = pid };
     }
 
     // 子进程：成为守护进程
@@ -859,26 +757,23 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_
     return error.ExecFailed;
 }
 
-/// 停止守护进程
-pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
+/// 停止守护进程。只返回事实（LifecycleOutcome）或错误；envelope/文本由
+/// main.zig 经 cli/output.zig 恰好打印一次。
+pub fn stopDaemon(allocator: std.mem.Allocator) !LifecycleOutcome {
     const runtime = try inspectRuntime(allocator);
     const pid = runtime.pid orelse {
         if (runtime.lock_held) {
-            printCliError(json_output, "STOP_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc stop`");
             return error.DaemonPidUntracked;
         }
-        printCliOk(json_output, "stop", "stopped", "already_stopped", null);
-        return;
+        return .{ .detail = "already_stopped" };
     };
 
     // 发送 SIGTERM 信号
     std.posix.kill(pid, std.posix.SIG.TERM) catch |err| {
         if (err == error.ProcessNotFound) {
-            printCliOk(json_output, "stop", "stopped", "already_stopped", null);
             removePidFile(allocator);
-            return;
+            return .{ .detail = "already_stopped" };
         }
-        printCliError(json_output, "STOP_FAILED", "failed to send terminate signal", "verify process permissions and retry `zc stop`");
         return err;
     };
 
@@ -901,48 +796,68 @@ pub fn stopDaemon(allocator: std.mem.Allocator, json_output: bool) !void {
 
     // 删除 PID 文件
     removePidFile(allocator);
-    printCliOk(json_output, "stop", "stopped", null, pid);
+    return .{ .pid = pid };
 }
 
-/// 重启守护进程
-pub fn restartDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool, extra_args: []const []const u8) !void {
-    const was_running = try isRunning(allocator);
+/// 静默重启：供 reloadOrRestart（config update / config override / zc reload）
+/// 使用，不产生任何 CLI 输出，调用方负责唯一的 envelope。
+///
+/// 保留旧 daemon 的 `-c`/`--port` 启动参数：否则 fallback restart 会把端口
+/// 打回默认 mixed-port，绑定失败时旧 daemon 已被杀死、新 daemon 起不来。
+/// 受监管的前台 daemon（`start --foreground`，systemd/容器 PID 1）绝不接管：
+/// 杀掉它会让监管者陷入 respawn/锁竞争循环，直接拒绝。
+fn restartDaemonQuiet(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
+    var preserved: ?TrackedInvocation = null;
+    defer if (preserved) |*inv| inv.deinit(allocator);
 
-    if (was_running) {
-        try stopDaemon(allocator, json_output);
-    } else {
-        printCliOk(json_output, "restart", "stopped", "service_was_stopped", null);
+    if (try isRunning(allocator)) {
+        preserved = captureTrackedInvocation(allocator) catch null;
+        if (preserved) |inv| {
+            if (inv.foreground) return error.ForegroundDaemonSupervised;
+        }
+        _ = try stopDaemon(allocator);
     }
 
-    try startDaemon(allocator, config_path, json_output, extra_args);
-    const pid = try readTrackedPid(allocator) orelse {
-        printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details");
+    const effective_config: ?[]const u8 = config_path orelse
+        (if (preserved) |inv| inv.config_path else null);
+
+    var port_buf: [32]u8 = undefined;
+    var extra_storage: [1][]const u8 = undefined;
+    var extra_args: []const []const u8 = &.{};
+    if (preserved) |inv| {
+        if (inv.port) |port| {
+            extra_storage[0] = try std.fmt.bufPrint(&port_buf, "--port={d}", .{port});
+            extra_args = extra_storage[0..1];
+        }
+    }
+
+    _ = try startDaemon(allocator, effective_config, extra_args);
+    if ((try readTrackedPid(allocator)) == null) {
         return error.StartFailed;
-    };
-    printCliOk(json_output, "restart", "running", null, pid);
+    }
 }
 
-pub fn reloadDaemon(_: std.mem.Allocator, _: ?[]const u8, _: bool) !void {
+pub fn reloadDaemon(_: std.mem.Allocator, _: ?[]const u8) !void {
     return error.HotReloadUnsupported;
 }
 
-pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, json_output: bool, apply_mode: ApplyMode) !ApplyResult {
+pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, apply_mode: ApplyMode) !ApplyResult {
     if (!try isRunning(allocator)) {
         return .hot_applied;
     }
 
     switch (apply_mode) {
         .restart => {
-            try restartDaemon(allocator, config_path, json_output, &.{});
+            try restartDaemonQuiet(allocator, config_path);
             return .restart_applied;
         },
         .hot => {
-            try reloadDaemon(allocator, config_path, json_output);
+            try reloadDaemon(allocator, config_path);
             return .hot_applied;
         },
         .auto => {
-            reloadDaemon(allocator, config_path, json_output) catch {
-                try restartDaemon(allocator, config_path, json_output, &.{});
+            reloadDaemon(allocator, config_path) catch {
+                try restartDaemonQuiet(allocator, config_path);
                 return .restart_fallback;
             };
             return .hot_applied;
@@ -950,27 +865,23 @@ pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, j
     }
 }
 
-/// 获取状态
-pub fn getStatus(allocator: std.mem.Allocator, json_output: bool) !void {
+/// 获取状态并经 cli/output.zig 渲染（stdout）。
+pub fn getStatus(allocator: std.mem.Allocator, out: *cli_output.Output) !void {
     var snapshot = try collectStatusSnapshot(allocator);
     defer snapshot.deinit(allocator);
-
-    if (json_output) {
-        try emitStatusJson(allocator, &snapshot);
-        return;
-    }
-
-    emitStatusText(allocator, &snapshot);
+    try emitStatus(allocator, out, &snapshot);
 }
 
-/// 查看日志（默认显示最后 50 行，持续刷新）
-pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void {
+/// 查看日志（默认显示最后 50 行，持续刷新）。
+/// 日志行是主输出，永远走 stdout：JSON 模式下为 JSON Lines（每行一个
+/// {"line":"..."} 对象），文本模式下为时间戳行；横幅类提示是诊断，走 stderr。
+pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool, out: *cli_output.Output) !void {
     const log_path = try getLogFilePath(allocator);
     defer allocator.free(log_path);
 
     const file = compat.fs.openFileAbsolute(log_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
-            std.debug.print("No log file found\n", .{});
+            if (out.mode != .json) out.note("No log file found\n", .{}) catch {};
             return;
         }
         return err;
@@ -979,11 +890,11 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
 
     // 首先显示最后 N 行
     const n = lines orelse 50;
-    try printLastNLines(allocator, file, n);
+    try printLastNLines(allocator, file, n, out);
 
     // 如果需要持续刷新
     if (follow) {
-        std.debug.print("\n--- Following log (Ctrl+C to exit) ---\n", .{});
+        if (out.mode != .json) out.note("\n--- Following log (Ctrl+C to exit) ---\n", .{}) catch {};
         var carry = std.ArrayList(u8).empty;
         defer carry.deinit(allocator);
 
@@ -1006,17 +917,17 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
                 while (true) {
                     const bytes_read = try compat.fileRead(file, &buffer);
                     if (bytes_read == 0) break;
-                    try printTimestampedChunk(allocator, buffer[0..bytes_read], &carry);
+                    try printTimestampedChunk(allocator, buffer[0..bytes_read], &carry, out);
                 }
 
                 last_pos = new_size;
             } else if (new_size < last_pos) {
                 // 文件被截断或轮转，从头开始
                 if (carry.items.len > 0) {
-                    printTimestampedLine(carry.items);
+                    emitLogLine(out, carry.items);
                     carry.clearRetainingCapacity();
                 }
-                std.debug.print("\n--- Log file rotated, restarting from beginning ---\n", .{});
+                if (out.mode != .json) out.note("\n--- Log file rotated, restarting from beginning ---\n", .{}) catch {};
                 try compat.fileSeekTo(file, 0);
                 last_pos = 0;
             }
@@ -1025,7 +936,7 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool) !void 
 }
 
 /// 打印文件最后 N 行
-fn printLastNLines(allocator: std.mem.Allocator, file: compat.fs.File, n: usize) !void {
+fn printLastNLines(allocator: std.mem.Allocator, file: compat.fs.File, n: usize, out: *cli_output.Output) !void {
     const file_size = (try file.stat(compat.io())).size;
     const max_size = 1024 * 1024 * 10; // 10MB max
     const read_size = @min(file_size, max_size);
@@ -1040,39 +951,42 @@ fn printLastNLines(allocator: std.mem.Allocator, file: compat.fs.File, n: usize)
     try compat.fileSeekTo(file, file_size - read_size);
     _ = try compat.fileReadAll(file, content);
 
-    // 找到最后 N 行的起始位置
-    var line_count: usize = 0;
-    var start_pos: usize = content.len;
+    try printTimestampedSlice(allocator, tailLinesSlice(content, n), out);
+}
 
+/// 返回 content 中最后 n 行的切片。不足 n 行时返回整个 content（修复
+/// fresh daemon 日志少于 50 行时 `zc log` 输出为空的问题）；结尾换行符
+/// 不算行边界（修复 88 行取 50 只得 49 的 off-by-one）。
+fn tailLinesSlice(content: []const u8, n: usize) []const u8 {
+    if (content.len == 0 or n == 0) return content[content.len..];
+
+    var line_count: usize = 0;
     var i: usize = content.len;
+    if (content[i - 1] == '\n') i -= 1;
     while (i > 0) : (i -= 1) {
         if (content[i - 1] == '\n') {
             line_count += 1;
-            if (line_count >= n) {
-                start_pos = i;
-                break;
-            }
+            if (line_count >= n) return content[i..];
         }
     }
-
-    try printTimestampedSlice(allocator, content[start_pos..]);
+    return content;
 }
 
-fn printTimestampedSlice(allocator: std.mem.Allocator, content: []const u8) !void {
+fn printTimestampedSlice(allocator: std.mem.Allocator, content: []const u8, out: *cli_output.Output) !void {
     var carry = std.ArrayList(u8).empty;
     defer carry.deinit(allocator);
-    try printTimestampedChunk(allocator, content, &carry);
+    try printTimestampedChunk(allocator, content, &carry, out);
     if (carry.items.len > 0) {
-        printTimestampedLine(carry.items);
+        emitLogLine(out, carry.items);
     }
 }
 
-fn printTimestampedChunk(allocator: std.mem.Allocator, chunk: []const u8, carry: *std.ArrayList(u8)) !void {
+fn printTimestampedChunk(allocator: std.mem.Allocator, chunk: []const u8, carry: *std.ArrayList(u8), out: *cli_output.Output) !void {
     try carry.appendSlice(allocator, chunk);
 
     while (std.mem.indexOfScalar(u8, carry.items, '\n')) |idx| {
         const line = carry.items[0..idx];
-        printTimestampedLine(line);
+        emitLogLine(out, line);
 
         const remaining = carry.items.len - (idx + 1);
         if (remaining > 0) {
@@ -1082,21 +996,20 @@ fn printTimestampedChunk(allocator: std.mem.Allocator, chunk: []const u8, carry:
     }
 }
 
-fn printTimestampedLine(line: []const u8) void {
-    const ts = compat.timestamp();
-    std.debug.print("[{d}] {s}\n", .{ ts, line });
+/// 日志行 = 主输出 = stdout（契约 docs/cli/ux-workflow.md 第 1 节），
+/// JSON 模式走 JSON Lines，文本模式走 Output.print（不再 std.debug.print 到 stderr）。
+fn emitLogLine(out: *cli_output.Output, line: []const u8) void {
+    if (out.mode == .json) {
+        // JSON Lines：每行一个对象，无 envelope（流式约定，决策见 ux-workflow.md）。
+        out.jsonLine(.{ .line = line }) catch {};
+        return;
+    }
+    out.print("[{d}] {s}\n", .{ compat.timestamp(), line }) catch {};
+    out.flush() catch {};
 }
 
 fn testPidNeverMatchesDaemon(_: std.mem.Allocator, _: i32) !bool {
     return false;
-}
-
-fn testDiscoverNoDaemon(_: std.mem.Allocator) !?i32 {
-    return null;
-}
-
-fn testDiscoverRecoveredDaemon(_: std.mem.Allocator) !?i32 {
-    return 4321;
 }
 
 fn testTmpRootAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
@@ -1151,7 +1064,6 @@ test "collectStatusSnapshot reports stopped state without pid file" {
         null,
         .{
             .pid_is_daemon = testPidNeverMatchesDaemon,
-            .discover_pid = testDiscoverNoDaemon,
         },
     );
     defer snapshot.deinit(allocator);
@@ -1191,7 +1103,6 @@ test "collectStatusSnapshot reports stale pid file and removes it" {
         null,
         .{
             .pid_is_daemon = testPidNeverMatchesDaemon,
-            .discover_pid = testDiscoverNoDaemon,
         },
     );
     defer snapshot.deinit(allocator);
@@ -1220,7 +1131,6 @@ test "inspectRuntime ignores stale live pid when it is not a zc daemon" {
 
     const runtime = try inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, .{
         .pid_is_daemon = testPidNeverMatchesDaemon,
-        .discover_pid = testDiscoverNoDaemon,
     });
 
     try std.testing.expect(runtime.pid == null);
@@ -1228,33 +1138,6 @@ test "inspectRuntime ignores stale live pid when it is not a zc daemon" {
     try std.testing.expectEqualStrings("stale_pid_file", runtime.detail.?);
     try std.testing.expectEqual(std.c.getpid(), runtime.stale_pid.?);
     try std.testing.expectError(error.FileNotFound, compat.fs.openFileAbsolute(pid_file, .{}));
-}
-
-test "inspectRuntime replaces stale pid file with discovered daemon pid" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_root = try testTmpRootAlloc(allocator, &tmp);
-    defer allocator.free(tmp_root);
-
-    const pid_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.pid" });
-    defer allocator.free(pid_file);
-    const lock_file = try compat.fs.path.join(allocator, &.{ tmp_root, "zc.lock" });
-    defer allocator.free(lock_file);
-
-    try writePidAtPath(pid_file, 999999);
-
-    const runtime = try inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, .{
-        .pid_is_daemon = testPidNeverMatchesDaemon,
-        .discover_pid = testDiscoverRecoveredDaemon,
-    });
-
-    try std.testing.expectEqual(@as(?i32, 4321), runtime.pid);
-    try std.testing.expect(runtime.lock_held);
-    try std.testing.expect(runtime.detail == null);
-    try std.testing.expectEqual(@as(?i32, null), runtime.stale_pid);
-    try std.testing.expectEqual(@as(?i32, 4321), try readPidAtPath(pid_file));
 }
 
 test "collectStatusSnapshot reports running when lock is held but pid is untracked" {
@@ -1283,7 +1166,6 @@ test "collectStatusSnapshot reports running when lock is held but pid is untrack
         null,
         .{
             .pid_is_daemon = testPidNeverMatchesDaemon,
-            .discover_pid = testDiscoverNoDaemon,
         },
     );
     defer snapshot.deinit(allocator);
@@ -1301,85 +1183,191 @@ test "commandLineLooksLikeDaemon requires zc daemon-run invocation" {
     try std.testing.expect(!commandLineLooksLikeDaemon("/bin/zsh -lc /Users/like/.local/bin/zc --daemon-run"));
 }
 
+test "commandLineLooksLikeDaemon accepts supervised foreground daemon (D1)" {
+    try std.testing.expect(commandLineLooksLikeDaemon("/usr/local/bin/zclash start --foreground"));
+    try std.testing.expect(commandLineLooksLikeDaemon("/usr/bin/zc start --foreground -c /etc/zc/config.yaml"));
+    try std.testing.expect(!commandLineLooksLikeDaemon("/usr/bin/zc start"));
+    try std.testing.expect(!commandLineLooksLikeDaemon("/usr/bin/zc stop --foreground"));
+}
+
 test "cmdlineBufferLooksLikeDaemon parses nul-separated argv" {
     const daemon_cmdline = "/Users/like/.local/bin/zc\x00--daemon-run\x00-c\x00/tmp/demo.yaml\x00";
+    const foreground_cmdline = "/usr/local/bin/zclash\x00start\x00--foreground\x00";
     const cli_cmdline = "/Users/like/.local/bin/zc\x00status\x00";
 
     try std.testing.expect(cmdlineBufferLooksLikeDaemon(daemon_cmdline));
+    try std.testing.expect(cmdlineBufferLooksLikeDaemon(foreground_cmdline));
     try std.testing.expect(!cmdlineBufferLooksLikeDaemon(cli_cmdline));
 }
 
-test "formatStatusJson preserves status compatibility fields and adds rich data" {
+test "parseTrackedInvocationFromCmdline extracts -c/--port/--foreground" {
     const allocator = std.testing.allocator;
+
+    var bg = try parseTrackedInvocationFromCmdline(
+        allocator,
+        4321,
+        "/Users/like/.local/bin/zc --daemon-run -c /tmp/demo.yaml --port=29101",
+    );
+    defer bg.deinit(allocator);
+    try std.testing.expect(!bg.foreground);
+    try std.testing.expectEqualStrings("/tmp/demo.yaml", bg.config_path.?);
+    try std.testing.expectEqual(@as(?u16, 29101), bg.port);
+
+    var fg = try parseTrackedInvocationFromCmdline(
+        allocator,
+        1,
+        "/usr/local/bin/zclash\x00start\x00--foreground\x00--port\x007901\x00",
+    );
+    defer fg.deinit(allocator);
+    try std.testing.expect(fg.foreground);
+    try std.testing.expect(fg.config_path == null);
+    try std.testing.expectEqual(@as(?u16, 7901), fg.port);
+
+    var bare = try parseTrackedInvocationFromCmdline(allocator, 7, "/usr/bin/zc --daemon-run");
+    defer bare.deinit(allocator);
+    try std.testing.expect(!bare.foreground);
+    try std.testing.expect(bare.config_path == null);
+    try std.testing.expect(bare.port == null);
+}
+
+test "tailLinesSlice returns whole content when fewer than n lines" {
+    const content = "l1\nl2\nl3\n";
+    try std.testing.expectEqualStrings(content, tailLinesSlice(content, 50));
+}
+
+test "tailLinesSlice returns exactly the last n lines despite trailing newline" {
+    const content = "l1\nl2\nl3\nl4\nl5\n";
+    try std.testing.expectEqualStrings("l4\nl5\n", tailLinesSlice(content, 2));
+    try std.testing.expectEqualStrings(content, tailLinesSlice(content, 5));
+    try std.testing.expectEqualStrings("l5\n", tailLinesSlice(content, 1));
+}
+
+test "tailLinesSlice handles missing trailing newline and n == 0" {
+    const content = "l1\nl2\nl3";
+    try std.testing.expectEqualStrings("l2\nl3", tailLinesSlice(content, 2));
+    try std.testing.expectEqualStrings("", tailLinesSlice(content, 0));
+    try std.testing.expectEqualStrings("", tailLinesSlice("", 3));
+}
+
+test "text mode log lines go to stdout, not stderr" {
+    const allocator = std.testing.allocator;
+
+    var out_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer out_aw.deinit();
+    var err_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer err_aw.deinit();
+    var out = cli_output.Output.init(.text, "log", false, &out_aw.writer, &err_aw.writer);
+
+    try printTimestampedSlice(allocator, "first line\nsecond line\n", &out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "first line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "second line") != null);
+    try std.testing.expectEqualStrings("", err_aw.written());
+}
+
+test "json mode log lines are JSON Lines on stdout" {
+    const allocator = std.testing.allocator;
+
+    var out_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer out_aw.deinit();
+    var err_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer err_aw.deinit();
+    var out = cli_output.Output.init(.json, "log", false, &out_aw.writer, &err_aw.writer);
+
+    try printTimestampedSlice(allocator, "alpha\nwith \"quotes\"\n", &out);
+
+    var lines = std.mem.tokenizeScalar(u8, out_aw.written(), '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("line") != null);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("", err_aw.written());
+}
+
+test "status json envelope preserves frozen field names and escapes strings" {
+    const allocator = std.testing.allocator;
+
+    const selections = try allocator.alloc(runtime_selection.SelectedProxy, 1);
+    selections[0] = .{
+        .group_name = try allocator.dupe(u8, "Pro\"xy"),
+        .proxy_name = try allocator.dupe(u8, "HK 01"),
+        .source = .persisted,
+    };
+
     var snapshot = StatusSnapshot{
         .state = "running",
         .pid = 321,
         .uptime_seconds = 42,
         .active_config = try allocator.dupe(u8, "demo"),
+        .selected_proxies = selections,
         .pid_file = try allocator.dupe(u8, "/tmp/zc.pid"),
         .lock_file = try allocator.dupe(u8, "/tmp/zc.lock"),
         .log_file = try allocator.dupe(u8, "/tmp/zc.log"),
     };
     defer snapshot.deinit(allocator);
 
-    const out = try formatStatusJson(allocator, &snapshot);
-    defer allocator.free(out);
+    var out_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer out_aw.deinit();
+    var err_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer err_aw.deinit();
+    var out = cli_output.Output.init(.json, "status", false, &out_aw.writer, &err_aw.writer);
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"action\":\"status\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"state\":\"running\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"pid\":321") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"uptime_seconds\":42") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"active_config\":\"demo\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"selected_proxies\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"paths\":{\"pid_file\":\"/tmp/zc.pid\",\"lock_file\":\"/tmp/zc.lock\",\"log_file\":\"/tmp/zc.log\"}") != null);
+    try emitStatus(allocator, &out, &snapshot);
+
+    // stderr 必须干净，stdout 恰好一行可解析 JSON。
+    try std.testing.expectEqualStrings("", err_aw.written());
+    const written = out_aw.written();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, std.mem.trimEnd(u8, written, "\n"), "\n") + 1);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, written, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("ok").?.bool);
+    try std.testing.expectEqualStrings("status", root.get("command").?.string);
+
+    const data = root.get("data").?.object;
+    try std.testing.expectEqualStrings("status", data.get("action").?.string);
+    try std.testing.expectEqualStrings("running", data.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 321), data.get("pid").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), data.get("uptime_seconds").?.integer);
+    try std.testing.expectEqualStrings("demo", data.get("active_config").?.string);
+
+    const selected = data.get("selected_proxies").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqualStrings("Pro\"xy", selected[0].object.get("group").?.string);
+    try std.testing.expectEqualStrings("HK 01", selected[0].object.get("proxy").?.string);
+    try std.testing.expectEqualStrings("persisted", selected[0].object.get("source").?.string);
+
+    const paths = data.get("paths").?.object;
+    try std.testing.expectEqualStrings("/tmp/zc.pid", paths.get("pid_file").?.string);
+    try std.testing.expectEqualStrings("/tmp/zc.lock", paths.get("lock_file").?.string);
+    try std.testing.expectEqualStrings("/tmp/zc.log", paths.get("log_file").?.string);
 }
 
-test "parseDaemonPidCandidateFromPsOutput finds daemon-run process" {
-    const output =
-        \\  100 /usr/bin/login /usr/bin/login -pfl like /bin/zsh -l
-        \\62559 /Users/like/.local/bin/zc /Users/like/.local/bin/zc --daemon-run
-        \\71242 rg rg zc
-        \\
-    ;
+test "status text output goes to stdout with state tokens" {
+    const allocator = std.testing.allocator;
+    var snapshot = StatusSnapshot{
+        .state = "stopped",
+        .detail = "stale_pid_file",
+        .pid_file = try allocator.dupe(u8, "/tmp/zc.pid"),
+        .lock_file = try allocator.dupe(u8, "/tmp/zc.lock"),
+        .log_file = try allocator.dupe(u8, "/tmp/zc.log"),
+    };
+    defer snapshot.deinit(allocator);
 
-    const pid = parseDaemonPidCandidateFromPsOutput(output);
-    try std.testing.expectEqual(@as(?i32, 62559), pid);
-}
+    var out_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer out_aw.deinit();
+    var err_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer err_aw.deinit();
+    var out = cli_output.Output.init(.text, "status", false, &out_aw.writer, &err_aw.writer);
 
-test "parseDaemonPidCandidateFromPsOutput accepts full args output" {
-    const output =
-        \\81256 /System/Library/ExtensionKit/Extensions/ClassroomSettings.appex/Contents/MacOS/ClassroomSettings /System/Library/ExtensionKit/Extensions/ClassroomSettings.appex/Contents/MacOS/ClassroomSettings -LaunchArguments xxx
-        \\62559 /Users/like/.local/bin/zc /Users/like/.local/bin/zc --daemon-run -c /Users/like/.config/zc/configs/D5koNO7H.yaml
-        \\
-    ;
+    try emitStatus(allocator, &out, &snapshot);
 
-    const pid = parseDaemonPidCandidateFromPsOutput(output);
-    try std.testing.expectEqual(@as(?i32, 62559), pid);
-}
-
-test "parseDaemonPidCandidateFromPsOutput ignores shell wrapper processes" {
-    const output =
-        \\62558 /bin/zsh /bin/zsh -lc /Users/like/.local/bin/zc --daemon-run
-        \\62559 /Users/like/.local/bin/zc /Users/like/.local/bin/zc --daemon-run
-        \\
-    ;
-
-    const pid = parseDaemonPidCandidateFromPsOutput(output);
-    try std.testing.expectEqual(@as(?i32, 62559), pid);
-}
-
-test "parseDaemonPidCandidateFromPsOutput tolerates truncated comm column on macOS" {
-    const output =
-        \\14597 /Users/like/.loc /Users/like/.local/bin/zc --daemon-run
-        \\
-    ;
-
-    const pid = parseDaemonPidCandidateFromPsOutput(output);
-    try std.testing.expectEqual(@as(?i32, 14597), pid);
-}
-
-test "parsePidFirstToken accepts pgrep pid-only and pid-with-command lines" {
-    try std.testing.expectEqual(@as(?i32, 14597), parsePidFirstToken("14597"));
-    try std.testing.expectEqual(@as(?i32, 14597), parsePidFirstToken("14597 /Users/like/.local/bin/zc --daemon-run"));
-    try std.testing.expectEqual(@as(?i32, null), parsePidFirstToken("not-a-pid"));
+    try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "state: stopped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "detail: stale_pid_file") != null);
+    try std.testing.expectEqualStrings("", err_aw.written());
 }

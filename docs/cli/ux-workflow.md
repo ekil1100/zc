@@ -50,6 +50,7 @@
 | D9 | 新增 `zc reload`：热重载当前配置（`daemon.reloadOrRestart`，restart 兜底）；podman e2e 已引用 | 默认 |
 | D10 | `profile` 保持 `proxy` 的别名组（不在本工作流中重命名/废弃），文案按命令路径渲染 | 默认 |
 | D11 | 未知 flag / 缺值 flag ⇒ 用法错误 exit ≠ 0（终结 `hasFlag` 全 argv 扫描） | 默认 |
+| D12 | 移除 ps/pgrep 全局 daemon 发现：`status`/`stop` 只信任本环境 pid/lock 文件，绝不收养并杀掉其他 HOME/XDG 环境（如生产实例）的 daemon；pid 文件丢失时按 `lock_held_pid_untracked`/端口占用报告，不再自动接管 | 验证中发现的危险行为，维护者隔离要求 |
 
 ## 3. 冻结词汇（不可变更）
 
