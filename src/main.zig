@@ -12,6 +12,7 @@ const meta = @import("meta.zig");
 const api = @import("api/server.zig");
 const daemon = @import("daemon.zig");
 const proxy_cli = @import("proxy_cli.zig");
+const runtime_selection = @import("runtime_selection.zig");
 const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
 const override = @import("override.zig");
@@ -363,289 +364,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // 处理 proxy 子命令
+    // 处理 proxy / profile 子命令（Batch 4：同一 handler，按命令路径渲染文案，
+    // 决策 D10 —— 终结 profile 块对 proxy 块的整段复制粘贴）
     if (std.mem.eql(u8, cmd, "proxy")) {
-        if (args.len < 3) {
-            try printProxyHelp();
-            return;
-        }
-
-        const subcmd = args[2];
-
-        if (isHelpArg(subcmd)) {
-            try printProxyHelp();
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
-            if (containsHelpArg(args, 3)) {
-                try printProxyListHelp();
-                return;
-            }
-            // 解析 -c 参数
-            var config_path: ?[]const u8 = null;
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-c")) {
-                    if (i + 1 < args.len) {
-                        config_path = args[i + 1];
-                        i += 1;
-                    }
-                }
-            }
-
-            // 加载配置
-            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "proxy.list") catch |err| {
-                if (printOverrideRuntimeError(json_output, err)) return err;
-                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy list", "check config path and retry with `-c <config>`");
-                return err;
-            };
-            defer cfg.deinit();
-
-            if (json_output) {
-                try proxy_cli.listProxiesJson(allocator, &cfg);
-            } else {
-                try proxy_cli.listProxies(allocator, &cfg);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "select")) {
-            if (containsHelpArg(args, 3)) {
-                try printProxySelectHelp("proxy");
-                return;
-            }
-            var group_name: ?[]const u8 = null;
-            var proxy_name: ?[]const u8 = null;
-            var config_path: ?[]const u8 = null;
-
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-g")) {
-                    if (i + 1 < args.len) {
-                        group_name = args[i + 1];
-                        i += 1;
-                    }
-                } else if (std.mem.eql(u8, args[i], "-p")) {
-                    if (i + 1 < args.len) {
-                        proxy_name = args[i + 1];
-                        i += 1;
-                    }
-                } else if (std.mem.eql(u8, args[i], "-c")) {
-                    if (i + 1 < args.len) {
-                        config_path = args[i + 1];
-                        i += 1;
-                    }
-                }
-            }
-
-            // 加载配置（需要可变引用）
-            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "proxy.select") catch |err| {
-                if (printOverrideRuntimeError(json_output, err)) return err;
-                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy select", "check config path and retry with `-c <config>`");
-                return err;
-            };
-            defer cfg.deinit();
-
-            if (json_output) {
-                proxy_cli.selectProxyJson(allocator, &cfg, group_name, proxy_name) catch |err| {
-                    switch (err) {
-                        error.GroupNotFound => printCliError(true, "PROXY_GROUP_NOT_FOUND", "proxy group not found", "run `zc proxy list --json` to inspect groups"),
-                        error.ProxyNotFound => printCliError(true, "PROXY_NOT_FOUND", "proxy not found in group", "run `zc proxy select -g <group> --json` to inspect choices"),
-                        error.NoSelectGroup => printCliError(true, "PROXY_SELECT_GROUP_MISSING", "no select-type proxy group found", "check profile proxy-groups config"),
-                        else => printCliError(true, "PROXY_SELECT_FAILED", "failed to select proxy", "retry with valid group/proxy arguments"),
-                    }
-                    return;
-                };
-            } else {
-                try proxy_cli.selectProxy(allocator, &cfg, group_name, proxy_name);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "test")) {
-            if (containsHelpArg(args, 3)) {
-                try printProxyTestHelp("proxy");
-                return;
-            }
-            var config_path: ?[]const u8 = null;
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-c") and i + 1 < args.len) {
-                    config_path = args[i + 1];
-                    i += 1;
-                }
-            }
-
-            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "proxy.test") catch |err| {
-                if (printOverrideRuntimeError(json_output, err)) return err;
-                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy test", "check config path and retry with `-c <config>`");
-                return err;
-            };
-            defer cfg.deinit();
-            const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
-            defer if (config_key) |key| allocator.free(key);
-
-            if (json_output) {
-                try test_cli.testProxyJson(allocator, &cfg, null, config_key);
-            } else {
-                try test_cli.testProxy(allocator, &cfg, null, config_key);
-            }
-            return;
-        }
-
-        // 未知子命令
-        if (json_output) {
-            printCliError(json_output, "PROXY_SUBCOMMAND_UNKNOWN", "unknown proxy subcommand", "use `zc proxy --help` or `zc help`");
-        } else {
-            std.debug.print("Unknown proxy subcommand: {s}\n", .{subcmd});
-            try printProxyHelp();
-        }
+        try runProxyFamilyCommand(allocator, args, json_output, &override_opts, &proxy_family_text);
         return;
     }
-
-    // 处理 profile 子命令
     if (std.mem.eql(u8, cmd, "profile")) {
-        if (args.len < 3) {
-            if (json_output) {
-                printCliError(json_output, "PROFILE_SUBCOMMAND_MISSING", "profile subcommand is required", "use `zc profile --help` or `zc help profile`");
-            } else {
-                try printProfileHelp();
-            }
-            return;
-        }
-
-        const subcmd = args[2];
-
-        if (isHelpArg(subcmd)) {
-            try printProfileHelp();
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
-            if (containsHelpArg(args, 3)) {
-                try printProfileListHelp();
-                return;
-            }
-            // 解析 -c 参数
-            var config_path: ?[]const u8 = null;
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-c")) {
-                    if (i + 1 < args.len) {
-                        config_path = args[i + 1];
-                        i += 1;
-                    }
-                }
-            }
-
-            // 加载配置
-            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "profile.list") catch |err| {
-                if (printOverrideRuntimeError(json_output, err)) return err;
-                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy list", "check config path and retry with `-c <config>`");
-                return err;
-            };
-            defer cfg.deinit();
-
-            if (json_output) {
-                try proxy_cli.listProxiesJson(allocator, &cfg);
-            } else {
-                try proxy_cli.listProxies(allocator, &cfg);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "select")) {
-            if (containsHelpArg(args, 3)) {
-                try printProxySelectHelp("profile");
-                return;
-            }
-            var group_name: ?[]const u8 = null;
-            var proxy_name: ?[]const u8 = null;
-            var config_path: ?[]const u8 = null;
-
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-g")) {
-                    if (i + 1 < args.len) {
-                        group_name = args[i + 1];
-                        i += 1;
-                    }
-                } else if (std.mem.eql(u8, args[i], "-p")) {
-                    if (i + 1 < args.len) {
-                        proxy_name = args[i + 1];
-                        i += 1;
-                    }
-                } else if (std.mem.eql(u8, args[i], "-c")) {
-                    if (i + 1 < args.len) {
-                        config_path = args[i + 1];
-                        i += 1;
-                    }
-                }
-            }
-
-            // 加载配置（需要可变引用）
-            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "profile.select") catch |err| {
-                if (printOverrideRuntimeError(json_output, err)) return err;
-                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy select", "check config path and retry with `-c <config>`");
-                return err;
-            };
-            defer cfg.deinit();
-
-            if (json_output) {
-                proxy_cli.selectProxyJson(allocator, &cfg, group_name, proxy_name) catch |err| {
-                    switch (err) {
-                        error.GroupNotFound => printCliError(true, "PROXY_GROUP_NOT_FOUND", "proxy group not found", "run `zc proxy list --json` to inspect groups"),
-                        error.ProxyNotFound => printCliError(true, "PROXY_NOT_FOUND", "proxy not found in group", "run `zc proxy select -g <group> --json` to inspect choices"),
-                        error.NoSelectGroup => printCliError(true, "PROXY_SELECT_GROUP_MISSING", "no select-type proxy group found", "check profile proxy-groups config"),
-                        else => printCliError(true, "PROXY_SELECT_FAILED", "failed to select proxy", "retry with valid group/proxy arguments"),
-                    }
-                    return;
-                };
-            } else {
-                try proxy_cli.selectProxy(allocator, &cfg, group_name, proxy_name);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "test")) {
-            if (containsHelpArg(args, 3)) {
-                try printProxyTestHelp("profile");
-                return;
-            }
-            var config_path: ?[]const u8 = null;
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-c") and i + 1 < args.len) {
-                    config_path = args[i + 1];
-                    i += 1;
-                }
-            }
-
-            var cfg = loadAndValidateConfig(allocator, config_path, null, !json_output, &override_opts, "profile.test") catch |err| {
-                if (printOverrideRuntimeError(json_output, err)) return err;
-                printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for proxy test", "check config path and retry with `-c <config>`");
-                return err;
-            };
-            defer cfg.deinit();
-            const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
-            defer if (config_key) |key| allocator.free(key);
-
-            if (json_output) {
-                try test_cli.testProxyJson(allocator, &cfg, null, config_key);
-            } else {
-                try test_cli.testProxy(allocator, &cfg, null, config_key);
-            }
-            return;
-        }
-
-        // 未知子命令
-        if (json_output) {
-            printCliError(json_output, "PROFILE_SUBCOMMAND_UNKNOWN", "unknown profile subcommand", "use `zc profile --help` or `zc help profile`");
-        } else {
-            std.debug.print("Unknown profile subcommand: {s}\n", .{subcmd});
-            try printProfileHelp();
-        }
+        try runProxyFamilyCommand(allocator, args, json_output, &override_opts, &profile_family_text);
         return;
     }
 
@@ -850,8 +576,8 @@ fn profileExists(allocator: std.mem.Allocator, name: []const u8) !bool {
 fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {
     var out_buf: [4096]u8 = undefined;
     var err_buf: [2048]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(compat.io(), &out_buf);
-    var stderr_writer = std.Io.File.stderr().writer(compat.io(), &err_buf);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(compat.io(), &out_buf);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(compat.io(), &err_buf);
     var out = cli_output.Output.init(
         if (json_output) .json else .text,
         g_cli_command,
@@ -871,6 +597,9 @@ fn stderrColorEnabled() bool {
 /// 生命周期命令共用的 stdout/stderr Output 构造器。
 /// 用法：`var streams = StdStreams{}; var out = streams.output(json_output);`
 /// streams 必须比返回的 Output 活得久（两者都放在同一栈帧即可）。
+/// 注意：必须用 writerStreaming —— 默认 positional writer 从 pos 0 pwrite，
+/// 流重定向到普通文件时会覆盖 std.debug.print（streaming）已写入的内容
+/// （例如 stderr 上的配置校验输出）。
 const StdStreams = struct {
     out_buf: [4096]u8 = undefined,
     err_buf: [2048]u8 = undefined,
@@ -878,8 +607,8 @@ const StdStreams = struct {
     stderr_writer: std.Io.File.Writer = undefined,
 
     fn output(self: *StdStreams, json_output: bool) cli_output.Output {
-        self.stdout_writer = std.Io.File.stdout().writer(compat.io(), &self.out_buf);
-        self.stderr_writer = std.Io.File.stderr().writer(compat.io(), &self.err_buf);
+        self.stdout_writer = std.Io.File.stdout().writerStreaming(compat.io(), &self.out_buf);
+        self.stderr_writer = std.Io.File.stderr().writerStreaming(compat.io(), &self.err_buf);
         return cli_output.Output.init(
             if (json_output) .json else .text,
             g_cli_command,
@@ -906,34 +635,34 @@ fn setCliCommand(canonical_top: []const u8, args: []const []const u8) void {
 
 fn printShortUsage() void {
     var buf: [256]u8 = undefined;
-    var w = std.Io.File.stderr().writer(compat.io(), &buf);
+    var w = std.Io.File.stderr().writerStreaming(compat.io(), &buf);
     w.interface.writeAll("Usage: zc <command> [options]\nRun `zc help` to list commands.\n") catch return;
     w.interface.flush() catch return;
 }
 
 fn printGlobalHelpStdout() !void {
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(compat.io(), &buf);
+    var w = std.Io.File.stdout().writerStreaming(compat.io(), &buf);
     try cli_commands.writeGlobalHelp(&w.interface, build_options.version);
 }
 
 fn printTopicHelpStdout(tokens: []const []const u8) !bool {
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(compat.io(), &buf);
+    var w = std.Io.File.stdout().writerStreaming(compat.io(), &buf);
     return cli_commands.writeTopicHelp(&w.interface, tokens);
 }
 
 fn printCommandHelpStdout(cmd: *const cli_commands.Command) !void {
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(compat.io(), &buf);
+    var w = std.Io.File.stdout().writerStreaming(compat.io(), &buf);
     try cli_commands.writeCommandHelp(&w.interface, cmd);
 }
 
 fn printVersion(json_output: bool) !void {
     var out_buf: [512]u8 = undefined;
     var err_buf: [256]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(compat.io(), &out_buf);
-    var stderr_writer = std.Io.File.stderr().writer(compat.io(), &err_buf);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(compat.io(), &out_buf);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(compat.io(), &err_buf);
     var out = cli_output.Output.init(
         if (json_output) .json else .text,
         "version",
@@ -1490,6 +1219,290 @@ fn runConfigCommand(
 
     // 未知 config 子命令：两种模式同语义（envelope/error block）+ exit_usage。
     printCliError(json_output, "CONFIG_SUBCOMMAND_UNKNOWN", "unknown config subcommand", "use `zc config --help` to list config subcommands");
+    std.process.exit(cli_output.exit_usage);
+}
+
+// ---------------------------------------------------------------------------
+// proxy/profile 命令家族（Batch 4）
+// ---------------------------------------------------------------------------
+
+/// 决策 D10：profile 是 proxy 的别名组，两条路径共用同一 handler，
+/// 文案/hint/错误码前缀按实际命令路径渲染（不再泄漏 "proxy" 字样）。
+const ProxyFamilyText = struct {
+    family: []const u8,
+    list_cmd_name: []const u8,
+    select_cmd_name: []const u8,
+    test_cmd_name: []const u8,
+    load_list_msg: []const u8,
+    load_select_msg: []const u8,
+    load_test_msg: []const u8,
+    list_arg_code: []const u8,
+    select_arg_code: []const u8,
+    test_arg_code: []const u8,
+    list_arg_msg: []const u8,
+    select_arg_msg: []const u8,
+    test_arg_msg: []const u8,
+    list_usage_hint: []const u8,
+    select_usage_hint: []const u8,
+    test_usage_hint: []const u8,
+    sub_unknown_code: []const u8,
+    sub_unknown_msg: []const u8,
+    sub_unknown_hint: []const u8,
+    group_not_found_hint: []const u8,
+    group_not_select_hint: []const u8,
+    proxy_not_found_hint: []const u8,
+    not_interactive_hint: []const u8,
+};
+
+fn proxyFamilyText(comptime family: []const u8, comptime code_prefix: []const u8) ProxyFamilyText {
+    return .{
+        .family = family,
+        .list_cmd_name = family ++ ".list",
+        .select_cmd_name = family ++ ".select",
+        .test_cmd_name = family ++ ".test",
+        .load_list_msg = "failed to load/validate config for " ++ family ++ " list",
+        .load_select_msg = "failed to load/validate config for " ++ family ++ " select",
+        .load_test_msg = "failed to load/validate config for " ++ family ++ " test",
+        .list_arg_code = code_prefix ++ "_LIST_ARGUMENT_INVALID",
+        .select_arg_code = code_prefix ++ "_SELECT_ARGUMENT_INVALID",
+        .test_arg_code = code_prefix ++ "_TEST_ARGUMENT_INVALID",
+        .list_arg_msg = "unknown or unexpected argument for `" ++ family ++ " list`",
+        .select_arg_msg = "unknown or unexpected argument for `" ++ family ++ " select`",
+        .test_arg_msg = "unknown or unexpected argument for `" ++ family ++ " test`",
+        .list_usage_hint = "use `zc " ++ family ++ " list [-c <config>] [--json]`",
+        .select_usage_hint = "use `zc " ++ family ++ " select [-g <group>] [-p <proxy>] [-c <config>] [--json]`",
+        .test_usage_hint = "use `zc " ++ family ++ " test [-c <config>] [--json]`",
+        // 冻结错误码（integration tests / docs/api/error-codes.md 断言）。
+        .sub_unknown_code = code_prefix ++ "_SUBCOMMAND_UNKNOWN",
+        .sub_unknown_msg = "unknown " ++ family ++ " subcommand",
+        .sub_unknown_hint = "use `zc " ++ family ++ " --help` or `zc help " ++ family ++ "`",
+        .group_not_found_hint = "run `zc " ++ family ++ " list --json` to inspect groups",
+        .group_not_select_hint = "only select-type groups support manual selection; run `zc " ++ family ++ " list` to see group types",
+        .proxy_not_found_hint = "run `zc " ++ family ++ " select -g <group> --json` to inspect choices",
+        .not_interactive_hint = "stdin is not a TTY; use `zc " ++ family ++ " select -g <group> -p <proxy>`",
+    };
+}
+
+const proxy_family_text = proxyFamilyText("proxy", "PROXY");
+const profile_family_text = proxyFamilyText("profile", "PROFILE");
+
+const proxy_config_load_hint = "check config path and retry with `-c <config>`";
+
+const ProxyFamilyArgs = struct {
+    group: ?[]const u8 = null,
+    proxy: ?[]const u8 = null,
+    config_path: ?[]const u8 = null,
+};
+
+/// list/test 只接受 `-c`；select 额外接受 `-g`/`-p`。override flags 由
+/// override.parseCliOptions 全局解析（含缺值校验），这里跳过 flag 及其值。
+/// 决策 D11：其余未知 flag / 缺值 flag / 多余位置参数 -> 用法错误。
+fn parseProxyFamilyArgs(args: []const []const u8, start_index: usize, allow_select_flags: bool) !ProxyFamilyArgs {
+    var parsed = ProxyFamilyArgs{};
+    var i = start_index;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isGlobalCliFlag(arg)) continue;
+        if (std.mem.eql(u8, arg, "-c")) {
+            // 紧跟全局 flag 视为缺值（`-g --json` 不能把 flag 吃成组名）。
+            if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingConfigPathValue;
+            parsed.config_path = args[i + 1];
+            i += 1;
+        } else if (allow_select_flags and std.mem.eql(u8, arg, "-g")) {
+            if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingGroupValue;
+            parsed.group = args[i + 1];
+            i += 1;
+        } else if (allow_select_flags and std.mem.eql(u8, arg, "-p")) {
+            if (i + 1 >= args.len or isGlobalCliFlag(args[i + 1])) return error.MissingProxyValue;
+            parsed.proxy = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--override-script") or
+            std.mem.eql(u8, arg, "--override-timeout-ms") or
+            std.mem.eql(u8, arg, "--override-arg"))
+        {
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--override-script=") or
+            std.mem.startsWith(u8, arg, "--override-timeout-ms=") or
+            std.mem.startsWith(u8, arg, "--override-arg="))
+        {
+            // `=` 形式自带值，整体跳过。
+        } else {
+            return error.UnexpectedArgument;
+        }
+    }
+    return parsed;
+}
+
+fn proxyArgsErrorMessage(err: anyerror, unexpected_msg: []const u8) []const u8 {
+    return switch (err) {
+        error.MissingConfigPathValue => "missing value for `-c`",
+        error.MissingGroupValue => "missing value for `-g`",
+        error.MissingProxyValue => "missing value for `-p`",
+        else => unexpected_msg,
+    };
+}
+
+/// select 路径错误统一出口：envelope/error block + 非零退出码
+/// （修复 JSON 模式 select 错误 exit 0 的缺口）。
+fn exitProxySelectError(json_output: bool, err: anyerror, text: *const ProxyFamilyText) noreturn {
+    switch (err) {
+        error.GroupNotFound => printCliError(json_output, "PROXY_GROUP_NOT_FOUND", "proxy group not found", text.group_not_found_hint),
+        error.GroupNotSelect => printCliError(json_output, "PROXY_GROUP_NOT_SELECTABLE", "group is not a select-type proxy group", text.group_not_select_hint),
+        error.ProxyNotFound => printCliError(json_output, "PROXY_NOT_FOUND", "proxy not found in group", text.proxy_not_found_hint),
+        error.NoSelectGroup => printCliError(json_output, "PROXY_SELECT_GROUP_MISSING", "no select-type proxy group found", "check profile proxy-groups config"),
+        error.NotInteractive => {
+            printCliError(json_output, "PROXY_SELECT_NOT_INTERACTIVE", "interactive selection requires a TTY on stdin", text.not_interactive_hint);
+            std.process.exit(cli_output.exit_usage);
+        },
+        else => printCliError(json_output, "PROXY_SELECT_FAILED", "failed to select proxy", "retry with valid group/proxy arguments"),
+    }
+    std.process.exit(cli_output.exit_failure);
+}
+
+fn loadProxyFamilyConfig(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    json_output: bool,
+    override_opts: *const override.CliOptions,
+    command_name: []const u8,
+    load_msg: []const u8,
+) config.Config {
+    return loadAndValidateConfig(allocator, config_path, null, !json_output, override_opts, command_name) catch |err| {
+        if (!printOverrideRuntimeError(json_output, err)) {
+            printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", load_msg, proxy_config_load_hint);
+        }
+        std.process.exit(cli_output.exit_failure);
+    };
+}
+
+/// proxy/profile 命令树 dispatch（结构与 runConfigCommand 对齐）：
+/// 错误统一走 printCliError 并以非零码退出；用法错误 exit_usage。
+fn runProxyFamilyCommand(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    json_output: bool,
+    override_opts: *const override.CliOptions,
+    text: *const ProxyFamilyText,
+) !void {
+    // 裸 `zc proxy` / `zc profile`（或只带全局 flag）-> 组帮助（stdout, exit 0），
+    // 与 config 组对齐。
+    if (args.len < 3 or isHelpArg(args[2]) or
+        std.mem.eql(u8, args[2], "--json") or std.mem.eql(u8, args[2], "--no-color"))
+    {
+        _ = try printTopicHelpStdout(&.{text.family});
+        return;
+    }
+    const subcmd = args[2];
+
+    if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
+        if (containsHelpArg(args, 3)) {
+            _ = try printTopicHelpStdout(&.{ text.family, "list" });
+            return;
+        }
+        const parsed = parseProxyFamilyArgs(args, 3, false) catch |err| {
+            printCliError(json_output, text.list_arg_code, proxyArgsErrorMessage(err, text.list_arg_msg), text.list_usage_hint);
+            std.process.exit(cli_output.exit_usage);
+        };
+
+        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, json_output, override_opts, text.list_cmd_name, text.load_list_msg);
+        defer cfg.deinit();
+
+        // 当前选择用于文本标记 / JSON 的 `now` 字段；拿不到不阻塞 list。
+        const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
+        defer if (config_key) |key| allocator.free(key);
+        const selections_opt: ?[]runtime_selection.SelectedProxy =
+            runtime_selection.collectSelectedProxies(allocator, &cfg, config_key) catch null;
+        defer if (selections_opt) |s| runtime_selection.deinitSelectedProxies(allocator, s);
+        const selections: []const runtime_selection.SelectedProxy = selections_opt orelse &.{};
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        if (json_output) {
+            proxy_cli.listProxiesJson(allocator, &cfg, selections, &out) catch std.process.exit(cli_output.exit_failure);
+        } else {
+            proxy_cli.listProxies(&cfg, selections, &out) catch std.process.exit(cli_output.exit_failure);
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "select")) {
+        if (containsHelpArg(args, 3)) {
+            _ = try printTopicHelpStdout(&.{ text.family, "select" });
+            return;
+        }
+        const parsed = parseProxyFamilyArgs(args, 3, true) catch |err| {
+            printCliError(json_output, text.select_arg_code, proxyArgsErrorMessage(err, text.select_arg_msg), text.select_usage_hint);
+            std.process.exit(cli_output.exit_usage);
+        };
+
+        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, json_output, override_opts, text.select_cmd_name, text.load_select_msg);
+        defer cfg.deinit();
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+
+        if (parsed.proxy) |proxy_name| {
+            // 非交互路径：两种模式同语义 —— 只在 select 组里解析、应用、
+            // 通知 daemon（修复 JSON 模式 state:"selected" 假成功的无操作）。
+            const group = proxy_cli.resolveSelectGroup(&cfg, parsed.group) catch |err| exitProxySelectError(json_output, err, text);
+            const applied = proxy_cli.applySelection(allocator, &cfg, group, proxy_name, &out) catch |err| exitProxySelectError(json_output, err, text);
+            if (json_output) {
+                // data.applied 反映是否真的通知到了运行中的 daemon（工作项 7）。
+                out.success(.{ .action = "proxy_select", .group = group.name, .proxy = proxy_name, .state = "selected", .applied = applied }) catch {};
+            }
+            return;
+        }
+
+        if (json_output) {
+            // JSON 无 `-p`：只读列出候选，不改任何选择。
+            const group = proxy_cli.resolveSelectGroup(&cfg, parsed.group) catch |err| exitProxySelectError(json_output, err, text);
+            out.success(.{ .action = "proxy_select", .group = group.name, .choices = group.proxies.items }) catch {};
+            return;
+        }
+
+        // 文本交互（仅 TTY）：非 TTY 缺 `-p` 一律报错退出，绝不静默选第一个节点。
+        const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
+        defer if (config_key) |key| allocator.free(key);
+        const selections_opt: ?[]runtime_selection.SelectedProxy =
+            runtime_selection.collectSelectedProxies(allocator, &cfg, config_key) catch null;
+        defer if (selections_opt) |s| runtime_selection.deinitSelectedProxies(allocator, s);
+        const selections: []const runtime_selection.SelectedProxy = selections_opt orelse &.{};
+
+        const picked = proxy_cli.selectProxyInteractive(allocator, &cfg, parsed.group, selections, &out) catch |err| exitProxySelectError(json_output, err, text);
+        if (picked) |selection| {
+            _ = proxy_cli.applySelection(allocator, &cfg, selection.group, selection.proxy, &out) catch |err| exitProxySelectError(json_output, err, text);
+        }
+        // picker 取消（q/Esc）：无输出，exit 0。
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "test")) {
+        if (containsHelpArg(args, 3)) {
+            _ = try printTopicHelpStdout(&.{ text.family, "test" });
+            return;
+        }
+        const parsed = parseProxyFamilyArgs(args, 3, false) catch |err| {
+            printCliError(json_output, text.test_arg_code, proxyArgsErrorMessage(err, text.test_arg_msg), text.test_usage_hint);
+            std.process.exit(cli_output.exit_usage);
+        };
+
+        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, json_output, override_opts, text.test_cmd_name, text.load_test_msg);
+        defer cfg.deinit();
+        const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
+        defer if (config_key) |key| allocator.free(key);
+
+        // 真实探测语义不变（CHECKS_FAILED 语义属下一批次）；失败时文本模式
+        // 已输出逐项诊断，这里只保证非零退出且不再抛 Zig stack trace。
+        if (json_output) {
+            test_cli.testProxyJson(allocator, &cfg, null, config_key) catch std.process.exit(cli_output.exit_failure);
+        } else {
+            test_cli.testProxy(allocator, &cfg, null, config_key) catch std.process.exit(cli_output.exit_failure);
+        }
+        return;
+    }
+
+    // 未知子命令：两种模式同语义（envelope/error block）+ exit_usage。
+    printCliError(json_output, text.sub_unknown_code, text.sub_unknown_msg, text.sub_unknown_hint);
     std.process.exit(cli_output.exit_usage);
 }
 
@@ -2118,14 +2131,6 @@ fn printConfigHelp() !void {
     _ = try printTopicHelpStdout(&.{"config"});
 }
 
-fn printProxyHelp() !void {
-    _ = try printTopicHelpStdout(&.{"proxy"});
-}
-
-fn printProfileHelp() !void {
-    _ = try printTopicHelpStdout(&.{"profile"});
-}
-
 fn printDiagHelp() !void {
     _ = try printTopicHelpStdout(&.{"diag"});
 }
@@ -2154,24 +2159,8 @@ fn printConfigOverrideHelp() !void {
     _ = try printTopicHelpStdout(&.{ "config", "override" });
 }
 
-fn printProxyListHelp() !void {
-    _ = try printTopicHelpStdout(&.{ "proxy", "list" });
-}
-
-fn printProfileListHelp() !void {
-    _ = try printTopicHelpStdout(&.{ "profile", "list" });
-}
-
 fn printDiagDoctorHelp() !void {
     _ = try printTopicHelpStdout(&.{ "diag", "doctor" });
-}
-
-fn printProxySelectHelp(group: []const u8) !void {
-    _ = try printTopicHelpStdout(&.{ group, "select" });
-}
-
-fn printProxyTestHelp(group: []const u8) !void {
-    _ = try printTopicHelpStdout(&.{ group, "test" });
 }
 
 test "parseExternalControllerPort valid and invalid" {
@@ -2249,6 +2238,68 @@ test "include auxiliary cli tests" {
     _ = @import("doctor_cli.zig");
     _ = @import("override.zig");
     _ = @import("protocol/trojan.zig");
+    _ = @import("proxy_cli.zig");
+}
+
+test "parseProxyFamilyArgs parses -c and select flags, rejects strays (D11)" {
+    const testing = std.testing;
+
+    const list_args = [_][]const u8{ "zc", "proxy", "list", "-c", "./x.yaml", "--json" };
+    const parsed = try parseProxyFamilyArgs(list_args[0..], 3, false);
+    try testing.expectEqualStrings("./x.yaml", parsed.config_path.?);
+    try testing.expect(parsed.group == null);
+
+    const select_args = [_][]const u8{ "zc", "proxy", "select", "-g", "Proxy", "-p", "HK", "--no-color" };
+    const parsed2 = try parseProxyFamilyArgs(select_args[0..], 3, true);
+    try testing.expectEqualStrings("Proxy", parsed2.group.?);
+    try testing.expectEqualStrings("HK", parsed2.proxy.?);
+
+    // list/test 不接受 -g/-p
+    try testing.expectError(error.UnexpectedArgument, parseProxyFamilyArgs(select_args[0..], 3, false));
+
+    const missing_c = [_][]const u8{ "zc", "proxy", "list", "-c" };
+    try testing.expectError(error.MissingConfigPathValue, parseProxyFamilyArgs(missing_c[0..], 3, false));
+
+    const missing_g = [_][]const u8{ "zc", "proxy", "select", "-g" };
+    try testing.expectError(error.MissingGroupValue, parseProxyFamilyArgs(missing_g[0..], 3, true));
+
+    // `-g --json` 不能把全局 flag 吃成组名
+    const flag_as_value = [_][]const u8{ "zc", "proxy", "select", "-g", "--json" };
+    try testing.expectError(error.MissingGroupValue, parseProxyFamilyArgs(flag_as_value[0..], 3, true));
+
+    const missing_p = [_][]const u8{ "zc", "proxy", "select", "-p" };
+    try testing.expectError(error.MissingProxyValue, parseProxyFamilyArgs(missing_p[0..], 3, true));
+
+    const stray = [_][]const u8{ "zc", "proxy", "list", "extra" };
+    try testing.expectError(error.UnexpectedArgument, parseProxyFamilyArgs(stray[0..], 3, false));
+
+    // override flags 由全局解析负责，这里跳过（含值）
+    const with_override = [_][]const u8{ "zc", "proxy", "test", "--override-script", "./s.lua", "--override-arg=k=v" };
+    const parsed3 = try parseProxyFamilyArgs(with_override[0..], 3, false);
+    try testing.expect(parsed3.config_path == null);
+}
+
+test "proxyFamilyText renders per-path wording without proxy leakage (D10)" {
+    const testing = std.testing;
+
+    try testing.expectEqualStrings("PROFILE_SUBCOMMAND_UNKNOWN", profile_family_text.sub_unknown_code);
+    try testing.expectEqualStrings("PROXY_SUBCOMMAND_UNKNOWN", proxy_family_text.sub_unknown_code);
+    try testing.expectEqualStrings("unknown profile subcommand", profile_family_text.sub_unknown_msg);
+    try testing.expectEqualStrings("profile.select", profile_family_text.select_cmd_name);
+    try testing.expectEqualStrings("failed to load/validate config for profile select", profile_family_text.load_select_msg);
+    // profile 路径的 hint 必须指向 zc profile，而不是 zc proxy。
+    try testing.expect(std.mem.indexOf(u8, profile_family_text.group_not_found_hint, "zc profile list") != null);
+    try testing.expect(std.mem.indexOf(u8, profile_family_text.group_not_found_hint, "zc proxy") == null);
+    try testing.expect(std.mem.indexOf(u8, profile_family_text.not_interactive_hint, "zc profile select") != null);
+}
+
+test "proxyArgsErrorMessage maps missing values to actionable text" {
+    const testing = std.testing;
+
+    try testing.expectEqualStrings("missing value for `-c`", proxyArgsErrorMessage(error.MissingConfigPathValue, "x"));
+    try testing.expectEqualStrings("missing value for `-g`", proxyArgsErrorMessage(error.MissingGroupValue, "x"));
+    try testing.expectEqualStrings("missing value for `-p`", proxyArgsErrorMessage(error.MissingProxyValue, "x"));
+    try testing.expectEqualStrings("fallback", proxyArgsErrorMessage(error.UnexpectedArgument, "fallback"));
 }
 
 test "hasInProcessPortConflict detects conflicts" {

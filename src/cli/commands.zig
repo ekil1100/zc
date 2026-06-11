@@ -179,13 +179,14 @@ pub const table = [_]Command{
     },
     .{
         .path = "proxy select",
-        .summary = "Select proxy for a group (interactive without -g/-p)",
+        .summary = "Select proxy for a select-type group (interactive picker on a TTY without -p)",
         .flags = &.{
-            .{ .spec = "-g <group>", .help = "Proxy group to change" },
-            .{ .spec = "-p <proxy>", .help = "Proxy node to select" },
+            .{ .spec = "-g <group>", .help = "Select-type proxy group to change (default: first select group)" },
+            .{ .spec = "-p <proxy>", .help = "Proxy node to select (required when stdin is not a TTY)" },
+            config_flag,
             json_flag,
         },
-        .examples = &.{ "zc proxy select", "zc proxy select -g Proxy -p HK" },
+        .examples = &.{ "zc proxy select", "zc proxy select -g Proxy -p HK", "zc proxy select -g Proxy -p HK --json" },
     },
     .{
         .path = "proxy test",
@@ -201,10 +202,11 @@ pub const table = [_]Command{
     },
     .{
         .path = "profile select",
-        .summary = "Select proxy for a group (interactive without -g/-p)",
+        .summary = "Select proxy for a select-type group (interactive picker on a TTY without -p)",
         .flags = &.{
-            .{ .spec = "-g <group>", .help = "Proxy group to change" },
-            .{ .spec = "-p <proxy>", .help = "Proxy node to select" },
+            .{ .spec = "-g <group>", .help = "Select-type proxy group to change (default: first select group)" },
+            .{ .spec = "-p <proxy>", .help = "Proxy node to select (required when stdin is not a TTY)" },
+            config_flag,
             json_flag,
         },
     },

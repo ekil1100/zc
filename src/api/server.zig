@@ -163,45 +163,42 @@ pub const ApiServer = struct {
     }
 
     /// PUT /proxies/<group_name> body: {"name":"proxy_name"}
+    ///
+    /// body 经 std.json 解析（真实反转义 —— 节点名可含 `"`/`\`/换行等，
+    /// 修复旧 extractJsonString 扫到第一个 `"` 字节截断转义名的 bug）；
+    /// 组/节点先对照配置校验，未命中返回 404 而不是无条件 200（修复 CLI
+    /// `data.applied` 假阳性）。
     fn handleSwitchProxy(self: *ApiServer, conn: net.Server.Connection, group_name: []const u8, body: []const u8) !void {
-        // 从 body 的 JSON 中提取 "name" 字段
-        const proxy_name = extractJsonString(body, "name") orelse {
+        const proxy_name = parseSelectionName(self.allocator, body) orelse {
             try self.sendError(conn, 400, "Missing name in body");
             return;
         };
+        defer self.allocator.free(proxy_name);
+
+        switch (validateSelection(self.config, group_name, proxy_name)) {
+            .group_not_found => {
+                try self.sendError(conn, 404, "Group not found");
+                return;
+            },
+            .proxy_not_found => {
+                try self.sendError(conn, 404, "Proxy not found in group");
+                return;
+            },
+            .ok => {},
+        }
 
         std.debug.print("[API] Switch proxy: group={s}, proxy={s}\n", .{ group_name, proxy_name });
         self.manager.selectProxy(group_name, proxy_name);
 
-        const resp = std.fmt.allocPrint(self.allocator, "{{\"ok\":true,\"group\":\"{s}\",\"proxy\":\"{s}\"}}", .{ group_name, proxy_name }) catch return;
-        defer self.allocator.free(resp);
-        try self.sendJsonRaw(conn, resp);
-    }
-
-    /// 从 JSON 字符串中提取指定 key 的 string value
-    fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
-        // 查找 "key":"  或  "key": "
-        var i: usize = 0;
-        while (i + key.len + 3 < json.len) : (i += 1) {
-            if (json[i] == '"' and i + 1 + key.len < json.len and
-                std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
-                json[i + 1 + key.len] == '"')
-            {
-                var pos = i + 1 + key.len + 1; // after closing "
-                if (pos < json.len and json[pos] == ':') {
-                    pos += 1;
-                    // skip whitespace
-                    while (pos < json.len and json[pos] == ' ') pos += 1;
-                    if (pos < json.len and json[pos] == '"') {
-                        pos += 1; // opening quote
-                        const val_start = pos;
-                        while (pos < json.len and json[pos] != '"') pos += 1;
-                        if (pos < json.len) return json[val_start..pos];
-                    }
-                }
-            }
-        }
-        return null;
+        // 响应体经 std.json 序列化（名称真实转义，禁止手拼 JSON）。
+        var resp: std.Io.Writer.Allocating = .init(self.allocator);
+        defer resp.deinit();
+        std.json.Stringify.value(
+            .{ .ok = true, .group = group_name, .proxy = proxy_name },
+            .{ .whitespace = .minified },
+            &resp.writer,
+        ) catch return;
+        try self.sendJsonRaw(conn, resp.written());
     }
 
     fn sendJson(self: *ApiServer, conn: net.Server.Connection, json_str: []const u8) !void {
@@ -233,3 +230,30 @@ pub const ApiServer = struct {
         try conn.stream.writeAll(response);
     }
 };
+
+/// 从 PUT body 解析 `name` 字段（std.json，真实反转义）。返回 owned slice，
+/// 调用方负责 free；body 非法/缺字段/非字符串返回 null。
+pub fn parseSelectionName(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const name_val = parsed.value.object.get("name") orelse return null;
+    if (name_val != .string) return null;
+    return allocator.dupe(u8, name_val.string) catch null;
+}
+
+pub const SelectionCheck = enum { ok, group_not_found, proxy_not_found };
+
+/// 对照配置校验选择目标（与 OutboundManager.selectProxyInternal 的成员
+/// 匹配语义一致），让 handleSwitchProxy 能对未命中返回 404。
+pub fn validateSelection(cfg: *const Config, group_name: []const u8, proxy_name: []const u8) SelectionCheck {
+    for (cfg.proxy_groups.items) |grp| {
+        if (std.mem.eql(u8, grp.name, group_name)) {
+            for (grp.proxies.items) |member| {
+                if (std.mem.eql(u8, member, proxy_name)) return .ok;
+            }
+            return .proxy_not_found;
+        }
+    }
+    return .group_not_found;
+}
