@@ -3,6 +3,7 @@ const std = @import("std");
 test "include zc test modules" {
     _ = std;
     _ = @import("main.zig");
+    _ = @import("cli/output.zig");
     _ = @import("config_test.zig");
     _ = @import("config.zig");
     _ = @import("daemon.zig");
