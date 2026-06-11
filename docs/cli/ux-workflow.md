@@ -133,4 +133,6 @@ list/download/update/use/dump/override + 裸/未知路径全量 `--json`、统�
 ## 6. 已知 follow-up（不在本工作流范围内）
 
 - **API server 手拼 JSON / 转义缺口**：`PUT /proxies/<group>` 的 body 解析已改用 `std.json`（修复旧 `extractJsonString` 扫到第一个 `"` 字节截断转义名的 bug），但 `src/api/server.zig` 的 `GET /proxies` / `GET /rules` 响应仍手拼 JSON 且不转义名称 —— 含 `"`/`\` 的节点/规则名会产生非法 JSON；URL path 中的组名也未做百分号解码（含空格/特殊字符的组名无法经 API 选择）。CLI 侧（`zc proxy select` 的 PUT body）已全量 `std.json` 序列化，不受影响。
+- **合并前 review 已修**（zc-branch-review workflow，42 候选 → 40 存活）：① stdout payload 颜色曾错误取自 stderr 的 TTY 状态（重定向文件会混入 ANSI）→ Output 改为按流持有 `color_out`/`color_err`；② `PUT /proxies/<group>` 组名未编码（含空格的组名永远选不上、CR/LF 可注入请求行）→ CLI 百分号编码 + API 路由解码；③ 删除 5 个零调用残留函数（`printValidationJson` 等）。
+- **review 发现、暂缓的重构**（行为正确，债务记账）：Output 的 mode 分派仍散落在 ~16 处调用点（`if json success else print`）；`g_cli_command` 全局副通道与 dispatch 双重解析命令路径；每个 handler 手搭 `StdStreams`（约 35 处）+ printCliError 独立构造第二个 Output；`zc start` 在父进程完整解析配置两次（含 override 子进程）；`config dump` 未走 `Output.document` 机制（行为等价，机制游离）。
 - API 错误响应仍为 `{"error":"…"}` 简单格式，未对齐 CLI 的 `{ok,command,error}` envelope（见 `docs/api/error-codes.md` 第 7 节）。

@@ -93,7 +93,10 @@ pub const ApiServer = struct {
             }
         } else if (std.mem.eql(u8, method, "PUT")) {
             if (std.mem.startsWith(u8, path, "/proxies/")) {
-                const group_name = path[9..];
+                // CLI 侧对组名做了百分号编码（空格/特殊字符），这里解码还原。
+                const group_buf = try self.allocator.dupe(u8, path[9..]);
+                defer self.allocator.free(group_buf);
+                const group_name = std.Uri.percentDecodeInPlace(group_buf);
                 try self.handleSwitchProxy(conn, group_name, body);
             } else {
                 try self.sendError(conn, 404, "Not Found");

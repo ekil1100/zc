@@ -1256,7 +1256,7 @@ test "text mode log lines go to stdout, not stderr" {
     defer out_aw.deinit();
     var err_aw: std.Io.Writer.Allocating = .init(allocator);
     defer err_aw.deinit();
-    var out = cli_output.Output.init(.text, "log", false, &out_aw.writer, &err_aw.writer);
+    var out = cli_output.Output.init(.text, "log", false, false, &out_aw.writer, &err_aw.writer);
 
     try printTimestampedSlice(allocator, "first line\nsecond line\n", &out);
 
@@ -1272,7 +1272,7 @@ test "json mode log lines are JSON Lines on stdout" {
     defer out_aw.deinit();
     var err_aw: std.Io.Writer.Allocating = .init(allocator);
     defer err_aw.deinit();
-    var out = cli_output.Output.init(.json, "log", false, &out_aw.writer, &err_aw.writer);
+    var out = cli_output.Output.init(.json, "log", false, false, &out_aw.writer, &err_aw.writer);
 
     try printTimestampedSlice(allocator, "alpha\nwith \"quotes\"\n", &out);
 
@@ -1314,7 +1314,7 @@ test "status json envelope preserves frozen field names and escapes strings" {
     defer out_aw.deinit();
     var err_aw: std.Io.Writer.Allocating = .init(allocator);
     defer err_aw.deinit();
-    var out = cli_output.Output.init(.json, "status", false, &out_aw.writer, &err_aw.writer);
+    var out = cli_output.Output.init(.json, "status", false, false, &out_aw.writer, &err_aw.writer);
 
     try emitStatus(allocator, &out, &snapshot);
 
@@ -1363,7 +1363,7 @@ test "status text output goes to stdout with state tokens" {
     defer out_aw.deinit();
     var err_aw: std.Io.Writer.Allocating = .init(allocator);
     defer err_aw.deinit();
-    var out = cli_output.Output.init(.text, "status", false, &out_aw.writer, &err_aw.writer);
+    var out = cli_output.Output.init(.text, "status", false, false, &out_aw.writer, &err_aw.writer);
 
     try emitStatus(allocator, &out, &snapshot);
 

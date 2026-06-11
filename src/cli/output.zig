@@ -56,7 +56,10 @@ pub const Output = struct {
     mode: Mode,
     /// Canonical command path used in the envelope, e.g. "config list".
     command: []const u8,
-    color_enabled: bool,
+    /// ANSI styling for the stdout payload stream (style()).
+    color_out: bool,
+    /// ANSI styling for the stderr diagnostics stream (fail() text blocks).
+    color_err: bool,
     /// Payload stream (stdout in production).
     out: *std.Io.Writer,
     /// Diagnostics stream (stderr in production).
@@ -65,14 +68,16 @@ pub const Output = struct {
     pub fn init(
         mode: Mode,
         command: []const u8,
-        color_enabled: bool,
+        color_out: bool,
+        color_err: bool,
         out: *std.Io.Writer,
         err: *std.Io.Writer,
     ) Output {
         return .{
             .mode = mode,
             .command = command,
-            .color_enabled = color_enabled,
+            .color_out = color_out,
+            .color_err = color_err,
             .out = out,
             .err = err,
         };
@@ -146,7 +151,7 @@ pub const Output = struct {
             try self.out.flush();
             return;
         }
-        try self.err.print("{s}error:{s} {s}\n", .{ self.style(.red), self.style(.reset), message });
+        try self.err.print("{s}error:{s} {s}\n", .{ self.styleErr(.red), self.styleErr(.reset), message });
         if (hint.len != 0) try self.err.print("  hint: {s}\n", .{hint});
         try self.err.print("  code: {s}\n", .{code});
         try self.err.flush();
@@ -178,9 +183,15 @@ pub const Output = struct {
         try self.err.flush();
     }
 
-    /// ANSI code when color is enabled, "" otherwise. Usable inline in print.
+    /// ANSI code for the stdout payload stream when its color is enabled,
+    /// "" otherwise. Usable inline in print.
     pub fn style(self: *const Output, c: Color) []const u8 {
-        return if (self.color_enabled) c.code() else "";
+        return if (self.color_out) c.code() else "";
+    }
+
+    /// ANSI code for the stderr diagnostics stream.
+    pub fn styleErr(self: *const Output, c: Color) []const u8 {
+        return if (self.color_err) c.code() else "";
     }
 
     pub fn flush(self: *Output) !void {
@@ -212,7 +223,7 @@ const Capture = struct {
     }
 
     fn output(self: *Capture, mode: Mode, command: []const u8, color: bool) Output {
-        return Output.init(mode, command, color, &self.out_alloc.writer, &self.err_alloc.writer);
+        return Output.init(mode, command, color, color, &self.out_alloc.writer, &self.err_alloc.writer);
     }
 
     fn stdout(self: *Capture) []const u8 {
@@ -363,6 +374,20 @@ test "style returns codes only when enabled" {
 
     try testing.expectEqualStrings("\x1b[32m", on.style(.green));
     try testing.expectEqualStrings("", off.style(.green));
+}
+
+test "per-stream color: stdout payload uncolored while stderr block is colored" {
+    var cap = Capture.init(testing.allocator);
+    defer cap.deinit();
+    // 模拟 `zc proxy list > f`：stdout 重定向（无色），stderr 还是 TTY（有色）。
+    var out = Output.init(.text, "proxy list", false, true, &cap.out_alloc.writer, &cap.err_alloc.writer);
+
+    try out.print("{s}group{s}\n", .{ out.style(.bold), out.style(.reset) });
+    try out.fail("X", "boom", "");
+    try out.flush();
+
+    try testing.expectEqualStrings("group\n", cap.stdout());
+    try testing.expect(std.mem.indexOf(u8, cap.stderr(), "\x1b[31m") != null);
 }
 
 test "shouldUseColor truth table" {

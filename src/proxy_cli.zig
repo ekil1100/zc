@@ -460,7 +460,14 @@ fn notifyDaemon(
     std.json.Stringify.value(.{ .name = proxy_name }, .{ .whitespace = .minified }, &body_writer.writer) catch return false;
     const body = body_writer.written();
 
-    const req = std.fmt.allocPrint(allocator, "PUT /proxies/{s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ group_name, ec, body.len, body }) catch return false;
+    // 组名进 URL path 必须百分号编码：含空格的组名否则会截断请求行，
+    // CR/LF 更会构成请求行注入（daemon 侧对应做解码）。
+    var path_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer path_writer.deinit();
+    std.Uri.Component.percentEncode(&path_writer.writer, group_name, isUriPathSegmentChar) catch return false;
+    const encoded_group = path_writer.written();
+
+    const req = std.fmt.allocPrint(allocator, "PUT /proxies/{s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ encoded_group, ec, body.len, body }) catch return false;
     defer allocator.free(req);
 
     const stream = compat.net.tcpConnectToHost(allocator, host, port) catch {
@@ -481,6 +488,11 @@ fn notifyDaemon(
     }
     noteDim(out, "(daemon at {s} rejected the selection; is it running this config?)", .{ec});
     return false;
+}
+
+/// URL path 段安全字符（RFC 3986 unreserved）；其余一律 %XX 编码。
+fn isUriPathSegmentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
 }
 
 /// HTTP 响应是否为 2xx 成功（按状态行判定，而非全文找 "200" 子串）。
@@ -596,7 +608,7 @@ const TestStreams = struct {
     }
 
     fn output(self: *TestStreams, mode: cli_output.Mode) cli_output.Output {
-        return cli_output.Output.init(mode, "proxy list", false, &self.out_alloc.writer, &self.err_alloc.writer);
+        return cli_output.Output.init(mode, "proxy list", false, false, &self.out_alloc.writer, &self.err_alloc.writer);
     }
 };
 
@@ -808,6 +820,13 @@ test "decodeKey maps Ctrl-C and friends to quit (terminal-restoring cancel path)
     try testing.expectEqual(Key.down, decodeKey("\x1b[B"));
     try testing.expectEqual(Key.other, decodeKey(""));
     try testing.expectEqual(Key.other, decodeKey("x"));
+}
+
+test "isUriPathSegmentChar drives percent-encoding of group names" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try std.Uri.Component.percentEncode(&aw.writer, "My Proxies/\r\n\"x\"", isUriPathSegmentChar);
+    try std.testing.expectEqualStrings("My%20Proxies%2F%0D%0A%22x%22", aw.written());
 }
 
 test "responseAccepted matches only the status line" {

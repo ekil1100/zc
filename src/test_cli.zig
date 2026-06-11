@@ -576,14 +576,14 @@ fn sinkLatencyResult(ctx_ptr: *anyopaque, target: TestTarget, latency: LatencyRe
         .ok => |ms| {
             // 状态标记：emoji 只在启用色彩（TTY 且未禁色）时输出；管道/
             // 重定向场景退回纯 ASCII，避免污染脚本消费（工作项 5 的判断）。
-            const marker = if (sink.out.color_enabled)
+            const marker = if (sink.out.color_out)
                 (if (ms < 100) "🟢" else if (ms < 300) "🟡" else "🔴")
             else
                 (if (ms < 300) "OK  " else "SLOW");
             try sink.out.print("{s} {d}ms\n", .{ marker, ms });
         },
         .failed => |reason| {
-            const marker = if (sink.out.color_enabled) "⚫" else "FAIL";
+            const marker = if (sink.out.color_out) "⚫" else "FAIL";
             try sink.out.print("{s} {s}\n", .{ marker, failureReasonText(reason) });
         },
     }
@@ -772,7 +772,7 @@ test "runConnectivityTest json: no configured ports -> CHECKS_FAILED envelope wi
     defer out_alloc.deinit();
     var err_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer err_alloc.deinit();
-    var out = cli_output.Output.init(.json, "test", false, &out_alloc.writer, &err_alloc.writer);
+    var out = cli_output.Output.init(.json, "test", false, false, &out_alloc.writer, &err_alloc.writer);
 
     try std.testing.expect(!try runConnectivityTest(allocator, &cfg, null, &out));
 
@@ -804,7 +804,7 @@ test "runConnectivityTest text: report on stdout, CHECKS_FAILED block on stderr"
     defer out_alloc.deinit();
     var err_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer err_alloc.deinit();
-    var out = cli_output.Output.init(.text, "test", false, &out_alloc.writer, &err_alloc.writer);
+    var out = cli_output.Output.init(.text, "test", false, false, &out_alloc.writer, &err_alloc.writer);
 
     // 不手动 flush：runConnectivityTest 自己必须保证报告落盘。
     try std.testing.expect(!try runConnectivityTest(allocator, &cfg, null, &out));
@@ -834,7 +834,7 @@ test "runConnectivityTest json: not-listening port fails port check without exte
     defer out_alloc.deinit();
     var err_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer err_alloc.deinit();
-    var out = cli_output.Output.init(.json, "proxy test", false, &out_alloc.writer, &err_alloc.writer);
+    var out = cli_output.Output.init(.json, "proxy test", false, false, &out_alloc.writer, &err_alloc.writer);
 
     try std.testing.expect(!try runConnectivityTest(allocator, &cfg, null, &out));
 

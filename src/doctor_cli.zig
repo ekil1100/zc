@@ -515,7 +515,7 @@ test "emitDoctorResult json success: one envelope, escaped strings, proxy_reacha
     defer out_alloc.deinit();
     var err_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer err_alloc.deinit();
-    var out = cli_output.Output.init(.json, "doctor", false, &out_alloc.writer, &err_alloc.writer);
+    var out = cli_output.Output.init(.json, "doctor", false, false, &out_alloc.writer, &err_alloc.writer);
 
     try std.testing.expect(try emitDoctorResult(allocator, &data, &out));
 
@@ -553,7 +553,7 @@ test "emitDoctorResult json failure: CHECKS_FAILED envelope carries data" {
     defer out_alloc.deinit();
     var err_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer err_alloc.deinit();
-    var out = cli_output.Output.init(.json, "doctor", false, &out_alloc.writer, &err_alloc.writer);
+    var out = cli_output.Output.init(.json, "doctor", false, false, &out_alloc.writer, &err_alloc.writer);
 
     try std.testing.expect(!try emitDoctorResult(allocator, &data, &out));
 
@@ -587,7 +587,7 @@ test "emitDoctorResult text failure: frozen-label report on stdout, error block 
     defer out_alloc.deinit();
     var err_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer err_alloc.deinit();
-    var out = cli_output.Output.init(.text, "doctor", false, &out_alloc.writer, &err_alloc.writer);
+    var out = cli_output.Output.init(.text, "doctor", false, false, &out_alloc.writer, &err_alloc.writer);
 
     try std.testing.expect(!try emitDoctorResult(allocator, &data, &out));
 

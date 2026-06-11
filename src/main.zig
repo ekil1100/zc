@@ -436,111 +436,6 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(cli_output.exit_failure);
 }
 
-fn importLocalProfile(allocator: std.mem.Allocator, source: []const u8, import_name: ?[]const u8) !?[]const u8 {
-    const src_abs = compat.fs.cwd().realpathAlloc(allocator, source) catch {
-        return error.FileNotFound;
-    };
-    defer allocator.free(src_abs);
-
-    const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return error.NoConfigDir;
-    defer allocator.free(config_dir);
-
-    compat.fs.makeDirAbsolute(config_dir) catch |err| {
-        if (err != error.PathAlreadyExists) return err;
-    };
-
-    const basename = compat.fs.path.basename(src_abs);
-    const raw_name = import_name orelse basename;
-    const final_name = if (std.mem.endsWith(u8, raw_name, ".yaml"))
-        try allocator.dupe(u8, raw_name)
-    else
-        try std.fmt.allocPrint(allocator, "{s}.yaml", .{raw_name});
-
-    const dst_abs = try compat.fs.path.join(allocator, &.{ config_dir, final_name });
-    defer allocator.free(dst_abs);
-
-    try compat.fs.copyFileAbsolute(src_abs, dst_abs, .{});
-    return final_name;
-}
-
-fn resolveProfileConfig(allocator: std.mem.Allocator, target: ?[]const u8) !config.Config {
-    if (target == null) {
-        return try config.loadDefault(allocator);
-    }
-
-    const t = target.?;
-    if (std.mem.indexOfScalar(u8, t, '/')) |_| {
-        return try config.load(allocator, t);
-    }
-
-    const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return error.NoConfigDir;
-    defer allocator.free(config_dir);
-
-    const profile_path = try compat.fs.path.join(allocator, &.{ config_dir, t });
-    defer allocator.free(profile_path);
-
-    return try config.load(allocator, profile_path);
-}
-
-fn printValidationJson(allocator: std.mem.Allocator, vr: *const validator.ValidationResult) !void {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    try out.appendSlice(allocator, "{\"ok\":true,\"data\":{\"valid\":");
-    try out.appendSlice(allocator, if (vr.isValid()) "true" else "false");
-    try out.appendSlice(allocator, ",\"warnings\":[");
-
-    for (vr.warnings.items, 0..) |w, i| {
-        if (i > 0) try out.appendSlice(allocator, ",");
-        try out.appendSlice(allocator, "\"");
-        try out.appendSlice(allocator, w.message);
-        try out.appendSlice(allocator, "\"");
-    }
-
-    try out.appendSlice(allocator, "],\"errors\":[");
-    for (vr.errors.items, 0..) |e, i| {
-        if (i > 0) try out.appendSlice(allocator, ",");
-        try out.appendSlice(allocator, "\"");
-        try out.appendSlice(allocator, e.message);
-        try out.appendSlice(allocator, "\"");
-    }
-
-    try out.appendSlice(allocator, "]}}\n");
-    std.debug.print("{s}", .{out.items});
-}
-
-fn switchProfileSilent(allocator: std.mem.Allocator, filename: []const u8) !void {
-    const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return error.NoConfigDir;
-    defer allocator.free(config_dir);
-
-    const source_path = try compat.fs.path.join(allocator, &.{ config_dir, filename });
-    defer allocator.free(source_path);
-
-    const link_path = try compat.fs.path.join(allocator, &.{ config_dir, "config.yaml" });
-    defer allocator.free(link_path);
-
-    compat.fs.deleteFileAbsolute(link_path) catch {};
-
-    compat.fs.symLinkAbsolute(source_path, link_path, .{}) catch |err| {
-        if (err == error.AccessDenied or err == error.NotSupported or err == error.InvalidArgument) {
-            try compat.fs.copyFileAbsolute(source_path, link_path, .{});
-        } else {
-            try compat.fs.copyFileAbsolute(source_path, link_path, .{});
-        }
-    };
-}
-
-fn profileExists(allocator: std.mem.Allocator, name: []const u8) !bool {
-    const config_dir = (try config.getDefaultConfigDir(allocator)) orelse return false;
-    defer allocator.free(config_dir);
-
-    const profile_path = try compat.fs.path.join(allocator, &.{ config_dir, name });
-    defer allocator.free(profile_path);
-
-    compat.fs.accessAbsolute(profile_path, .{}) catch return false;
-    return true;
-}
-
 fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {
     var out_buf: [4096]u8 = undefined;
     var err_buf: [2048]u8 = undefined;
@@ -549,6 +444,7 @@ fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint:
     var out = cli_output.Output.init(
         if (json_output) .json else .text,
         g_cli_command,
+        stdoutColorEnabled(),
         stderrColorEnabled(),
         &stdout_writer.interface,
         &stderr_writer.interface,
@@ -556,10 +452,20 @@ fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint:
     out.fail(code, message, hint) catch {};
 }
 
-fn stderrColorEnabled() bool {
-    const is_tty = std.c.isatty(std.posix.STDERR_FILENO) == 1;
+/// 按流判定颜色：payload 看 stdout 的 TTY，诊断看 stderr 的 TTY
+/// （`zc proxy list > f` 时 stderr 还是 TTY，但文件里绝不能混入 ANSI 码）。
+fn streamColorEnabled(fd: std.posix.fd_t) bool {
+    const is_tty = std.c.isatty(fd) == 1;
     const no_color_env = std.c.getenv("NO_COLOR") != null;
     return cli_output.shouldUseColor(is_tty, g_no_color, no_color_env);
+}
+
+fn stdoutColorEnabled() bool {
+    return streamColorEnabled(std.posix.STDOUT_FILENO);
+}
+
+fn stderrColorEnabled() bool {
+    return streamColorEnabled(std.posix.STDERR_FILENO);
 }
 
 /// 生命周期命令共用的 stdout/stderr Output 构造器。
@@ -580,6 +486,7 @@ const StdStreams = struct {
         return cli_output.Output.init(
             if (json_output) .json else .text,
             g_cli_command,
+            stdoutColorEnabled(),
             stderrColorEnabled(),
             &self.stdout_writer.interface,
             &self.stderr_writer.interface,
@@ -638,6 +545,7 @@ fn printVersion(json_output: bool) !void {
     var out = cli_output.Output.init(
         if (json_output) .json else .text,
         "version",
+        false,
         false,
         &stdout_writer.interface,
         &stderr_writer.interface,
