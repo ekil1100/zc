@@ -280,7 +280,7 @@ fn sanitizeEnvKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
 }
 
 fn luaWrapper() []const u8 {
-    return 
+    return
     \\local function parse_args(raw)
     \\  local out = {}
     \\  if not raw or raw == "" then return out end
@@ -766,125 +766,108 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
     return try out.toOwnedSlice(allocator);
 }
 
+/// 经 std.json 序列化（真实转义），禁止手拼 JSON 字符串。
+/// 字段名保持 clash 风格（连字符），密钥字段统一打码。
 pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try out.appendSlice(allocator, "{");
-    try out.appendSlice(allocator, "\"port\":");
-    try out.print(allocator, "{d}", .{cfg.port});
-    try out.appendSlice(allocator, ",\"socks-port\":");
-    try out.print(allocator, "{d}", .{cfg.socks_port});
-    try out.appendSlice(allocator, ",\"mixed-port\":");
-    try out.print(allocator, "{d}", .{cfg.mixed_port});
-    try out.appendSlice(allocator, ",\"allow-lan\":");
-    try out.appendSlice(allocator, if (cfg.allow_lan) "true" else "false");
+    var js: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .minified } };
+    try js.beginObject();
 
-    try out.appendSlice(allocator, ",\"bind-address\":");
-    try writeJsonString(&out, allocator, cfg.bind_address);
-    try out.appendSlice(allocator, ",\"mode\":");
-    try writeJsonString(&out, allocator, cfg.mode);
-    try out.appendSlice(allocator, ",\"log-level\":");
-    try writeJsonString(&out, allocator, cfg.log_level);
-    try out.appendSlice(allocator, ",\"external-controller\":");
-    if (cfg.external_controller) |ec| {
-        try writeJsonString(&out, allocator, ec);
-    } else {
-        try out.appendSlice(allocator, "null");
+    try js.objectField("port");
+    try js.write(cfg.port);
+    try js.objectField("socks-port");
+    try js.write(cfg.socks_port);
+    try js.objectField("mixed-port");
+    try js.write(cfg.mixed_port);
+    try js.objectField("allow-lan");
+    try js.write(cfg.allow_lan);
+    try js.objectField("bind-address");
+    try js.write(cfg.bind_address);
+    try js.objectField("mode");
+    try js.write(cfg.mode);
+    try js.objectField("log-level");
+    try js.write(cfg.log_level);
+    try js.objectField("external-controller");
+    try js.write(cfg.external_controller);
+
+    try js.objectField("rule-providers");
+    try js.beginObject();
+    for (cfg.rule_providers.items) |provider| {
+        try js.objectField(provider.name);
+        try js.beginObject();
+        try js.objectField("type");
+        try js.write(provider.provider_type);
+        try js.objectField("behavior");
+        try js.write(ruleProviderBehaviorString(provider.behavior));
+        try js.objectField("url");
+        try js.write(provider.url);
+        try js.objectField("path");
+        try js.write(provider.path);
+        try js.objectField("interval");
+        try js.write(provider.interval);
+        try js.endObject();
     }
+    try js.endObject();
 
-    try out.appendSlice(allocator, ",\"rule-providers\":{");
-    for (cfg.rule_providers.items, 0..) |provider, i| {
-        if (i > 0) try out.append(allocator, ',');
-        try writeJsonString(&out, allocator, provider.name);
-        try out.appendSlice(allocator, ":{\"type\":");
-        try writeJsonString(&out, allocator, provider.provider_type);
-        try out.appendSlice(allocator, ",\"behavior\":");
-        try writeJsonString(&out, allocator, ruleProviderBehaviorString(provider.behavior));
-        try out.appendSlice(allocator, ",\"url\":");
-        if (provider.url) |url| {
-            try writeJsonString(&out, allocator, url);
-        } else {
-            try out.appendSlice(allocator, "null");
-        }
-        try out.appendSlice(allocator, ",\"path\":");
-        try writeJsonString(&out, allocator, provider.path);
-        try out.appendSlice(allocator, ",\"interval\":");
-        try out.print(allocator, "{d}", .{provider.interval});
-        try out.append(allocator, '}');
-    }
-    try out.appendSlice(allocator, "}");
-
-    try out.appendSlice(allocator, ",\"proxies\":[");
-    for (cfg.proxies.items, 0..) |proxy, i| {
-        if (i > 0) try out.append(allocator, ',');
-        try out.appendSlice(allocator, "{");
-        try out.appendSlice(allocator, "\"name\":");
-        try writeJsonString(&out, allocator, proxy.name);
-        try out.appendSlice(allocator, ",\"type\":");
-        try writeJsonString(&out, allocator, proxyTypeString(proxy.proxy_type));
-        try out.appendSlice(allocator, ",\"server\":");
-        try writeJsonString(&out, allocator, proxy.server);
-        try out.appendSlice(allocator, ",\"port\":");
-        try out.print(allocator, "{d}", .{proxy.port});
+    try js.objectField("proxies");
+    try js.beginArray();
+    for (cfg.proxies.items) |proxy| {
+        try js.beginObject();
+        try js.objectField("name");
+        try js.write(proxy.name);
+        try js.objectField("type");
+        try js.write(proxyTypeString(proxy.proxy_type));
+        try js.objectField("server");
+        try js.write(proxy.server);
+        try js.objectField("port");
+        try js.write(proxy.port);
         if (proxy.password != null) {
-            try out.appendSlice(allocator, ",\"password\":");
-            try writeJsonString(&out, allocator, "******");
+            try js.objectField("password");
+            try js.write("******");
         }
         if (proxy.uuid != null) {
-            try out.appendSlice(allocator, ",\"uuid\":");
-            try writeJsonString(&out, allocator, "******");
+            try js.objectField("uuid");
+            try js.write("******");
         }
         if (proxy.sni != null) {
-            try out.appendSlice(allocator, ",\"sni\":");
-            try writeJsonString(&out, allocator, "******");
+            try js.objectField("sni");
+            try js.write("******");
         }
-        try out.appendSlice(allocator, "}");
+        try js.endObject();
     }
-    try out.appendSlice(allocator, "]");
+    try js.endArray();
 
-    try out.appendSlice(allocator, ",\"proxy-groups\":[");
-    for (cfg.proxy_groups.items, 0..) |group, i| {
-        if (i > 0) try out.append(allocator, ',');
-        try out.appendSlice(allocator, "{");
-        try out.appendSlice(allocator, "\"name\":");
-        try writeJsonString(&out, allocator, group.name);
-        try out.appendSlice(allocator, ",\"type\":");
-        try writeJsonString(&out, allocator, proxyGroupTypeString(group.group_type));
-        try out.appendSlice(allocator, ",\"proxies\":[");
-        for (group.proxies.items, 0..) |proxy_name, pi| {
-            if (pi > 0) try out.append(allocator, ',');
-            try writeJsonString(&out, allocator, proxy_name);
+    try js.objectField("proxy-groups");
+    try js.beginArray();
+    for (cfg.proxy_groups.items) |group| {
+        try js.beginObject();
+        try js.objectField("name");
+        try js.write(group.name);
+        try js.objectField("type");
+        try js.write(proxyGroupTypeString(group.group_type));
+        try js.objectField("proxies");
+        try js.beginArray();
+        for (group.proxies.items) |proxy_name| {
+            try js.write(proxy_name);
         }
-        try out.appendSlice(allocator, "]}");
+        try js.endArray();
+        try js.endObject();
     }
-    try out.appendSlice(allocator, "]");
+    try js.endArray();
 
-    try out.appendSlice(allocator, ",\"rules\":[");
-    for (cfg.rules.items, 0..) |rule, i| {
-        if (i > 0) try out.append(allocator, ',');
+    try js.objectField("rules");
+    try js.beginArray();
+    for (cfg.rules.items) |rule| {
         const as_text = try ruleToText(allocator, rule);
         defer allocator.free(as_text);
-        try writeJsonString(&out, allocator, as_text);
+        try js.write(as_text);
     }
-    try out.appendSlice(allocator, "]}");
+    try js.endArray();
 
-    return try out.toOwnedSlice(allocator);
-}
-
-fn writeJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try out.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, c),
-        }
-    }
-    try out.append(allocator, '"');
+    try js.endObject();
+    return try aw.toOwnedSlice();
 }
 
 fn proxyTypeString(pt: config.ProxyType) []const u8 {
@@ -979,6 +962,41 @@ test "override parse options rejects deprecated dump flags" {
     };
 
     try std.testing.expectError(error.DeprecatedOverrideDumpOption, parseCliOptions(allocator, args[0..]));
+}
+
+test "dumpConfigJson emits parseable std.json with escaping and masked secrets" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\port: 7890
+        \\proxies:
+        \\  - name: node "HK" 线路
+        \\    type: ss
+        \\    server: 127.0.0.1
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: topsecret
+        \\proxy-groups:
+        \\  - name: Proxy
+        \\    type: select
+        \\    proxies:
+        \\      - node "HK" 线路
+        \\rules:
+        \\  - MATCH,DIRECT
+    ;
+
+    var cfg = try config.parse(allocator, content);
+    defer cfg.deinit();
+
+    const dumped = try dumpConfigJson(allocator, &cfg);
+    defer allocator.free(dumped);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, dumped, .{});
+    defer parsed.deinit();
+
+    const proxy = parsed.value.object.get("proxies").?.array.items[0].object;
+    try std.testing.expectEqualStrings("node \"HK\" 线路", proxy.get("name").?.string);
+    try std.testing.expectEqualStrings("******", proxy.get("password").?.string);
+    try std.testing.expectEqualStrings("MATCH,DIRECT", parsed.value.object.get("rules").?.array.items[0].string);
 }
 
 test "override apply map supports scalar fields" {

@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const yaml = @import("util/yaml.zig");
 const meta = @import("meta.zig");
+const cli_output = @import("cli/output.zig");
 
 pub const ProxyType = enum {
     direct,
@@ -1219,15 +1220,46 @@ fn parseCurlFetchResult(allocator: std.mem.Allocator, stdout: []const u8) !Downl
     };
 }
 
+/// 归一化配置 key：剥掉一个尾部 `.yaml` 后缀（`smoke.yaml` -> `smoke`）。
+/// download/use/update/订阅查询必须共用同一套归一化，否则
+/// `config download -n smoke.yaml` 之后 `config use smoke.yaml` 会因
+/// key 不一致而 CONFIG_NOT_FOUND（store 不剥、lookup 剥）。
+pub fn normalizeConfigKey(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ".yaml") and name.len > ".yaml".len) {
+        return name[0 .. name.len - ".yaml".len];
+    }
+    return name;
+}
+
+/// 下载结果（key/path 均为 caller 所有）。
+pub const DownloadOutcome = struct {
+    key: []const u8,
+    path: []const u8,
+    /// 是否被设为默认（active）配置。
+    set_default: bool,
+
+    pub fn deinit(self: *DownloadOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.path);
+    }
+};
+
 /// 下载配置文件从 URL 并保存到 configs/ 目录
 /// name: 可选的自定义 key，为 null 则生成 8 位随机 key
-/// 返回: 配置 key（需要调用者释放内存），出错返回 null
-pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]const u8) !?[]const u8 {
+/// set_default: `-d`，下载后设为默认（active）；当前没有 active 时首个下载也会设为 active
+/// 文本输出经 out 渲染（stdout）；JSON envelope 由调用方负责。
+pub fn downloadConfig(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    name: ?[]const u8,
+    set_default: bool,
+    out: *cli_output.Output,
+) !DownloadOutcome {
     const fetch_result = try fetchConfig(allocator, url);
     defer allocator.free(fetch_result.body);
 
     if (fetch_result.status != .ok) {
-        std.debug.print("Failed to download config: HTTP {d}\n", .{@intFromEnum(fetch_result.status)});
+        try out.note("Failed to download config: HTTP {d}\n", .{@intFromEnum(fetch_result.status)});
         return error.DownloadFailed;
     }
 
@@ -1235,16 +1267,17 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     try meta.ensureConfigsDir(allocator);
 
     const configs_dir = try meta.getConfigsDir(allocator) orelse {
-        std.debug.print("Could not determine config directory\n", .{});
+        try out.note("Could not determine config directory\n", .{});
         return error.NoConfigDir;
     };
     defer allocator.free(configs_dir);
 
-    // 确定 key
+    // 确定 key（与 switchConfig/updateConfig 同一套归一化：`-n smoke.yaml` -> key "smoke"）
     const key = if (name) |n|
-        try allocator.dupe(u8, n)
+        try allocator.dupe(u8, normalizeConfigKey(n))
     else
         try meta.generateKey(allocator);
+    errdefer allocator.free(key);
 
     // 保存文件到 configs/{key}.yaml
     const yaml_filename = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
@@ -1274,20 +1307,40 @@ pub fn downloadConfig(allocator: std.mem.Allocator, url: []const u8, name: ?[]co
     cm.params.deinit();
     cm.params = url_params;
 
-    const key_owned = try allocator.dupe(u8, key);
-    try meta_data.configs.put(key_owned, cm);
+    // 文件先于 meta.load 落盘，syncFromDisk 可能已为 key 建了空 entry：
+    // 用 getOrPut 替换旧值并复用旧 key，避免泄漏（put 不会释放已存在的 key/value）。
+    const gop = try meta_data.configs.getOrPut(key);
+    if (gop.found_existing) {
+        gop.value_ptr.deinit(allocator);
+    } else {
+        gop.key_ptr.* = try allocator.dupe(u8, key);
+    }
+    gop.value_ptr.* = cm;
 
-    // 设为活跃配置
-    if (meta_data.active) |old| allocator.free(old);
-    meta_data.active = try allocator.dupe(u8, key);
+    // 设为默认（active）：显式 `-d`，或当前还没有 active 配置。
+    const make_active = set_default or meta_data.active == null;
+    if (make_active) {
+        if (meta_data.active) |old| allocator.free(old);
+        meta_data.active = try allocator.dupe(u8, key);
+    }
 
     try meta.save(allocator, &meta_data);
 
     const display = meta.getDisplayName(&cm, key);
-    std.debug.print("Config downloaded: {s} (key: {s})\n", .{ display, key });
-    std.debug.print("Config saved to: {s}\n", .{config_path});
+    if (out.mode == .text) {
+        try out.print("Config downloaded: {s} (key: {s})\n", .{ display, key });
+        try out.print("Config saved to: {s}\n", .{config_path});
+        if (make_active) {
+            try out.print("Config set as default: {s}\n", .{key});
+        }
+        try out.flush();
+    }
 
-    return key;
+    return .{
+        .key = key,
+        .path = try allocator.dupe(u8, config_path),
+        .set_default = make_active,
+    };
 }
 
 /// 获取当前激活的配置 key（从 meta.json）
@@ -1549,10 +1602,7 @@ pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8)
     defer meta_data.deinit();
 
     // config_name 可能带 .yaml 后缀
-    var key = config_name;
-    if (std.mem.endsWith(u8, config_name, ".yaml")) {
-        key = config_name[0 .. config_name.len - 5];
-    }
+    const key = normalizeConfigKey(config_name);
 
     if (meta_data.configs.get(key)) |cm| {
         if (cm.url) |url| {
@@ -1562,29 +1612,24 @@ pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8)
     return null;
 }
 
-/// 更新配置文件（从 meta.json 中保存的订阅 URL）
-pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8) !?[]const u8 {
+/// 更新配置文件（从 meta.json 中保存的订阅 URL）。
+/// 进度文本走 out.note（stderr）；最终结果文本模式走 out.print（stdout）。
+/// 没有订阅 URL 返回 error.NoSubscriptionUrl；成功返回 key（caller 释放）。
+pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8, out: *cli_output.Output) ![]const u8 {
     // config_name 可能带 .yaml 后缀
-    var key = config_name;
-    if (std.mem.endsWith(u8, config_name, ".yaml")) {
-        key = config_name[0 .. config_name.len - 5];
-    }
+    const key = normalizeConfigKey(config_name);
 
-    const url = try getSubscriptionUrl(allocator, key) orelse {
-        std.debug.print("No subscription URL found for config: {s}\n", .{key});
-        std.debug.print("Use 'zc config download <url>' to download a new config\n", .{});
-        return null;
-    };
+    const url = (try getSubscriptionUrl(allocator, key)) orelse return error.NoSubscriptionUrl;
     defer allocator.free(url);
 
-    std.debug.print("Updating from: {s}\n", .{url});
+    try out.note("Updating from: {s}\n", .{url});
 
     // 重新下载但使用相同的 key
     const fetch_result = try fetchConfig(allocator, url);
     defer allocator.free(fetch_result.body);
 
     if (fetch_result.status != .ok) {
-        std.debug.print("Failed to download config: HTTP {d}\n", .{@intFromEnum(fetch_result.status)});
+        try out.note("Failed to download config: HTTP {d}\n", .{@intFromEnum(fetch_result.status)});
         return error.DownloadFailed;
     }
 
@@ -1603,23 +1648,54 @@ pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8) !?[]c
     defer file.close(compat.io());
     try compat.fileWriteAll(file, fetch_result.body);
 
-    std.debug.print("Config updated: {s}\n", .{config_path});
+    if (out.mode == .text) {
+        try out.print("Config updated: {s}\n", .{config_path});
+        try out.flush();
+    } else {
+        try out.note("Config updated: {s}\n", .{config_path});
+    }
 
     return try allocator.dupe(u8, key);
 }
 
-/// 列出所有可用的配置文件
-pub fn listConfigs(allocator: std.mem.Allocator) !void {
+/// 列出所有可用的配置文件。
+/// 文本模式经 out.print 走 stdout；JSON 模式经 out.success 输出单个 envelope。
+pub fn listConfigs(allocator: std.mem.Allocator, out: *cli_output.Output) !void {
     var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
     defer meta_data.deinit();
 
-    const configs_dir = try meta.getConfigsDir(allocator) orelse {
-        std.debug.print("Could not determine config directory\n", .{});
-        return error.NoConfigDir;
-    };
-    defer allocator.free(configs_dir);
+    const configs_dir = try meta.getConfigsDir(allocator) orelse return error.NoConfigDir;
+    allocator.free(configs_dir);
 
-    std.debug.print("Available configs:\n\n", .{});
+    if (out.mode == .json) {
+        const Entry = struct {
+            name: []const u8,
+            display: []const u8,
+            active: bool,
+        };
+        var entries = std.ArrayList(Entry).empty;
+        defer entries.deinit(allocator);
+
+        var it = meta_data.configs.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const cm = entry.value_ptr;
+            const is_active = if (meta_data.active) |active|
+                std.mem.eql(u8, active, key)
+            else
+                false;
+            try entries.append(allocator, .{
+                .name = key,
+                .display = meta.getDisplayName(cm, key),
+                .active = is_active,
+            });
+        }
+
+        try out.success(.{ .configs = entries.items, .active = meta_data.active });
+        return;
+    }
+
+    try out.print("Available configs:\n\n", .{});
 
     var count: usize = 0;
     var it = meta_data.configs.iterator();
@@ -1634,48 +1710,45 @@ pub fn listConfigs(allocator: std.mem.Allocator) !void {
             false;
 
         if (is_active) {
-            std.debug.print("  * {s}", .{display});
+            try out.print("  * {s}", .{display});
         } else {
-            std.debug.print("    {s}", .{display});
+            try out.print("    {s}", .{display});
         }
 
         // 如果 display 不等于 key，显示 key
         if (!std.mem.eql(u8, display, key)) {
-            std.debug.print(" ({s})", .{key});
+            try out.print(" ({s})", .{key});
         }
 
         if (is_active) {
-            std.debug.print(" (active)", .{});
+            try out.print(" (active)", .{});
         }
 
-        std.debug.print("\n", .{});
+        try out.print("\n", .{});
     }
 
     if (count == 0) {
-        std.debug.print("  (no config files found)\n", .{});
+        try out.print("  (no config files found)\n", .{});
     } else {
-        std.debug.print("\nUse 'zc config use <key>' to switch config\n", .{});
+        try out.print("\nUse 'zc config use <key>' to switch config\n", .{});
     }
+    try out.flush();
 }
 
-/// 切换配置文件（更新 meta.json 的 active 字段）
-pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8) !void {
+/// 切换配置文件（更新 meta.json 的 active 字段）。
+/// 决策 D8：绝不自动 apply 到运行中的 daemon，文本模式提示下一步。
+/// 找不到目标返回 error.ConfigNotFound（envelope 由调用方渲染）。
+pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_output.Output) !void {
     var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
     defer meta_data.deinit();
 
     // target 可能带 .yaml 后缀
-    var key = target;
-    if (std.mem.endsWith(u8, target, ".yaml")) {
-        key = target[0 .. target.len - 5];
-    }
+    const key = normalizeConfigKey(target);
 
     // 验证 key 存在于 meta 中
     if (!meta_data.configs.contains(key)) {
         // 尝试在 configs/ 目录中查找对应文件
-        const configs_dir = try meta.getConfigsDir(allocator) orelse {
-            std.debug.print("Config not found: {s}\n", .{key});
-            return error.ConfigNotFound;
-        };
+        const configs_dir = try meta.getConfigsDir(allocator) orelse return error.ConfigNotFound;
         defer allocator.free(configs_dir);
 
         const yaml_name = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
@@ -1684,11 +1757,7 @@ pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8) !void {
         const file_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_name });
         defer allocator.free(file_path);
 
-        compat.fs.accessAbsolute(file_path, .{}) catch {
-            std.debug.print("Config not found: {s}\n", .{key});
-            std.debug.print("Use 'zc config ls' to see available configs\n", .{});
-            return error.ConfigNotFound;
-        };
+        compat.fs.accessAbsolute(file_path, .{}) catch return error.ConfigNotFound;
 
         // 文件存在但不在 meta 中，添加 entry
         const key_owned = try allocator.dupe(u8, key);
@@ -1702,11 +1771,14 @@ pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8) !void {
 
     try meta.save(allocator, &meta_data);
 
-    if (meta_data.configs.getPtr(key)) |cm| {
-        const display = meta.getDisplayName(cm, key);
-        std.debug.print("Switched to config: {s}\n", .{display});
-    } else {
-        std.debug.print("Switched to config: {s}\n", .{key});
+    if (out.mode == .text) {
+        const display = if (meta_data.configs.getPtr(key)) |cm|
+            meta.getDisplayName(cm, key)
+        else
+            key;
+        try out.print("Switched to config: {s}\n", .{display});
+        try out.print("Run `zc reload` (or `zc restart`) to apply it to a running daemon\n", .{});
+        try out.flush();
     }
 }
 
@@ -2064,6 +2136,15 @@ test "normalizeRuleProviderLine strips payload dash and quotes" {
     try std.testing.expectEqualStrings("DOMAIN-SUFFIX,example.com", b);
 
     try std.testing.expect(normalizeRuleProviderLine("payload:") == null);
+}
+
+test "normalizeConfigKey strips exactly one .yaml suffix (download/use/update share it)" {
+    try std.testing.expectEqualStrings("smoke", normalizeConfigKey("smoke.yaml"));
+    try std.testing.expectEqualStrings("smoke", normalizeConfigKey("smoke"));
+    // 只剥一层：`-n foo.yaml.yaml` 的 key 是 "foo.yaml"
+    try std.testing.expectEqualStrings("foo.yaml", normalizeConfigKey("foo.yaml.yaml"));
+    // 退化输入不产生空 key
+    try std.testing.expectEqualStrings(".yaml", normalizeConfigKey(".yaml"));
 }
 
 test "resolveRuntimeConfigKey infers key from explicit configs path" {

@@ -81,19 +81,15 @@ pub fn getMetaPath(allocator: std.mem.Allocator) !?[]const u8 {
     return try compat.fs.path.join(allocator, &.{ config_dir, "meta.json" });
 }
 
-/// 确保 configs/ 目录存在
+/// 确保 configs/ 目录存在。
+/// 必须递归创建：全新 HOME 里连 ~/.config 都没有，逐级 makeDirAbsolute
+/// 会因父目录缺失而失败（曾让 `zc config download` 在 pristine HOME 上报
+/// 误导性的网络错误）。
 pub fn ensureConfigsDir(allocator: std.mem.Allocator) !void {
     const configs_dir = try getConfigsDir(allocator) orelse return;
     defer allocator.free(configs_dir);
 
-    // 也要确保父目录存在
-    const config_dir = try config_mod.getDefaultConfigDir(allocator) orelse return;
-    defer allocator.free(config_dir);
-
-    compat.fs.makeDirAbsolute(config_dir) catch |err| {
-        if (err != error.PathAlreadyExists) return err;
-    };
-    compat.fs.makeDirAbsolute(configs_dir) catch |err| {
+    compat.fs.cwd().makePath(configs_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 }

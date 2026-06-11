@@ -357,289 +357,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // 处理 config 子命令
+    // 处理 config 子命令（Batch 3：统一 envelope/退出码/stdout 路由）
     if (std.mem.eql(u8, cmd, "config")) {
-        if (args.len < 3) {
-            try config.listConfigs(allocator);
-            return;
-        }
-
-        const subcmd = args[2];
-
-        if (isHelpArg(subcmd)) {
-            try printConfigHelp();
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
-            if (containsHelpArg(args, 3)) {
-                try printConfigListHelp();
-                return;
-            }
-            try config.listConfigs(allocator);
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "download")) {
-            if (containsHelpArg(args, 3)) {
-                try printConfigDownloadHelp();
-                return;
-            }
-            if (args.len < 4) {
-                try printConfigDownloadHelp();
-                return;
-            }
-
-            const url = args[3];
-            var download_name: ?[]const u8 = null;
-
-            var i: usize = 4;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "-n")) {
-                    if (i + 1 < args.len) {
-                        download_name = args[i + 1];
-                        i += 1;
-                    }
-                }
-            }
-
-            const key = try config.downloadConfig(allocator, url, download_name);
-            defer if (key) |k| allocator.free(k);
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "update")) {
-            if (containsHelpArg(args, 3)) {
-                try printConfigUpdateHelp();
-                return;
-            }
-            var config_name: ?[]const u8 = null;
-            var apply_mode: UpdateApplyMode = .auto;
-
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                if (std.mem.eql(u8, args[i], "--apply")) {
-                    if (i + 1 >= args.len) {
-                        try printConfigUpdateHelp();
-                        return;
-                    }
-                    apply_mode = parseUpdateApplyMode(args[i + 1]) catch {
-                        std.debug.print("Invalid --apply value: {s}\n", .{args[i + 1]});
-                        std.debug.print("Expected one of: auto, hot, restart\n", .{});
-                        return;
-                    };
-                    i += 1;
-                } else if (std.mem.startsWith(u8, args[i], "--apply=")) {
-                    const value = args[i]["--apply=".len..];
-                    apply_mode = parseUpdateApplyMode(value) catch {
-                        std.debug.print("Invalid --apply value: {s}\n", .{value});
-                        std.debug.print("Expected one of: auto, hot, restart\n", .{});
-                        return;
-                    };
-                } else if (args[i].len > 0 and args[i][0] != '-') {
-                    if (config_name == null) {
-                        config_name = args[i];
-                    }
-                }
-            }
-
-            const current_config = config.getCurrentConfigName(allocator) catch null;
-            defer if (current_config) |c| allocator.free(c);
-
-            const target_name = config_name orelse current_config orelse {
-                try printConfigUpdateHelp();
-                return;
-            };
-
-            const filename = try config.updateConfig(allocator, target_name);
-            defer if (filename) |f| allocator.free(f);
-
-            if (filename != null) {
-                // 应用策略：auto(默认)/hot/restart
-                if (try daemon.isRunning(allocator)) {
-                    const result = daemon.reloadOrRestart(allocator, null, apply_mode) catch |err| {
-                        std.debug.print("Failed to apply updated config: {s}\n", .{@errorName(err)});
-                        return err;
-                    };
-
-                    switch (result) {
-                        .hot_applied => std.debug.print("Config applied via hot reload\n", .{}),
-                        .restart_applied => std.debug.print("Config applied via restart\n", .{}),
-                        .restart_fallback => std.debug.print("Config hot reload unavailable, fell back to restart\n", .{}),
-                    }
-                }
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "use")) {
-            if (containsHelpArg(args, 3)) {
-                try printConfigUseHelp();
-                return;
-            }
-            if (args.len < 4) {
-                try printConfigUseHelp();
-                return;
-            }
-
-            try config.switchConfig(allocator, args[3]);
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "dump")) {
-            if (containsHelpArg(args, 3)) {
-                try printConfigDumpHelp();
-                return;
-            }
-            const config_path = parseConfigPathArg(args, 3);
-            const no_override = hasFlag(args, "--no-override");
-            var cfg = if (config_path) |path|
-                try config.load(allocator, path)
-            else
-                try config.loadDefault(allocator);
-            defer cfg.deinit();
-
-            if (!no_override) {
-                var persisted_script: ?[]u8 = null;
-                defer if (persisted_script) |p| allocator.free(p);
-                var effective_override = resolveEffectiveOverrideOptions(
-                    allocator,
-                    &override_opts,
-                    config_path,
-                    &persisted_script,
-                ) catch |err| {
-                    if (printOverrideRuntimeError(json_output, err)) return err;
-                    printConfigDumpError(json_output, err);
-                    return err;
-                };
-
-                override.apply(allocator, &cfg, &effective_override, "config.dump", config_path) catch |err| {
-                    if (printOverrideRuntimeError(json_output, err)) return err;
-                    printConfigDumpError(json_output, err);
-                    return err;
-                };
-            }
-
-            const dumped = if (json_output)
-                override.dumpConfigJson(allocator, &cfg)
-            else
-                override.dumpConfigYaml(allocator, &cfg);
-            const dumped_text = dumped catch |err| {
-                printConfigDumpError(json_output, err);
-                return err;
-            };
-            defer allocator.free(dumped_text);
-
-            std.debug.print("{s}\n", .{dumped_text});
-            return;
-        }
-
-        if (std.mem.eql(u8, subcmd, "override")) {
-            if (containsHelpArg(args, 3)) {
-                try printConfigOverrideHelp();
-                return;
-            }
-            const action = parseConfigOverrideAction(args, 3) catch {
-                if (json_output) {
-                    printCliError(true, "CONFIG_OVERRIDE_ARGUMENT_INVALID", "invalid config override arguments", "use `zc config override <script.lua>` / `zc config override --clear` / `zc config override`");
-                } else {
-                    try printConfigOverrideHelp();
-                }
-                return;
-            };
-
-            const runtime_key = config.resolveRuntimeConfigKey(allocator, null) catch null;
-            defer if (runtime_key) |k| allocator.free(k);
-            const profile_name = runtime_key orelse "(none)";
-
-            switch (action) {
-                .set => |script| {
-                    const managed_path = config.copyOverrideScriptForCurrentConfig(allocator, script) catch |err| {
-                        printConfigOverrideError(json_output, err);
-                        return err;
-                    };
-                    defer allocator.free(managed_path);
-
-                    validateOverrideAndPrepareRuleProviders(allocator, managed_path) catch |err| {
-                        compat.fs.deleteFileAbsolute(managed_path) catch {};
-                        if (printOverrideRuntimeError(json_output, err)) return err;
-                        printConfigOverridePrepareError(json_output, err);
-                        return err;
-                    };
-
-                    config.persistOverrideScriptPathForCurrentConfig(allocator, managed_path) catch |err| {
-                        compat.fs.deleteFileAbsolute(managed_path) catch {};
-                        printConfigOverrideError(json_output, err);
-                        return err;
-                    };
-
-                    applyConfigOverrideToRunningDaemon(allocator) catch |err| {
-                        printConfigOverrideApplyError(json_output, err);
-                        return err;
-                    };
-
-                    if (json_output) {
-                        std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_set\",\"profile\":\"{s}\",\"enabled\":true,\"script\":\"{s}\"}}}}\n", .{
-                            profile_name,
-                            managed_path,
-                        });
-                    } else {
-                        std.debug.print("Persisted override set for config {s}: {s}\n", .{ profile_name, managed_path });
-                    }
-                    return;
-                },
-                .clear => {
-                    const had_override = config.clearPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
-                        printConfigOverrideError(json_output, err);
-                        return err;
-                    };
-
-                    if (had_override) {
-                        applyConfigOverrideToRunningDaemon(allocator) catch |err| {
-                            printConfigOverrideApplyError(json_output, err);
-                            return err;
-                        };
-                    }
-
-                    if (json_output) {
-                        std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_clear\",\"profile\":\"{s}\",\"enabled\":false,\"cleared\":{s}}}}}\n", .{
-                            profile_name,
-                            if (had_override) "true" else "false",
-                        });
-                    } else if (had_override) {
-                        std.debug.print("Cleared persisted override for config {s}\n", .{profile_name});
-                    } else {
-                        std.debug.print("No persisted override set for config {s}\n", .{profile_name});
-                    }
-                    return;
-                },
-                .show => {
-                    const current_script = config.getPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
-                        printConfigOverrideError(json_output, err);
-                        return err;
-                    };
-                    defer if (current_script) |s| allocator.free(s);
-
-                    if (json_output) {
-                        if (current_script) |s| {
-                            std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_get\",\"profile\":\"{s}\",\"enabled\":true,\"script\":\"{s}\"}}}}\n", .{
-                                profile_name,
-                                s,
-                            });
-                        } else {
-                            std.debug.print("{{\"ok\":true,\"data\":{{\"action\":\"config_override_get\",\"profile\":\"{s}\",\"enabled\":false,\"script\":null}}}}\n", .{profile_name});
-                        }
-                    } else if (current_script) |s| {
-                        std.debug.print("Config {s} persisted override: {s}\n", .{ profile_name, s });
-                    } else {
-                        std.debug.print("Config {s} persisted override: (none)\n", .{profile_name});
-                    }
-                    return;
-                },
-            }
-        }
-
-        std.debug.print("Unknown config subcommand: {s}\n", .{subcmd});
+        try runConfigCommand(allocator, args, json_output, &override_opts);
         return;
     }
 
@@ -1127,7 +847,6 @@ fn profileExists(allocator: std.mem.Allocator, name: []const u8) !bool {
     return true;
 }
 
-
 fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint: []const u8) void {
     var out_buf: [4096]u8 = undefined;
     var err_buf: [2048]u8 = undefined;
@@ -1306,6 +1025,474 @@ fn printConfigDumpError(json_output: bool, _: anyerror) void {
     printCliError(json_output, "CONFIG_DUMP_FAILED", "failed to dump merged config", "check config path/override script and retry");
 }
 
+// ---------------------------------------------------------------------------
+// config 命令树（Batch 3）
+// ---------------------------------------------------------------------------
+
+const ConfigDownloadArgs = struct {
+    url: []const u8,
+    name: ?[]const u8 = null,
+    /// `-d`：下载后设为默认（active）。
+    set_default: bool = false,
+};
+
+/// 全局 flag（main() 经 hasFlag 解析）：子命令解析器跳过它们但不报错。
+fn isGlobalCliFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "--no-color");
+}
+
+/// 决策 D11：剩余参数里只允许全局 flag，任何其他残余参数都是用法错误。
+/// 返回 true 表示存在意外参数（调用方负责报错 + exit_usage）。
+fn hasUnexpectedArgs(args: []const []const u8, start_index: usize) bool {
+    var i = start_index;
+    while (i < args.len) : (i += 1) {
+        if (!isGlobalCliFlag(args[i])) return true;
+    }
+    return false;
+}
+
+/// `zc config download <url> [-n <name>] [-d]`：url 必须是第一个位置参数。
+/// 决策 D11：未知 flag / 多余位置参数 -> error.UnexpectedArgument。
+fn parseConfigDownloadArgs(args: []const []const u8, start_index: usize) !ConfigDownloadArgs {
+    if (args.len <= start_index) return error.MissingUrl;
+    const url = args[start_index];
+    if (url.len == 0 or url[0] == '-') return error.MissingUrl;
+
+    var name: ?[]const u8 = null;
+    var set_default = false;
+    var i = start_index + 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isGlobalCliFlag(arg)) continue;
+        if (std.mem.eql(u8, arg, "-n")) {
+            if (i + 1 >= args.len) return error.MissingNameValue;
+            name = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "-d")) {
+            set_default = true;
+        } else {
+            return error.UnexpectedArgument;
+        }
+    }
+    return .{ .url = url, .name = name, .set_default = set_default };
+}
+
+const ConfigUpdateArgs = struct {
+    name: ?[]const u8 = null,
+    apply_mode: UpdateApplyMode = .auto,
+};
+
+/// `zc config update [name] [--apply auto|hot|restart]`。
+/// 决策 D11：未知 flag（如 `--aply` 拼写错误）/ 多余位置参数 ->
+/// error.UnexpectedArgument，绝不静默忽略后照常执行。
+fn parseConfigUpdateArgs(args: []const []const u8, start_index: usize) !ConfigUpdateArgs {
+    var parsed = ConfigUpdateArgs{};
+    var i = start_index;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isGlobalCliFlag(arg)) continue;
+        if (std.mem.eql(u8, arg, "--apply")) {
+            if (i + 1 >= args.len) return error.MissingApplyValue;
+            parsed.apply_mode = try parseUpdateApplyMode(args[i + 1]);
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--apply=")) {
+            parsed.apply_mode = try parseUpdateApplyMode(arg["--apply=".len..]);
+        } else if (arg.len > 0 and arg[0] == '-') {
+            return error.UnexpectedArgument;
+        } else if (parsed.name == null) {
+            parsed.name = arg;
+        } else {
+            return error.UnexpectedArgument;
+        }
+    }
+    return parsed;
+}
+
+const ConfigDumpArgs = struct {
+    config_path: ?[]const u8 = null,
+    no_override: bool = false,
+};
+
+/// `zc config dump [-c <config>] [--no-override]`，外加帮助里声明的
+/// override flags（它们由 override.parseCliOptions 全局解析/校验，这里只跳过）。
+/// 决策 D11：其余未知 flag / 缺值 flag -> 用法错误（终结 hasFlag 全 argv 扫描）。
+fn parseConfigDumpArgs(args: []const []const u8, start_index: usize) !ConfigDumpArgs {
+    var parsed = ConfigDumpArgs{};
+    var i = start_index;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isGlobalCliFlag(arg)) continue;
+        if (std.mem.eql(u8, arg, "-c")) {
+            if (i + 1 >= args.len) return error.MissingConfigPathValue;
+            parsed.config_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--no-override")) {
+            parsed.no_override = true;
+        } else if (std.mem.eql(u8, arg, "--override-script") or
+            std.mem.eql(u8, arg, "--override-timeout-ms") or
+            std.mem.eql(u8, arg, "--override-arg"))
+        {
+            // 值的存在性/合法性由 override.parseCliOptions 负责（缺值在
+            // dispatch 前就已报 usage 错误），这里跳过 flag 及其值。
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--override-script=") or
+            std.mem.startsWith(u8, arg, "--override-timeout-ms=") or
+            std.mem.startsWith(u8, arg, "--override-arg="))
+        {
+            // `=` 形式自带值，整体跳过。
+        } else {
+            return error.UnexpectedArgument;
+        }
+    }
+    return parsed;
+}
+
+/// reload/update 共用的 apply 结果 token（与 `zc reload` 的 `applied` 取值一致）。
+fn applyResultToken(result: ?daemon.ApplyResult) ?[]const u8 {
+    const r = result orelse return null;
+    return switch (r) {
+        .hot_applied => "hot",
+        .restart_applied => "restart",
+        .restart_fallback => "restart_fallback",
+    };
+}
+
+/// config 命令树 dispatch。错误统一走 printCliError（envelope/error block）
+/// 并以非零码退出；用法错误用 exit_usage，运行失败用 exit_failure。
+fn runConfigCommand(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    json_output: bool,
+    override_opts: *const override.CliOptions,
+) !void {
+    // 裸 `zc config`（或只带全局 flag）-> 组帮助（stdout, exit 0）
+    if (args.len < 3 or isHelpArg(args[2]) or
+        std.mem.eql(u8, args[2], "--json") or std.mem.eql(u8, args[2], "--no-color"))
+    {
+        try printConfigHelp();
+        return;
+    }
+    const subcmd = args[2];
+
+    if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigListHelp();
+            return;
+        }
+        if (hasUnexpectedArgs(args, 3)) {
+            printCliError(json_output, "CONFIG_LIST_ARGUMENT_INVALID", "unknown or unexpected argument for `config list`", "use `zc config list [--json]`");
+            std.process.exit(cli_output.exit_usage);
+        }
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        config.listConfigs(allocator, &out) catch {
+            printCliError(json_output, "CONFIG_LIST_FAILED", "failed to list configs", "ensure the config directory exists and is readable");
+            std.process.exit(cli_output.exit_failure);
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "download")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigDownloadHelp();
+            return;
+        }
+        const dl = parseConfigDownloadArgs(args, 3) catch |err| {
+            switch (err) {
+                error.MissingUrl => printCliError(json_output, "CONFIG_DOWNLOAD_URL_REQUIRED", "missing <url> for config download", "use `zc config download <url> [-n <name>] [-d]`"),
+                error.MissingNameValue => printCliError(json_output, "CONFIG_DOWNLOAD_NAME_REQUIRED", "missing value for `-n`", "use `zc config download <url> -n <name>`"),
+                error.UnexpectedArgument => printCliError(json_output, "CONFIG_DOWNLOAD_ARGUMENT_INVALID", "unknown or unexpected argument for `config download`", "use `zc config download <url> [-n <name>] [-d]`"),
+            }
+            std.process.exit(cli_output.exit_usage);
+        };
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        var outcome = config.downloadConfig(allocator, dl.url, dl.name, dl.set_default, &out) catch |err| {
+            // 诊断走 stderr：envelope 的 message/hint 是静态文案，必须另给出
+            // 真实错误名，否则文件系统失败会被误读成网络问题（零诊断违反
+            // “errors actionable” 契约）。
+            out.note("config download failed: {s}\n", .{@errorName(err)}) catch {};
+            switch (err) {
+                error.NoConfigDir,
+                error.AccessDenied,
+                error.PermissionDenied,
+                error.ReadOnlyFileSystem,
+                error.NotDir,
+                error.IsDir,
+                error.NoSpaceLeft,
+                => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config could not be stored", "ensure `~/.config/zc` is creatable and writable, then retry"),
+                else => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "failed to download config", "check the url/network and retry"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer outcome.deinit(allocator);
+
+        if (json_output) {
+            out.success(.{ .name = outcome.key, .path = outcome.path, .set_default = outcome.set_default }) catch {};
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "update")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigUpdateHelp();
+            return;
+        }
+        const upd = parseConfigUpdateArgs(args, 3) catch |err| {
+            switch (err) {
+                error.MissingApplyValue => printCliError(json_output, "CONFIG_UPDATE_APPLY_INVALID", "missing value for `--apply`", "use `--apply auto|hot|restart`"),
+                error.InvalidApplyMode => printCliError(json_output, "CONFIG_UPDATE_APPLY_INVALID", "invalid `--apply` value", "use `--apply auto|hot|restart`"),
+                error.UnexpectedArgument => printCliError(json_output, "CONFIG_UPDATE_ARGUMENT_INVALID", "unknown or unexpected argument for `config update`", "use `zc config update [name] [--apply auto|hot|restart]`"),
+            }
+            std.process.exit(cli_output.exit_usage);
+        };
+
+        const current_config = config.getCurrentConfigName(allocator) catch null;
+        defer if (current_config) |c| allocator.free(c);
+        const target_name = upd.name orelse current_config orelse {
+            printCliError(json_output, "CONFIG_UPDATE_NAME_REQUIRED", "no config name given and no active config", "use `zc config update <name>`, or `zc config use <name>` first");
+            std.process.exit(cli_output.exit_usage);
+        };
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        const updated_key = config.updateConfig(allocator, target_name, &out) catch |err| {
+            switch (err) {
+                error.NoSubscriptionUrl => printCliError(json_output, "CONFIG_UPDATE_NO_SUBSCRIPTION", "no subscription url recorded for this config", "use `zc config download <url>` to (re)create it"),
+                else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to update config", "check subscription url/network and retry"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer allocator.free(updated_key);
+
+        // 应用策略：auto(默认)/hot/restart —— 只对运行中的 daemon 生效。
+        // JSON 模式只输出一个最终 envelope（D6 同款），apply 结果折叠进 data。
+        var apply_result: ?daemon.ApplyResult = null;
+        if (daemon.isRunning(allocator) catch false) {
+            apply_result = daemon.reloadOrRestart(allocator, null, upd.apply_mode) catch |err| {
+                switch (err) {
+                    error.ForegroundDaemonSupervised => printCliError(json_output, "CONFIG_UPDATE_APPLY_FAILED", "config updated but daemon runs in the foreground (likely under a supervisor)", "restart it via the supervisor (e.g. `systemctl restart`)"),
+                    else => printCliError(json_output, "CONFIG_UPDATE_APPLY_FAILED", "config updated but failed to apply to running daemon", "check `zc log --no-follow`, then run `zc restart`"),
+                }
+                std.process.exit(cli_output.exit_failure);
+            };
+        }
+
+        if (json_output) {
+            out.success(.{
+                .name = updated_key,
+                .applied = apply_result != null,
+                .apply_result = applyResultToken(apply_result),
+            }) catch {};
+        } else if (apply_result) |result| {
+            switch (result) {
+                .hot_applied => out.print("Config applied via hot reload\n", .{}) catch {},
+                .restart_applied => out.print("Config applied via restart\n", .{}) catch {},
+                .restart_fallback => out.print("Config hot reload unavailable, fell back to restart\n", .{}) catch {},
+            }
+            out.flush() catch {};
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "use")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigUseHelp();
+            return;
+        }
+        if (args.len < 4 or args[3].len == 0 or args[3][0] == '-') {
+            printCliError(json_output, "CONFIG_USE_NAME_REQUIRED", "missing <name> for config use", "use `zc config use <name>`; run `zc config list` to see candidates");
+            std.process.exit(cli_output.exit_usage);
+        }
+        if (hasUnexpectedArgs(args, 4)) {
+            printCliError(json_output, "CONFIG_USE_ARGUMENT_INVALID", "unknown or unexpected argument for `config use`", "use `zc config use <name>`");
+            std.process.exit(cli_output.exit_usage);
+        }
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        config.switchConfig(allocator, args[3], &out) catch |err| {
+            switch (err) {
+                error.ConfigNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
+                else => printCliError(json_output, "CONFIG_SWITCH_FAILED", "failed to switch active config", "verify file permission and retry"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+
+        // 决策 D8：use 绝不自动 apply 到运行中的 daemon；data 注明 applied:false。
+        if (json_output) {
+            // 与 switchConfig/downloadConfig 共用同一套 key 归一化。
+            out.success(.{ .name = config.normalizeConfigKey(args[3]), .applied = false }) catch {};
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "dump")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigDumpHelp();
+            return;
+        }
+        const dump_args = parseConfigDumpArgs(args, 3) catch |err| {
+            switch (err) {
+                error.MissingConfigPathValue => printCliError(json_output, "CONFIG_DUMP_ARGUMENT_INVALID", "missing value for `-c`", "use `zc config dump -c <config>`"),
+                error.UnexpectedArgument => printCliError(json_output, "CONFIG_DUMP_ARGUMENT_INVALID", "unknown or unexpected argument for `config dump`", "use `zc config dump [-c <config>] [--no-override]`"),
+            }
+            std.process.exit(cli_output.exit_usage);
+        };
+        const config_path = dump_args.config_path;
+        const no_override = dump_args.no_override;
+        var cfg = (if (config_path) |path|
+            config.load(allocator, path)
+        else
+            config.loadDefault(allocator)) catch |err|
+            {
+                // 配置加载失败也必须走 envelope/error block（不再裸 try 抛 trace）。
+                printConfigDumpError(json_output, err);
+                std.process.exit(cli_output.exit_failure);
+            };
+        defer cfg.deinit();
+
+        if (!no_override) {
+            var persisted_script: ?[]u8 = null;
+            defer if (persisted_script) |p| allocator.free(p);
+            var effective_override = resolveEffectiveOverrideOptions(
+                allocator,
+                override_opts,
+                config_path,
+                &persisted_script,
+            ) catch |err| {
+                if (!printOverrideRuntimeError(json_output, err)) printConfigDumpError(json_output, err);
+                std.process.exit(cli_output.exit_failure);
+            };
+
+            override.apply(allocator, &cfg, &effective_override, "config.dump", config_path) catch |err| {
+                if (!printOverrideRuntimeError(json_output, err)) printConfigDumpError(json_output, err);
+                std.process.exit(cli_output.exit_failure);
+            };
+        }
+
+        const dumped = if (json_output)
+            override.dumpConfigJson(allocator, &cfg)
+        else
+            override.dumpConfigYaml(allocator, &cfg);
+        const dumped_text = dumped catch |err| {
+            printConfigDumpError(json_output, err);
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer allocator.free(dumped_text);
+
+        // 决策 D2：dump 是唯一的裸文档例外 —— payload 走 stdout，可直接管道。
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        out.print("{s}\n", .{dumped_text}) catch {};
+        out.flush() catch {};
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "override")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigOverrideHelp();
+            return;
+        }
+        const action = parseConfigOverrideAction(args, 3) catch {
+            // 两种模式同语义：用法错误 -> envelope/error block + exit_usage。
+            printCliError(json_output, "CONFIG_OVERRIDE_ARGUMENT_INVALID", "invalid config override arguments", "use `zc config override <script.lua>`, `zc config override --clear`, or `zc config override`");
+            std.process.exit(cli_output.exit_usage);
+        };
+
+        const runtime_key = config.resolveRuntimeConfigKey(allocator, null) catch null;
+        defer if (runtime_key) |k| allocator.free(k);
+        const profile_name = runtime_key orelse "(none)";
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+
+        switch (action) {
+            .set => |script| {
+                const managed_path = config.copyOverrideScriptForCurrentConfig(allocator, script) catch |err| {
+                    printConfigOverrideError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+                defer allocator.free(managed_path);
+
+                validateOverrideAndPrepareRuleProviders(allocator, managed_path) catch |err| {
+                    compat.fs.deleteFileAbsolute(managed_path) catch {};
+                    if (!printOverrideRuntimeError(json_output, err)) printConfigOverridePrepareError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+
+                config.persistOverrideScriptPathForCurrentConfig(allocator, managed_path) catch |err| {
+                    compat.fs.deleteFileAbsolute(managed_path) catch {};
+                    printConfigOverrideError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+
+                applyConfigOverrideToRunningDaemon(allocator) catch |err| {
+                    printConfigOverrideApplyError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+
+                if (json_output) {
+                    out.success(.{ .action = "config_override_set", .profile = profile_name, .enabled = true, .script = managed_path }) catch {};
+                } else {
+                    out.print("Persisted override set for config {s}: {s}\n", .{ profile_name, managed_path }) catch {};
+                    out.flush() catch {};
+                }
+            },
+            .clear => {
+                const had_override = config.clearPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
+                    printConfigOverrideError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+
+                if (had_override) {
+                    applyConfigOverrideToRunningDaemon(allocator) catch |err| {
+                        printConfigOverrideApplyError(json_output, err);
+                        std.process.exit(cli_output.exit_failure);
+                    };
+                }
+
+                if (json_output) {
+                    out.success(.{ .action = "config_override_clear", .profile = profile_name, .enabled = false, .cleared = had_override }) catch {};
+                } else if (had_override) {
+                    out.print("Cleared persisted override for config {s}\n", .{profile_name}) catch {};
+                    out.flush() catch {};
+                } else {
+                    out.print("No persisted override set for config {s}\n", .{profile_name}) catch {};
+                    out.flush() catch {};
+                }
+            },
+            .show => {
+                const current_script = config.getPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
+                    printConfigOverrideError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+                defer if (current_script) |s| allocator.free(s);
+
+                if (json_output) {
+                    if (current_script) |s| {
+                        out.success(.{ .action = "config_override_get", .profile = profile_name, .enabled = true, .script = s }) catch {};
+                    } else {
+                        out.success(.{ .action = "config_override_get", .profile = profile_name, .enabled = false, .script = null }) catch {};
+                    }
+                } else if (current_script) |s| {
+                    out.print("Config {s} persisted override: {s}\n", .{ profile_name, s }) catch {};
+                    out.flush() catch {};
+                } else {
+                    out.print("Config {s} persisted override: (none)\n", .{profile_name}) catch {};
+                    out.flush() catch {};
+                }
+            },
+        }
+        return;
+    }
+
+    // 未知 config 子命令：两种模式同语义（envelope/error block）+ exit_usage。
+    printCliError(json_output, "CONFIG_SUBCOMMAND_UNKNOWN", "unknown config subcommand", "use `zc config --help` to list config subcommands");
+    std.process.exit(cli_output.exit_usage);
+}
+
 fn validateOverrideAndPrepareRuleProviders(allocator: std.mem.Allocator, script_path: []const u8) !void {
     var cfg = try config.loadDefault(allocator);
     defer cfg.deinit();
@@ -1347,7 +1534,7 @@ fn parseConfigOverrideAction(args: []const []const u8, start_index: usize) !Conf
     var i: usize = start_index;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--json")) continue;
+        if (isGlobalCliFlag(arg)) continue;
         if (std.mem.eql(u8, arg, "--clear")) {
             clear = true;
             continue;
@@ -2096,6 +2283,122 @@ test "hasInProcessPortConflict detects conflicts" {
     cfg.mixed_port = 7892;
     cfg.external_controller = try allocator.dupe(u8, "127.0.0.1:7892");
     try testing.expect(try hasInProcessPortConflict(&cfg));
+}
+
+test "parseConfigDownloadArgs parses url, -n, -d and rejects missing url" {
+    const testing = std.testing;
+
+    const full = [_][]const u8{ "zc", "config", "download", "https://example.com/c.yaml", "-n", "myconf", "-d", "--json" };
+    const parsed = try parseConfigDownloadArgs(full[0..], 3);
+    try testing.expectEqualStrings("https://example.com/c.yaml", parsed.url);
+    try testing.expectEqualStrings("myconf", parsed.name.?);
+    try testing.expect(parsed.set_default);
+
+    const bare = [_][]const u8{ "zc", "config", "download", "https://example.com/c.yaml" };
+    const parsed2 = try parseConfigDownloadArgs(bare[0..], 3);
+    try testing.expect(parsed2.name == null);
+    try testing.expect(!parsed2.set_default);
+
+    const missing_url = [_][]const u8{ "zc", "config", "download" };
+    try testing.expectError(error.MissingUrl, parseConfigDownloadArgs(missing_url[0..], 3));
+
+    const flag_first = [_][]const u8{ "zc", "config", "download", "--json" };
+    try testing.expectError(error.MissingUrl, parseConfigDownloadArgs(flag_first[0..], 3));
+
+    const missing_name = [_][]const u8{ "zc", "config", "download", "https://example.com/c.yaml", "-n" };
+    try testing.expectError(error.MissingNameValue, parseConfigDownloadArgs(missing_name[0..], 3));
+}
+
+test "parseConfigDownloadArgs rejects unknown flags and stray positionals (D11)" {
+    const testing = std.testing;
+
+    const unknown_flag = [_][]const u8{ "zc", "config", "download", "https://example.com/c.yaml", "--bogus" };
+    try testing.expectError(error.UnexpectedArgument, parseConfigDownloadArgs(unknown_flag[0..], 3));
+
+    const stray_positional = [_][]const u8{ "zc", "config", "download", "https://example.com/c.yaml", "extra" };
+    try testing.expectError(error.UnexpectedArgument, parseConfigDownloadArgs(stray_positional[0..], 3));
+
+    // 全局 flag 不算未知
+    const with_globals = [_][]const u8{ "zc", "config", "download", "https://example.com/c.yaml", "--json", "--no-color", "-d" };
+    const parsed = try parseConfigDownloadArgs(with_globals[0..], 3);
+    try testing.expect(parsed.set_default);
+}
+
+test "parseConfigUpdateArgs parses name and --apply, rejects bad values" {
+    const testing = std.testing;
+
+    const full = [_][]const u8{ "zc", "config", "update", "myconf", "--apply", "restart", "--json" };
+    const parsed = try parseConfigUpdateArgs(full[0..], 3);
+    try testing.expectEqualStrings("myconf", parsed.name.?);
+    try testing.expectEqual(UpdateApplyMode.restart, parsed.apply_mode);
+
+    const eq_form = [_][]const u8{ "zc", "config", "update", "--apply=hot" };
+    const parsed2 = try parseConfigUpdateArgs(eq_form[0..], 3);
+    try testing.expect(parsed2.name == null);
+    try testing.expectEqual(UpdateApplyMode.hot, parsed2.apply_mode);
+
+    const missing_value = [_][]const u8{ "zc", "config", "update", "--apply" };
+    try testing.expectError(error.MissingApplyValue, parseConfigUpdateArgs(missing_value[0..], 3));
+
+    const bad_value = [_][]const u8{ "zc", "config", "update", "--apply", "noop" };
+    try testing.expectError(error.InvalidApplyMode, parseConfigUpdateArgs(bad_value[0..], 3));
+}
+
+test "parseConfigUpdateArgs rejects unknown flags and extra positionals (D11)" {
+    const testing = std.testing;
+
+    // 曾经的静默 bug：`--aply` 拼错被忽略后照常以 apply_mode=auto 执行
+    const typo_flag = [_][]const u8{ "zc", "config", "update", "--aply", "hot" };
+    try testing.expectError(error.UnexpectedArgument, parseConfigUpdateArgs(typo_flag[0..], 3));
+
+    const extra_positional = [_][]const u8{ "zc", "config", "update", "one", "two" };
+    try testing.expectError(error.UnexpectedArgument, parseConfigUpdateArgs(extra_positional[0..], 3));
+}
+
+test "parseConfigDumpArgs parses -c/--no-override, skips override flags, rejects unknown (D11)" {
+    const testing = std.testing;
+
+    const full = [_][]const u8{ "zc", "config", "dump", "-c", "./x.yaml", "--no-override", "--json" };
+    const parsed = try parseConfigDumpArgs(full[0..], 3);
+    try testing.expectEqualStrings("./x.yaml", parsed.config_path.?);
+    try testing.expect(parsed.no_override);
+
+    // override flags 由 override.parseCliOptions 全局解析，这里跳过（含值）
+    const with_override = [_][]const u8{ "zc", "config", "dump", "--override-script", "./s.lua", "--override-arg=k=v" };
+    const parsed2 = try parseConfigDumpArgs(with_override[0..], 3);
+    try testing.expect(parsed2.config_path == null);
+    try testing.expect(!parsed2.no_override);
+
+    const missing_c = [_][]const u8{ "zc", "config", "dump", "-c" };
+    try testing.expectError(error.MissingConfigPathValue, parseConfigDumpArgs(missing_c[0..], 3));
+
+    const unknown_flag = [_][]const u8{ "zc", "config", "dump", "--no-overide" };
+    try testing.expectError(error.UnexpectedArgument, parseConfigDumpArgs(unknown_flag[0..], 3));
+
+    const stray_positional = [_][]const u8{ "zc", "config", "dump", "extra" };
+    try testing.expectError(error.UnexpectedArgument, parseConfigDumpArgs(stray_positional[0..], 3));
+}
+
+test "hasUnexpectedArgs allows only global flags (D11)" {
+    const testing = std.testing;
+
+    const clean = [_][]const u8{ "zc", "config", "use", "smoke", "--json", "--no-color" };
+    try testing.expect(!hasUnexpectedArgs(clean[0..], 4));
+
+    const dirty = [_][]const u8{ "zc", "config", "use", "smoke", "--force" };
+    try testing.expect(hasUnexpectedArgs(dirty[0..], 4));
+
+    const dirty_positional = [_][]const u8{ "zc", "config", "list", "extra" };
+    try testing.expect(hasUnexpectedArgs(dirty_positional[0..], 3));
+}
+
+test "applyResultToken matches zc reload applied tokens" {
+    const testing = std.testing;
+
+    try testing.expect(applyResultToken(null) == null);
+    try testing.expectEqualStrings("hot", applyResultToken(.hot_applied).?);
+    try testing.expectEqualStrings("restart", applyResultToken(.restart_applied).?);
+    try testing.expectEqualStrings("restart_fallback", applyResultToken(.restart_fallback).?);
 }
 
 test "parseUpdateApplyMode supports auto hot restart" {

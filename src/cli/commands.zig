@@ -122,7 +122,8 @@ pub const table = [_]Command{
         .path = "config list",
         .aliases = &.{"config ls"},
         .summary = "List all available configs",
-        .examples = &.{"zc config list"},
+        .flags = &.{json_flag},
+        .examples = &.{ "zc config list", "zc config list --json" },
     },
     .{
         .path = "config download",
@@ -131,6 +132,7 @@ pub const table = [_]Command{
         .flags = &.{
             .{ .spec = "-n <name>", .help = "Config filename (default: timestamp)" },
             .{ .spec = "-d", .help = "Set as default after download" },
+            json_flag,
         },
         .examples = &.{"zc config download https://example.com/config.yaml -n myconfig -d"},
     },
@@ -138,13 +140,17 @@ pub const table = [_]Command{
         .path = "config update",
         .args = "[name]",
         .summary = "Re-download a previously downloaded config",
-        .flags = &.{.{ .spec = "--apply <auto|hot|restart>", .help = "How to apply to a running daemon" }},
+        .flags = &.{
+            .{ .spec = "--apply <auto|hot|restart>", .help = "How to apply to a running daemon" },
+            json_flag,
+        },
         .examples = &.{"zc config update --apply auto"},
     },
     .{
         .path = "config use",
         .args = "<name>",
-        .summary = "Switch to specified config",
+        .summary = "Switch to specified config (apply with `zc reload` afterwards)",
+        .flags = &.{json_flag},
         .examples = &.{"zc config use myconfig.yaml"},
     },
     .{
