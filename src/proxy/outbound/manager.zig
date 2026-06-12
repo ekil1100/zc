@@ -7,6 +7,8 @@ const ProxyType = @import("../../config.zig").ProxyType;
 const meta = @import("../../meta.zig");
 const ss = @import("shadowsocks.zig");
 const anytls = @import("../../protocol/anytls.zig");
+const anytls_pool = @import("anytls_pool.zig");
+const crypto = std.crypto;
 const vmess = @import("../../protocol/vmess.zig");
 const trojan = @import("../../protocol/trojan.zig");
 const vless = @import("../../protocol/vless.zig");
@@ -17,7 +19,11 @@ pub const ProxyStream = struct {
     base_stream: net.Stream,
     allocator: ?std.mem.Allocator = null,
     owned_ss_client: ?*ss.ShadowsocksClient = null,
-    owned_anytls_client: ?*anytls.Client = null,
+    /// AnyTLS multiplexed stream borrowed from a SessionPool (C3b). The pool owns
+    /// the Session; this struct owns ONLY the per-stream borrow. close() routes to
+    /// Stream.close (FIN + return-to-idle + ref drop) — the manager NEVER destroys
+    /// the Session here (that is the pool's drain in §13).
+    owned_anytls_stream: ?*anytls.Stream = null,
     owned_trojan_client: ?*trojan.Client = null,
     is_closed: bool = false,
 
@@ -43,11 +49,27 @@ pub const ProxyStream = struct {
         };
     }
 
-    pub fn initAnyTls(allocator: std.mem.Allocator, stream: net.Stream, client: *anytls.Client) ProxyStream {
+    /// Borrow an AnyTLS multiplexed Stream from a SessionPool (C3b). No
+    /// `net.Stream`/allocator: read/write/close/hasPendingRead/getHandle all route
+    /// to the Stream, whose getHandle() returns the per-stream notifier read fd so
+    /// the plain CONNECT relay polls it unchanged.
+    ///
+    /// KNOWN GAP (TODO C5): the HTTPS-forward path (mixed.zig HttpsForwardStream)
+    /// is NOT yet correct over anytls. The guard at mixed.zig:621
+    /// (`owned_ss_client == null and owned_trojan_client == null`) does NOT exclude
+    /// `owned_anytls_stream`, so an anytls target currently takes the no-poll
+    /// `handleDirectHttpsForwardStream` path whose UpstreamReader turns WouldBlock
+    /// into a FATAL error.ReadFailed. C5 must (a) add `and
+    /// target_stream.owned_anytls_stream == null` to that guard so anytls takes the
+    /// move()/HttpsForwardStream path, and (b) route that reader through
+    /// `Stream.readBlocking` (§14). We do NOT touch mixed.zig in C3b (relays are
+    /// out of scope for this sub-stage); until C5, anytls is production-reachable
+    /// on the plain CONNECT relay path only.
+    pub fn initAnyTlsStream(stream: *anytls.Stream) ProxyStream {
         return .{
-            .base_stream = stream,
-            .allocator = allocator,
-            .owned_anytls_client = client,
+            .base_stream = .{ .handle = -1 },
+            .allocator = null,
+            .owned_anytls_stream = stream,
         };
     }
 
@@ -56,7 +78,7 @@ pub const ProxyStream = struct {
         self.base_stream = .{ .handle = -1 };
         self.allocator = null;
         self.owned_ss_client = null;
-        self.owned_anytls_client = null;
+        self.owned_anytls_stream = null;
         self.owned_trojan_client = null;
         self.is_closed = true;
         return moved;
@@ -66,8 +88,8 @@ pub const ProxyStream = struct {
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             try client.write(data);
-        } else if (self.owned_anytls_client) |client| {
-            try client.write(data);
+        } else if (self.owned_anytls_stream) |stream| {
+            try stream.write(data);
         } else if (self.owned_trojan_client) |client| {
             try client.write(data);
         } else {
@@ -79,8 +101,8 @@ pub const ProxyStream = struct {
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             return try client.read(buf);
-        } else if (self.owned_anytls_client) |client| {
-            return try client.read(buf);
+        } else if (self.owned_anytls_stream) |stream| {
+            return try stream.read(buf);
         } else if (self.owned_trojan_client) |client| {
             return try client.read(buf);
         } else {
@@ -98,10 +120,13 @@ pub const ProxyStream = struct {
             self.allocator.?.destroy(client);
             return;
         }
-        if (self.owned_anytls_client) |client| {
-            self.owned_anytls_client = null;
-            client.deinit();
-            self.allocator.?.destroy(client);
+        if (self.owned_anytls_stream) |stream| {
+            // The Stream owns its own teardown: close() sends a per-stream FIN,
+            // returns the Session to the pool's idle list (or frees it), and drops
+            // the relay-borrow ref. The manager does NOT destroy the Session — the
+            // pool's §13 drain (OutboundManager.deinit) owns Session lifetimes.
+            self.owned_anytls_stream = null;
+            stream.close();
             return;
         }
         if (self.owned_trojan_client) |client| {
@@ -118,8 +143,8 @@ pub const ProxyStream = struct {
         if (self.owned_ss_client) |client| {
             return client.hasPendingRead();
         }
-        if (self.owned_anytls_client) |client| {
-            return client.hasPendingRead();
+        if (self.owned_anytls_stream) |stream| {
+            return stream.hasPendingRead();
         }
         if (self.owned_trojan_client) |client| {
             return client.hasPendingRead();
@@ -129,6 +154,11 @@ pub const ProxyStream = struct {
 
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
         if (self.is_closed) return -1;
+        if (self.owned_anytls_stream) |stream| {
+            // The per-stream notifier read fd: the plain CONNECT relay polls this
+            // for readiness exactly as it would a socket fd.
+            return stream.getHandle();
+        }
         return self.base_stream.handle;
     }
 };
@@ -146,6 +176,13 @@ pub const OutboundManager = struct {
     config_key: ?[]const u8 = null,
     persist_invocations: usize = 0,
 
+    /// AnyTLS per-identity SessionPools (§12). Keyed by an owned poolKey string
+    /// (addr|port|sni|skip|hex(pwhash[0..8])). Guarded by pools_mutex, which is the
+    /// outermost lock (§16): NEVER held while calling a pool method that locks
+    /// pool.mutex.
+    anytls_pools: std.StringHashMapUnmanaged(*anytls_pool.SessionPool) = .empty,
+    pools_mutex: std.Io.Mutex = .init,
+
     pub fn init(allocator: std.mem.Allocator, config_arg: *const Config) !OutboundManager {
         return try initWithKey(allocator, config_arg, null);
     }
@@ -162,10 +199,77 @@ pub const OutboundManager = struct {
     }
 
     pub fn deinit(self: *OutboundManager) void {
+        // §13 drain: tear down every AnyTLS pool. pool.deinit joins the reaper +
+        // every recv-loop thread; relay-held Streams free later via
+        // ProxyStream.close -> Stream.close -> Session.releaseRef. We hold
+        // pools_mutex only to snapshot/iterate the map (pool.deinit takes the
+        // pool's own mutex, never pools_mutex — no inversion, §16).
+        self.lockPools();
+        var it = self.anytls_pools.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        self.anytls_pools.deinit(self.allocator);
+        self.unlockPools();
+
         self.lockSelections();
         defer self.unlockSelections();
         self.group_selections.deinit();
         if (self.config_key) |k| self.allocator.free(k);
+    }
+
+    fn lockPools(self: *OutboundManager) void {
+        std.Io.Threaded.mutexLock(&self.pools_mutex);
+    }
+
+    fn unlockPools(self: *OutboundManager) void {
+        std.Io.Threaded.mutexUnlock(&self.pools_mutex);
+    }
+
+    /// Builds an owned per-identity pool key (§12):
+    /// "addr|port|sni|skip|hex(pwhash[0..8])". Two proxies sharing every field
+    /// share a pool; any difference (incl. password) routes to a distinct pool.
+    /// Caller owns the returned slice.
+    fn poolKey(self: *OutboundManager, proxy: *const Proxy) ![]u8 {
+        var pwhash: [32]u8 = undefined;
+        crypto.hash.sha2.Sha256.hash(proxy.password orelse "", &pwhash, .{});
+        return std.fmt.allocPrint(self.allocator, "{s}|{d}|{s}|{d}|{x}", .{
+            proxy.server,
+            proxy.port,
+            proxy.sni orelse "",
+            @as(u8, if (proxy.skip_cert_verify) 1 else 0),
+            pwhash[0..8],
+        });
+    }
+
+    /// Returns the SessionPool for `key`, lazily creating it (and spawning its
+    /// reaper) on a miss. Stored under the owned `key`; on a hit the passed `key`
+    /// is the caller's to free. Held under pools_mutex (§16: we do NOT call into
+    /// pool methods that lock pool.mutex while holding it — createStream runs after
+    /// this returns and the lock is released).
+    fn getOrCreatePool(self: *OutboundManager, key: []const u8, proxy: *const Proxy) !*anytls_pool.SessionPool {
+        self.lockPools();
+        defer self.unlockPools();
+
+        if (self.anytls_pools.get(key)) |existing| return existing;
+
+        const dial_config = anytls.Config{
+            .password = proxy.password orelse return error.MissingPassword,
+            .address = proxy.server,
+            .port = proxy.port,
+            .sni = proxy.sni,
+            .skip_cert_verify = proxy.skip_cert_verify,
+        };
+        // PoolConfig defaults (C6 plumbs config tunables; until then, §12 defaults).
+        const pool = try anytls_pool.SessionPool.init(self.allocator, key, dial_config, .{});
+        errdefer pool.deinit();
+        try pool.startReaper();
+
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        try self.anytls_pools.put(self.allocator, owned_key, pool);
+        return pool;
     }
 
     /// 设置代理组的选择（由 TUI/API 调用）
@@ -315,18 +419,14 @@ pub const OutboundManager = struct {
                 return ProxyStream.initShadowsocks(self.allocator, stream, client);
             },
             .anytls => {
-                const client = try self.allocator.create(anytls.Client);
-                errdefer self.allocator.destroy(client);
-                client.* = try anytls.Client.init(self.allocator, .{
-                    .password = proxy.password orelse return error.MissingPassword,
-                    .address = proxy.server,
-                    .port = proxy.port,
-                    .sni = proxy.sni,
-                    .skip_cert_verify = proxy.skip_cert_verify,
-                });
-                errdefer client.deinit();
-                const stream = try client.connect(target, port);
-                return ProxyStream.initAnyTls(self.allocator, stream, client);
+                // Route through the per-identity SessionPool (§12): reuse a warm
+                // idle Session or dial a fresh one, then check out a multiplexed
+                // Stream. The pool owns the Session; ProxyStream borrows the Stream.
+                const key = try self.poolKey(proxy);
+                defer self.allocator.free(key);
+                const pool = try self.getOrCreatePool(key, proxy);
+                const stream = try pool.createStream(target, port);
+                return ProxyStream.initAnyTlsStream(stream);
             },
             .vmess => {
                 var client = try vmess.Client.init(self.allocator, .{
@@ -557,25 +657,68 @@ test "ProxyStream move transfers shadowsocks ownership" {
     try std.testing.expect(moved.owned_ss_client == ss_client);
 }
 
+// KNOWN GAP (TODO C7): a real end-to-end loopback test — manager.connect(.anytls)
+// -> real dial -> relay, asserting "one dial on reuse" — needs a TLS + anytls-
+// protocol fake server. Deferred to C7; here we cover the ProxyStream ownership
+// transfer with a non-dialed Stream stand-in only.
+
+// Build a NON-DIALED Session stand-in (conn = null, recv_thread = null) +
+// registered Stream, mirroring the seam used by anytls.zig C2/C3a tests and the
+// pool's makeStandin. Uses only pub anytls API (Session.initForTest, the pub
+// Session/Stream struct fields, compat.Notifier). The Stream's close() is safe on
+// a stand-in: sendFin -> sendFrame -> writeSessionPayload returns NotConnected
+// (conn == null), which sendFin swallows.
+const anytls_test_config = anytls.Config{ .password = "password", .address = "127.0.0.1", .port = 443 };
+
+fn makeStandinAnyTlsStream(allocator: std.mem.Allocator) !struct { session: *anytls.Session, stream: *anytls.Stream } {
+    const session = try allocator.create(anytls.Session);
+    errdefer allocator.destroy(session);
+    session.* = try anytls.Session.initForTest(allocator, anytls_test_config);
+    // Stand-in for the recv-loop ref; +1 per-stream session-ref added below.
+    session.refs = std.atomic.Value(u32).init(1);
+
+    const stream = try allocator.create(anytls.Stream);
+    errdefer allocator.destroy(stream);
+    stream.* = .{
+        .session = session,
+        .id = 1,
+        .notifier = try compat.Notifier.init(),
+    };
+
+    // Mirror Session.openStream / testRegisterStream: insert into the map, add the
+    // per-stream session-ref, and bind it to the Stream struct so releaseStreamRef
+    // drops it exactly once when the Stream is finally freed.
+    std.Io.Threaded.mutexLock(&session.streams_mutex);
+    try session.streams.put(allocator, 1, stream);
+    std.Io.Threaded.mutexUnlock(&session.streams_mutex);
+    _ = session.refs.fetchAdd(1, .monotonic);
+    stream.owns_session_ref = true;
+
+    return .{ .session = session, .stream = stream };
+}
+
 test "ProxyStream move transfers AnyTLS ownership" {
     const allocator = std.testing.allocator;
 
-    const anytls_client = try allocator.create(anytls.Client);
-    errdefer allocator.destroy(anytls_client);
-    anytls_client.* = try anytls.Client.init(allocator, .{
-        .password = "password",
-        .address = "127.0.0.1",
-        .port = 443,
-    });
+    const standin = try makeStandinAnyTlsStream(allocator);
+    const session = standin.session;
+    const stream = standin.stream;
 
-    var source = ProxyStream.initAnyTls(allocator, .{ .handle = -1 }, anytls_client);
+    var source = ProxyStream.initAnyTlsStream(stream);
     var moved = source.move();
-    defer moved.close();
-    source.close();
 
     try std.testing.expect(source.is_closed);
-    try std.testing.expect(source.owned_anytls_client == null);
-    try std.testing.expect(moved.owned_anytls_client == anytls_client);
+    try std.testing.expect(source.owned_anytls_stream == null);
+    try std.testing.expect(moved.owned_anytls_stream == stream);
+
+    // close() routes to Stream.close (drops map-presence + relay-borrow refs ->
+    // frees the Stream -> drops the per-stream session-ref). source.close() is a
+    // no-op (ownership moved). Then drive the session teardown like a recv-loop
+    // exit would: requestClose + drop the stand-in recv-loop ref -> finalize.
+    source.close();
+    moved.close();
+    session.requestClose(.shutdown);
+    session.releaseRef();
 }
 
 test "ProxyStream write rejects closed stream" {

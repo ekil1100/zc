@@ -1251,6 +1251,26 @@ pub const Stream = struct {
         if (r.dropped_map) {
             self.releaseStreamRef(); // drop map-presence ref
         }
+
+        // §8 return-to-idle: this stream is the session's single active stream, so
+        // on a clean close (session NOT dying) hand the session back to its pool
+        // for reuse. putIdle flips active_streams/in_idle under the pool mutex.
+        // A non-pooled session (Client shim / stand-in) or a putIdle refusal
+        // (shutting down / OOM on re-insert) means the session can never be
+        // reused -> tear it down with requestClose(.discard) so its recv-loop +
+        // TLS socket are reclaimed rather than orphaned. If d (already dying),
+        // requestClose has already run; do nothing. This decision MUST happen
+        // here, BEFORE the final releaseStreamRef below, because that drop may
+        // free the Stream and release the per-stream Session-ref (the last ref to
+        // a dead session), after which `session` is no longer safe to touch.
+        if (!r.dying) {
+            if (session.pool) |p| {
+                if (!p.putIdle(session)) session.requestClose(.discard);
+            } else {
+                session.requestClose(.discard);
+            }
+        }
+
         // Drop the relay-borrow ref last. When this is the Stream's final ref,
         // releaseStreamRef frees the struct and then drops the per-stream
         // Session-ref (which may finalize the Session) — strictly after the

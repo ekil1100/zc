@@ -694,3 +694,108 @@ test "C3a: createStream returns PoolShuttingDown after deinit set the flag" {
     pool.reaper_wake.deinit();
     allocator.destroy(pool);
 }
+
+/// Register a real *Stream (refs = 2: map-presence + relay-borrow) on a pooled
+/// stand-in session, adding the per-stream Session-ref bound to the Stream
+/// struct — exactly as Session.openStream does on a real checkout. Uses only
+/// pub anytls API + the Stream struct fields, mirroring manager.zig's
+/// makeStandinAnyTlsStream. The Stream's close() is safe on a stand-in:
+/// sendFin -> sendFrame -> writeSessionPayload returns NotConnected (conn ==
+/// null), which sendFin swallows.
+fn registerStandinStream(sess: *Session, sid: u32) !*Stream {
+    const allocator = sess.allocator;
+    const stream = try allocator.create(Stream);
+    errdefer allocator.destroy(stream);
+    stream.* = .{
+        .session = sess,
+        .id = sid,
+        .notifier = try compat.Notifier.init(),
+    };
+    std.Io.Threaded.mutexLock(&sess.streams_mutex);
+    try sess.streams.put(allocator, sid, stream);
+    std.Io.Threaded.mutexUnlock(&sess.streams_mutex);
+    _ = sess.refs.fetchAdd(1, .monotonic); // per-stream Session-ref
+    stream.owns_session_ref = true; // lifetime bound to the Stream struct
+    return stream;
+}
+
+test "C3b: Stream.close returns its session to idle for reuse (one session, no second dial)" {
+    // Regression for the missing-putIdle blocker: after a relay closes its
+    // stream the session MUST go back to the pool's idle list so the next
+    // createStream reuses it (popHighestIdle != null) instead of dialing fresh,
+    // and so the session is reapable rather than orphaned in `all` forever.
+    // Stand-in session only (no dial); the production close() path is exercised
+    // end-to-end through pool.putIdle.
+    const allocator = std.testing.allocator;
+    const pool = try makePool(allocator, .{});
+    defer pool.deinit();
+
+    // Simulate a checkout: session in `all`, NOT idle, active_streams = 1.
+    const sess = try makeStandin(pool, 1);
+    pool.lock();
+    try pool.all.put(allocator, sess, {});
+    sess.active_streams = 1;
+    pool.unlock();
+
+    const stream = try registerStandinStream(sess, 1);
+
+    // Relay close -> §8 return-to-idle. The stand-in keeps its recv-loop ref, so
+    // the session is NOT freed: it lands back in idle, reusable.
+    stream.close();
+
+    pool.lock();
+    try std.testing.expectEqual(@as(usize, 1), pool.idle.items.len);
+    try std.testing.expect(pool.idle.items[0] == sess);
+    try std.testing.expect(sess.in_idle);
+    try std.testing.expectEqual(@as(u32, 0), sess.active_streams);
+    // recv-loop ref only (per-stream ref dropped when the Stream freed).
+    try std.testing.expectEqual(@as(u32, 1), sess.refs.load(.acquire));
+    // Reuse: the next checkout pops the SAME session (no second dial).
+    const reused = pool.popHighestIdle();
+    pool.unlock();
+    try std.testing.expect(reused.? == sess);
+    try std.testing.expect(!sess.in_idle and sess.active_streams == 1);
+
+    // Tear down the (now checked-out-again) stand-in like a recv-loop exit would.
+    destroyStandin(sess);
+}
+
+test "C3b: Stream.close on a checked-out session discards it when the pool is shutting down" {
+    // putIdle refusal path: a shutting-down pool refuses the session, so close()
+    // must requestClose(.discard) it (NOT orphan it in `all`). Stand-in keeps a
+    // recv-loop ref; requestClose evicts from the pool, the per-stream ref drops
+    // when the Stream frees, and destroyStandin's releaseRef finalizes.
+    const allocator = std.testing.allocator;
+    const pool = try makePool(allocator, .{});
+
+    const sess = try makeStandin(pool, 1);
+    pool.lock();
+    try pool.all.put(allocator, sess, {});
+    sess.active_streams = 1;
+    pool.unlock();
+
+    const stream = try registerStandinStream(sess, 1);
+
+    pool.lock();
+    pool.shutting_down = true;
+    pool.unlock();
+
+    stream.close();
+
+    // Refused -> discarded: evicted from idle + all, marked dying, never pooled.
+    pool.lock();
+    try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
+    try std.testing.expect(pool.all.get(sess) == null);
+    pool.unlock();
+    try std.testing.expect(sess.dying);
+
+    // destroyStandin's releaseRef drops the lone recv-loop ref -> finalize.
+    destroyStandin(sess);
+
+    // Manually finish pool teardown (shutting_down set by hand, no reaper).
+    pool.idle.deinit(allocator);
+    pool.all.deinit(allocator);
+    allocator.free(pool.key);
+    pool.reaper_wake.deinit();
+    allocator.destroy(pool);
+}
