@@ -181,35 +181,61 @@ pub const Config = struct {
     skip_cert_verify: bool = false,
 };
 
-pub const Client = struct {
+/// Verbatim TLS connection state (unchanged from the original Client). Promoted
+/// to file scope (was `Client.TlsConnection`) so `Session` can own it.
+pub const TlsConnection = struct {
+    stream: net.Stream,
+    stream_reader: net.Stream.Reader,
+    stream_writer: net.Stream.Writer,
+    tls_client: tls.Client,
+    ca_bundle: ?Certificate.Bundle = null,
+    ca_lock: std.Io.RwLock = .init,
+    socket_read_buffer: [tls.Client.min_buffer_len]u8,
+    socket_write_buffer: [tls.Client.min_buffer_len]u8,
+    tls_read_buffer: [tls.Client.min_buffer_len]u8,
+    tls_write_buffer: [tls.Client.min_buffer_len]u8,
+};
+
+const FrameHeader = struct {
+    command: u8,
+    stream_id: u32,
+    length: u16,
+};
+
+/// A single AnyTLS session: owns the TLS connection, the active padding scheme,
+/// the monotonic packet counter, the negotiated peer protocol version, and the
+/// `tls_mutex` that serializes all access to the TLS engine + counter + padding.
+///
+/// In C1 the Session carries exactly ONE logical stream (sid=1) and is driven
+/// synchronously by the `Client` shim (no recv-loop, no streams map, no
+/// Notifier — those arrive in C2). All wire framing/shaping is byte-identical to
+/// the pre-refactor `Client`; the only structural change is that
+/// `writeSessionPayload`'s TLS writes are now wrapped in
+/// `tls_mutex` lock/unlock so later multiplex stages have the lock in place.
+pub const Session = struct {
     allocator: std.mem.Allocator,
     config: Config,
     password_hash: [32]u8,
-    tls_conn: ?*TlsConnection = null,
-    stream_id: u32 = 0,
-    stream_closed: bool = false,
+    conn: ?*TlsConnection = null,
     peer_version: u8 = 1,
     packet_counter: u32 = 0,
-    pending_read: ?[]u8 = null,
-    pending_offset: usize = 0,
     /// Active padding scheme. Seeded from default_padding_scheme in init() and
     /// atomically replaced when the server pushes cmdUpdatePaddingScheme (cmd 6).
     padding: PaddingFactory,
+    /// Guards ALL access to `conn.tls_client` (reader + writer sides) plus
+    /// `packet_counter` and `padding` during shaping. In C1 the writer is the
+    /// only contender; later stages add a recv-loop that also takes it.
+    tls_mutex: std.Io.Mutex = .init,
 
-    const TlsConnection = struct {
-        stream: net.Stream,
-        stream_reader: net.Stream.Reader,
-        stream_writer: net.Stream.Writer,
-        tls_client: tls.Client,
-        ca_bundle: ?Certificate.Bundle = null,
-        ca_lock: std.Io.RwLock = .init,
-        socket_read_buffer: [tls.Client.min_buffer_len]u8,
-        socket_write_buffer: [tls.Client.min_buffer_len]u8,
-        tls_read_buffer: [tls.Client.min_buffer_len]u8,
-        tls_write_buffer: [tls.Client.min_buffer_len]u8,
-    };
+    fn lockTls(self: *Session) void {
+        std.Io.Threaded.mutexLock(&self.tls_mutex);
+    }
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
+    fn unlockTls(self: *Session) void {
+        std.Io.Threaded.mutexUnlock(&self.tls_mutex);
+    }
+
+    fn init(allocator: std.mem.Allocator, config: Config) !Session {
         var password_hash: [32]u8 = undefined;
         crypto.hash.sha2.Sha256.hash(config.password, &password_hash, .{});
 
@@ -223,32 +249,27 @@ pub const Client = struct {
         };
     }
 
-    pub fn deinit(self: *Client) void {
-        // Send the session-close FIN before freeing the padding factory:
-        // sendFrame -> writeSessionPayload -> buildSessionRecords reads
-        // self.padding, so it must remain live until no further frame is sent.
-        if (!self.stream_closed and self.tls_conn != null and self.stream_id != 0) {
-            self.sendFrame(.fin, self.stream_id, "") catch {};
-            self.stream_closed = true;
-        }
+    /// Frees the padding factory and the owned TLS connection. Callers that need
+    /// to emit a session-close FIN first must do so before calling this (see
+    /// Client.deinit), since FIN shaping reads `padding`.
+    fn deinit(self: *Session) void {
         self.padding.deinit();
-        if (self.pending_read) |pending| {
-            self.allocator.free(pending);
-            self.pending_read = null;
-        }
-        if (self.tls_conn) |conn| {
+        if (self.conn) |conn| {
             _ = conn.tls_client.end() catch {};
             conn.stream.close();
             if (conn.ca_bundle) |*ca_bundle| {
                 ca_bundle.deinit(self.allocator);
             }
             self.allocator.destroy(conn);
-            self.tls_conn = null;
+            self.conn = null;
         }
     }
 
-    pub fn connect(self: *Client, target_host: []const u8, target_port: u16) !net.Stream {
-        if (self.tls_conn != null) return error.AlreadyConnected;
+    /// Dials the upstream, performs the TLS handshake, and sends the auth
+    /// request. On success `self.conn` is populated. Verbatim from the original
+    /// Client.connect prologue.
+    fn dial(self: *Session) !void {
+        if (self.conn != null) return error.AlreadyConnected;
 
         const stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
         var stream_owned_by_conn = false;
@@ -265,131 +286,29 @@ pub const Client = struct {
         try conn.tls_client.writer.writeAll(auth);
         try flushTlsAndSocket(conn);
 
-        self.tls_conn = conn;
+        self.conn = conn;
         conn_owned_by_self = true;
-        self.stream_id = 1;
-        self.stream_closed = false;
-
-        self.openStream(target_host, target_port) catch |err| {
-            self.deinit();
-            return err;
-        };
-
-        return conn.stream;
     }
 
-    pub fn write(self: *Client, data: []const u8) !void {
-        if (self.stream_closed) return error.StreamClosed;
-        if (self.tls_conn == null) return error.NotConnected;
-
-        var offset: usize = 0;
-        while (offset < data.len) {
-            const n = @min(data.len - offset, max_frame_data_len);
-            try self.sendFrame(.psh, self.stream_id, data[offset..][0..n]);
-            offset += n;
-        }
-    }
-
-    pub fn read(self: *Client, buf: []u8) !usize {
-        if (buf.len == 0) return 0;
-        if (self.stream_closed) return 0;
-        if (self.tls_conn == null) return error.NotConnected;
-
-        if (self.consumePending(buf)) |n| return n;
-
-        while (true) {
-            const frame = try self.readFrameHeader();
-            const command = commandFromByte(frame.command) orelse {
-                try self.discardFrameData(frame.length);
-                continue;
-            };
-            switch (command) {
-                .psh => {
-                    const data = try self.readFrameData(frame.length);
-                    if (frame.stream_id != self.stream_id) {
-                        if (data.len > 0) self.allocator.free(data);
-                        continue;
-                    }
-                    if (data.len == 0) continue;
-                    return self.copyFrameData(buf, data);
-                },
-                .fin => {
-                    try self.discardFrameData(frame.length);
-                    if (frame.stream_id == self.stream_id) {
-                        self.stream_closed = true;
-                        return 0;
-                    }
-                },
-                .syn_ack => {
-                    const data = try self.readFrameData(frame.length);
-                    defer if (data.len > 0) self.allocator.free(data);
-                    if (frame.stream_id == self.stream_id and data.len > 0) {
-                        return error.AnyTlsStreamRejected;
-                    }
-                },
-                .server_settings => {
-                    const data = try self.readFrameData(frame.length);
-                    defer if (data.len > 0) self.allocator.free(data);
-                    self.applyServerSettings(data);
-                },
-                .alert => {
-                    const data = try self.readFrameData(frame.length);
-                    defer if (data.len > 0) self.allocator.free(data);
-                    // The alert body is attacker-controlled and may be non-UTF8:
-                    // bound the length and sanitize before logging.
-                    var alert_buf: [max_alert_log_len]u8 = undefined;
-                    const text = sanitizeAlertText(&alert_buf, data);
-                    std.log.err("anytls: server alert: {s}", .{text});
-                    self.stream_closed = true;
-                    return error.AnyTlsAlert;
-                },
-                .update_padding_scheme => {
-                    const data = try self.readFrameData(frame.length);
-                    defer if (data.len > 0) self.allocator.free(data);
-                    self.adoptPaddingScheme(data);
-                },
-                .waste, .settings => {
-                    try self.discardFrameData(frame.length);
-                },
-                .heart_request => {
-                    try self.discardFrameData(frame.length);
-                    try self.sendFrame(.heart_response, frame.stream_id, "");
-                },
-                .heart_response, .syn => {
-                    try self.discardFrameData(frame.length);
-                },
-            }
-        }
-    }
-
-    pub fn hasPendingRead(self: *const Client) bool {
-        if (self.pending_read) |pending| {
-            if (self.pending_offset < pending.len) return true;
-        }
-        if (self.tls_conn) |conn| {
-            return conn.tls_client.reader.bufferedLen() > 0 or
-                conn.stream_reader.interface.bufferedLen() > 0;
-        }
-        return false;
-    }
-
-    fn openStream(self: *Client, target_host: []const u8, target_port: u16) !void {
+    /// Sends `settings + syn + psh(socks_addr)` for the first logical stream of
+    /// the session (sid). Verbatim from the original Client.openStream.
+    fn openStream(self: *Session, stream_id: u32, target_host: []const u8, target_port: u16) !void {
         var payload = std.ArrayList(u8).empty;
         defer payload.deinit(self.allocator);
 
         const settings = try buildSettings(self.allocator, &self.padding.md5_hex);
         defer self.allocator.free(settings);
         try appendFrame(self.allocator, &payload, .settings, 0, settings);
-        try appendFrame(self.allocator, &payload, .syn, self.stream_id, "");
+        try appendFrame(self.allocator, &payload, .syn, stream_id, "");
 
         const socks_addr = try encodeSocksAddr(self.allocator, target_host, target_port);
         defer self.allocator.free(socks_addr);
-        try appendFrame(self.allocator, &payload, .psh, self.stream_id, socks_addr);
+        try appendFrame(self.allocator, &payload, .psh, stream_id, socks_addr);
 
         try self.writeSessionPayload(payload.items);
     }
 
-    fn sendFrame(self: *Client, command: Command, stream_id: u32, data: []const u8) !void {
+    fn sendFrame(self: *Session, command: Command, stream_id: u32, data: []const u8) !void {
         var payload = std.ArrayList(u8).empty;
         defer payload.deinit(self.allocator);
 
@@ -403,8 +322,16 @@ pub const Client = struct {
     /// pkt >= stop, write `payload` unshaped in a single record; otherwise split
     /// per GenerateRecordPayloadSizes, inserting cmdWaste(0) frames to hit target
     /// sizes, with CheckMark short-circuiting the padding-only tail.
-    fn writeSessionPayload(self: *Client, payload: []const u8) !void {
-        const conn = self.tls_conn orelse return error.NotConnected;
+    ///
+    /// The TLS writes (and the counter increment + padding read that feed them)
+    /// run under `tls_mutex` so later multiplex stages can share this lock. The
+    /// counter-increment-then-build-records ordering is unchanged, so the shaped
+    /// wire bytes are byte-identical to the pre-refactor code.
+    fn writeSessionPayload(self: *Session, payload: []const u8) !void {
+        self.lockTls();
+        defer self.unlockTls();
+
+        const conn = self.conn orelse return error.NotConnected;
         self.packet_counter += 1;
 
         var records = std.ArrayList(u8).empty;
@@ -444,7 +371,7 @@ pub const Client = struct {
         try flushTlsAndSocket(conn);
     }
 
-    fn initTlsConnection(self: *Client, stream: net.Stream) !*TlsConnection {
+    fn initTlsConnection(self: *Session, stream: net.Stream) !*TlsConnection {
         const conn = try self.allocator.create(TlsConnection);
         errdefer self.allocator.destroy(conn);
         errdefer if (conn.ca_bundle) |*ca_bundle| ca_bundle.deinit(self.allocator);
@@ -515,11 +442,11 @@ pub const Client = struct {
         return conn;
     }
 
-    fn tlsHost(self: *const Client) []const u8 {
+    fn tlsHost(self: *const Session) []const u8 {
         return self.config.sni orelse self.config.address;
     }
 
-    fn deinitTlsConnection(self: *Client, conn: *TlsConnection) void {
+    fn deinitTlsConnection(self: *Session, conn: *TlsConnection) void {
         _ = conn.tls_client.end() catch {};
         conn.stream.close();
         if (conn.ca_bundle) |*ca_bundle| {
@@ -528,14 +455,8 @@ pub const Client = struct {
         self.allocator.destroy(conn);
     }
 
-    const FrameHeader = struct {
-        command: u8,
-        stream_id: u32,
-        length: u16,
-    };
-
-    fn readFrameHeader(self: *Client) !FrameHeader {
-        const conn = self.tls_conn orelse return error.NotConnected;
+    fn readFrameHeader(self: *Session) !FrameHeader {
+        const conn = self.conn orelse return error.NotConnected;
         var header: [frame_header_len]u8 = undefined;
         try readTlsExact(&conn.tls_client.reader, &header);
         return .{
@@ -545,18 +466,18 @@ pub const Client = struct {
         };
     }
 
-    fn readFrameData(self: *Client, length: u16) ![]u8 {
+    fn readFrameData(self: *Session, length: u16) ![]u8 {
         if (length == 0) return &.{};
-        const conn = self.tls_conn orelse return error.NotConnected;
+        const conn = self.conn orelse return error.NotConnected;
         const data = try self.allocator.alloc(u8, length);
         errdefer self.allocator.free(data);
         try readTlsExact(&conn.tls_client.reader, data);
         return data;
     }
 
-    fn discardFrameData(self: *Client, length: u16) !void {
+    fn discardFrameData(self: *Session, length: u16) !void {
         if (length == 0) return;
-        const conn = self.tls_conn orelse return error.NotConnected;
+        const conn = self.conn orelse return error.NotConnected;
         var remaining: usize = length;
         var scratch: [1024]u8 = undefined;
         while (remaining > 0) {
@@ -566,6 +487,176 @@ pub const Client = struct {
         }
     }
 
+    /// Adopts a server-pushed padding scheme (cmdUpdatePaddingScheme, cmd 6).
+    /// On successful parse, atomically replaces the active factory (freeing the
+    /// old one) and logs adoption with the new md5; on parse failure keeps the
+    /// existing factory and logs a warning.
+    fn adoptPaddingScheme(self: *Session, data: []const u8) void {
+        const next = PaddingFactory.init(self.allocator, data) catch {
+            std.log.warn("anytls: rejected update_padding_scheme: invalid scheme (keeping current)", .{});
+            return;
+        };
+        self.padding.deinit();
+        self.padding = next;
+        std.log.info("anytls: adopted padding scheme md5={s}", .{&self.padding.md5_hex});
+    }
+
+    fn applyServerSettings(self: *Session, data: []const u8) void {
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "v=")) {
+                self.peer_version = std.fmt.parseInt(u8, line[2..], 10) catch self.peer_version;
+            }
+        }
+    }
+
+    fn hasBufferedRead(self: *const Session) bool {
+        if (self.conn) |conn| {
+            return conn.tls_client.reader.bufferedLen() > 0 or
+                conn.stream_reader.interface.bufferedLen() > 0;
+        }
+        return false;
+    }
+};
+
+/// Thin public shim preserving the exact pre-C1 Client API. It is exactly ONE
+/// Session driving ONE logical stream (sid=1) with a SYNCHRONOUS read path —
+/// no recv-loop, no streams map, no Notifier (those land in C2). All wire
+/// behavior is byte-identical to the original Client.
+pub const Client = struct {
+    session: Session,
+    stream_id: u32 = 0,
+    stream_closed: bool = false,
+    pending_read: ?[]u8 = null,
+    pending_offset: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
+        return .{ .session = try Session.init(allocator, config) };
+    }
+
+    pub fn deinit(self: *Client) void {
+        // Send the session-close FIN before freeing the padding factory:
+        // sendFrame -> writeSessionPayload -> buildSessionRecords reads
+        // padding, so it must remain live until no further frame is sent.
+        if (!self.stream_closed and self.session.conn != null and self.stream_id != 0) {
+            self.session.sendFrame(.fin, self.stream_id, "") catch {};
+            self.stream_closed = true;
+        }
+        if (self.pending_read) |pending| {
+            self.session.allocator.free(pending);
+            self.pending_read = null;
+        }
+        self.session.deinit();
+    }
+
+    pub fn connect(self: *Client, target_host: []const u8, target_port: u16) !net.Stream {
+        try self.session.dial();
+        const conn = self.session.conn.?;
+
+        self.stream_id = 1;
+        self.stream_closed = false;
+
+        // On failure, do NOT self-destruct here: the sole caller
+        // (OutboundManager.connectToProxy .anytls) owns cleanup via
+        // `errdefer client.deinit()`, mirroring the ss/trojan paths. Calling
+        // self.deinit() here too would double-free the PaddingFactory (its
+        // deinit sets self.* = undefined, so a second deinit frees freed memory).
+        try self.session.openStream(self.stream_id, target_host, target_port);
+
+        return conn.stream;
+    }
+
+    pub fn write(self: *Client, data: []const u8) !void {
+        if (self.stream_closed) return error.StreamClosed;
+        if (self.session.conn == null) return error.NotConnected;
+
+        var offset: usize = 0;
+        while (offset < data.len) {
+            const n = @min(data.len - offset, max_frame_data_len);
+            try self.session.sendFrame(.psh, self.stream_id, data[offset..][0..n]);
+            offset += n;
+        }
+    }
+
+    pub fn read(self: *Client, buf: []u8) !usize {
+        if (buf.len == 0) return 0;
+        if (self.stream_closed) return 0;
+        if (self.session.conn == null) return error.NotConnected;
+
+        if (self.consumePending(buf)) |n| return n;
+
+        while (true) {
+            const frame = try self.session.readFrameHeader();
+            const command = commandFromByte(frame.command) orelse {
+                try self.session.discardFrameData(frame.length);
+                continue;
+            };
+            switch (command) {
+                .psh => {
+                    const data = try self.session.readFrameData(frame.length);
+                    if (frame.stream_id != self.stream_id) {
+                        if (data.len > 0) self.session.allocator.free(data);
+                        continue;
+                    }
+                    if (data.len == 0) continue;
+                    return self.copyFrameData(buf, data);
+                },
+                .fin => {
+                    try self.session.discardFrameData(frame.length);
+                    if (frame.stream_id == self.stream_id) {
+                        self.stream_closed = true;
+                        return 0;
+                    }
+                },
+                .syn_ack => {
+                    const data = try self.session.readFrameData(frame.length);
+                    defer if (data.len > 0) self.session.allocator.free(data);
+                    if (frame.stream_id == self.stream_id and data.len > 0) {
+                        return error.AnyTlsStreamRejected;
+                    }
+                },
+                .server_settings => {
+                    const data = try self.session.readFrameData(frame.length);
+                    defer if (data.len > 0) self.session.allocator.free(data);
+                    self.session.applyServerSettings(data);
+                },
+                .alert => {
+                    const data = try self.session.readFrameData(frame.length);
+                    defer if (data.len > 0) self.session.allocator.free(data);
+                    // The alert body is attacker-controlled and may be non-UTF8:
+                    // bound the length and sanitize before logging.
+                    var alert_buf: [max_alert_log_len]u8 = undefined;
+                    const text = sanitizeAlertText(&alert_buf, data);
+                    std.log.err("anytls: server alert: {s}", .{text});
+                    self.stream_closed = true;
+                    return error.AnyTlsAlert;
+                },
+                .update_padding_scheme => {
+                    const data = try self.session.readFrameData(frame.length);
+                    defer if (data.len > 0) self.session.allocator.free(data);
+                    self.session.adoptPaddingScheme(data);
+                },
+                .waste, .settings => {
+                    try self.session.discardFrameData(frame.length);
+                },
+                .heart_request => {
+                    try self.session.discardFrameData(frame.length);
+                    try self.session.sendFrame(.heart_response, frame.stream_id, "");
+                },
+                .heart_response, .syn => {
+                    try self.session.discardFrameData(frame.length);
+                },
+            }
+        }
+    }
+
+    pub fn hasPendingRead(self: *const Client) bool {
+        if (self.pending_read) |pending| {
+            if (self.pending_offset < pending.len) return true;
+        }
+        return self.session.hasBufferedRead();
+    }
+
     fn consumePending(self: *Client, buf: []u8) ?usize {
         const pending = self.pending_read orelse return null;
         const remaining = pending[self.pending_offset..];
@@ -573,7 +664,7 @@ pub const Client = struct {
         @memcpy(buf[0..n], remaining[0..n]);
         self.pending_offset += n;
         if (self.pending_offset >= pending.len) {
-            self.allocator.free(pending);
+            self.session.allocator.free(pending);
             self.pending_read = null;
             self.pending_offset = 0;
         }
@@ -588,36 +679,9 @@ pub const Client = struct {
             self.pending_read = data;
             self.pending_offset = n;
         } else {
-            self.allocator.free(data);
+            self.session.allocator.free(data);
         }
         return n;
-    }
-
-    /// Adopts a server-pushed padding scheme (cmdUpdatePaddingScheme, cmd 6).
-    /// On successful parse, atomically replaces the active factory (freeing the
-    /// old one) and logs adoption with the new md5; on parse failure keeps the
-    /// existing factory and logs a warning.
-    ///
-    /// NOTE: manager.zig builds a fresh Client per outbound connection, so an
-    /// adopted scheme currently lives only for the lifetime of THIS connection.
-    /// Cross-connection persistence arrives with session pooling in a later stage.
-    fn adoptPaddingScheme(self: *Client, data: []const u8) void {
-        const next = PaddingFactory.init(self.allocator, data) catch {
-            std.log.warn("anytls: rejected update_padding_scheme: invalid scheme (keeping current)", .{});
-            return;
-        };
-        self.padding.deinit();
-        self.padding = next;
-        std.log.info("anytls: adopted padding scheme md5={s}", .{&self.padding.md5_hex});
-    }
-
-    fn applyServerSettings(self: *Client, data: []const u8) void {
-        var lines = std.mem.splitScalar(u8, data, '\n');
-        while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, "v=")) {
-                self.peer_version = std.fmt.parseInt(u8, line[2..], 10) catch self.peer_version;
-            }
-        }
     }
 };
 
@@ -777,7 +841,7 @@ fn commandFromByte(value: u8) ?Command {
     };
 }
 
-fn flushTlsAndSocket(conn: *Client.TlsConnection) !void {
+fn flushTlsAndSocket(conn: *TlsConnection) !void {
     try conn.tls_client.writer.flush();
     try conn.stream_writer.interface.flush();
 }

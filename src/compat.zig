@@ -115,6 +115,123 @@ pub fn shutdownWrite(fd: std.posix.fd_t) !void {
     if (std.c.shutdown(fd, std.c.SHUT.WR) < 0) return error.InputOutput;
 }
 
+/// A cross-platform, level-triggered readiness primitive a relay can `poll()`.
+///
+/// Linux: a single `eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC)` whose fd serves as both
+/// read and write end (`read_fd == write_fd`); `signal` adds 1 to the 64-bit
+/// counter, `drain` reads it back to 0.
+/// macOS/darwin: a self-pipe (`pipe()` + per-fd O_NONBLOCK / FD_CLOEXEC);
+/// `read_fd = fds[0]`, `write_fd = fds[1]`; `signal` writes one byte, `drain`
+/// loops reading into scratch until EAGAIN.
+///
+/// All I/O is raw `std.posix.write`/`std.posix.read` so EAGAIN is a plain errno
+/// (a transient "already readable"/"already drained"), never an errnoBug panic.
+pub const Notifier = struct {
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t, // == read_fd on linux (eventfd)
+
+    // EFD flags are not exposed by std.c on this toolchain; define them locally.
+    const EFD_NONBLOCK: c_uint = 0o0004000; // O_NONBLOCK on linux
+    const EFD_CLOEXEC: c_uint = 0o2000000; // O_CLOEXEC on linux
+    const FD_CLOEXEC: c_int = 1;
+
+    pub fn init() !Notifier {
+        if (builtin.os.tag == .linux) {
+            const fd = std.c.eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (fd < 0) return error.NotifierInitFailed;
+            return .{ .read_fd = fd, .write_fd = fd };
+        } else {
+            var fds: [2]std.posix.fd_t = undefined;
+            if (std.c.pipe(&fds) < 0) return error.NotifierInitFailed;
+            errdefer {
+                _ = std.c.close(fds[0]);
+                _ = std.c.close(fds[1]);
+            }
+            const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+            for (fds) |fd| {
+                if (std.c.fcntl(fd, std.posix.F.SETFL, nonblock) < 0) return error.NotifierInitFailed;
+                if (std.c.fcntl(fd, std.posix.F.SETFD, FD_CLOEXEC) < 0) return error.NotifierInitFailed;
+            }
+            return .{ .read_fd = fds[0], .write_fd = fds[1] };
+        }
+    }
+
+    /// Raise the readiness level. Idempotent and non-fatal: EINTR retries; EAGAIN
+    /// (eventfd counter saturated / pipe full) means "already readable" and is
+    /// ignored. Never errors out.
+    pub fn signal(self: Notifier) void {
+        if (builtin.os.tag == .linux) {
+            const one: u64 = 1;
+            const buf = std.mem.asBytes(&one);
+            while (true) {
+                const rc = std.c.write(self.write_fd, buf.ptr, buf.len);
+                if (rc < 0) {
+                    switch (std.c.errno(rc)) {
+                        .INTR => continue,
+                        else => return, // EAGAIN/saturated/closed -> already readable
+                    }
+                }
+                return;
+            }
+        } else {
+            const byte = [_]u8{1};
+            while (true) {
+                const rc = std.c.write(self.write_fd, &byte, byte.len);
+                if (rc < 0) {
+                    switch (std.c.errno(rc)) {
+                        .INTR => continue,
+                        else => return, // EAGAIN (full pipe == already readable)
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// Lower the readiness level. eventfd: a single 8-byte read resets the
+    /// counter. pipe: loop reading into scratch until EAGAIN so the level goes low.
+    pub fn drain(self: Notifier) void {
+        if (builtin.os.tag == .linux) {
+            var val: u64 = undefined;
+            const buf = std.mem.asBytes(&val);
+            while (true) {
+                const rc = std.c.read(self.read_fd, buf.ptr, buf.len);
+                if (rc < 0) {
+                    switch (std.c.errno(rc)) {
+                        .INTR => continue,
+                        else => return, // EAGAIN -> already drained
+                    }
+                }
+                return;
+            }
+        } else {
+            var scratch: [256]u8 = undefined;
+            while (true) {
+                const rc = std.c.read(self.read_fd, &scratch, scratch.len);
+                if (rc < 0) {
+                    switch (std.c.errno(rc)) {
+                        .INTR => continue,
+                        else => return, // EAGAIN -> fully drained
+                    }
+                }
+                if (rc == 0) return; // EOF (write end closed) -> nothing left
+                // A short read may still leave bytes; loop until EAGAIN.
+            }
+        }
+    }
+
+    pub fn handle(self: Notifier) std.posix.fd_t {
+        return self.read_fd;
+    }
+
+    pub fn deinit(self: *Notifier) void {
+        if (self.read_fd >= 0) _ = std.c.close(self.read_fd);
+        if (self.write_fd != self.read_fd and self.write_fd >= 0) _ = std.c.close(self.write_fd);
+        self.read_fd = -1;
+        self.write_fd = -1;
+    }
+};
+
 pub fn udpSocket4() !std.posix.fd_t {
     const any = try net.Address.parseIp4("0.0.0.0", 0);
     var inner = any.toIo();
@@ -512,3 +629,64 @@ pub const net = struct {
         };
     }
 };
+
+// ---------------------------------------------------------------------------
+// C0: compat.Notifier tests
+// ---------------------------------------------------------------------------
+
+/// Returns true when `n`'s read handle currently reports POLL.IN (readable).
+fn notifierReadable(n: Notifier) bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = n.handle(),
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&fds, 0) catch return false;
+    if (ready == 0) return false;
+    return (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
+test "Notifier: signal then poll(0) reports POLL.IN" {
+    var n = try Notifier.init();
+    defer n.deinit();
+    try std.testing.expect(!notifierReadable(n)); // fresh: not readable
+    n.signal();
+    try std.testing.expect(notifierReadable(n));
+}
+
+test "Notifier: drain clears readability" {
+    var n = try Notifier.init();
+    defer n.deinit();
+    n.signal();
+    try std.testing.expect(notifierReadable(n));
+    n.drain();
+    try std.testing.expect(!notifierReadable(n));
+}
+
+test "Notifier: multiple signals collapse to a single drain (no spin)" {
+    var n = try Notifier.init();
+    defer n.deinit();
+    n.signal();
+    n.signal();
+    n.signal();
+    try std.testing.expect(notifierReadable(n));
+    n.drain(); // one drain must leave it NOT readable
+    try std.testing.expect(!notifierReadable(n));
+}
+
+test "Notifier: re-signal after drain is readable again" {
+    var n = try Notifier.init();
+    defer n.deinit();
+    n.signal();
+    n.drain();
+    try std.testing.expect(!notifierReadable(n));
+    n.signal();
+    try std.testing.expect(notifierReadable(n));
+}
+
+test "Notifier: deinit sets fds to -1" {
+    var n = try Notifier.init();
+    n.deinit();
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), n.read_fd);
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), n.write_fd);
+}
