@@ -244,8 +244,14 @@ pub const Session = struct {
     streams_mutex: std.Io.Mutex = .init,
     /// The recv-loop thread, spawned JOINABLE in `startRecvLoop`.
     recv_thread: ?std.Thread = null,
-    /// Set under `streams_mutex` by requestClose; gates openStream + read paths.
-    dying: bool = false,
+    /// Set by requestClose (store .release, still under `streams_mutex` for the
+    /// map snapshot). Atomic because it is also read across DIFFERENT locks:
+    /// SessionPool.putIdle holds pool.mutex (not streams_mutex), and Stream
+    /// write/shutdownWrite/close read it lock-free. A plain bool gave no
+    /// happens-before between the requestClose write and the putIdle read, so a
+    /// stale dying==false could re-pool an evicted/dying session -> UAF. The
+    /// acquire/release pairing supplies that ordering (§16 amendment).
+    dying: std.atomic.Value(bool) = .init(false),
     /// Idempotency gate for requestClose (the loser of the cmpxchg returns).
     die_once: std.atomic.Value(bool) = .init(false),
     /// recv-loop ref + one session-ref per live stream. The Session is freed
@@ -638,7 +644,7 @@ pub const Session = struct {
         errdefer if (!registered) stream.destroyNow();
 
         self.lockStreams();
-        if (self.dying) {
+        if (self.dying.load(.acquire)) {
             self.unlockStreams();
             return error.SessionDying;
         }
@@ -728,7 +734,7 @@ pub const Session = struct {
         self.lockStreams();
         defer self.unlockStreams();
         const dropped = self.streams.fetchRemove(sid) != null;
-        return .{ .dropped_map = dropped, .dying = self.dying };
+        return .{ .dropped_map = dropped, .dying = self.dying.load(.acquire) };
     }
 
     /// THREAD ENTRY for the recv-loop. Reads + demuxes frames from the TLS
@@ -739,6 +745,47 @@ pub const Session = struct {
         self.recvLoop(src.source());
         self.requestClose(.eof); // idempotent
         self.releaseRef(); // drop recv-loop ref
+    }
+
+    /// Test-only seam (C7): spawn the REAL recv-loop on a JOINABLE thread over an
+    /// injected FrameSource, bypassing only the TLS frame DECODE (everything else
+    /// — demux, dispatch, the production exit cleanup of requestClose(.eof) +
+    /// releaseRef — is the production code path). This lets the C7 concurrency/e2e
+    /// tests drive a genuine recv-loop thread (running concurrently with
+    /// Stream.close, putIdle, the reaper, etc.) over a non-TLS in-memory frame
+    /// transport, surfacing races the synchronous dispatchFrame seam cannot.
+    ///
+    /// The caller seeds the recv-loop ref (refs == 1) and owns the FrameSource's
+    /// backing context for the lifetime of the loop. The spawned thread is stored
+    /// in `recv_thread` so the pool's reapClose/deinit/onOpenFail JOIN it exactly
+    /// like a production session — i.e. the SAME join protocol (§13) is exercised.
+    /// NOT for production use (the production entry is `recvLoopEntry` via `open`).
+    pub fn testSpawnRecvLoop(
+        self: *Session,
+        ctx: *anyopaque,
+        nextFn: *const fn (ctx: *anyopaque) anyerror!DecodedFrame,
+    ) !void {
+        const Injected = struct {
+            session: *Session,
+            ctx: *anyopaque,
+            nextFn: *const fn (ctx: *anyopaque) anyerror!DecodedFrame,
+            fn entry(arg: *@This()) void {
+                const session = arg.session;
+                const fs = FrameSource{ .ctx = arg.ctx, .nextFn = arg.nextFn };
+                // Free the heap arg BEFORE running the loop so the recv-loop's
+                // own exit (which may finalize the Session) leaves nothing dangling.
+                const a = session.allocator;
+                const owned = arg;
+                a.destroy(owned);
+                session.recvLoop(fs);
+                session.requestClose(.eof); // idempotent — production exit cleanup
+                session.releaseRef(); // drop recv-loop ref
+            }
+        };
+        const arg = try self.allocator.create(Injected);
+        errdefer self.allocator.destroy(arg);
+        arg.* = .{ .session = self, .ctx = ctx, .nextFn = nextFn };
+        self.recv_thread = try std.Thread.spawn(.{}, Injected.entry, .{arg});
     }
 
     /// The demux pump. Drains frames from `fs` (the seam tests drive in-memory),
@@ -852,7 +899,7 @@ pub const Session = struct {
         // never be woken. If ensureTotalCapacity itself OOMs we fall back to the
         // best-effort append loop and the catch documents the residual risk.
         self.lockStreams();
-        self.dying = true;
+        self.dying.store(true, .release);
         var snapshot = std.ArrayList(*Stream).empty;
         snapshot.ensureTotalCapacity(self.allocator, self.streams.count()) catch {};
         var it = self.streams.iterator();
@@ -924,7 +971,9 @@ pub const CloseReason = enum { eof, alert, write_error, syn_timeout, shutdown, d
 
 /// A decoded frame handed to `dispatchFrame`. `owned_body` is heap-allocated by
 /// the FrameSource and freed by the recv-loop after dispatch.
-const DecodedFrame = struct {
+/// Public so the C7 test seam (`Session.testSpawnRecvLoop`) can construct frames
+/// from another module's in-memory fake-server source.
+pub const DecodedFrame = struct {
     command: u8,
     stream_id: u32,
     owned_body: []u8,
@@ -1229,7 +1278,7 @@ pub const Stream = struct {
     /// Relay write: fragment into PSH frames. On any write error escalate to
     /// session.requestClose(.write_error) and surface error.StreamClosed.
     pub fn write(self: *Stream, data: []const u8) !void {
-        if (self.closed or self.session.dying) return error.StreamClosed;
+        if (self.closed or self.session.dying.load(.acquire)) return error.StreamClosed;
         self.session.writeDataFrame(self.id, data) catch {
             self.session.requestClose(.write_error);
             return error.StreamClosed;
@@ -1240,7 +1289,7 @@ pub const Stream = struct {
     pub fn shutdownWrite(self: *Stream) void {
         if (self.write_shut) return;
         self.write_shut = true;
-        if (!self.session.dying) self.session.sendFin(self.id);
+        if (!self.session.dying.load(.acquire)) self.session.sendFin(self.id);
     }
 
     pub fn hasPendingRead(self: *Stream) bool {
@@ -1264,7 +1313,7 @@ pub const Stream = struct {
         self.closed = true;
 
         const session = self.session;
-        if (!session.dying) session.sendFin(self.id);
+        if (!session.dying.load(.acquire)) session.sendFin(self.id);
 
         const r = session.streamClosed(self.id);
         // The remover of the map entry drops the map-presence ref. If requestClose
@@ -2526,7 +2575,7 @@ test "C2: session-death (requestClose) wakes ALL streams; no leak, refs released
     // The map was cleared by death.
     session.lockStreams();
     const empty = session.streams.count() == 0;
-    try std.testing.expect(session.dying);
+    try std.testing.expect(session.dying.load(.acquire));
     session.unlockStreams();
     try std.testing.expect(empty);
 
@@ -2553,7 +2602,7 @@ test "C2: write-error escalates to requestClose; session marked dying" {
     try std.testing.expect(session.die_once.load(.acquire));
 
     session.lockStreams();
-    try std.testing.expect(session.dying);
+    try std.testing.expect(session.dying.load(.acquire));
     session.unlockStreams();
 
     // After death the stream surfaces the terminal error and the map was cleared.

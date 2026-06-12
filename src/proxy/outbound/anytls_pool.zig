@@ -270,7 +270,7 @@ pub const SessionPool = struct {
     pub fn putIdle(self: *SessionPool, sess: *Session) bool {
         self.lock();
         defer self.unlock();
-        if (self.shutting_down or sess.dying) return false;
+        if (self.shutting_down or sess.dying.load(.acquire)) return false;
         sess.active_streams = 0;
         sess.idle_since_ms = nowMs();
         sess.in_idle = true;
@@ -585,7 +585,7 @@ test "C3a: putIdle inserts sorted seq-DESC and refuses a dying/shutting-down ses
     pool.lock();
     try pool.all.put(allocator, d, {});
     pool.unlock();
-    d.dying = true;
+    d.dying.store(true, .release);
     try std.testing.expect(!pool.putIdle(d));
     try std.testing.expect(!d.in_idle);
 
@@ -861,7 +861,7 @@ test "C3b: Stream.close on a checked-out session discards it when the pool is sh
     try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
     try std.testing.expect(pool.all.get(sess) == null);
     pool.unlock();
-    try std.testing.expect(sess.dying);
+    try std.testing.expect(sess.dying.load(.acquire));
 
     // destroyStandin's releaseRef drops the lone recv-loop ref -> finalize.
     destroyStandin(sess);
@@ -903,7 +903,7 @@ test "C4: SYN-DONE withheld SYNACK times out and tears the session down" {
     // Bounded by ~syn_done_ms (generous upper bound to avoid flakiness).
     try std.testing.expect(elapsed < 2000);
     // Torn down: requestClose set dying + evicted from the pool.
-    try std.testing.expect(sess.dying);
+    try std.testing.expect(sess.dying.load(.acquire));
     pool.lock();
     try std.testing.expect(pool.all.get(sess) == null);
     try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
@@ -948,7 +948,7 @@ test "C4: SYN-DONE returns ok when markSynAck(false) signals before the deadline
     th.join();
 
     try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &stream.syn_state, .acquire));
-    try std.testing.expect(!sess.dying);
+    try std.testing.expect(!sess.dying.load(.acquire));
 
     // Stream still live (success path leaves it for the relay). Close it back to
     // idle, then let pool.deinit drain the session.
@@ -980,7 +980,7 @@ test "C4: SYN-DONE surfaces AnyTlsStreamRejected when markSynAck(true) signals" 
     th.join();
 
     // synDoneWait's reject branch tore the session down (write_error reason).
-    try std.testing.expect(sess.dying);
+    try std.testing.expect(sess.dying.load(.acquire));
     pool.lock();
     try std.testing.expect(pool.all.get(sess) == null);
     pool.unlock();
@@ -992,4 +992,417 @@ test "C4: SYN-DONE surfaces AnyTlsStreamRejected when markSynAck(true) signals" 
     allocator.free(pool.key);
     pool.reaper_wake.deinit();
     allocator.destroy(pool);
+}
+
+// ===========================================================================
+// C7 — Stage-C capstone: CONCURRENCY STRESS + best-effort E2E INTEGRATION.
+//
+// These tests drive the SessionPool + Session + Stream lifecycle from MANY
+// threads at once under std.testing.allocator (leak/UAF/double-free detection)
+// and assert the whole graph tears down cleanly with no hang/deadlock. They
+// deliberately surface races the synchronous dispatchFrame/stand-in seam tests
+// (C2/C3/C4) cannot:
+//   - recv-loop demux (appendInbound/markEof) vs Stream.close
+//   - putIdle (return-to-idle) vs reaper reapOnce (eviction)
+//   - evict (die-hook) vs createStream checkout
+//   - ref-count balance on both Session.refs and Stream.refs under contention
+//   - pool.deinit while sessions are idle AND checked-out with live recv-loops
+//
+// Determinism: per-thread behavior is varied by THREAD INDEX (NO Math.random),
+// iteration counts are bounded so the suite finishes in a few seconds, and EVERY
+// spawned thread is joined.
+//
+// E2E COVERAGE NOTE (read also the report): a real-TLS in-process end-to-end
+// test is NOT possible with Zig std (it provides a CLIENT-only TLS stack — there
+// is no server-side handshake to stand up a fake AnyTLS-over-TLS server in
+// process). The full wire WRITE path (auth + settings + syn + psh byte framing
+// and padding shaping) is already covered byte-for-byte by the Stage-B
+// writeSessionPayload wire-compat tests in anytls.zig. What the C7 e2e test below
+// covers is the INTEGRATION of the multiplex/relay machinery MINUS the
+// std-provided TLS layer: a REAL recv-loop thread (Session.testSpawnRecvLoop,
+// the production recvLoop + production exit cleanup) demuxing frames fed by an
+// in-process fake AnyTLS frame server over an in-memory transport, driving
+// Stream.read relay-style reads, REUSE (a 2nd sequential stream on the same
+// pooled session — no second dial), and half-close (shutdownWrite then reads
+// continue until the server FIN -> read returns 0). DEFERRED (documented, not
+// hacked): the real TLS handshake + on-the-wire write-byte verification end to
+// end; covered instead by the existing wire-compat suite.
+// ===========================================================================
+
+/// Thread-safe, blocking in-memory FrameSource backing the C7 recv-loop seam.
+/// A fake AnyTLS frame server (any thread) pushes DecodedFrames; the recv-loop
+/// thread pops them in order. `close()` makes `next()` return EndOfStream once
+/// the queue drains, mirroring a peer/socket close. Bodies are duplicated onto
+/// the heap so the recv-loop's symmetric `free(owned_body)` is balanced.
+const FrameQueue = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    items: std.ArrayListUnmanaged(anytls.DecodedFrame) = .empty,
+    head: usize = 0,
+    closed: bool = false,
+    /// u32 futex flag bumped on every push/close so a blocked `next()` wakes.
+    gen: u32 = 0,
+
+    fn init(allocator: std.mem.Allocator) FrameQueue {
+        return .{ .allocator = allocator };
+    }
+
+    /// Frees any frames never consumed (queue closed before the recv-loop drained
+    /// them) plus the backing storage. Safe to call after the recv-loop joined.
+    fn deinit(self: *FrameQueue) void {
+        for (self.items.items[self.head..]) |f| self.allocator.free(f.owned_body);
+        self.items.deinit(self.allocator);
+    }
+
+    fn push(self: *FrameQueue, command: u8, stream_id: u32, body: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, body);
+        errdefer self.allocator.free(owned);
+        std.Io.Threaded.mutexLock(&self.mutex);
+        defer std.Io.Threaded.mutexUnlock(&self.mutex);
+        try self.items.append(self.allocator, .{ .command = command, .stream_id = stream_id, .owned_body = owned });
+        _ = @atomicRmw(u32, &self.gen, .Add, 1, .acq_rel);
+        compat.io().futexWake(u32, &self.gen, 1);
+    }
+
+    fn close(self: *FrameQueue) void {
+        std.Io.Threaded.mutexLock(&self.mutex);
+        self.closed = true;
+        std.Io.Threaded.mutexUnlock(&self.mutex);
+        _ = @atomicRmw(u32, &self.gen, .Add, 1, .acq_rel);
+        compat.io().futexWake(u32, &self.gen, 1);
+    }
+
+    /// FrameSource.nextFn: block until a frame is available or the queue closes.
+    fn next(ctx: *anyopaque) anyerror!anytls.DecodedFrame {
+        const self: *FrameQueue = @ptrCast(@alignCast(ctx));
+        while (true) {
+            const observed = @atomicLoad(u32, &self.gen, .acquire);
+            std.Io.Threaded.mutexLock(&self.mutex);
+            if (self.head < self.items.items.len) {
+                const f = self.items.items[self.head];
+                self.head += 1;
+                std.Io.Threaded.mutexUnlock(&self.mutex);
+                return f;
+            }
+            const done = self.closed;
+            std.Io.Threaded.mutexUnlock(&self.mutex);
+            if (done) return error.EndOfStream;
+            // Bounded wait so a missed wake can never hang the suite.
+            compat.io().futexWaitTimeout(
+                u32,
+                &self.gen,
+                observed,
+                .{ .duration = .{ .raw = .{ .nanoseconds = 5 * std.time.ns_per_ms }, .clock = .boot } },
+            ) catch {};
+        }
+    }
+};
+
+test "C7: concurrency stress — pool/session/stream churn vs reaper (stand-in, no leak/UAF/deadlock)" {
+    // PRIMARY C7 DELIVERABLE (design §17 C7). 8 worker threads each run a bounded
+    // loop of: checkout a pooled session (popHighestIdle-or-create via the same
+    // bookkeeping createStream uses), register a stream, append+read inbound
+    // bytes, then close the stream (exercising putIdle return-to-idle + reuse) —
+    // interleaved with the REAL reaper thread reaping idle sessions and occasional
+    // requestClose(.write_error) to drive the die-hook + eviction races. Uses the
+    // non-dialed stand-in seam (recv_thread == null): the pool's reapClose/deinit
+    // drop the recv-loop ref directly, so the pool-mechanics races (putIdle vs
+    // reapOnce, evict vs checkout, ref balance) are exercised WITHOUT a TLS
+    // handshake. A SEPARATE C7 test drives a real recv-loop thread for the
+    // demux-vs-close race.
+    const allocator = std.testing.allocator;
+    // Aggressive reaper: 1ms interval, 0ms timeout so it races checkouts/returns
+    // hard; min_idle 0 so it can drain everything.
+    const pool = try makePool(allocator, .{
+        .idle_session_check_interval_ms = 1,
+        .idle_session_timeout_ms = 0,
+        .min_idle_session = 0,
+    });
+    try pool.startReaper();
+
+    const worker_count = 8;
+    const iters_per_worker = 300;
+
+    const Worker = struct {
+        pool: *SessionPool,
+        idx: usize,
+
+        /// Mirror createStream's checkout bookkeeping for a STAND-IN session:
+        /// reuse the warmest idle session, else create a fresh stand-in. Returns a
+        /// checked-out session (in_idle == false, active_streams == 1, in `all`).
+        fn checkout(p: *SessionPool) !*Session {
+            p.lock();
+            var sess = p.popHighestIdle();
+            if (sess == null) {
+                p.seq_counter += 1;
+                const seq = p.seq_counter;
+                p.unlock();
+                const fresh = try makeStandin(p, seq);
+                p.lock();
+                p.all.put(p.allocator, fresh, {}) catch |e| {
+                    p.unlock();
+                    // tear the orphan down (no recv-loop: drop the stand-in ref).
+                    fresh.requestClose(.open_error);
+                    fresh.releaseRef();
+                    return e;
+                };
+                fresh.active_streams = 1;
+                sess = fresh;
+            }
+            p.unlock();
+            return sess.?;
+        }
+
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < iters_per_worker) : (i += 1) {
+                const sess = checkout(self.pool) catch continue;
+                const sid: u32 = @intCast((self.idx << 16) | (i & 0xffff) | 1);
+                const stream = registerStandinStream(sess, sid) catch {
+                    // Could not register: return the (still checked-out) session.
+                    if (!self.pool.putIdle(sess)) sess.requestClose(.discard);
+                    continue;
+                };
+
+                // Exercise the inbound producer/consumer path concurrently with
+                // the reaper: append a few chunks + drain them.
+                stream.testAppendInbound("hello");
+                stream.testAppendInbound("world");
+                var buf: [64]u8 = undefined;
+                _ = stream.read(&buf) catch {};
+                _ = stream.read(&buf) catch {};
+
+                // Vary the close path by (idx + i) so every branch is hit:
+                //  - mostly clean close -> putIdle return-to-idle + reuse
+                //  - occasionally requestClose(.write_error) BEFORE close ->
+                //    die-hook + eviction race with the reaper / other workers
+                //  - occasionally markEof via the stand-in seam before close
+                switch ((self.idx + i) % 4) {
+                    0, 1 => stream.close(), // clean: return-to-idle / reuse
+                    2 => {
+                        // Die-hook race: requestClose evicts the stand-in from the
+                        // pool (`all`), so the pool's deinit/reaper will NOT reclaim
+                        // it. For a stand-in (no recv-loop thread to drop the
+                        // recv-loop ref on exit) this worker must drop that ref
+                        // itself AFTER stream.close has dropped the per-stream +
+                        // relay refs — mirroring the recv-loop exit. A real session
+                        // never needs this (its recv-loop thread drops the ref).
+                        sess.requestClose(.write_error);
+                        stream.close(); // sees dying -> no putIdle, drops its refs
+                        sess.releaseRef(); // drop the stand-in recv-loop ref -> finalize
+                    },
+                    3 => {
+                        stream.testMarkEof(); // simulate peer FIN landed
+                        stream.close(); // clean (not dying) -> return-to-idle / reuse
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+    };
+
+    var workers: [worker_count]Worker = undefined;
+    var threads: [worker_count]std.Thread = undefined;
+    for (0..worker_count) |k| {
+        workers[k] = .{ .pool = pool, .idx = k };
+    }
+    for (0..worker_count) |k| {
+        threads[k] = try std.Thread.spawn(.{}, Worker.run, .{&workers[k]});
+    }
+    for (0..worker_count) |k| threads[k].join();
+
+    // deinit drains every remaining idle session (joins the reaper first), frees
+    // the containers + key + reaper_wake. std.testing.allocator asserts no leak;
+    // the run completing asserts no deadlock/hang.
+    pool.deinit();
+}
+
+test "C7: concurrency stress — REAL recv-loop demux vs Stream.close (UAF/leak/deadlock)" {
+    // Surfaces the race the synchronous dispatchFrame seam cannot: a genuine
+    // recv-loop thread (Session.testSpawnRecvLoop -> production recvLoop) demuxing
+    // PSH/FIN frames into a Stream WHILE the relay thread reads and then closes
+    // that same Stream. Many sessions, each with its own recv-loop thread fed by a
+    // fake-server thread; a relay thread per session reads + closes. All under
+    // std.testing.allocator (any UAF/double-free in the lock-free appendInbound vs
+    // releaseStreamRef path trips the allocator or a sanitizer).
+    const allocator = std.testing.allocator;
+    const session_count = 8;
+    const frames_per_session = 200;
+
+    const FakeServer = struct {
+        fn run(q: *FrameQueue) void {
+            var i: usize = 0;
+            while (i < frames_per_session) : (i += 1) {
+                // sid 1 throughout (single-active model). PSH bodies the relay reads.
+                q.push(2, 1, "payload-bytes") catch break; // cmd 2 = psh
+            }
+            q.push(3, 1, "") catch {}; // cmd 3 = fin -> markEof
+            q.close(); // drain -> recv-loop EndOfStream -> requestClose(.eof)
+        }
+    };
+
+    const Relay = struct {
+        // The Stream is registered up front (so the relay-borrow + per-stream
+        // Session-ref are held BEFORE the recv-loop can drain and exit — otherwise
+        // the lone recv-loop ref could finalize the Session while we still hold a
+        // raw `sess`/`stream` pointer). The relay thread only reads + closes.
+        fn run(stream: *Stream) void {
+            var buf: [32]u8 = undefined;
+            var reads: usize = 0;
+            while (reads < frames_per_session + 50) : (reads += 1) {
+                const n = stream.read(&buf) catch |e| switch (e) {
+                    error.WouldBlock => {
+                        compat.sleepNs(50 * std.time.ns_per_us);
+                        continue;
+                    },
+                    else => break, // terminal err
+                };
+                if (n == 0) break; // eof
+            }
+            stream.close(); // races the recv-loop's demux of the SAME sid
+        }
+    };
+
+    var queues: [session_count]FrameQueue = undefined;
+    var streams: [session_count]*Stream = undefined;
+    // recv_thread handles snapshotted up front: the recv-loop's exit may finalize
+    // (free) its Session, so reading `sess.recv_thread` AFTER the relays run would
+    // be a UAF. A std.Thread is a value handle that stays valid to join even after
+    // the Session struct is freed (same rationale as synDoneAbort, §11).
+    var recv_threads: [session_count]std.Thread = undefined;
+    var server_threads: [session_count]std.Thread = undefined;
+    var relay_threads: [session_count]std.Thread = undefined;
+
+    for (0..session_count) |k| {
+        queues[k] = FrameQueue.init(allocator);
+    }
+    // Build sessions, register the relay stream (refs=2: recv-loop + per-stream),
+    // THEN spawn the real recv-loops. Registering before the recv-loop can run
+    // guarantees the relay ref is held before any drain/exit.
+    for (0..session_count) |k| {
+        const sess = try allocator.create(Session);
+        sess.* = try Session.initForTest(allocator, test_config);
+        sess.refs = std.atomic.Value(u32).init(1); // recv-loop ref (seam contract)
+        streams[k] = try registerStandinStream(sess, 1); // refs -> 2
+        try sess.testSpawnRecvLoop(&queues[k], FrameQueue.next);
+        recv_threads[k] = sess.recv_thread.?; // snapshot the joinable handle
+    }
+    // Spawn fake servers + relays.
+    for (0..session_count) |k| {
+        server_threads[k] = try std.Thread.spawn(.{}, FakeServer.run, .{&queues[k]});
+        relay_threads[k] = try std.Thread.spawn(.{}, Relay.run, .{streams[k]});
+    }
+    // Join servers + relays, then the recv-loops (whose exit drops the last ref
+    // -> finalize frees the Session). Joining the snapshotted handles never
+    // touches a (possibly freed) Session.
+    for (0..session_count) |k| server_threads[k].join();
+    for (0..session_count) |k| relay_threads[k].join();
+    for (0..session_count) |k| recv_threads[k].join();
+    for (0..session_count) |k| queues[k].deinit();
+}
+
+test "C7: e2e integration — real recv-loop demux + relay + REUSE + half-close (no TLS)" {
+    // Best-effort end-to-end (read the C7 COVERAGE NOTE above): exercises the full
+    // multiplex/relay path MINUS the std-provided TLS layer via a real recv-loop
+    // thread fed by an in-process fake AnyTLS frame server.
+    //   1. RELAY READ: server pushes PSH frames -> recv-loop demux -> Stream.read
+    //      returns exactly those bytes in order.
+    //   2. REUSE: a 2nd sequential stream (sid 2) on the SAME session reuses the
+    //      same recv-loop (no second "dial") and demuxes to the new sid.
+    //   3. HALF-CLOSE: the relay shutdownWrite()s (send-side FIN best-effort; here
+    //      the session is non-dialed so it's a no-op write) and KEEPS reading; the
+    //      server then sends a FIN frame -> recv-loop markEof -> Stream.read == 0.
+    const allocator = std.testing.allocator;
+
+    // A real pool so the first stream's close() returns the session to idle
+    // (genuine REUSE: not dying, reused by popHighestIdle for the 2nd stream)
+    // rather than discarding it. Long timeouts so the reaper never interferes.
+    const pool = try makePool(allocator, .{
+        .idle_session_timeout_ms = 60_000,
+        .idle_session_check_interval_ms = 60_000,
+    });
+
+    var q = FrameQueue.init(allocator);
+    // Checkout bookkeeping for a stand-in (in `all`, pool back-pointer set, refs=1
+    // recv-loop ref), then spawn the real recv-loop over the in-memory transport.
+    const sess = try makeStandin(pool, 1);
+    pool.lock();
+    try pool.all.put(allocator, sess, {});
+    sess.active_streams = 1; // checked out
+    pool.unlock();
+    try sess.testSpawnRecvLoop(&q, FrameQueue.next);
+    // Snapshot the joinable handle up front: at teardown the recv-loop self-exits
+    // (q.close -> EndOfStream -> requestClose(.eof) evicts from the pool + drops
+    // the recv-loop ref -> finalize frees the Session), so we join via this value
+    // handle and let pool.deinit see an already-emptied `all` (no UAF).
+    const recv_thread = sess.recv_thread.?;
+
+    // ---- Stream 1: relay read of demuxed PSH bytes ----
+    const s1 = try registerStandinStream(sess, 1);
+    try q.push(2, 1, "AB"); // psh sid 1
+    try q.push(2, 1, "CDE"); // psh sid 1
+    var buf: [64]u8 = undefined;
+    var got = std.ArrayListUnmanaged(u8).empty;
+    defer got.deinit(allocator);
+    while (got.items.len < 5) {
+        const n = s1.read(&buf) catch |e| switch (e) {
+            error.WouldBlock => {
+                compat.sleepNs(100 * std.time.ns_per_us);
+                continue;
+            },
+            else => return e,
+        };
+        try got.appendSlice(allocator, buf[0..n]);
+    }
+    try std.testing.expectEqualSlices(u8, "ABCDE", got.items);
+
+    // Half-close the send side, then prove reads continue until the server FIN.
+    s1.shutdownWrite(); // send-side FIN (best-effort; non-dialed -> no-op)
+    try std.testing.expect(s1.write_shut);
+    try q.push(3, 1, ""); // server FIN -> markEof; read side open until consumed
+    while (true) {
+        const n = s1.read(&buf) catch |e| switch (e) {
+            error.WouldBlock => {
+                compat.sleepNs(100 * std.time.ns_per_us);
+                continue;
+            },
+            else => return e,
+        };
+        if (n == 0) break; // FIN observed -> half-close read complete
+    }
+    s1.close(); // pool != null, not dying -> putIdle: session returns to idle
+
+    // The close returned the session to idle (alive, NOT dying) -> REUSE.
+    pool.lock();
+    try std.testing.expectEqual(@as(usize, 1), pool.idle.items.len);
+    const reused = pool.popHighestIdle().?; // check the SAME session back out
+    pool.unlock();
+    try std.testing.expect(reused == sess); // reuse: no second dial
+    try std.testing.expect(!sess.dying.load(.acquire));
+
+    // ---- Stream 2: REUSE the same session (same recv-loop, no new dial) ----
+    const s2 = try registerStandinStream(sess, 2);
+    try q.push(2, 2, "XYZ"); // psh sid 2 -> demuxed to the NEW stream by the SAME recv-loop
+    got.clearRetainingCapacity();
+    while (got.items.len < 3) {
+        const n = s2.read(&buf) catch |e| switch (e) {
+            error.WouldBlock => {
+                compat.sleepNs(100 * std.time.ns_per_us);
+                continue;
+            },
+            else => return e,
+        };
+        try got.appendSlice(allocator, buf[0..n]);
+    }
+    try std.testing.expectEqualSlices(u8, "XYZ", got.items);
+    s2.close(); // putIdle again -> back to idle
+
+    // Tear down: close the queue so the recv-loop hits EndOfStream and self-exits
+    // (requestClose(.eof) evicts the session + drops the recv-loop ref ->
+    // finalize). JOIN the recv-loop via the snapshotted handle BEFORE pool.deinit,
+    // so deinit snapshots an already-emptied `all` and never touches freed memory.
+    q.close();
+    recv_thread.join();
+    pool.deinit();
+    q.deinit();
 }
