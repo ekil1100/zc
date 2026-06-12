@@ -7,6 +7,7 @@ const Certificate = std.crypto.Certificate;
 const socket_options = @import("../socket_options.zig");
 
 const frame_header_len = 7;
+const max_alert_log_len = 256;
 const default_padding0_len: u16 = 30;
 const max_frame_data_len = std.math.maxInt(u16);
 
@@ -105,7 +106,7 @@ pub const Client = struct {
         const stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
         var stream_owned_by_conn = false;
         errdefer if (!stream_owned_by_conn) stream.close();
-        try socket_options.configureConnectedStream(stream);
+        try socket_options.configureUpstreamProxyStream(stream);
 
         const conn = try self.initTlsConnection(stream);
         stream_owned_by_conn = true;
@@ -185,7 +186,13 @@ pub const Client = struct {
                     self.applyServerSettings(data);
                 },
                 .alert => {
-                    try self.discardFrameData(frame.length);
+                    const data = try self.readFrameData(frame.length);
+                    defer if (data.len > 0) self.allocator.free(data);
+                    // The alert body is attacker-controlled and may be non-UTF8:
+                    // bound the length and sanitize before logging.
+                    var alert_buf: [max_alert_log_len]u8 = undefined;
+                    const text = sanitizeAlertText(&alert_buf, data);
+                    std.log.err("anytls: server alert: {s}", .{text});
                     self.stream_closed = true;
                     return error.AnyTlsAlert;
                 },
@@ -284,9 +291,23 @@ pub const Client = struct {
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
         compat.randomBytes(&entropy);
         const now = std.Io.Timestamp.now(compat.io(), .real);
+        const effective_host = self.tlsHost();
+        // For IP-literal targets there is no hostname to send or match: emitting
+        // the IP as SNI produces an abnormal ClientHello (a strong DPI
+        // fingerprint) and violates the AnyTLS URI contract. std TLS couples SNI
+        // omission to .no_verification, which only disables HOSTNAME verification
+        // (correct for an IP). The CA-chain verification configured below via
+        // .ca = .{ .bundle = ... } when skip_cert_verify is false is UNAFFECTED.
         var options = tls.Client.Options{
-            .host = .{ .explicit = self.tlsHost() },
+            .host = if (shouldOmitSni(effective_host))
+                .{ .no_verification = {} }
+            else
+                .{ .explicit = effective_host },
             .ca = .{ .no_verification = {} },
+            // AnyTLS frames carry explicit lengths and sessions end via FIN
+            // (cmd 3) / alert (cmd 5); a mid-frame TCP truncation still surfaces
+            // as error.EndOfStream via readTlsExact. close_notify-truncation
+            // protection is therefore redundant here, so we allow it.
             .allow_truncation_attacks = true,
             .read_buffer = &conn.tls_read_buffer,
             .write_buffer = &conn.tls_write_buffer,
@@ -528,6 +549,29 @@ fn readTlsExact(reader: *std.Io.Reader, out: []u8) !void {
     }
 }
 
+/// Copies up to `out.len` (and at most `max_alert_log_len`) bytes of an
+/// untrusted server alert body into `out`, replacing any non-printable byte
+/// with '?', and returns the sanitized slice. Bounds the logged length and
+/// guarantees the result is safe to format with {s}.
+fn sanitizeAlertText(out: *[max_alert_log_len]u8, data: []const u8) []const u8 {
+    const n = @min(data.len, out.len);
+    for (data[0..n], 0..) |byte, i| {
+        out[i] = if (byte >= 0x20 and byte < 0x7f) byte else '?';
+    }
+    return out[0..n];
+}
+
+/// Returns true when `host` is an IPv4 or IPv6 literal, in which case SNI must
+/// be omitted (an IP has no hostname to send or match). Used to select between
+/// .no_verification (omit server_name) and .explicit (send hostname) for TLS.
+fn shouldOmitSni(host: []const u8) bool {
+    var ipv4: [4]u8 = undefined;
+    if (parseIpv4(host, &ipv4)) return true;
+    var ipv6: [16]u8 = undefined;
+    if (parseIpv6(host, &ipv6)) return true;
+    return false;
+}
+
 fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     var parts: [4]u8 = undefined;
     var part_idx: usize = 0;
@@ -688,6 +732,36 @@ test "AnyTLS settings advertise protocol v2 and default padding md5" {
 test "AnyTLS treats unknown frame commands as ignorable" {
     try std.testing.expectEqual(@as(?Command, null), commandFromByte(255));
     try std.testing.expectEqual(Command.psh, commandFromByte(2).?);
+}
+
+test "AnyTLS omits SNI for IP-literal targets but keeps it for hostnames" {
+    // IPv4 and IPv6 literals (including an IP passed via sni) must omit SNI.
+    try std.testing.expect(shouldOmitSni("192.168.1.2"));
+    try std.testing.expect(shouldOmitSni("8.8.8.8"));
+    try std.testing.expect(shouldOmitSni("2001:db8::1"));
+    try std.testing.expect(shouldOmitSni("::1"));
+    try std.testing.expect(shouldOmitSni("::ffff:192.168.0.1"));
+
+    // Hostnames must keep SNI.
+    try std.testing.expect(!shouldOmitSni("example.com"));
+    try std.testing.expect(!shouldOmitSni("anytls.example.org"));
+    try std.testing.expect(!shouldOmitSni("localhost"));
+}
+
+test "AnyTLS sanitizes and bounds untrusted alert text" {
+    var buf: [max_alert_log_len]u8 = undefined;
+
+    const ascii = sanitizeAlertText(&buf, "auth failed");
+    try std.testing.expectEqualStrings("auth failed", ascii);
+
+    // Non-printable bytes are replaced with '?'.
+    const mixed = sanitizeAlertText(&buf, &[_]u8{ 'a', 0x00, 'b', 0xff, '\n', 'c' });
+    try std.testing.expectEqualStrings("a?b??c", mixed);
+
+    // Over-long payload is bounded to max_alert_log_len.
+    const long = [_]u8{'x'} ** (max_alert_log_len + 100);
+    const bounded = sanitizeAlertText(&buf, &long);
+    try std.testing.expectEqual(@as(usize, max_alert_log_len), bounded.len);
 }
 
 test "AnyTLS SocksAddr encoding matches sing-box serializer" {
