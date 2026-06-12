@@ -1141,12 +1141,34 @@ pub const Stream = struct {
     /// surfaces error.AnyTlsStreamRejected through the read path.
     fn markSynAck(self: *Stream, rejected: bool) void {
         if (rejected) {
-            @atomicStore(u32, &self.syn_state, 2, .release);
+            // Set err/eof FIRST so a SYN-DONE waiter that observes syn_state==2
+            // (release/acquire) is guaranteed to see a non-null stream.err.
             self.markErr(error.AnyTlsStreamRejected);
+            @atomicStore(u32, &self.syn_state, 2, .release);
         } else {
             @atomicStore(u32, &self.syn_state, 1, .release);
             self.notifier.signal();
         }
+        // Wake the bounded SYN-DONE futex waiter in createStream (§11). Harmless
+        // when no one is waiting (sid==1 path or non-armed reuse).
+        compat.io().futexWake(u32, &self.syn_state, 1);
+    }
+
+    /// Test-only seam: drive the recv-loop's cmdSYNACK demux from another module
+    /// (anytls_pool.zig's C4 SYN-DONE tests) without a real TLS recv-loop.
+    pub fn testMarkSynAck(self: *Stream, rejected: bool) void {
+        self.markSynAck(rejected);
+    }
+
+    /// Test-only seam: drive the recv-loop's inbound producer side from another
+    /// module (manager.zig's C5 delegation tests) without a real TLS recv-loop.
+    pub fn testAppendInbound(self: *Stream, bytes: []const u8) void {
+        self.appendInbound(bytes);
+    }
+
+    /// Test-only seam: drive the recv-loop's peer-FIN/EOF from another module.
+    pub fn testMarkEof(self: *Stream) void {
+        self.markEof();
     }
 
     // ---- relay consumer side (single-threaded per stream) ----

@@ -8,6 +8,7 @@ test "include zc test modules" {
     _ = @import("cli/output.zig");
     _ = @import("config_test.zig");
     _ = @import("config.zig");
+    _ = @import("config_validator.zig");
     _ = @import("daemon.zig");
     _ = @import("doctor_cli.zig");
     _ = @import("geoip.zig");

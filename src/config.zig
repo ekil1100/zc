@@ -159,6 +159,13 @@ pub const Config = struct {
     external_ui: ?[]const u8 = null,
     secret: ?[]const u8 = null,
 
+    // AnyTLS idle session pool tunables (§15), in SECONDS. Defaults apply when
+    // absent from the YAML. config_validator clamps the two sub-5s intervals to
+    // 30s independently; min_idle_session is unclamped.
+    idle_session_check_interval: i64 = 30,
+    idle_session_timeout: i64 = 30,
+    min_idle_session: u32 = 0,
+
     proxies: std.ArrayList(Proxy),
     proxy_groups: std.ArrayList(ProxyGroup),
     rule_providers: std.ArrayList(RuleProvider) = .empty,
@@ -274,6 +281,18 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
     }
     if (root.map.get("external-controller")) |v| {
         if (v == .string) config.external_controller = try allocator.dupe(u8, v.string);
+    }
+
+    // AnyTLS idle session pool tunables (§15). Optional; defaults stay when
+    // absent. Stored raw (seconds); config_validator clamps the two intervals.
+    if (root.map.get("idle-session-check-interval")) |v| {
+        if (v == .integer) config.idle_session_check_interval = v.integer;
+    }
+    if (root.map.get("idle-session-timeout")) |v| {
+        if (v == .integer) config.idle_session_timeout = v.integer;
+    }
+    if (root.map.get("min-idle-session")) |v| {
+        if (v == .integer and v.integer >= 0) config.min_idle_session = @intCast(v.integer);
     }
 
     // 解析代理列表
@@ -1835,6 +1854,45 @@ test "config parsing supports rule-providers and rule-set" {
     try std.testing.expectEqualStrings("directset", cfg.rule_providers.items[0].name);
     try std.testing.expectEqual(@as(RuleType, .rule_set), cfg.rules.items[0].rule_type);
     try std.testing.expectEqualStrings("directset", cfg.rules.items[0].payload);
+}
+
+test "C6: idle session tunables default when absent" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+    ;
+    var cfg = try parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_check_interval);
+    try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_timeout);
+    try std.testing.expectEqual(@as(u32, 0), cfg.min_idle_session);
+}
+
+test "C6: idle session tunables parsed from YAML" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\idle-session-check-interval: 60
+        \\idle-session-timeout: 45
+        \\min-idle-session: 3
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+    ;
+    var cfg = try parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(i64, 60), cfg.idle_session_check_interval);
+    try std.testing.expectEqual(@as(i64, 45), cfg.idle_session_timeout);
+    try std.testing.expectEqual(@as(u32, 3), cfg.min_idle_session);
 }
 
 fn testTmpPathAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir, name: []const u8) ![]u8 {

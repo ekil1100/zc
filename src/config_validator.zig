@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_mod = @import("config.zig");
 const Config = @import("config.zig").Config;
 const ProxyType = @import("config.zig").ProxyType;
 const RuleType = @import("config.zig").RuleType;
@@ -53,12 +54,15 @@ pub const ValidationResult = struct {
 };
 
 /// 校验配置
-pub fn validate(allocator: std.mem.Allocator, config: *const Config) !ValidationResult {
+pub fn validate(allocator: std.mem.Allocator, config: *Config) !ValidationResult {
     var result = ValidationResult.init(allocator);
     errdefer result.deinit();
 
     // 校验基础配置
     try validateBasicConfig(config, &result);
+
+    // Clamp AnyTLS idle session pool tunables (§15) — mutates config in place.
+    try clampIdleSessionTunables(config, &result);
 
     // 校验代理节点
     try validateProxies(allocator, config, &result);
@@ -145,6 +149,29 @@ fn validateBasicConfig(config: *const Config, result: *ValidationResult) !void {
     if (config.port == 0 and config.socks_port == 0 and config.mixed_port == 0) {
         try result.addError("At least one port (port, socks-port, or mixed-port) must be configured", .{});
     }
+}
+
+/// Clamp the AnyTLS idle session pool tunables (§15). The two interval/timeout
+/// values are clamped INDEPENDENTLY: any value <= 5 (seconds) is forced to the
+/// 30s default and a warning is recorded. `min_idle_session` is NOT clamped.
+/// Takes a mutable Config because it overrides the offending values in place;
+/// callers run this BEFORE building a PoolConfig from the config.
+pub fn clampIdleSessionTunables(config: *Config, result: *ValidationResult) !void {
+    if (config.idle_session_check_interval <= 5) {
+        try result.addWarning(
+            "idle-session-check-interval={d}s is too low (<=5s); clamped to 30s",
+            .{config.idle_session_check_interval},
+        );
+        config.idle_session_check_interval = 30;
+    }
+    if (config.idle_session_timeout <= 5) {
+        try result.addWarning(
+            "idle-session-timeout={d}s is too low (<=5s); clamped to 30s",
+            .{config.idle_session_timeout},
+        );
+        config.idle_session_timeout = 30;
+    }
+    // min_idle_session is intentionally unclamped (§15).
 }
 
 /// 校验代理节点
@@ -526,4 +553,82 @@ pub fn printResult(result: *const ValidationResult) void {
     } else {
         std.debug.print("\n✗ Configuration is invalid\n", .{});
     }
+}
+
+// ===========================================================================
+// C6 — idle session pool tunable clamps (§15).
+// ===========================================================================
+
+const base_yaml =
+    \\mixed-port: 7899
+    \\proxies:
+    \\  - name: DIRECT
+    \\    type: direct
+    \\    server: ""
+    \\    port: 0
+;
+
+test "C6: validator clamps both sub-5s idle interval/timeout to 30 and warns" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\idle-session-check-interval: 3
+        \\idle-session-timeout: 5
+        \\min-idle-session: 2
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Both clamped to 30; min_idle untouched.
+    try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_check_interval);
+    try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_timeout);
+    try std.testing.expectEqual(@as(u32, 2), cfg.min_idle_session);
+    // Two clamp warnings recorded; config remains valid (no errors from clamps).
+    try std.testing.expect(result.warnings.items.len >= 2);
+    try std.testing.expect(result.isValid());
+}
+
+test "C6: validator leaves valid idle values and min_idle untouched" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\idle-session-check-interval: 60
+        \\idle-session-timeout: 45
+        \\min-idle-session: 4
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\    server: ""
+        \\    port: 0
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(i64, 60), cfg.idle_session_check_interval);
+    try std.testing.expectEqual(@as(i64, 45), cfg.idle_session_timeout);
+    try std.testing.expectEqual(@as(u32, 4), cfg.min_idle_session);
+}
+
+test "C6: validator clamps defaults are valid (no clamp on the 30s default)" {
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parse(allocator, base_yaml);
+    defer cfg.deinit();
+
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // The 30s defaults are > 5 -> untouched.
+    try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_check_interval);
+    try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_timeout);
 }

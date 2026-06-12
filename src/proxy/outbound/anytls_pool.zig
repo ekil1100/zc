@@ -177,17 +177,91 @@ pub const SessionPool = struct {
             return e;
         };
 
-        // §11 SYN-DONE arm decision (computed now; the bounded futex wait is C4):
-        //   arm = (stream.id >= 2) and not session.knownBelowV2()
-        // TODO(C4): when armed, perform the bounded `io.futexWaitTimeout` on
-        // `stream.syn_state` here (§11); on timeout call
-        // `session.requestClose(.syn_timeout)` and return error.AnyTlsSynTimeout.
-        // For C3a we open/reuse + openStream only and return the stream
-        // immediately (the recv-loop still surfaces a rejection via the
-        // notifier, matching the sid==1 path).
-        _ = (stream.id >= 2) and !session.knownBelowV2();
+        // §11 SYN-DONE bounded wait. Arm on the REUSE path (sid >= 2) unless we
+        // have positively learned the peer is below v2 (unknown/default => treat
+        // as v2 => arm). The first-ever stream (sid == 1) is pipelined
+        // optimistically and never waits; its rejection surfaces via the recv-loop
+        // notifier just like before.
+        const arm = (stream.id >= 2) and !session.knownBelowV2();
+        if (arm) {
+            try self.synDoneWait(session, stream);
+        }
 
         return stream;
+    }
+
+    /// §11 SYN-DONE bounded futex wait. Blocks until the recv-loop records a
+    /// SYNACK on `stream.syn_state` or the once-computed `.boot` deadline passes.
+    /// On timeout it tears the (now-desynced/unusable) session down and returns
+    /// error.AnyTlsSynTimeout; on cancellation it tears down and returns
+    /// error.Canceled; on rejection it returns the err the recv-loop stored.
+    ///
+    /// CRITICAL (§11): `io.futexWaitTimeout` returns `Cancelable!void` —
+    /// error{Canceled} ONLY. A TIMEOUT is NOT an error: it returns void. Timeout
+    /// is detected solely by re-reading the clock against the deadline computed
+    /// ONCE up front.
+    fn synDoneWait(self: *SessionPool, session: *Session, stream: *Stream) !void {
+        const io = compat.io();
+        const start_ns = std.Io.Timestamp.now(io, .boot).toNanoseconds();
+        const deadline_ns = start_ns + @as(i96, self.cfg.syn_done_ms) * std.time.ns_per_ms;
+        while (true) {
+            if (@atomicLoad(u32, &stream.syn_state, .acquire) != 0) break; // SYNACK/err arrived
+            const now_ns = std.Io.Timestamp.now(io, .boot).toNanoseconds();
+            const remaining_ns = deadline_ns - now_ns;
+            if (remaining_ns <= 0) {
+                // Timeout detected by the clock recheck (NOT a futex error).
+                self.synDoneAbort(session, stream, .syn_timeout);
+                return error.AnyTlsSynTimeout;
+            }
+            io.futexWaitTimeout(
+                u32,
+                &stream.syn_state,
+                0,
+                .{ .duration = .{ .raw = .{ .nanoseconds = remaining_ns }, .clock = .boot } },
+            ) catch |e| switch (e) {
+                error.Canceled => {
+                    self.synDoneAbort(session, stream, .canceled);
+                    return error.Canceled;
+                },
+            };
+            // Wake may be real / spurious / timeout — loop rechecks flag and clock.
+        }
+        switch (@atomicLoad(u32, &stream.syn_state, .acquire)) {
+            1 => {}, // acked OK
+            else => {
+                // Rejected: the recv-loop already markErr'd the stream and (since
+                // we hold only the recv-loop + this stream's refs) the session is
+                // poisoned for reuse. Tear it down + reclaim the just-opened stream
+                // and surface the err the recv-loop stored.
+                const e = stream.err orelse error.AnyTlsStreamRejected;
+                self.synDoneAbort(session, stream, .write_error);
+                return e;
+            },
+        }
+    }
+
+    /// Reclaims a just-opened stream when its SYN-DONE wait fails (timeout /
+    /// cancellation / rejection). The session is unusable for reuse, so we tear it
+    /// down and reclaim the orphaned Stream (no ProxyStream will ever borrow it).
+    ///
+    /// requestClose(reason) sets `dying`, evicts the session from the pool, drops
+    /// each stream's map-presence ref + markErr's it, and closes the TLS socket so
+    /// the recv-loop unblocks. We then run Stream.close (idempotent, sees dying ->
+    /// no FIN / no putIdle, drops the relay-borrow ref -> frees the struct -> drops
+    /// the per-stream session-ref) and JOIN the recv-loop (§11/§13) so no detached
+    /// thread outlives the freed Session and the recv-loop's exit drops the last
+    /// (recv-loop) ref -> finalize.
+    fn synDoneAbort(self: *SessionPool, session: *Session, stream: *Stream, reason: anytls.CloseReason) void {
+        _ = self;
+        // Capture the recv_thread handle BEFORE any ref drop: stream.close may
+        // drop the last non-recv-loop ref, and a racing recv-loop exit could then
+        // finalize+destroy the Session, making a later `session.recv_thread` read
+        // a use-after-free. The thread handle is a value copy and stays valid to
+        // join even after the Session struct is freed.
+        const recv_thread = session.recv_thread;
+        session.requestClose(reason);
+        stream.close();
+        if (recv_thread) |t| t.join();
     }
 
     /// Returns a session to the idle list after its stream closed. Returns false
@@ -793,6 +867,126 @@ test "C3b: Stream.close on a checked-out session discards it when the pool is sh
     destroyStandin(sess);
 
     // Manually finish pool teardown (shutting_down set by hand, no reaper).
+    pool.idle.deinit(allocator);
+    pool.all.deinit(allocator);
+    allocator.free(pool.key);
+    pool.reaper_wake.deinit();
+    allocator.destroy(pool);
+}
+
+// ===========================================================================
+// C4 — SYN-DONE bounded futex wait (§11). Driven through synDoneWait on
+// stand-in sessions (no real TLS): a withheld SYNACK times out and tears the
+// session down; a signalled markSynAck(false) returns ok; markSynAck(true)
+// surfaces the rejection error. Stand-ins carry no recv_thread, so synDoneAbort
+// skips the join (the production join is covered by the C3 reap/deinit tests).
+// ===========================================================================
+
+test "C4: SYN-DONE withheld SYNACK times out and tears the session down" {
+    const allocator = std.testing.allocator;
+    // Short syn_done_ms so the clock-recheck timeout fires fast.
+    const pool = try makePool(allocator, .{ .syn_done_ms = 30 });
+
+    const sess = try makeStandin(pool, 1);
+    pool.lock();
+    try pool.all.put(allocator, sess, {});
+    sess.active_streams = 1;
+    pool.unlock();
+
+    // Reuse-path stream (sid >= 2). syn_state stays 0 (SYNACK never delivered).
+    const stream = try registerStandinStream(sess, 2);
+
+    const t0 = SessionPool.nowMs();
+    try std.testing.expectError(error.AnyTlsSynTimeout, pool.synDoneWait(sess, stream));
+    const elapsed = SessionPool.nowMs() - t0;
+
+    // Bounded by ~syn_done_ms (generous upper bound to avoid flakiness).
+    try std.testing.expect(elapsed < 2000);
+    // Torn down: requestClose set dying + evicted from the pool.
+    try std.testing.expect(sess.dying);
+    pool.lock();
+    try std.testing.expect(pool.all.get(sess) == null);
+    try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
+    pool.unlock();
+    // synDoneAbort -> stream.close dropped the relay-borrow ref (freeing the
+    // Stream and its per-stream session-ref); only the stand-in recv-loop ref
+    // remains. Drop it to finalize.
+    try std.testing.expectEqual(@as(u32, 1), sess.refs.load(.acquire));
+    sess.releaseRef();
+
+    pool.idle.deinit(allocator);
+    pool.all.deinit(allocator);
+    allocator.free(pool.key);
+    pool.reaper_wake.deinit();
+    allocator.destroy(pool);
+}
+
+test "C4: SYN-DONE returns ok when markSynAck(false) signals before the deadline" {
+    const allocator = std.testing.allocator;
+    const pool = try makePool(allocator, .{ .syn_done_ms = 3000 });
+    defer pool.deinit();
+
+    const sess = try makeStandin(pool, 1);
+    pool.lock();
+    try pool.all.put(allocator, sess, {});
+    sess.active_streams = 1;
+    pool.unlock();
+
+    const stream = try registerStandinStream(sess, 2);
+
+    // Stand-in for the recv-loop: signal a successful SYNACK shortly.
+    const Waker = struct {
+        fn run(s: *anytls.Stream) void {
+            compat.sleepNs(5 * std.time.ns_per_ms);
+            s.testMarkSynAck(false); // not rejected -> syn_state = 1 + futexWake
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Waker.run, .{stream});
+
+    // No error: the wait observes syn_state == 1.
+    try pool.synDoneWait(sess, stream);
+    th.join();
+
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &stream.syn_state, .acquire));
+    try std.testing.expect(!sess.dying);
+
+    // Stream still live (success path leaves it for the relay). Close it back to
+    // idle, then let pool.deinit drain the session.
+    stream.close();
+}
+
+test "C4: SYN-DONE surfaces AnyTlsStreamRejected when markSynAck(true) signals" {
+    const allocator = std.testing.allocator;
+    const pool = try makePool(allocator, .{ .syn_done_ms = 3000 });
+
+    const sess = try makeStandin(pool, 1);
+    pool.lock();
+    try pool.all.put(allocator, sess, {});
+    sess.active_streams = 1;
+    pool.unlock();
+
+    const stream = try registerStandinStream(sess, 2);
+
+    const Waker = struct {
+        fn run(s: *anytls.Stream) void {
+            compat.sleepNs(5 * std.time.ns_per_ms);
+            s.testMarkSynAck(true); // rejected -> markErr + syn_state = 2 + futexWake
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Waker.run, .{stream});
+
+    // Rejection surfaces as the err the recv-loop stored.
+    try std.testing.expectError(error.AnyTlsStreamRejected, pool.synDoneWait(sess, stream));
+    th.join();
+
+    // synDoneWait's reject branch tore the session down (write_error reason).
+    try std.testing.expect(sess.dying);
+    pool.lock();
+    try std.testing.expect(pool.all.get(sess) == null);
+    pool.unlock();
+    try std.testing.expectEqual(@as(u32, 1), sess.refs.load(.acquire));
+    sess.releaseRef();
+
     pool.idle.deinit(allocator);
     pool.all.deinit(allocator);
     allocator.free(pool.key);

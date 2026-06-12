@@ -253,7 +253,11 @@ const HttpsForwardStream = struct {
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *UpstreamReader = @alignCast(@fieldParentPtr("interface", io_r));
             var buf: [4096]u8 = undefined;
-            const n = self.parent.inner.read(&buf) catch return error.ReadFailed;
+            // readBlocking (not read) so a multiplexed anytls stream waits on its
+            // notifier instead of returning WouldBlock into this no-poll pump
+            // (§14). For non-anytls streams readBlocking IS a plain read, so the
+            // behavior is unchanged.
+            const n = self.parent.inner.readBlocking(&buf) catch return error.ReadFailed;
             if (n == 0) return error.EndOfStream;
             return try w.write(buf[0..n]);
         }
@@ -618,7 +622,7 @@ fn handleHttpsForwardRequest(
         try conn.stream.writeAll("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     };
-    if (target_stream.owned_ss_client == null and target_stream.owned_trojan_client == null) {
+    if (target_stream.owned_ss_client == null and target_stream.owned_trojan_client == null and target_stream.owned_anytls_stream == null) {
         defer target_stream.close();
         try handleDirectHttpsForwardStream(allocator, conn, request, forward, &target_stream);
         return;
@@ -999,7 +1003,10 @@ fn shutdownClientWrite(stream: net.Stream, already_shutdown: *bool) void {
 fn shutdownTargetWrite(target_stream: *ProxyStream, already_shutdown: *bool) void {
     if (already_shutdown.*) return;
     already_shutdown.* = true;
-    compat.shutdownWrite(target_stream.getHandle()) catch |err| {
+    // ProxyStream.shutdownWrite half-closes correctly per type: anytls sends a
+    // per-stream cmdFIN (keeping reads open); every other type does
+    // compat.shutdownWrite(getHandle()) exactly as this code did before (§14).
+    target_stream.shutdownWrite() catch |err| {
         relayLog("target shutdown(send) ignored: {}", .{err});
     };
 }

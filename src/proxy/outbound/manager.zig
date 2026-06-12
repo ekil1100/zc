@@ -110,6 +110,19 @@ pub const ProxyStream = struct {
         }
     }
 
+    /// Blocking read that never surfaces WouldBlock. Used by the HttpsForward
+    /// no-poll TLS pump (mixed.zig UpstreamReader): a multiplexed anytls stream
+    /// must wait on its notifier rather than returning WouldBlock. For every
+    /// non-anytls type this is a plain read — byte-for-byte the prior behavior of
+    /// the no-poll pump (direct/ss/trojan/vless took the same blocking read).
+    pub fn readBlocking(self: *ProxyStream, buf: []u8) !usize {
+        if (self.is_closed) return error.StreamClosed;
+        if (self.owned_anytls_stream) |stream| {
+            return try stream.readBlocking(buf);
+        }
+        return try self.read(buf);
+    }
+
     pub fn close(self: *ProxyStream) void {
         if (self.is_closed) return;
         self.is_closed = true;
@@ -160,6 +173,20 @@ pub const ProxyStream = struct {
             return stream.getHandle();
         }
         return self.base_stream.handle;
+    }
+
+    /// Half-close the write side. For anytls this sends a per-stream cmdFIN and
+    /// keeps the read side open (§14); shutdown(SHUT_WR) on the notifier fd would
+    /// be a no-op and break half-close. For every other type it does
+    /// compat.shutdownWrite(getHandle()) — byte-for-byte what shutdownTargetWrite
+    /// did before (direct/ss/trojan/vless all shut down the real socket fd).
+    pub fn shutdownWrite(self: *ProxyStream) !void {
+        if (self.is_closed) return;
+        if (self.owned_anytls_stream) |stream| {
+            stream.shutdownWrite();
+            return;
+        }
+        try compat.shutdownWrite(self.getHandle());
     }
 };
 
@@ -261,8 +288,16 @@ pub const OutboundManager = struct {
             .sni = proxy.sni,
             .skip_cert_verify = proxy.skip_cert_verify,
         };
-        // PoolConfig defaults (C6 plumbs config tunables; until then, §12 defaults).
-        const pool = try anytls_pool.SessionPool.init(self.allocator, key, dial_config, .{});
+        // §15: build PoolConfig from the validated config. Config carries the
+        // tunables in SECONDS (already clamped by config_validator); the pool wants
+        // milliseconds. syn_done_ms is fixed at 3000 (not user-configurable).
+        const pool_cfg = anytls_pool.PoolConfig{
+            .idle_session_check_interval_ms = self.config.idle_session_check_interval * 1000,
+            .idle_session_timeout_ms = self.config.idle_session_timeout * 1000,
+            .min_idle_session = self.config.min_idle_session,
+            .syn_done_ms = 3000,
+        };
+        const pool = try anytls_pool.SessionPool.init(self.allocator, key, dial_config, pool_cfg);
         errdefer pool.deinit();
         try pool.startReaper();
 
@@ -719,6 +754,89 @@ test "ProxyStream move transfers AnyTLS ownership" {
     moved.close();
     session.requestClose(.shutdown);
     session.releaseRef();
+}
+
+test "C5: ProxyStream.readBlocking delegates to the anytls stream" {
+    // The HttpsForward no-poll pump (mixed.zig UpstreamReader) reads through
+    // readBlocking; for an anytls stand-in it must route to Stream.readBlocking.
+    // Seed inbound bytes so the blocking read returns deterministically.
+    const allocator = std.testing.allocator;
+
+    const standin = try makeStandinAnyTlsStream(allocator);
+    const session = standin.session;
+    const stream = standin.stream;
+
+    stream.testAppendInbound("hello");
+
+    var ps = ProxyStream.initAnyTlsStream(stream);
+    var buf: [16]u8 = undefined;
+    const n = try ps.readBlocking(&buf);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("hello", buf[0..5]);
+
+    // Next read sees EOF (peer FIN) -> returns 0 without blocking.
+    stream.testMarkEof();
+    try std.testing.expectEqual(@as(usize, 0), try ps.readBlocking(&buf));
+
+    ps.close();
+    session.requestClose(.shutdown);
+    session.releaseRef();
+}
+
+test "C5: ProxyStream.readBlocking falls back to plain read for a non-anytls stream" {
+    // A pipe pair stands in for a plain socket: readBlocking must just call read.
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) < 0) return error.PipeFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    _ = try compat.posixWrite(fds[1], "ping");
+
+    var ps = ProxyStream{ .base_stream = .{ .handle = fds[0] } };
+    var buf: [16]u8 = undefined;
+    const n = try ps.readBlocking(&buf);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("ping", buf[0..4]);
+}
+
+test "C5: ProxyStream.shutdownWrite delegates to the anytls stream (half-close)" {
+    // anytls branch -> Stream.shutdownWrite (per-stream cmdFIN; sendFin on a
+    // conn==null stand-in is swallowed). Idempotent: a 2nd call is a no-op.
+    const allocator = std.testing.allocator;
+
+    const standin = try makeStandinAnyTlsStream(allocator);
+    const session = standin.session;
+    const stream = standin.stream;
+
+    var ps = ProxyStream.initAnyTlsStream(stream);
+    try ps.shutdownWrite();
+    try std.testing.expect(stream.write_shut);
+    // 2nd call stays a no-op (idempotent half-close).
+    try ps.shutdownWrite();
+    try std.testing.expect(stream.write_shut);
+
+    ps.close();
+    session.requestClose(.shutdown);
+    session.releaseRef();
+}
+
+test "C5: ProxyStream.shutdownWrite falls back to compat.shutdownWrite for a non-anytls stream" {
+    // Non-anytls path must call compat.shutdownWrite(getHandle()). Use a real
+    // connected socketpair so shutdown(SHUT_WR) succeeds (byte-for-byte the
+    // pre-existing direct/ss/trojan/vless behavior).
+    var pair: [2]std.posix.fd_t = undefined;
+    const rc = std.c.socketpair(
+        @as(c_uint, @intCast(std.posix.AF.UNIX)),
+        @as(c_uint, @intCast(std.posix.SOCK.STREAM)),
+        0,
+        &pair,
+    );
+    if (rc != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+
+    var ps = ProxyStream{ .base_stream = .{ .handle = pair[0] } };
+    try ps.shutdownWrite(); // shutdown(SHUT_WR) on the real fd — no error.
 }
 
 test "ProxyStream write rejects closed stream" {
