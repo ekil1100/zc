@@ -227,6 +227,38 @@ pub const Session = struct {
     /// only contender; later stages add a recv-loop that also takes it.
     tls_mutex: std.Io.Mutex = .init,
 
+    // ---- C2 multiplex state (used only by the recv-loop / Stream path) ----
+    /// Monotonic stream-id allocator. `openStream` does fetchAdd(1)+1, so the
+    /// first stream gets sid=1.
+    next_stream_id: std.atomic.Value(u32) = .init(0),
+    /// Live streams keyed by sid. Holds at most one entry in the single-active
+    /// model, but the map machinery generalizes to N for the demux tests.
+    streams: std.AutoHashMapUnmanaged(u32, *Stream) = .empty,
+    /// Guards `streams` + `dying`. Leaf-ordered above `buf_mutex`, never nested
+    /// with `tls_mutex` (§16).
+    streams_mutex: std.Io.Mutex = .init,
+    /// The recv-loop thread, spawned JOINABLE in `startRecvLoop`.
+    recv_thread: ?std.Thread = null,
+    /// Set under `streams_mutex` by requestClose; gates openStream + read paths.
+    dying: bool = false,
+    /// Idempotency gate for requestClose (the loser of the cmpxchg returns).
+    die_once: std.atomic.Value(bool) = .init(false),
+    /// recv-loop ref + one session-ref per live stream. The Session is freed
+    /// (finalize) only when this reaches 0.
+    refs: std.atomic.Value(u32) = .init(0),
+    /// One-shot deferred "send heart-response" flag set by the recv-loop's
+    /// heart_request demux, drained at the top of the next iteration BEFORE
+    /// polling (so we never recursively lock tls_mutex, §7).
+    heart_pending: std.atomic.Value(bool) = .init(false),
+
+    fn lockStreams(self: *Session) void {
+        std.Io.Threaded.mutexLock(&self.streams_mutex);
+    }
+
+    fn unlockStreams(self: *Session) void {
+        std.Io.Threaded.mutexUnlock(&self.streams_mutex);
+    }
+
     fn lockTls(self: *Session) void {
         std.Io.Threaded.mutexLock(&self.tls_mutex);
     }
@@ -291,8 +323,10 @@ pub const Session = struct {
     }
 
     /// Sends `settings + syn + psh(socks_addr)` for the first logical stream of
-    /// the session (sid). Verbatim from the original Client.openStream.
-    fn openStream(self: *Session, stream_id: u32, target_host: []const u8, target_port: u16) !void {
+    /// the session (sid). Verbatim from the original Client.openStream. Used
+    /// only by the synchronous Client shim (the multiplex path uses the public
+    /// `openStream` below).
+    fn openFirstStream(self: *Session, stream_id: u32, target_host: []const u8, target_port: u16) !void {
         var payload = std.ArrayList(u8).empty;
         defer payload.deinit(self.allocator);
 
@@ -517,6 +551,614 @@ pub const Session = struct {
         }
         return false;
     }
+
+    // -----------------------------------------------------------------------
+    // C2 multiplex API (recv-loop + Stream path). Cleanly separate from the
+    // synchronous Client shim above: the shim never touches any of this.
+    // -----------------------------------------------------------------------
+
+    /// Heap-allocates and connects a multiplex Session: dial + TLS + auth, seed
+    /// the recv-loop ref, then spawn the JOINABLE recv-loop. On any failure the
+    /// half-built Session is fully torn down and the error propagates.
+    pub fn open(allocator: std.mem.Allocator, config: Config) !*Session {
+        const self = try allocator.create(Session);
+        errdefer allocator.destroy(self);
+        self.* = try Session.init(allocator, config);
+        errdefer self.padding.deinit();
+
+        try self.dial();
+        // dial populated self.conn; from here teardown must close it.
+        errdefer if (self.conn) |conn| self.deinitTlsConnection(conn);
+
+        self.refs.store(1, .monotonic); // recv-loop ref
+        self.recv_thread = try std.Thread.spawn(.{}, recvLoopEntry, .{self});
+        return self;
+    }
+
+    /// Allocates a sid, registers a fresh Stream under streams_mutex, and
+    /// pipelines the open frames (settings+syn+psh on the first stream of the
+    /// session, syn+psh on a reused session). Returns the borrowed Stream (the
+    /// caller holds the relay-borrow ref). On write failure escalates (§9).
+    pub fn openStream(self: *Session, target_host: []const u8, target_port: u16) !*Stream {
+        const sid = self.next_stream_id.fetchAdd(1, .monotonic) + 1;
+        const first = (sid == 1);
+
+        const stream = try Stream.create(self, sid);
+        // Until the map put transfers ownership this is the ONLY cleanup; once
+        // `registered`, unregisterStreamOnOpenFail (below) takes over. The guard
+        // ensures the two errdefers never BOTH run on a post-put error — that
+        // would free the Stream twice (unregister drops the last ref and frees,
+        // then destroyNow runs on freed memory → UAF/double-free).
+        var registered = false;
+        errdefer if (!registered) stream.destroyNow();
+
+        self.lockStreams();
+        if (self.dying) {
+            self.unlockStreams();
+            return error.SessionDying;
+        }
+        // On put failure unlock before returning (the errdefer frees the stream);
+        // a bare `try` here would leak streams_mutex.
+        self.streams.put(self.allocator, sid, stream) catch |e| {
+            self.unlockStreams();
+            return e;
+        };
+        self.unlockStreams();
+        // session-ref for this stream (paired with the map-presence ref already
+        // baked into Stream.create's refs=2).
+        _ = self.refs.fetchAdd(1, .monotonic);
+        registered = true;
+
+        // From here a failure must unregister + drop both refs the stream owns.
+        errdefer self.unregisterStreamOnOpenFail(stream);
+
+        var payload = std.ArrayList(u8).empty;
+        defer payload.deinit(self.allocator);
+
+        if (first) {
+            const settings = try buildSettings(self.allocator, &self.padding.md5_hex);
+            defer self.allocator.free(settings);
+            try appendFrame(self.allocator, &payload, .settings, 0, settings);
+        }
+        try appendFrame(self.allocator, &payload, .syn, sid, "");
+        const socks_addr = try encodeSocksAddr(self.allocator, target_host, target_port);
+        defer self.allocator.free(socks_addr);
+        try appendFrame(self.allocator, &payload, .psh, sid, socks_addr);
+
+        self.writeSessionPayload(payload.items) catch |e| {
+            // The shared stream is desynced; the session is unusable.
+            self.requestClose(.write_error);
+            return e;
+        };
+
+        return stream;
+    }
+
+    /// Rolls back a stream registration when openStream fails AFTER the map put.
+    /// Mirrors the ownership rule in Stream.close: only the evictor of the map
+    /// entry drops BOTH the map-presence ref and the per-stream session-ref, so
+    /// if requestClose (e.g. the write-error path) already evicted this stream it
+    /// dropped both and we must NOT drop them again. The relay-borrow ref is
+    /// always dropped here because the caller receives an error and therefore
+    /// never calls Stream.close (the only other dropper of the relay-borrow ref);
+    /// a never-handed-out stream must be fully freed. Used only on the error
+    /// path, never on normal close.
+    fn unregisterStreamOnOpenFail(self: *Session, stream: *Stream) void {
+        self.lockStreams();
+        const removed = self.streams.fetchRemove(stream.id) != null;
+        self.unlockStreams();
+        if (removed) {
+            stream.releaseStreamRef(); // drop map-presence ref
+            self.releaseRef(); // drop session-ref for this stream
+        }
+        stream.releaseStreamRef(); // drop relay-borrow ref (always)
+    }
+
+    /// Fragments `data` into <=65535-byte cmdPSH frames. Any write error means
+    /// the session is desynced -> caller escalates (Stream.write does).
+    fn writeDataFrame(self: *Session, sid: u32, data: []const u8) !void {
+        var offset: usize = 0;
+        if (data.len == 0) return;
+        while (offset < data.len) {
+            const n = @min(data.len - offset, max_frame_data_len);
+            try self.sendFrame(.psh, sid, data[offset..][0..n]);
+            offset += n;
+        }
+    }
+
+    /// Best-effort per-stream FIN. Errors ignored (peer/session may be gone).
+    fn sendFin(self: *Session, sid: u32) void {
+        self.sendFrame(.fin, sid, "") catch {};
+    }
+
+    /// Removes a stream from the map on explicit close. Returns whether the map
+    /// entry was present (so the caller drops the map-presence ref) and whether
+    /// the session is dying. Single-active bookkeeping is implicit.
+    fn streamClosed(self: *Session, sid: u32) struct { dropped_map: bool, dying: bool } {
+        self.lockStreams();
+        defer self.unlockStreams();
+        const dropped = self.streams.fetchRemove(sid) != null;
+        return .{ .dropped_map = dropped, .dying = self.dying };
+    }
+
+    /// THREAD ENTRY for the recv-loop. Reads + demuxes frames from the TLS
+    /// connection until EndOfStream, then ensures requestClose ran and drops the
+    /// recv-loop ref.
+    fn recvLoopEntry(self: *Session) void {
+        var src = TlsFrameSource{ .session = self };
+        self.recvLoop(src.source());
+        self.requestClose(.eof); // idempotent
+        self.releaseRef(); // drop recv-loop ref
+    }
+
+    /// The demux pump. Drains frames from `fs` (the seam tests drive in-memory),
+    /// handling the deferred heart-response at the top of each iteration BEFORE
+    /// reading the next frame so tls_mutex is never recursively held.
+    fn recvLoop(self: *Session, fs: FrameSource) void {
+        while (true) {
+            if (self.heart_pending.swap(false, .acq_rel)) {
+                self.sendFrame(.heart_response, 0, "") catch {};
+            }
+            const frame = fs.next() catch break; // EndOfStream / WouldYield-as-EOF
+            self.dispatchFrame(frame);
+            self.allocator.free(frame.owned_body);
+        }
+    }
+
+    /// Handles exactly one decoded frame. Factored out so tests can drive it via
+    /// a scripted FrameSource without a TLS handshake.
+    fn dispatchFrame(self: *Session, frame: DecodedFrame) void {
+        const command = commandFromByte(frame.command) orelse return; // unknown -> ignore
+        const body = frame.owned_body;
+        switch (command) {
+            .psh => {
+                if (body.len == 0) return;
+                self.lockStreams();
+                const s = self.streams.get(frame.stream_id);
+                // Take a transient ref WHILE holding streams_mutex so a concurrent
+                // Stream.close() on the relay thread cannot free the Stream in the
+                // window between unlock and the deref below (§8 UAF safety).
+                if (s) |stream| _ = stream.refs.fetchAdd(1, .acq_rel);
+                self.unlockStreams();
+                if (s) |stream| {
+                    stream.appendInbound(body); // copies under buf_mutex
+                    stream.releaseStreamRef(); // drop transient ref
+                }
+            },
+            .fin => {
+                self.lockStreams();
+                const entry = self.streams.fetchRemove(frame.stream_id);
+                self.unlockStreams();
+                if (entry) |kv| {
+                    kv.value.markEof();
+                    // The map remover owns both the map-presence ref and the
+                    // per-stream session-ref (mirrors Stream.close / requestClose).
+                    kv.value.releaseStreamRef(); // drop map-presence ref
+                    self.releaseRef(); // drop session-ref for this stream
+                }
+            },
+            .syn_ack => {
+                self.lockStreams();
+                const s = self.streams.get(frame.stream_id);
+                // Transient ref under streams_mutex, same UAF rationale as .psh.
+                if (s) |stream| _ = stream.refs.fetchAdd(1, .acq_rel);
+                self.unlockStreams();
+                if (s) |stream| {
+                    stream.markSynAck(body.len > 0);
+                    stream.releaseStreamRef(); // drop transient ref
+                }
+            },
+            .alert => {
+                var alert_buf: [max_alert_log_len]u8 = undefined;
+                const text = sanitizeAlertText(&alert_buf, body);
+                std.log.err("anytls: server alert: {s}", .{text});
+                self.requestClose(.alert);
+            },
+            .server_settings => {
+                // peer_version is read by openStream's arming decision (C4) and
+                // is otherwise leaf state; guard under tls_mutex for consistency
+                // with the writer that may race on a reused session.
+                self.lockTls();
+                defer self.unlockTls();
+                self.applyServerSettings(body);
+            },
+            .update_padding_scheme => {
+                // padding is read by writeSessionPayload under tls_mutex; the
+                // adoption must take the same lock (§16) so a concurrent shaped
+                // write never sees a half-swapped factory.
+                self.lockTls();
+                defer self.unlockTls();
+                self.adoptPaddingScheme(body);
+            },
+            .heart_request => self.heart_pending.store(true, .release),
+            .waste, .settings, .heart_response, .syn => {}, // discard
+        }
+    }
+
+    /// External/internal death trigger. Idempotent; the loser of the cmpxchg
+    /// returns immediately. Sets dying, wakes every live stream with an error,
+    /// and self-closes the TLS socket to unblock the recv-loop's fillMore.
+    pub fn requestClose(self: *Session, reason: CloseReason) void {
+        if (self.die_once.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+
+        const err: anyerror = switch (reason) {
+            .alert => error.AnyTlsAlert,
+            .write_error => error.StreamClosed,
+            .syn_timeout => error.AnyTlsSynTimeout,
+            else => error.SessionClosed,
+        };
+
+        // Snapshot + clear the streams map under streams_mutex.
+        self.lockStreams();
+        self.dying = true;
+        var snapshot = std.ArrayList(*Stream).empty;
+        var it = self.streams.iterator();
+        while (it.next()) |e| snapshot.append(self.allocator, e.value_ptr.*) catch {};
+        self.streams.clearRetainingCapacity();
+        self.unlockStreams();
+
+        for (snapshot.items) |stream| {
+            stream.markErr(err); // wakes blocked relays
+            stream.releaseStreamRef(); // drop map-presence ref
+            self.releaseRef(); // drop session-ref
+        }
+        snapshot.deinit(self.allocator);
+
+        // Close the TLS socket to unblock the recv-loop's poll/fillMore.
+        self.lockTls();
+        if (self.conn) |conn| {
+            _ = conn.tls_client.end() catch {};
+            conn.stream.close();
+        }
+        self.unlockTls();
+    }
+
+    /// Drops a session-ref; on the last ref, finalize: free padding, conn,
+    /// config-owned state, and the Session itself.
+    fn releaseRef(self: *Session) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.finalize();
+    }
+
+    fn finalize(self: *Session) void {
+        self.padding.deinit();
+        self.streams.deinit(self.allocator);
+        if (self.conn) |conn| {
+            // requestClose already ran end()+close() under tls_mutex; here we
+            // only free the heap struct + CA bundle.
+            if (conn.ca_bundle) |*ca_bundle| ca_bundle.deinit(self.allocator);
+            self.allocator.destroy(conn);
+            self.conn = null;
+        }
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    /// deinit for a Session opened via `open` (multiplex): requestClose then JOIN
+    /// the recv-loop before any free, so no detached thread touches freed memory.
+    /// The recv-loop's exit drops the last ref and finalizes. If no recv_thread
+    /// was ever spawned (init-only Session), fall back to the synchronous deinit.
+    pub fn deinitMultiplex(self: *Session) void {
+        if (self.recv_thread) |t| {
+            self.requestClose(.shutdown);
+            t.join(); // recv-loop exit -> releaseRef -> finalize frees self
+        } else {
+            self.deinit();
+            self.allocator.destroy(self);
+        }
+    }
+};
+
+pub const CloseReason = enum { eof, alert, write_error, syn_timeout, shutdown, discard, reaped, open_error, canceled };
+
+/// A decoded frame handed to `dispatchFrame`. `owned_body` is heap-allocated by
+/// the FrameSource and freed by the recv-loop after dispatch.
+const DecodedFrame = struct {
+    command: u8,
+    stream_id: u32,
+    owned_body: []u8,
+};
+
+/// The recv-loop reads frames through this seam. The production source decodes
+/// from the TLS connection (poll-before-lock, §4); tests inject a scripted
+/// in-memory source. `next` returns error.EndOfStream to end the loop.
+const FrameSource = struct {
+    ctx: *anyopaque,
+    nextFn: *const fn (ctx: *anyopaque) anyerror!DecodedFrame,
+
+    fn next(self: FrameSource) anyerror!DecodedFrame {
+        return self.nextFn(self.ctx);
+    }
+};
+
+/// Production FrameSource: poll-before-lock read of the TLS connection.
+const TlsFrameSource = struct {
+    session: *Session,
+    recv_poll_timeout_ms: i32 = 1000,
+
+    fn source(self: *TlsFrameSource) FrameSource {
+        return .{ .ctx = self, .nextFn = nextImpl };
+    }
+
+    fn nextImpl(ctx: *anyopaque) anyerror!DecodedFrame {
+        const self: *TlsFrameSource = @ptrCast(@alignCast(ctx));
+        const session = self.session;
+        while (true) {
+            if (session.die_once.load(.acquire)) return error.EndOfStream;
+
+            // Step 1 (§4): poll the socket with NO lock held, unless ciphertext
+            // is already buffered in the TLS/socket reader (then go straight to
+            // decode under the lock).
+            session.lockTls();
+            const buffered = if (session.conn) |conn|
+                conn.tls_client.reader.bufferedLen() > 0 or
+                    conn.stream_reader.interface.bufferedLen() > 0
+            else
+                false;
+            session.unlockTls();
+
+            if (!buffered) {
+                const fd = blk: {
+                    session.lockTls();
+                    defer session.unlockTls();
+                    const conn = session.conn orelse return error.EndOfStream;
+                    break :blk conn.stream.handle;
+                };
+                var fds = [_]std.posix.pollfd{.{
+                    .fd = fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&fds, self.recv_poll_timeout_ms) catch return error.EndOfStream;
+                if (ready == 0) continue; // timeout: re-check dying, re-poll
+                if ((fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0 and
+                    (fds[0].revents & std.posix.POLL.IN) == 0)
+                {
+                    // peer hung up with no pending data
+                    return error.EndOfStream;
+                }
+            }
+
+            // Step 2-3 (§4): take tls_mutex, decode exactly ONE frame. (One frame
+            // per call keeps the seam simple; the loop re-polls between frames.)
+            session.lockTls();
+            defer session.unlockTls();
+            if (session.conn == null) return error.EndOfStream;
+
+            const header = session.readFrameHeader() catch return error.EndOfStream;
+            const body = session.readFrameData(header.length) catch return error.EndOfStream;
+            // readFrameData returns &.{} for length==0 (not heap); normalize so
+            // the recv-loop can always free owned_body.
+            const owned: []u8 = if (header.length == 0)
+                session.allocator.alloc(u8, 0) catch return error.EndOfStream
+            else
+                body;
+            return .{ .command = header.command, .stream_id = header.stream_id, .owned_body = owned };
+        }
+    }
+};
+
+/// One logical multiplexed stream on a Session. Owns a level-triggered Notifier
+/// the relay polls, an inbound byte buffer the recv-loop fills, and terminal
+/// eof/err state. Ref-counted by two independent owners: the map-presence ref
+/// (held while in `session.streams`) and the relay-borrow ref (held by the
+/// ProxyStream from creation to close). The struct frees only when both drop
+/// (§8) — this is what makes the recv-loop's `appendInbound` UAF-safe.
+pub const Stream = struct {
+    session: *Session,
+    id: u32,
+    notifier: compat.Notifier,
+
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    buf_off: usize = 0,
+    /// Guards buf/buf_off/eof/err. Leaf lock (§16).
+    buf_mutex: std.Io.Mutex = .init,
+    eof: bool = false,
+    err: ?anyerror = null,
+
+    // SYN-DONE state (§11). Fields only in C2; the full bounded wait is C4. The
+    // recv-loop sets these on cmdSYNACK so the relay's read still surfaces a
+    // rejection immediately via the notifier.
+    syn_state: u32 = 0, // 0 unacked, 1 acked-ok, 2 rejected/err
+    syn_deadline_ms: i64 = 0,
+
+    refs: std.atomic.Value(u8) = .init(2), // map-presence ref + relay-borrow ref
+    closed: bool = false, // set by close() on the relay side
+    write_shut: bool = false, // set by shutdownWrite (idempotent half-close)
+
+    fn lockBuf(self: *Stream) void {
+        std.Io.Threaded.mutexLock(&self.buf_mutex);
+    }
+
+    fn unlockBuf(self: *Stream) void {
+        std.Io.Threaded.mutexUnlock(&self.buf_mutex);
+    }
+
+    /// Allocates a Stream with refs=2 (map-presence + relay-borrow). On any
+    /// failure nothing is leaked.
+    fn create(session: *Session, id: u32) !*Stream {
+        const self = try session.allocator.create(Stream);
+        errdefer session.allocator.destroy(self);
+        self.* = .{
+            .session = session,
+            .id = id,
+            .notifier = try compat.Notifier.init(),
+        };
+        return self;
+    }
+
+    /// Frees a never-registered Stream (refs still 2, no map/relay ownership
+    /// transferred). Used only on the openStream allocation/registration error
+    /// path before any ref was handed out.
+    fn destroyNow(self: *Stream) void {
+        const allocator = self.session.allocator;
+        self.notifier.deinit();
+        self.buf.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    /// Drops one ref; on the last ref free the Stream (buf + notifier). A
+    /// buf_mutex acquire/release barrier guarantees no `appendInbound` is
+    /// mid-flight at free time (§7).
+    fn releaseStreamRef(self: *Stream) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            self.lockBuf();
+            self.unlockBuf(); // barrier: drain any in-flight appendInbound
+            const allocator = self.session.allocator;
+            self.notifier.deinit();
+            self.buf.deinit(allocator);
+            allocator.destroy(self);
+        }
+    }
+
+    // ---- recv-loop producer side ----
+
+    /// recv-loop: append inbound PSH bytes (copied) then raise readiness.
+    fn appendInbound(self: *Stream, bytes: []const u8) void {
+        self.lockBuf();
+        self.buf.appendSlice(self.session.allocator, bytes) catch {
+            // OOM on the inbound path: surface as a terminal error so the relay
+            // tears down rather than silently dropping bytes.
+            if (self.err == null) self.err = error.OutOfMemory;
+            self.eof = true;
+            self.unlockBuf();
+            self.notifier.signal();
+            return;
+        };
+        self.unlockBuf();
+        self.notifier.signal();
+    }
+
+    /// recv-loop: peer FIN OR session death (clean half/full close).
+    fn markEof(self: *Stream) void {
+        self.lockBuf();
+        self.eof = true;
+        self.unlockBuf();
+        self.notifier.signal();
+    }
+
+    /// recv-loop: terminal error (alert / rejection / death). First error wins.
+    fn markErr(self: *Stream, e: anyerror) void {
+        self.lockBuf();
+        if (self.err == null) self.err = e;
+        self.eof = true;
+        self.unlockBuf();
+        self.notifier.signal();
+    }
+
+    /// recv-loop: cmdSYNACK demux. Records the syn_state and, on rejection,
+    /// surfaces error.AnyTlsStreamRejected through the read path.
+    fn markSynAck(self: *Stream, rejected: bool) void {
+        if (rejected) {
+            @atomicStore(u32, &self.syn_state, 2, .release);
+            self.markErr(error.AnyTlsStreamRejected);
+        } else {
+            @atomicStore(u32, &self.syn_state, 1, .release);
+            self.notifier.signal();
+        }
+    }
+
+    // ---- relay consumer side (single-threaded per stream) ----
+
+    /// Drains buffered bytes; on empty buffer surfaces terminal err/eof. Returns
+    /// error.WouldBlock on a spurious wake (empty + no terminal). The §6
+    /// notifier-drain-vs-EOF invariant: drain ONLY when the buffer empties AND
+    /// no terminal is pending, so a blocking poll always wakes for EOF/err.
+    pub fn read(self: *Stream, out: []u8) !usize {
+        self.lockBuf();
+        defer self.unlockBuf();
+
+        const available = self.buf.items.len - self.buf_off;
+        if (available > 0) {
+            const n = @min(out.len, available);
+            @memcpy(out[0..n], self.buf.items[self.buf_off..][0..n]);
+            self.buf_off += n;
+            if (self.buf_off == self.buf.items.len) {
+                self.buf.clearRetainingCapacity();
+                self.buf_off = 0;
+                // Keep the level HIGH if a terminal is still pending so the next
+                // read's poll wakes for it; otherwise lower the level.
+                if (!(self.eof or self.err != null)) self.notifier.drain();
+            }
+            return n;
+        }
+        if (self.err) |e| {
+            self.notifier.drain();
+            return e;
+        }
+        if (self.eof) {
+            self.notifier.drain();
+            return 0;
+        }
+        return error.WouldBlock;
+    }
+
+    /// Blocking read for the no-poll HttpsForward caller (§6, C5). Waits on the
+    /// notifier until data/eof/err; NEVER returns WouldBlock.
+    pub fn readBlocking(self: *Stream, out: []u8) !usize {
+        while (true) {
+            const n = self.read(out) catch |e| switch (e) {
+                error.WouldBlock => {
+                    var fds = [_]std.posix.pollfd{.{
+                        .fd = self.notifier.handle(),
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    _ = std.posix.poll(&fds, -1) catch {};
+                    continue;
+                },
+                else => return e,
+            };
+            return n;
+        }
+    }
+
+    /// Relay write: fragment into PSH frames. On any write error escalate to
+    /// session.requestClose(.write_error) and surface error.StreamClosed.
+    pub fn write(self: *Stream, data: []const u8) !void {
+        if (self.closed or self.session.dying) return error.StreamClosed;
+        self.session.writeDataFrame(self.id, data) catch {
+            self.session.requestClose(.write_error);
+            return error.StreamClosed;
+        };
+    }
+
+    /// Half-close: send a per-stream FIN, keep the read side open. Idempotent.
+    pub fn shutdownWrite(self: *Stream) void {
+        if (self.write_shut) return;
+        self.write_shut = true;
+        if (!self.session.dying) self.session.sendFin(self.id);
+    }
+
+    pub fn hasPendingRead(self: *Stream) bool {
+        self.lockBuf();
+        defer self.unlockBuf();
+        return self.buf_off < self.buf.items.len;
+    }
+
+    pub fn getHandle(self: *Stream) std.posix.fd_t {
+        return if (self.closed) -1 else self.notifier.handle();
+    }
+
+    /// Relay-driven explicit close (§8). Idempotent. Sends FIN, removes from the
+    /// map (dropping the map-presence ref), drops the session-ref, and finally
+    /// drops the relay-borrow ref.
+    pub fn close(self: *Stream) void {
+        if (self.closed) return;
+        self.closed = true;
+
+        const session = self.session;
+        if (!session.dying) session.sendFin(self.id);
+
+        const r = session.streamClosed(self.id);
+        // The remover of the map entry owns BOTH the map-presence ref and the
+        // per-stream session-ref. If requestClose already evicted this stream it
+        // dropped both, so we must NOT drop them again here.
+        if (r.dropped_map) {
+            self.releaseStreamRef(); // drop map-presence ref
+            session.releaseRef(); // drop session-ref for this stream
+        }
+        self.releaseStreamRef(); // drop relay-borrow ref (always)
+    }
 };
 
 /// Thin public shim preserving the exact pre-C1 Client API. It is exactly ONE
@@ -561,7 +1203,7 @@ pub const Client = struct {
         // `errdefer client.deinit()`, mirroring the ss/trojan paths. Calling
         // self.deinit() here too would double-free the PaddingFactory (its
         // deinit sets self.* = undefined, so a second deinit frees freed memory).
-        try self.session.openStream(self.stream_id, target_host, target_port);
+        try self.session.openFirstStream(self.stream_id, target_host, target_port);
 
         return conn.stream;
     }
@@ -1495,4 +2137,421 @@ test "AnyTLS shaped write splits into multiple per-boundary records" {
         try std.testing.expect(end > prev);
         prev = end;
     }
+}
+
+// ===========================================================================
+// C2: multiplex + demux + readiness tests
+//
+// These drive the recv-loop's per-frame dispatch through the FrameSource seam
+// and the Stream readiness state machine WITHOUT a TLS handshake. All run under
+// std.testing.allocator (leak detection) and join every spawned thread.
+// ===========================================================================
+
+const test_config = Config{ .password = "pw", .address = "127.0.0.1", .port = 443 };
+
+/// Builds a heap Session with NO TLS connection and NO recv-loop thread, seeded
+/// with one synthetic ref so tests can register streams and drive dispatch.
+/// Tear down with `testDestroySession` (drops the synthetic ref -> finalize).
+fn testMakeSession(allocator: std.mem.Allocator) !*Session {
+    const self = try allocator.create(Session);
+    errdefer allocator.destroy(self);
+    self.* = try Session.init(allocator, test_config);
+    self.refs.store(1, .monotonic); // stand-in for the recv-loop ref
+    return self;
+}
+
+fn testDestroySession(session: *Session) void {
+    // Mirror recv-loop exit: ensure death ran, then drop the synthetic ref.
+    session.requestClose(.shutdown);
+    session.releaseRef();
+}
+
+/// A scripted in-memory FrameSource: yields the queued frames in order, then
+/// error.EndOfStream. Each body is duplicated onto the heap so the recv-loop's
+/// `free(owned_body)` is symmetric with the production source.
+const ScriptedSource = struct {
+    allocator: std.mem.Allocator,
+    frames: []const ScriptFrame,
+    idx: usize = 0,
+
+    const ScriptFrame = struct { command: Command, stream_id: u32, body: []const u8 };
+
+    fn source(self: *ScriptedSource) FrameSource {
+        return .{ .ctx = self, .nextFn = nextImpl };
+    }
+
+    fn nextImpl(ctx: *anyopaque) anyerror!DecodedFrame {
+        const self: *ScriptedSource = @ptrCast(@alignCast(ctx));
+        if (self.idx >= self.frames.len) return error.EndOfStream;
+        const f = self.frames[self.idx];
+        self.idx += 1;
+        const owned = try self.allocator.dupe(u8, f.body);
+        return .{ .command = @intFromEnum(f.command), .stream_id = f.stream_id, .owned_body = owned };
+    }
+};
+
+/// Registers a freshly-created Stream under the session (map-presence +
+/// relay-borrow refs from create, plus the session-ref the map remover owns).
+fn testRegisterStream(session: *Session, sid: u32) !*Stream {
+    const stream = try Stream.create(session, sid);
+    session.lockStreams();
+    try session.streams.put(session.allocator, sid, stream);
+    session.unlockStreams();
+    _ = session.refs.fetchAdd(1, .monotonic); // session-ref for this stream
+    return stream;
+}
+
+fn pollReadable(fd: std.posix.fd_t) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, 0) catch return false;
+    return ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
+test "C2: readiness self-pipe level-trigger (append/read/re-poll)" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    try std.testing.expect(!pollReadable(s.getHandle())); // fresh: not readable
+
+    s.appendInbound("hello");
+    try std.testing.expect(pollReadable(s.getHandle())); // readable after append
+
+    var buf: [16]u8 = undefined;
+    const n = try s.read(&buf);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualSlices(u8, "hello", buf[0..5]);
+
+    // Buffer drained, no terminal -> level low again.
+    try std.testing.expect(!pollReadable(s.getHandle()));
+
+    // Re-append -> readable again.
+    s.appendInbound("x");
+    try std.testing.expect(pollReadable(s.getHandle()));
+    const m = try s.read(&buf);
+    try std.testing.expectEqual(@as(usize, 1), m);
+
+    s.close();
+}
+
+test "C2: buffer-empties-with-EOF invariant (the critical §6 case)" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    // append bytes then mark eof (two signals; collapse to one readable level).
+    s.appendInbound("abcd");
+    s.markEof();
+    try std.testing.expect(pollReadable(s.getHandle()));
+
+    // First read returns ALL the bytes; notifier MUST stay readable (eof pending).
+    var buf: [16]u8 = undefined;
+    const n = try s.read(&buf);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualSlices(u8, "abcd", buf[0..4]);
+    try std.testing.expect(pollReadable(s.getHandle())); // level still HIGH for eof
+
+    // Next read returns 0 (eof) and now the poll has been satisfied/drained.
+    const z = try s.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), z);
+    try std.testing.expect(!pollReadable(s.getHandle()));
+
+    s.close();
+}
+
+test "C2: syn-reject surfaces AnyTlsStreamRejected via dispatch" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    // A cmdSYNACK with a non-empty body == rejection.
+    var src = ScriptedSource{ .allocator = allocator, .frames = &.{
+        .{ .command = .syn_ack, .stream_id = 1, .body = "rejected" },
+    } };
+    session.recvLoop(src.source());
+
+    try std.testing.expectEqual(@as(u32, 2), @atomicLoad(u32, &s.syn_state, .acquire));
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.AnyTlsStreamRejected, s.read(&buf));
+
+    s.close();
+}
+
+test "C2: WouldBlock on spurious wake (empty buffer, no terminal)" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    // Manually raise the level without buffering data or a terminal -> read must
+    // report WouldBlock (the relay then re-polls).
+    s.notifier.signal();
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, s.read(&buf));
+
+    s.close();
+}
+
+test "C2: multi-sid demux isolation (frames land only in their own stream)" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+
+    const s1 = try testRegisterStream(session, 1);
+    const s2 = try testRegisterStream(session, 2);
+    const s3 = try testRegisterStream(session, 3);
+
+    var src = ScriptedSource{ .allocator = allocator, .frames = &.{
+        .{ .command = .psh, .stream_id = 1, .body = "one" },
+        .{ .command = .psh, .stream_id = 2, .body = "twotwo" },
+        .{ .command = .psh, .stream_id = 3, .body = "three!" },
+        .{ .command = .psh, .stream_id = 1, .body = "-1again" },
+        .{ .command = .psh, .stream_id = 99, .body = "orphan-dropped" }, // no such stream
+    } };
+    session.recvLoop(src.source());
+
+    var buf: [32]u8 = undefined;
+    const n1 = try s1.read(&buf);
+    try std.testing.expectEqualSlices(u8, "one-1again", buf[0..n1]);
+    const n2 = try s2.read(&buf);
+    try std.testing.expectEqualSlices(u8, "twotwo", buf[0..n2]);
+    const n3 = try s3.read(&buf);
+    try std.testing.expectEqualSlices(u8, "three!", buf[0..n3]);
+
+    s1.close();
+    s2.close();
+    s3.close();
+}
+
+test "C2: FIN demux marks eof + removes from map" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    var src = ScriptedSource{ .allocator = allocator, .frames = &.{
+        .{ .command = .psh, .stream_id = 1, .body = "tail" },
+        .{ .command = .fin, .stream_id = 1, .body = "" },
+    } };
+    session.recvLoop(src.source());
+
+    // Stream removed from the map by FIN.
+    session.lockStreams();
+    const present = session.streams.get(1) != null;
+    session.unlockStreams();
+    try std.testing.expect(!present);
+
+    // Bytes still delivered, then eof.
+    var buf: [16]u8 = undefined;
+    const n = try s.read(&buf);
+    try std.testing.expectEqualSlices(u8, "tail", buf[0..n]);
+    try std.testing.expect(pollReadable(s.getHandle())); // eof level high
+    try std.testing.expectEqual(@as(usize, 0), try s.read(&buf));
+
+    s.close(); // dropped_map=false now (FIN already removed it) -> only relay ref
+}
+
+test "C2: session-death (requestClose) wakes ALL streams; no leak, refs released" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    // No testDestroySession here: requestClose is the death; we close streams.
+
+    const s1 = try testRegisterStream(session, 1);
+    const s2 = try testRegisterStream(session, 2);
+
+    s1.appendInbound("buffered"); // pending data must still be drainable... not after death? death marks err.
+
+    session.requestClose(.alert);
+
+    // Both streams woken; their polls fire and reads surface the terminal error.
+    try std.testing.expect(pollReadable(s1.getHandle()));
+    try std.testing.expect(pollReadable(s2.getHandle()));
+
+    var buf: [16]u8 = undefined;
+    // s1 had buffered bytes appended BEFORE death: read drains them first.
+    const n1 = try s1.read(&buf);
+    try std.testing.expectEqualSlices(u8, "buffered", buf[0..n1]);
+    // Then the terminal error.
+    try std.testing.expectError(error.AnyTlsAlert, s1.read(&buf));
+    // s2 had nothing buffered: terminal error immediately.
+    try std.testing.expectError(error.AnyTlsAlert, s2.read(&buf));
+
+    // The map was cleared by death.
+    session.lockStreams();
+    const empty = session.streams.count() == 0;
+    try std.testing.expect(session.dying);
+    session.unlockStreams();
+    try std.testing.expect(empty);
+
+    // Relays close: dropped_map=false (death evicted them) -> only relay ref
+    // drops; the death already dropped map+session refs. This is the last ref on
+    // each Stream -> freed (leak detector validates). And the synthetic
+    // session-ref drop below frees the Session.
+    s1.close();
+    s2.close();
+    session.releaseRef(); // drop the synthetic recv-loop stand-in ref -> finalize
+}
+
+test "C2: write-error escalates to requestClose; session marked dying" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    // session has no conn -> writeSessionPayload returns NotConnected.
+    const s = try testRegisterStream(session, 1);
+
+    try std.testing.expectError(error.StreamClosed, s.write("payload"));
+    try std.testing.expect(session.die_once.load(.acquire));
+
+    session.lockStreams();
+    try std.testing.expect(session.dying);
+    session.unlockStreams();
+
+    // After death the stream surfaces the terminal error and the map was cleared.
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.StreamClosed, s.read(&buf));
+
+    s.close();
+    session.releaseRef(); // synthetic ref -> finalize
+}
+
+test "C2: openStream registration-error rollback frees the stream (no leak)" {
+    // Mirrors the openStream failure path AFTER the map put but BEFORE any error
+    // escalation (e.g. an OOM in buildSettings/appendFrame/encodeSocksAddr). The
+    // stream is still in the map, so unregisterStreamOnOpenFail must drop ALL
+    // THREE refs it owns: map-presence, per-stream session-ref, and the
+    // relay-borrow ref (the caller gets an error and never calls Stream.close).
+    // A surviving relay-borrow ref would leak the Stream (buf + notifier fd),
+    // caught by std.testing.allocator.
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+
+    const stream = try testRegisterStream(session, 1); // refs=2, +1 session-ref
+    const refs_before = session.refs.load(.acquire);
+
+    session.unregisterStreamOnOpenFail(stream); // rollback (stream still in map)
+
+    // Map-presence + session-ref both dropped; the session-ref returns to its
+    // pre-registration count.
+    try std.testing.expectEqual(refs_before - 1, session.refs.load(.acquire));
+    session.lockStreams();
+    try std.testing.expect(session.streams.get(1) == null);
+    session.unlockStreams();
+    // If the relay-borrow ref were NOT dropped, the Stream would leak here.
+}
+
+test "C2: openStream write-error rollback after eviction drops only relay ref (no UAF)" {
+    // Mirrors openStream's write-error path: writeSessionPayload fails ->
+    // requestClose(.write_error) evicts the just-registered stream and drops its
+    // map-presence + session-ref. The errdefer then runs
+    // unregisterStreamOnOpenFail, which must NOT drop those two a second time
+    // (double-release -> Session use-after-free) and must drop ONLY the
+    // relay-borrow ref so the Stream is freed exactly once. Run under the leak
+    // detector to validate no leak and no double-free.
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+
+    const stream = try testRegisterStream(session, 1); // refs=2, +1 session-ref
+
+    // requestClose evicts the stream: drops map-presence + session-ref, marks
+    // dying, clears the map. The stream now holds only its relay-borrow ref.
+    session.requestClose(.write_error);
+    try std.testing.expectEqual(@as(u8, 1), stream.refs.load(.acquire));
+
+    // errdefer rollback: stream no longer in map (removed == false), so the
+    // session-ref must NOT be dropped again; only the relay-borrow ref drops.
+    session.unregisterStreamOnOpenFail(stream); // frees the Stream exactly here.
+
+    // The synthetic recv-loop stand-in ref is the only Session ref left.
+    session.releaseRef(); // -> finalize, no UAF
+}
+
+test "C2: openStream write failure runs both errdefers without double-free" {
+    // Drives the REAL openStream() into a write failure (conn == null ->
+    // writeSessionPayload returns error.NotConnected AFTER the map put), so the
+    // stacked errdefers actually execute. Before the `registered` guard, the
+    // create-only destroyNow errdefer AND unregisterStreamOnOpenFail both fired
+    // and double-freed the Stream. Under std.testing.allocator a double-free /
+    // leak / UAF fails the test; a clean error return passes.
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+
+    try std.testing.expectError(error.NotConnected, session.openStream("example.com", 443));
+
+    // The stream was rolled back: map empty and the per-stream session-ref was
+    // returned (only the recv-loop stand-in ref remains).
+    session.lockStreams();
+    try std.testing.expect(session.streams.count() == 0);
+    session.unlockStreams();
+    try std.testing.expectEqual(@as(u32, 1), session.refs.load(.acquire));
+}
+
+test "C2: hasPendingRead true while buffered, false after drain" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    try std.testing.expect(!s.hasPendingRead());
+    s.appendInbound("data");
+    try std.testing.expect(s.hasPendingRead());
+
+    var buf: [16]u8 = undefined;
+    _ = try s.read(&buf);
+    try std.testing.expect(!s.hasPendingRead());
+
+    s.close();
+}
+
+test "C2: readBlocking returns data then 0 on eof (never WouldBlock)" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    // Producer thread appends then marks eof after the consumer is likely blocked.
+    const Producer = struct {
+        fn run(stream: *Stream) void {
+            stream.appendInbound("blocking-bytes");
+            stream.markEof();
+        }
+    };
+    var t = try std.Thread.spawn(.{}, Producer.run, .{s});
+    defer t.join();
+
+    var buf: [32]u8 = undefined;
+    const n = try s.readBlocking(&buf);
+    try std.testing.expect(n > 0);
+    // Drain remaining + eof.
+    var total = n;
+    while (total < "blocking-bytes".len) {
+        total += try s.readBlocking(buf[0..]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), try s.readBlocking(&buf)); // eof
+
+    s.close();
+}
+
+test "C2: shutdownWrite is idempotent and keeps read side open" {
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator);
+    defer testDestroySession(session);
+    const s = try testRegisterStream(session, 1);
+
+    // No conn -> sendFin's writeSessionPayload errors but is swallowed
+    // (best-effort). shutdownWrite must not panic and must be idempotent.
+    s.shutdownWrite();
+    try std.testing.expect(s.write_shut);
+    s.shutdownWrite(); // no-op second call
+
+    // Read side remains usable: append + read still work.
+    s.appendInbound("still-reading");
+    var buf: [32]u8 = undefined;
+    const n = try s.read(&buf);
+    try std.testing.expectEqualSlices(u8, "still-reading", buf[0..n]);
+
+    s.close();
 }
