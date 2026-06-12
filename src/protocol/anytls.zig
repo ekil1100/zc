@@ -5,6 +5,7 @@ const crypto = std.crypto;
 const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
 const socket_options = @import("../socket_options.zig");
+const anytls_pool = @import("../proxy/outbound/anytls_pool.zig");
 
 const frame_header_len = 7;
 const max_alert_log_len = 256;
@@ -218,6 +219,10 @@ pub const Session = struct {
     password_hash: [32]u8,
     conn: ?*TlsConnection = null,
     peer_version: u8 = 1,
+    /// True once cmdServerSettings has been parsed with an explicit `v=`. Until
+    /// then `peer_version` is the unverified default (1) and `knownBelowV2`
+    /// returns false (conservative "treat as v2" per §11).
+    learned_version: bool = false,
     packet_counter: u32 = 0,
     /// Active padding scheme. Seeded from default_padding_scheme in init() and
     /// atomically replaced when the server pushes cmdUpdatePaddingScheme (cmd 6).
@@ -251,6 +256,27 @@ pub const Session = struct {
     /// polling (so we never recursively lock tls_mutex, §7).
     heart_pending: std.atomic.Value(bool) = .init(false),
 
+    // ---- C3 pool linkage (§3/§12). These fields are managed exclusively by the
+    // SessionPool under `pool.mutex`; the Session never mutates them itself
+    // except `pool`/`pool_key` set once at open time. `in_idle`/`active_streams`
+    // are flipped ONLY under `pool.mutex` so the reaper can never grab a
+    // checked-out session.
+    /// Monotonic pool sequence (higher == warmer). Assigned by the pool at open.
+    seq: u64 = 0,
+    /// True while this session sits in the pool's idle list. Flipped only under
+    /// pool.mutex.
+    in_idle: bool = false,
+    /// 0 or 1 in the single-active model. Flipped only under pool.mutex.
+    active_streams: u32 = 0,
+    /// Monotonic-clock timestamp (ms, .boot) of when the session entered idle.
+    idle_since_ms: i64 = 0,
+    /// Back-pointer to the owning pool, or null for a non-pooled session (the
+    /// Client shim and the C2/C3 stand-in tests). When non-null, requestClose's
+    /// die-hook removes this session from the pool (§12) before tearing down.
+    pool: ?*anytls_pool.SessionPool = null,
+    /// Owned dup of the pool's key, freed in finalize. Empty for non-pooled.
+    pool_key: []u8 = &.{},
+
     fn lockStreams(self: *Session) void {
         std.Io.Threaded.mutexLock(&self.streams_mutex);
     }
@@ -279,6 +305,14 @@ pub const Session = struct {
             .password_hash = password_hash,
             .padding = padding,
         };
+    }
+
+    /// Test-only public constructor for a NON-DIALED Session stand-in
+    /// (conn = null, recv_thread = null). Used by anytls_pool.zig's pool-mechanics
+    /// tests, which exercise the pool without a real TLS handshake (§ "TESTING").
+    /// NOT for production use — the production path is `open`.
+    pub fn initForTest(allocator: std.mem.Allocator, config: Config) !Session {
+        return Session.init(allocator, config);
     }
 
     /// Frees the padding factory and the owned TLS connection. Callers that need
@@ -540,6 +574,7 @@ pub const Session = struct {
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "v=")) {
                 self.peer_version = std.fmt.parseInt(u8, line[2..], 10) catch self.peer_version;
+                self.learned_version = true;
             }
         }
     }
@@ -560,11 +595,12 @@ pub const Session = struct {
     /// Heap-allocates and connects a multiplex Session: dial + TLS + auth, seed
     /// the recv-loop ref, then spawn the JOINABLE recv-loop. On any failure the
     /// half-built Session is fully torn down and the error propagates.
-    pub fn open(allocator: std.mem.Allocator, config: Config) !*Session {
+    pub fn open(allocator: std.mem.Allocator, config: Config, seq: u64) !*Session {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
         self.* = try Session.init(allocator, config);
         errdefer self.padding.deinit();
+        self.seq = seq;
 
         try self.dial();
         // dial populated self.conn; from here teardown must close it.
@@ -573,6 +609,15 @@ pub const Session = struct {
         self.refs.store(1, .monotonic); // recv-loop ref
         self.recv_thread = try std.Thread.spawn(.{}, recvLoopEntry, .{self});
         return self;
+    }
+
+    /// True only when we have POSITIVELY learned the peer speaks anytls < v2
+    /// (i.e. cmdServerSettings was observed with v < 2). An unknown/default
+    /// peer_version (the conservative "treat as v2" case in §11) returns false,
+    /// so the SYN-DONE wait is armed on reuse. `learned_version` is set by
+    /// applyServerSettings; until then this is false.
+    pub fn knownBelowV2(self: *Session) bool {
+        return self.learned_version and self.peer_version < 2;
     }
 
     /// Allocates a sid, registers a fresh Stream under streams_mutex, and
@@ -605,8 +650,11 @@ pub const Session = struct {
         };
         self.unlockStreams();
         // session-ref for this stream (paired with the map-presence ref already
-        // baked into Stream.create's refs=2).
+        // baked into Stream.create's refs=2). This ref's lifetime is bound to
+        // the Stream STRUCT: owns_session_ref marks it so releaseStreamRef drops
+        // it exactly once when the Stream is finally freed (UAF fix).
         _ = self.refs.fetchAdd(1, .monotonic);
+        stream.owns_session_ref = true;
         registered = true;
 
         // From here a failure must unregister + drop both refs the stream owns.
@@ -636,12 +684,15 @@ pub const Session = struct {
 
     /// Rolls back a stream registration when openStream fails AFTER the map put.
     /// Mirrors the ownership rule in Stream.close: only the evictor of the map
-    /// entry drops BOTH the map-presence ref and the per-stream session-ref, so
-    /// if requestClose (e.g. the write-error path) already evicted this stream it
-    /// dropped both and we must NOT drop them again. The relay-borrow ref is
-    /// always dropped here because the caller receives an error and therefore
-    /// never calls Stream.close (the only other dropper of the relay-borrow ref);
-    /// a never-handed-out stream must be fully freed. Used only on the error
+    /// entry drops the map-presence ref, so if requestClose (e.g. the write-error
+    /// path) already evicted this stream we must NOT drop it again. The
+    /// per-stream Session-ref is NOT dropped here: it is bound to the Stream
+    /// struct and travels out in releaseStreamRef's last-ref branch when the
+    /// Stream frees (UAF fix). The relay-borrow ref is always dropped here
+    /// because the caller receives an error and therefore never calls
+    /// Stream.close (the only other dropper of the relay-borrow ref); a
+    /// never-handed-out stream must be fully freed — and that final
+    /// releaseStreamRef is what drops the Session-ref. Used only on the error
     /// path, never on normal close.
     fn unregisterStreamOnOpenFail(self: *Session, stream: *Stream) void {
         self.lockStreams();
@@ -649,9 +700,8 @@ pub const Session = struct {
         self.unlockStreams();
         if (removed) {
             stream.releaseStreamRef(); // drop map-presence ref
-            self.releaseRef(); // drop session-ref for this stream
         }
-        stream.releaseStreamRef(); // drop relay-borrow ref (always)
+        stream.releaseStreamRef(); // drop relay-borrow ref (always) -> frees Stream -> drops Session-ref
     }
 
     /// Fragments `data` into <=65535-byte cmdPSH frames. Any write error means
@@ -731,10 +781,12 @@ pub const Session = struct {
                 self.unlockStreams();
                 if (entry) |kv| {
                     kv.value.markEof();
-                    // The map remover owns both the map-presence ref and the
-                    // per-stream session-ref (mirrors Stream.close / requestClose).
+                    // The map remover drops the map-presence ref. The per-stream
+                    // Session-ref is NOT dropped here: it is bound to the Stream
+                    // struct and is released in releaseStreamRef when the Stream
+                    // finally frees (UAF fix) — which, if the relay still holds
+                    // the relay-borrow ref, happens only after Stream.close.
                     kv.value.releaseStreamRef(); // drop map-presence ref
-                    self.releaseRef(); // drop session-ref for this stream
                 }
             },
             .syn_ack => {
@@ -781,6 +833,11 @@ pub const Session = struct {
     pub fn requestClose(self: *Session, reason: CloseReason) void {
         if (self.die_once.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
 
+        // §12 die-hook: a dying session must leave the pool FIRST (remove from
+        // idle + all) so no concurrent createStream/reaper can resurrect it.
+        // evict takes pool.mutex and holds NO session lock (lock order §16).
+        if (self.pool) |p| p.evict(self);
+
         const err: anyerror = switch (reason) {
             .alert => error.AnyTlsAlert,
             .write_error => error.StreamClosed,
@@ -788,19 +845,33 @@ pub const Session = struct {
             else => error.SessionClosed,
         };
 
-        // Snapshot + clear the streams map under streams_mutex.
+        // Snapshot + clear the streams map under streams_mutex. Reserve capacity
+        // for the whole map FIRST (still under the lock) so the per-entry append
+        // below cannot OOM and silently drop a stream from the wake/eviction set
+        // — a dropped stream would keep its map-presence ref forever (leak) and
+        // never be woken. If ensureTotalCapacity itself OOMs we fall back to the
+        // best-effort append loop and the catch documents the residual risk.
         self.lockStreams();
         self.dying = true;
         var snapshot = std.ArrayList(*Stream).empty;
+        snapshot.ensureTotalCapacity(self.allocator, self.streams.count()) catch {};
         var it = self.streams.iterator();
-        while (it.next()) |e| snapshot.append(self.allocator, e.value_ptr.*) catch {};
+        while (it.next()) |e| snapshot.append(self.allocator, e.value_ptr.*) catch {
+            // OOM with capacity reserved is unreachable; should the reserve above
+            // have failed, this drops a stream from the eviction set (it keeps its
+            // map-presence ref / is never woken). Accepted as a last-resort path.
+        };
         self.streams.clearRetainingCapacity();
         self.unlockStreams();
 
         for (snapshot.items) |stream| {
             stream.markErr(err); // wakes blocked relays
+            // Drop only the map-presence ref. The per-stream Session-ref is bound
+            // to the Stream struct: if the relay still holds the relay-borrow ref
+            // the Stream survives here (and so does its Session-ref), and the
+            // Session-ref is dropped later in releaseStreamRef when the Stream is
+            // finally freed by the relay's Stream.close (UAF fix).
             stream.releaseStreamRef(); // drop map-presence ref
-            self.releaseRef(); // drop session-ref
         }
         snapshot.deinit(self.allocator);
 
@@ -815,13 +886,14 @@ pub const Session = struct {
 
     /// Drops a session-ref; on the last ref, finalize: free padding, conn,
     /// config-owned state, and the Session itself.
-    fn releaseRef(self: *Session) void {
+    pub fn releaseRef(self: *Session) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) self.finalize();
     }
 
     fn finalize(self: *Session) void {
         self.padding.deinit();
         self.streams.deinit(self.allocator);
+        if (self.pool_key.len > 0) self.allocator.free(self.pool_key);
         if (self.conn) |conn| {
             // requestClose already ran end()+close() under tls_mutex; here we
             // only free the heap struct + CA bundle.
@@ -964,6 +1036,16 @@ pub const Stream = struct {
     refs: std.atomic.Value(u8) = .init(2), // map-presence ref + relay-borrow ref
     closed: bool = false, // set by close() on the relay side
     write_shut: bool = false, // set by shutdownWrite (idempotent half-close)
+    /// True once a per-stream Session-ref has been added on behalf of THIS
+    /// Stream (in Session.openStream / testRegisterStream, right after the
+    /// fetchAdd that adds it). That Session-ref lives exactly as long as the
+    /// Stream STRUCT: it is dropped EXACTLY ONCE, in releaseStreamRef's
+    /// last-ref branch when the Stream is finally freed. This couples the
+    /// Session-ref's lifetime to the Stream's actual free so the Session can
+    /// never finalize while a Stream still points at it (UAF fix). Stays false
+    /// for a never-registered Stream (destroyNow path), which owns no
+    /// Session-ref and must not drop one.
+    owns_session_ref: bool = false,
 
     fn lockBuf(self: *Stream) void {
         std.Io.Threaded.mutexLock(&self.buf_mutex);
@@ -998,15 +1080,25 @@ pub const Stream = struct {
 
     /// Drops one ref; on the last ref free the Stream (buf + notifier). A
     /// buf_mutex acquire/release barrier guarantees no `appendInbound` is
-    /// mid-flight at free time (§7).
+    /// mid-flight at free time (§7). If this Stream owns a per-stream
+    /// Session-ref it travels out WITH the struct: it is dropped LAST, after
+    /// the Stream is freed, so the Session can outlive every Stream that points
+    /// at it and only finalize once the last such Stream is gone (UAF fix).
+    /// Capture session + allocator + owns into locals BEFORE destroy, since
+    /// destroy invalidates `self`, and `session.releaseRef()` may finalize the
+    /// Session (freeing it) so it must be the very last thing we touch.
     fn releaseStreamRef(self: *Stream) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
             self.lockBuf();
             self.unlockBuf(); // barrier: drain any in-flight appendInbound
-            const allocator = self.session.allocator;
+            const session = self.session;
+            const allocator = session.allocator;
+            const owns = self.owns_session_ref;
             self.notifier.deinit();
             self.buf.deinit(allocator);
             allocator.destroy(self);
+            // self is now invalid; only the captured locals are safe.
+            if (owns) session.releaseRef(); // may finalize the Session — LAST
         }
     }
 
@@ -1140,8 +1232,11 @@ pub const Stream = struct {
     }
 
     /// Relay-driven explicit close (§8). Idempotent. Sends FIN, removes from the
-    /// map (dropping the map-presence ref), drops the session-ref, and finally
-    /// drops the relay-borrow ref.
+    /// map (dropping the map-presence ref if still present), and finally drops
+    /// the relay-borrow ref. The per-stream Session-ref is NOT dropped here: it
+    /// is bound to the Stream struct and is released in releaseStreamRef when the
+    /// Stream is finally freed — which, on this relay-borrow-ref drop being the
+    /// last ref, happens right below (UAF fix).
     pub fn close(self: *Stream) void {
         if (self.closed) return;
         self.closed = true;
@@ -1150,13 +1245,16 @@ pub const Stream = struct {
         if (!session.dying) session.sendFin(self.id);
 
         const r = session.streamClosed(self.id);
-        // The remover of the map entry owns BOTH the map-presence ref and the
-        // per-stream session-ref. If requestClose already evicted this stream it
-        // dropped both, so we must NOT drop them again here.
+        // The remover of the map entry drops the map-presence ref. If requestClose
+        // (or a peer FIN) already evicted this stream it dropped the map-presence
+        // ref, so we must NOT drop it again here.
         if (r.dropped_map) {
             self.releaseStreamRef(); // drop map-presence ref
-            session.releaseRef(); // drop session-ref for this stream
         }
+        // Drop the relay-borrow ref last. When this is the Stream's final ref,
+        // releaseStreamRef frees the struct and then drops the per-stream
+        // Session-ref (which may finalize the Session) — strictly after the
+        // Stream that points at the Session is gone.
         self.releaseStreamRef(); // drop relay-borrow ref (always)
     }
 };
@@ -2191,13 +2289,17 @@ const ScriptedSource = struct {
 };
 
 /// Registers a freshly-created Stream under the session (map-presence +
-/// relay-borrow refs from create, plus the session-ref the map remover owns).
+/// relay-borrow refs from create, plus the per-stream session-ref bound to the
+/// Stream struct). Mirrors Session.openStream: the session-ref is added here and
+/// owns_session_ref is set so releaseStreamRef drops it exactly once when the
+/// Stream struct is finally freed.
 fn testRegisterStream(session: *Session, sid: u32) !*Stream {
     const stream = try Stream.create(session, sid);
     session.lockStreams();
     try session.streams.put(session.allocator, sid, stream);
     session.unlockStreams();
     _ = session.refs.fetchAdd(1, .monotonic); // session-ref for this stream
+    stream.owns_session_ref = true; // lifetime bound to the Stream struct
     return stream;
 }
 
@@ -2386,10 +2488,14 @@ test "C2: session-death (requestClose) wakes ALL streams; no leak, refs released
     session.unlockStreams();
     try std.testing.expect(empty);
 
-    // Relays close: dropped_map=false (death evicted them) -> only relay ref
-    // drops; the death already dropped map+session refs. This is the last ref on
-    // each Stream -> freed (leak detector validates). And the synthetic
-    // session-ref drop below frees the Session.
+    // Relays close: dropped_map=false (death evicted them) -> only the relay
+    // ref drops. Death dropped the map-presence ref but, under the NEW model, NOT
+    // the per-stream session-ref — that one is bound to the Stream struct and is
+    // dropped now, as the relay-borrow drop frees each Stream (releaseStreamRef
+    // drops it LAST). So at this point the Session still holds: 1 synthetic ref +
+    // 1 session-ref per still-living Stream. The two close()es free the Streams
+    // and return their session-refs; the synthetic drop below frees the Session.
+    // The leak detector validates each Stream is freed exactly once.
     s1.close();
     s2.close();
     session.releaseRef(); // drop the synthetic recv-loop stand-in ref -> finalize
@@ -2419,11 +2525,14 @@ test "C2: write-error escalates to requestClose; session marked dying" {
 test "C2: openStream registration-error rollback frees the stream (no leak)" {
     // Mirrors the openStream failure path AFTER the map put but BEFORE any error
     // escalation (e.g. an OOM in buildSettings/appendFrame/encodeSocksAddr). The
-    // stream is still in the map, so unregisterStreamOnOpenFail must drop ALL
-    // THREE refs it owns: map-presence, per-stream session-ref, and the
-    // relay-borrow ref (the caller gets an error and never calls Stream.close).
-    // A surviving relay-borrow ref would leak the Stream (buf + notifier fd),
-    // caught by std.testing.allocator.
+    // stream is still in the map, so unregisterStreamOnOpenFail drops the
+    // map-presence ref AND the relay-borrow ref (the caller gets an error and
+    // never calls Stream.close). The relay-borrow drop is the Stream's last ref,
+    // so the struct frees and — under the NEW ref model — releaseStreamRef drops
+    // the per-stream session-ref LAST as part of that free. Net: after rollback
+    // the session-ref has returned to its pre-registration count and the Stream
+    // is fully freed (a surviving relay-borrow ref would leak it; a double-drop
+    // would underflow the Session refcount). std.testing.allocator validates.
     const allocator = std.testing.allocator;
     const session = try testMakeSession(allocator);
     defer testDestroySession(session);
@@ -2433,8 +2542,8 @@ test "C2: openStream registration-error rollback frees the stream (no leak)" {
 
     session.unregisterStreamOnOpenFail(stream); // rollback (stream still in map)
 
-    // Map-presence + session-ref both dropped; the session-ref returns to its
-    // pre-registration count.
+    // The session-ref returns to its pre-registration count — but now it is
+    // dropped by the Stream's free (releaseStreamRef), not by unregister itself.
     try std.testing.expectEqual(refs_before - 1, session.refs.load(.acquire));
     session.lockStreams();
     try std.testing.expect(session.streams.get(1) == null);
@@ -2444,28 +2553,83 @@ test "C2: openStream registration-error rollback frees the stream (no leak)" {
 
 test "C2: openStream write-error rollback after eviction drops only relay ref (no UAF)" {
     // Mirrors openStream's write-error path: writeSessionPayload fails ->
-    // requestClose(.write_error) evicts the just-registered stream and drops its
-    // map-presence + session-ref. The errdefer then runs
-    // unregisterStreamOnOpenFail, which must NOT drop those two a second time
-    // (double-release -> Session use-after-free) and must drop ONLY the
-    // relay-borrow ref so the Stream is freed exactly once. Run under the leak
-    // detector to validate no leak and no double-free.
+    // requestClose(.write_error) evicts the just-registered stream. Under the NEW
+    // ref model requestClose drops ONLY the map-presence ref; the per-stream
+    // session-ref stays alive, bound to the still-living Stream struct (the
+    // relay-borrow ref keeps the struct alive). The errdefer then runs
+    // unregisterStreamOnOpenFail, which finds the stream already out of the map
+    // and so drops ONLY the relay-borrow ref. That is the Stream's last ref:
+    // releaseStreamRef frees the struct and THEN drops the per-stream session-ref
+    // exactly once. No double-release, no UAF. The leak detector validates the
+    // Stream is freed exactly once and the Session refcount stays balanced.
     const allocator = std.testing.allocator;
     const session = try testMakeSession(allocator);
 
     const stream = try testRegisterStream(session, 1); // refs=2, +1 session-ref
+    const refs_after_register = session.refs.load(.acquire);
 
-    // requestClose evicts the stream: drops map-presence + session-ref, marks
-    // dying, clears the map. The stream now holds only its relay-borrow ref.
+    // requestClose evicts the stream: drops ONLY the map-presence ref, marks
+    // dying, clears the map. The stream now holds only its relay-borrow ref, and
+    // its per-stream session-ref is STILL alive (not dropped at eviction).
     session.requestClose(.write_error);
     try std.testing.expectEqual(@as(u8, 1), stream.refs.load(.acquire));
+    // The session-ref survives eviction (this is the UAF fix): refcount unchanged
+    // by requestClose's per-stream handling.
+    try std.testing.expectEqual(refs_after_register, session.refs.load(.acquire));
 
-    // errdefer rollback: stream no longer in map (removed == false), so the
-    // session-ref must NOT be dropped again; only the relay-borrow ref drops.
+    // errdefer rollback: stream no longer in map (removed == false), so only the
+    // relay-borrow ref drops -> Stream frees -> session-ref dropped LAST.
     session.unregisterStreamOnOpenFail(stream); // frees the Stream exactly here.
+    try std.testing.expectEqual(refs_after_register - 1, session.refs.load(.acquire));
 
     // The synthetic recv-loop stand-in ref is the only Session ref left.
     session.releaseRef(); // -> finalize, no UAF
+}
+
+test "C3b: requestClose-then-relay-close cannot UAF the Session (regression)" {
+    // Reproduces the original HIGH UAF and proves it fixed. OLD model: the
+    // per-stream Session-ref was dropped at MAP-REMOVAL time (in requestClose),
+    // decoupled from the Stream struct's actual free. The relay still held the
+    // Stream via its relay-borrow ref. Once the only other Session-ref (the
+    // synthetic recv-loop stand-in) was gone, Session.refs hit 0 and finalize()
+    // FREED the Session while the relay's Stream still pointed at it; the relay's
+    // Stream.close() then dereferenced the freed Session (sendFin/streamClosed/
+    // releaseRef) -> UAF.
+    //
+    // NEW model: requestClose drops only the map-presence ref; the per-stream
+    // Session-ref is bound to the Stream struct and survives. The Session CANNOT
+    // finalize while the Stream is alive. Only when the relay's close() drops the
+    // last Stream ref does releaseStreamRef free the Stream and THEN drop the
+    // Session-ref, finalizing the Session exactly once, strictly after the Stream
+    // is gone. Run under std.testing.allocator: any UAF/double-free/leak fails.
+    const allocator = std.testing.allocator;
+    const session = try testMakeSession(allocator); // refs=1 (synthetic stand-in)
+
+    const s = try testRegisterStream(session, 1); // refs=2 (session-ref + stand-in)
+    try std.testing.expectEqual(@as(u32, 2), session.refs.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 2), s.refs.load(.acquire)); // map + relay
+
+    // Death: drops the map-presence ref (Stream.refs 2 -> 1, relay-borrow only)
+    // and clears the map. The per-stream Session-ref is NOT dropped here.
+    session.requestClose(.shutdown);
+    try std.testing.expectEqual(@as(u8, 1), s.refs.load(.acquire));
+
+    // CRITICAL: drop the synthetic stand-in NOW, simulating the recv-loop ref
+    // going away while the relay still holds the Stream. Under the OLD model this
+    // would have finalized the Session (refs would be 1 -> 0 had the session-ref
+    // already been dropped). Under the NEW model the Stream still owns a
+    // Session-ref, so refs goes 2 -> 1 and the Session stays ALIVE.
+    session.releaseRef();
+    try std.testing.expectEqual(@as(u32, 1), session.refs.load(.acquire));
+
+    // The relay now closes its Stream. Stream.close dereferences session
+    // (sendFin / streamClosed) — this is the exact deref that UAF'd before — then
+    // drops the last Stream ref. releaseStreamRef frees the Stream and finally
+    // drops the per-stream Session-ref, taking Session.refs 1 -> 0 and finalizing
+    // the Session exactly ONCE, only after the Stream is gone.
+    s.close();
+    // No assertions on `session` after this point: it is now freed (validated by
+    // the leak detector: exactly one Session alloc, exactly one free, no UAF).
 }
 
 test "C2: openStream write failure runs both errdefers without double-free" {

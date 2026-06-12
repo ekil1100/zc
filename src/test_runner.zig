@@ -32,6 +32,7 @@ test "include zc test modules" {
     _ = @import("proxy/http_test.zig");
     _ = @import("proxy/mixed.zig");
     _ = @import("proxy/mixed_test.zig");
+    _ = @import("proxy/outbound/anytls_pool.zig");
     _ = @import("proxy/outbound/manager.zig");
     _ = @import("proxy/outbound/proxy_type_test.zig");
     _ = @import("proxy/outbound/shadowsocks.zig");
