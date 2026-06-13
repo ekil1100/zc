@@ -1305,3 +1305,204 @@ test "D7 e2e: full udpRelayLoop with a stand-in opener — open on first datagra
     session_ptr.requestClose(.shutdown);
     session_ptr.releaseRef();
 }
+
+// ===========================================================================
+// D8: REAL udpRelayLoop INBOUND reply branch (c) — full round-trip e2e
+// ===========================================================================
+//
+// Unlike D7 e2e#1 (which drives readDatagram/buildClientDatagram/posixSendTo
+// MANUALLY, outside the loop) and D7 e2e#2 (whose stand-in OUTBOUND write fails
+// before branch (c) is reached), this test genuinely routes through the REAL
+// udpRelayLoop's INBOUND branch (c): poll the UotStream notifier fd ->
+// readDatagram -> buildClientDatagram -> posixSendTo back to the learned
+// client_addr.
+//
+// What makes branch (c) reachable here that wasn't before: a stand-in
+// anytls.Session has conn=null, so the relay's OUTBOUND writeDatagram normally
+// fails with error.StreamClosed and the loop returns BEFORE ever polling the
+// notifier. We install the test-only `test_outbound_sink` seam on the Session so
+// that outbound write SUCCEEDS (bytes captured, no TLS) — the loop keeps running,
+// adds the per-stream notifier fd to its poll set, and when we make an INBOUND
+// UoT frame available via testAppendInbound (== what the real recv-loop demux
+// delivers), the notifier fires and the REAL branch (c) runs end-to-end.
+//
+// PROOF branch (c) ran (not the steps manually): the assertion reads a SOCKS5-UDP
+// datagram off the TEST's real client UDP socket. The ONLY code path that
+// posixSendTo's to that socket from the learned client_addr is branch (c) inside
+// udpRelayLoop — the test never calls buildClientDatagram / posixSendTo on ufd
+// itself. The decoded payload + source addr must equal the inbound UoT frame.
+
+/// Shared rendezvous between the relay-thread opener and the test thread. The
+/// opener publishes the stand-in Stream/Session it created (so the test can feed
+/// an inbound frame) and signals when the relay's OUTBOUND write reached the
+/// stand-in sink (== the loop processed the client datagram and is now polling
+/// the notifier, so branch (c) is armed).
+const BranchCRendezvous = struct {
+    stream: std.atomic.Value(?*anytls.Stream) = .init(null),
+    session: std.atomic.Value(?*anytls.Session) = .init(null),
+    outbound_seen: std.atomic.Value(bool) = .init(false),
+
+    /// The test-only outbound sink: records that the relay's outbound writeDatagram
+    /// fragmented at least one frame through the stand-in Session.
+    fn sink(ctx: ?*anyopaque, payload: []const u8) void {
+        _ = payload;
+        const self: *BranchCRendezvous = @ptrCast(@alignCast(ctx.?));
+        self.outbound_seen.store(true, .release);
+    }
+};
+
+test "D8 e2e: REAL udpRelayLoop inbound branch (c) -> SOCKS5-UDP datagram on a real client socket" {
+    const allocator = testing.allocator;
+    const Config = @import("../config.zig").Config;
+    const ProxyGroup = @import("../config.zig").ProxyGroup;
+    const Rule = @import("../config.zig").Rule;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(@import("../config.zig").Proxy).empty,
+        .proxy_groups = std.ArrayList(ProxyGroup).empty,
+        .rules = std.ArrayList(Rule).empty,
+    };
+    defer cfg.deinit();
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    var rv = BranchCRendezvous{};
+
+    // Stand-in opener: returns a UDP ProxyStream over a REAL anytls.Stream
+    // (conn=null) whose Session has the test outbound sink installed so the
+    // relay's OUTBOUND writeDatagram succeeds. Publishes the Stream/Session to
+    // the rendezvous so the test thread can feed the inbound UoT frame.
+    const StandinOpener = struct {
+        allocator: std.mem.Allocator,
+        rv: *BranchCRendezvous,
+        fn open(self: @This(), proxy_name: []const u8) anyerror!ProxyStream {
+            _ = proxy_name;
+            const s = try makeStandinStream(self.allocator);
+            s.session.test_outbound_ctx = self.rv;
+            s.session.test_outbound_sink = BranchCRendezvous.sink;
+            self.rv.session.store(s.session, .release);
+            self.rv.stream.store(s.stream, .release);
+            const u = try self.allocator.create(ManagerLessAnyTlsUdp);
+            u.* = ManagerLessAnyTlsUdp.init(self.allocator, s.stream);
+            return ProxyStream.initAnyTlsUdp(self.allocator, u);
+        }
+    };
+
+    const pair = try makeControlPair();
+    defer pair.control.close();
+
+    // Bind the relay's client-facing UDP socket (production binds this in
+    // handleSocks5Associate and hands it to the loop; the loop is the unit under
+    // test). Send the ASSOCIATE reply as production would so the SOCKS5 client
+    // (this test) learns BND.PORT.
+    const ufd = try compat.udpSocket4();
+    defer compat.posixClose(ufd);
+    try compat.setNonBlock(ufd);
+    const bnd = try compat.udpGetSockName(ufd);
+    try pair.control.writeAll(&buildAssociateReply(bnd.port));
+
+    const conn = net.Server.Connection{ .stream = pair.control, .address = try net.Address.parseIp4("127.0.0.1", 1) };
+    const opener = StandinOpener{ .allocator = allocator, .rv = &rv };
+
+    const T = struct {
+        fn run(o: StandinOpener, c: net.Server.Connection, e: *Engine, fd: std.posix.fd_t, done: *std.atomic.Value(bool)) void {
+            udpRelayLoop(o, c, e, fd) catch {};
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const th = try std.Thread.spawn(.{}, T.run, .{ opener, conn, &engine, ufd, &done });
+
+    // Single hang-proof + double-close-proof teardown for ALL exit paths (normal
+    // and any early `try`-error return): close pair.peer ONCE to drive the
+    // control-TCP EOF that returns udpRelayLoop, then JOIN the relay thread.
+    var torn_down = false;
+    const Teardown = struct {
+        fn run(p: net.Stream, t: std.Thread, flag: *bool) void {
+            if (flag.*) return;
+            flag.* = true;
+            p.close(); // EOF on the relay's control fd -> udpRelayLoop returns
+            t.join(); // bounded: the loop returns promptly on EOF
+        }
+    };
+    defer Teardown.run(pair.peer, th, &torn_down);
+
+    // The TEST is the SOCKS5 UDP client. Read the ASSOCIATE reply to confirm
+    // BND.PORT, then send a SOCKS5-UDP datagram (target 1.1.1.1:53 + payload) to
+    // that bound port from a real loopback UDP socket so the loop learns
+    // client_addr and lazily opens the upstream via the injected opener.
+    var reply: [10]u8 = undefined;
+    try testing.expectEqual(@as(usize, 10), try pair.peer.read(&reply));
+    try testing.expectEqual(@as(u8, 0x05), reply[0]);
+    try testing.expectEqual(@as(u8, 0x00), reply[1]);
+    const reply_port = (@as(u16, reply[8]) << 8) | reply[9];
+    try testing.expectEqual(bnd.port, reply_port);
+
+    const cfd = try compat.udpSocket4();
+    defer compat.posixClose(cfd);
+    try compat.setNonBlock(cfd); // bounded poll on the inbound reply -> no hang
+    var dst = std.c.sockaddr.in{ .family = std.c.AF.INET, .port = std.mem.nativeToBig(u16, reply_port), .addr = undefined };
+    @memcpy(std.mem.asBytes(&dst.addr)[0..4], &[4]u8{ 127, 0, 0, 1 });
+    // target 1.1.1.1:53 + "DNSQ"
+    const out_dgram = [_]u8{ 0, 0, 0, 0x01, 1, 1, 1, 1, 0x00, 0x35, 'D', 'N', 'S', 'Q' };
+    _ = try compat.posixSendTo(cfd, &out_dgram, 0, @ptrCast(&dst), @sizeOf(std.c.sockaddr.in));
+
+    // Wait (bounded) until the relay's OUTBOUND writeDatagram reached the sink:
+    // this guarantees the loop learned client_addr, opened the upstream, sent the
+    // outbound frame, and is now polling the notifier — branch (c) is armed.
+    {
+        var tries: usize = 0;
+        while (!rv.outbound_seen.load(.acquire)) : (tries += 1) {
+            if (tries >= 5000) return error.OutboundTimeout; // ~5s deadline
+            compat.sleepNs(1 * std.time.ns_per_ms);
+        }
+    }
+
+    const stream = rv.stream.load(.acquire).?;
+    const session = rv.session.load(.acquire).?;
+
+    // Make an INBOUND UoT v2 frame available exactly as the recv-loop demux would
+    // ([SOCKS-addr(1.2.3.4:9000)][len u16 BE][payload]). testAppendInbound signals
+    // the stream notifier -> the REAL loop's poll wakes on fds[2] -> branch (c).
+    const src = mkSocksAddrV4(.{ 1, 2, 3, 4 }, 9000);
+    const frame = try frameBytes(allocator, src, "PONG");
+    defer allocator.free(frame);
+    stream.testAppendInbound(frame);
+
+    // ASSERT branch (c) ran: the TEST's client socket receives the SOCKS5-UDP
+    // datagram that ONLY branch (c)'s buildClientDatagram + posixSendTo could have
+    // produced. Bounded poll on the nonblocking client socket.
+    var got: [256]u8 = undefined;
+    const rf = blk: {
+        var tries: usize = 0;
+        while (tries < 5000) : (tries += 1) {
+            const r = compat.udpRecvFrom(cfd, &got) catch |e| switch (e) {
+                error.WouldBlock => {
+                    compat.sleepNs(1 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return e,
+            };
+            break :blk r;
+        }
+        return error.InboundReplyTimeout;
+    };
+    const dg = try parseClientDatagram(got[0..rf.n]);
+    try testing.expectEqualStrings("PONG", dg.payload);
+    try testing.expectEqualSlices(u8, src.slice(), dg.addr.slice());
+
+    // Tear down: close the control TCP -> the relay's control-fd poll wakes,
+    // read()==0, udpRelayLoop returns. Join (guarded, idempotent) and confirm
+    // no hang.
+    Teardown.run(pair.peer, th, &torn_down);
+    try testing.expect(done.load(.acquire));
+
+    // Free the stand-in Session (the relay's ProxyStream.close already freed the
+    // UotStream wrapper + dropped the stream refs); drive recv-loop-exit teardown.
+    session.requestClose(.shutdown);
+    session.releaseRef();
+}

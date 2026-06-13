@@ -283,6 +283,15 @@ pub const Session = struct {
     /// Owned dup of the pool's key, freed in finalize. Empty for non-pooled.
     pool_key: []u8 = &.{},
 
+    /// TEST-ONLY outbound sink. When non-null, `writeSessionPayload` delivers the
+    /// shaped-payload bytes here INSTEAD of the (absent) TLS connection, so a
+    /// stand-in Session (conn=null) can have a SUCCEEDING outbound write. This is
+    /// the seam the udp_uot D-stage branch-(c) e2e uses to drive the REAL
+    /// udpRelayLoop's outbound leg without a TLS handshake. NEVER set in
+    /// production (the production path always has a real `conn`).
+    test_outbound_sink: ?*const fn (ctx: ?*anyopaque, payload: []const u8) void = null,
+    test_outbound_ctx: ?*anyopaque = null,
+
     fn lockStreams(self: *Session) void {
         std.Io.Threaded.mutexLock(&self.streams_mutex);
     }
@@ -404,6 +413,17 @@ pub const Session = struct {
     fn writeSessionPayload(self: *Session, payload: []const u8) !void {
         self.lockTls();
         defer self.unlockTls();
+
+        // TEST-ONLY seam: a stand-in Session (conn=null) with a test sink set
+        // delivers the logical payload to the sink and returns success, so the
+        // REAL relay's outbound writeDatagram does not fail before branch (c).
+        if (self.conn == null) {
+            if (self.test_outbound_sink) |sink| {
+                self.packet_counter += 1;
+                sink(self.test_outbound_ctx, payload);
+                return;
+            }
+        }
 
         const conn = self.conn orelse return error.NotConnected;
         self.packet_counter += 1;
