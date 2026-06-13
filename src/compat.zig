@@ -293,6 +293,16 @@ pub fn udpSocket4() !std.posix.fd_t {
     return socket.handle;
 }
 
+/// Set O_NONBLOCK on a socket fd. udpSocket4() returns a BLOCKING socket on this
+/// toolchain (std.Io.Threaded), so the poll-driven UoT relay MUST mark its client
+/// UDP socket nonblocking before polling — otherwise recvfrom blocks the worker.
+pub fn setNonBlock(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.SetNonblockFailed;
+    const nb: c_int = flags | @as(c_int, @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))));
+    if (std.c.fcntl(fd, std.posix.F.SETFL, nb) < 0) return error.SetNonblockFailed;
+}
+
 pub fn fileRead(file: std.Io.File, buffer: []u8) !usize {
     return posixRead(file.handle, buffer);
 }

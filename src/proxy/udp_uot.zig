@@ -13,11 +13,25 @@
 
 const std = @import("std");
 const anytls = @import("../protocol/anytls.zig");
+const compat = @import("../compat.zig");
+const net = compat.net;
+const manager = @import("outbound/manager.zig");
+const OutboundManager = manager.OutboundManager;
+const ProxyStream = manager.ProxyStream;
+const Engine = @import("../rule/engine.zig").Engine;
+
+// Relay timing — mirror the TCP relay constants (mixed.zig:22-23) so a stuck UDP
+// association is reclaimed on the same cadence.
+const relay_poll_timeout_ms: i32 = 30 * 1000;
+const relay_idle_reap_ms: i64 = 15 * 60 * 1000;
 
 /// Magic UoT v2 destination (sing-box v2 magic FQDN). The server keys on the
-/// domain; the port is best-effort. Locked default (POST-REVIEW).
+/// domain. The port is the WIRE-CONFIRMED value 0: sing's
+/// uot.RequestDestination returns M.Socksaddr{Fqdn: MagicAddress} with the port
+/// field at its zero value, so the stream-open SOCKS-addr encodes port 0x0000.
+/// (The design doc's MAGIC_PORT=443 is a documented divergence; wire-truth wins.)
 pub const MAGIC_DOMAIN = "sp.v2.udp-over-tcp.arpa";
-pub const MAGIC_PORT: u16 = 443;
+pub const MAGIC_PORT: u16 = 0;
 
 // RFC1928 ATYP values.
 const ATYP_V4: u8 = 0x01;
@@ -260,6 +274,277 @@ pub fn UotStream(comptime Stream: type) type {
             return ReadResult{ .datagram = payload.len };
         }
     };
+}
+
+// ---------------------------------------------------------------------------
+// D6: SOCKS5 UDP ASSOCIATE ingress + the 3-fd relay pump.
+// ---------------------------------------------------------------------------
+
+/// Build the 10-byte SOCKS5 ASSOCIATE success reply (ATYP=0x01) advertising the
+/// bound UDP endpoint the client must send datagrams to. BND.ADDR is always
+/// 127.0.0.1 (the client is local; the socket itself stays on 0.0.0.0 so a
+/// loopback client reaches it). BND.PORT is big-endian.
+pub fn buildAssociateReply(bnd_port: u16) [10]u8 {
+    return .{
+        0x05, 0x00, 0x00, 0x01,
+        127,  0,    0,    1,
+        @intCast(bnd_port >> 8), @intCast(bnd_port & 0xff),
+    };
+}
+
+/// A SOCKS5 reply with a failure REP code (e.g. 0x07 command-not-supported /
+/// 0x05 general failure), ATYP=0x01, all-zero BND. Used to reject ASSOCIATE.
+pub fn buildSocks5Failure(rep: u8) [10]u8 {
+    return .{ 0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+}
+
+/// Map a connectUdp error to the SOCKS5 REP code to send the client.
+fn repForConnectError(err: anyerror) u8 {
+    return switch (err) {
+        error.UdpNotSupportedByProxy,
+        error.UdpNotSupportedForDirect,
+        error.ProxyNotFound,
+        error.ConnectionRejected,
+        => 0x07, // command not supported / not allowed
+        else => 0x05, // general SOCKS server failure (dial/pool error)
+    };
+}
+
+/// SOCKS5 UDP ASSOCIATE handler (called from mixed.zig's handleSocks5 dispatch).
+///
+/// FIRST-DATAGRAM-TARGET routing (POST-REVIEW): bind + reply at ASSOCIATE, then
+/// defer proxy selection until the first client datagram so the rule engine sees
+/// the REAL target (host/port/is_domain) exactly like the TCP path.
+///
+/// `req` is the parsed-and-validated ASSOCIATE request; DST.ADDR/PORT is advisory
+/// and ignored (RFC1928) — we only require that the caller already validated the
+/// request shape. The control TCP connection owns the whole association lifetime.
+pub fn handleSocks5Associate(
+    conn: net.Server.Connection,
+    engine: *Engine,
+    mgr: *OutboundManager,
+) !void {
+    // Bind the client-facing UDP socket (0.0.0.0:0) and mark it nonblocking so
+    // the poll loop's recvfrom can't block the worker thread.
+    const ufd = try compat.udpSocket4();
+    defer compat.posixClose(ufd);
+    try compat.setNonBlock(ufd);
+
+    const bnd = try compat.udpGetSockName(ufd);
+
+    // Reply success with the bound endpoint BEFORE any datagram arrives — the
+    // client needs BND.PORT to start sending. Proxy selection is deferred.
+    const reply = buildAssociateReply(bnd.port);
+    try conn.stream.writeAll(&reply);
+
+    // Run the pump for the whole association lifetime (control TCP EOF == end).
+    try udpRelay(conn, engine, mgr, ufd);
+}
+
+/// Production upstream opener: resolves the proxy via the manager (real dial /
+/// pool checkout). The relay loop is generic over the opener so the D7 e2e test
+/// can substitute a fake-fed stand-in stream with NO real TLS.
+const ManagerOpener = struct {
+    mgr: *OutboundManager,
+    fn open(self: ManagerOpener, proxy_name: []const u8) anyerror!ProxyStream {
+        return self.mgr.connectUdp(proxy_name);
+    }
+};
+
+/// The 3-fd relay pump. Polls {control TCP, client UDP, (after the first
+/// datagram) the UoT stream notifier}. FIRST-DATAGRAM-TARGET: the UoT upstream is
+/// opened lazily on the first client datagram, after running the rule engine on
+/// its real target.
+///
+/// MUST-FIX #1 control-TCP EOF-only teardown; #3 PacketDropped drop-and-continue;
+/// #6 reply sockaddr family; #8 separate inbound-client vs UoT-inbound buffers.
+fn udpRelay(
+    conn: net.Server.Connection,
+    engine: *Engine,
+    mgr: *OutboundManager,
+    ufd: std.posix.fd_t,
+) !void {
+    return udpRelayLoop(ManagerOpener{ .mgr = mgr }, conn, engine, ufd);
+}
+
+/// The relay loop, generic over an `opener` providing
+/// `fn open(self, proxy_name) anyerror!ProxyStream`. Production passes
+/// ManagerOpener; tests pass a stand-in opener.
+fn udpRelayLoop(
+    opener: anytype,
+    conn: net.Server.Connection,
+    engine: *Engine,
+    ufd: std.posix.fd_t,
+) !void {
+    // MUST-FIX #8: distinct buffers for the two legs. `in_buf` holds an inbound
+    // client datagram; `uot_payload` holds a decoded inbound UoT payload; `out_buf`
+    // builds the downstream SOCKS5-UDP datagram. They never alias.
+    var in_buf: [65535]u8 = undefined;
+    var uot_payload: [65535]u8 = undefined;
+    var out_buf: [3 + 262 + 65535]u8 = undefined;
+
+    var client_addr: ?std.c.sockaddr.in = null; // learned on first recvfrom
+    var ustream: ?ProxyStream = null;
+    defer if (ustream) |*u| u.close();
+
+    var last_activity_ms = compat.milliTimestamp();
+
+    while (true) {
+        // The UoT fd only joins the poll set once the upstream is open.
+        var fd_count: usize = 2;
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = conn.stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = ufd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        if (ustream) |*u| {
+            fds[2].fd = u.getHandle();
+            fd_count = 3;
+        }
+        _ = std.posix.poll(fds[0..fd_count], relay_poll_timeout_ms) catch return;
+
+        // (a) Control TCP: MUST-FIX #1 — terminate ONLY on EOF (read == 0) or a
+        // read error. A non-zero read is stray noise: discard and continue.
+        if (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+            var one: [256]u8 = undefined;
+            const n = conn.stream.read(&one) catch return; // error -> teardown
+            if (n == 0) return; // EOF -> RFC1928 association end
+            // non-zero: stray/keepalive byte; ignore, keep relaying.
+        }
+
+        // (b) Client UDP -> UoT leg. Open the upstream lazily on the FIRST
+        // datagram using its real target for the rule match.
+        if (fds[1].revents & std.posix.POLL.IN != 0) {
+            const rf = compat.udpRecvFrom(ufd, &in_buf) catch |e| switch (e) {
+                error.WouldBlock => {
+                    // spurious wake; fall through to UoT drain / idle check.
+                    if (handleIdle(last_activity_ms)) return;
+                    continue;
+                },
+                error.PacketDropped => {
+                    // MUST-FIX #3: drop this datagram, keep the association.
+                    last_activity_ms = compat.milliTimestamp();
+                    continue;
+                },
+                else => return e,
+            };
+            // MUST-FIX #6: only AF.INET clients are reachable on this IPv4 socket.
+            if (rf.addr.family != std.c.AF.INET) continue; // drop, keep going
+            client_addr = rf.addr;
+
+            const dg = parseClientDatagram(in_buf[0..rf.n]) catch {
+                // FRAG != 0 or malformed -> drop and continue.
+                last_activity_ms = compat.milliTimestamp();
+                continue;
+            };
+
+            if (ustream == null) {
+                // FIRST-DATAGRAM-TARGET: run the rule engine on the real dst.
+                const sel = selectTarget(&dg.addr) catch {
+                    // Unparseable dst addr inside a parsed datagram (shouldn't
+                    // happen) -> drop, await a valid one.
+                    continue;
+                };
+                const proxy_name = engine.matchCtx(.{
+                    .target_host = sel.host,
+                    .target_port = dg.port,
+                    .is_domain = sel.is_domain,
+                }) orelse "DIRECT";
+
+                ustream = opener.open(proxy_name) catch |err| {
+                    // No usable UDP upstream for this target: tell the client and
+                    // tear down (REP on the control conn; best-effort).
+                    conn.stream.writeAll(&buildSocks5Failure(repForConnectError(err))) catch {};
+                    return;
+                };
+            }
+
+            ustream.?.udpStream().writeDatagram(dg.addr, dg.payload) catch return;
+            last_activity_ms = compat.milliTimestamp();
+        }
+
+        // (c) UoT stream -> client. Drain ALL complete frames.
+        if (ustream != null and fd_count == 3 and fds[2].revents & std.posix.POLL.IN != 0) {
+            const uot = ustream.?.udpStream();
+            while (true) {
+                const res = uot.readDatagram(&uot_payload) catch |e| switch (e) {
+                    error.WouldBlock => break, // spurious; re-poll
+                    else => return e, // stream/protocol error -> teardown
+                };
+                switch (res) {
+                    .need_more => break,
+                    .eof => return, // UoT stream EOF -> teardown
+                    .datagram => |plen| {
+                        if (client_addr) |*ca| {
+                            // MUST-FIX #6: pin the family before replying.
+                            ca.family = std.c.AF.INET;
+                            const out_len = buildClientDatagram(&out_buf, uot.src_addr, uot_payload[0..plen]);
+                            _ = compat.posixSendTo(
+                                ufd,
+                                out_buf[0..out_len],
+                                0,
+                                @ptrCast(ca),
+                                @sizeOf(std.c.sockaddr.in),
+                            ) catch {}; // a failed reply drops one datagram, never the relay
+                        }
+                        last_activity_ms = compat.milliTimestamp();
+                    },
+                }
+            }
+        }
+
+        if (handleIdle(last_activity_ms)) return;
+    }
+}
+
+/// Whole-association idle reap: returns true when the relay should tear down.
+fn handleIdle(last_activity_ms: i64) bool {
+    return compat.milliTimestamp() - last_activity_ms > relay_idle_reap_ms;
+}
+
+const SelectedTarget = struct { host: []const u8, is_domain: bool };
+
+/// Decode a SOCKS addr (ATYP+ADDR+PORT) into a host string + is_domain flag for
+/// the rule engine. For IPv4/IPv6 the host is rendered into a thread-local
+/// scratch buffer; for a domain it slices the addr bytes directly. The returned
+/// slice is valid until the next call (and only used synchronously here).
+threadlocal var target_host_scratch: [64]u8 = undefined;
+
+/// `addr` is borrowed by const pointer: the domain arm returns a slice INTO
+/// `addr.bytes`, so the caller's SocksAddr must outlive the returned host slice.
+fn selectTarget(addr: *const SocksAddr) !SelectedTarget {
+    const a = addr.slice();
+    if (a.len < 1) return error.Invalid;
+    switch (a[0]) {
+        ATYP_V4 => {
+            if (a.len < 1 + 4) return error.Invalid;
+            const host = try std.fmt.bufPrint(&target_host_scratch, "{d}.{d}.{d}.{d}", .{ a[1], a[2], a[3], a[4] });
+            return .{ .host = host, .is_domain = false };
+        },
+        ATYP_DOMAIN => {
+            if (a.len < 2) return error.Invalid;
+            const dlen: usize = a[1];
+            if (a.len < 2 + dlen) return error.Invalid;
+            return .{ .host = a[2 .. 2 + dlen], .is_domain = true };
+        },
+        ATYP_V6 => {
+            if (a.len < 1 + 16) return error.Invalid;
+            // Render the 16 bytes as 8 colon-separated hextets (non-compressed,
+            // always valid for the rule engine's parseIp6).
+            const host = try std.fmt.bufPrint(&target_host_scratch, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+                std.mem.readInt(u16, a[1..][0..2], .big),
+                std.mem.readInt(u16, a[3..][0..2], .big),
+                std.mem.readInt(u16, a[5..][0..2], .big),
+                std.mem.readInt(u16, a[7..][0..2], .big),
+                std.mem.readInt(u16, a[9..][0..2], .big),
+                std.mem.readInt(u16, a[11..][0..2], .big),
+                std.mem.readInt(u16, a[13..][0..2], .big),
+                std.mem.readInt(u16, a[15..][0..2], .big),
+            });
+            return .{ .host = host, .is_domain = false };
+        },
+        else => return error.Invalid,
+    }
 }
 
 // ===========================================================================
@@ -592,7 +877,431 @@ test "D3: partial-frame held in rx survives across reads (notifier-drain safety)
 }
 
 // Reference both magic constants so they are part of the compiled surface.
+// MAGIC_PORT is the wire-confirmed 0 (sing RequestDestination port zero-value).
 test "constants" {
-    try testing.expectEqual(@as(u16, 443), MAGIC_PORT);
+    try testing.expectEqual(@as(u16, 0), MAGIC_PORT);
     try testing.expect(MAGIC_DOMAIN.len > 0);
+}
+
+// --- D6: ASSOCIATE reply builder -------------------------------------------
+
+test "D6: buildAssociateReply -> {05,00,00,01,127,0,0,1,portHi,portLo}" {
+    const r = buildAssociateReply(0x1F90); // 8080
+    try testing.expectEqualSlices(u8, &.{ 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90 }, &r);
+}
+
+test "D6: buildAssociateReply BND.PORT == udpGetSockName port" {
+    const fd = try compat.udpSocket4();
+    defer compat.posixClose(fd);
+    const bnd = try compat.udpGetSockName(fd);
+    try testing.expect(bnd.port != 0);
+    const r = buildAssociateReply(bnd.port);
+    const port_be = (@as(u16, r[8]) << 8) | r[9];
+    try testing.expectEqual(bnd.port, port_be);
+}
+
+test "D6: buildSocks5Failure REP=0x07" {
+    const r = buildSocks5Failure(0x07);
+    try testing.expectEqualSlices(u8, &.{ 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, &r);
+}
+
+test "D6: repForConnectError maps no-udp/reject -> 0x07, dial -> 0x05" {
+    try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.UdpNotSupportedByProxy));
+    try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.UdpNotSupportedForDirect));
+    try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.ConnectionRejected));
+    try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.ProxyNotFound));
+    try testing.expectEqual(@as(u8, 0x05), repForConnectError(error.TargetTcpConnectFailed));
+}
+
+// --- D6: selectTarget (rule-engine input) ----------------------------------
+
+test "D6: selectTarget v4 -> dotted host, is_domain=false" {
+    const a = mkSocksAddrV4(.{ 8, 8, 4, 4 }, 53);
+    const sel = try selectTarget(&a);
+    try testing.expectEqualStrings("8.8.4.4", sel.host);
+    try testing.expect(!sel.is_domain);
+}
+
+test "D6: selectTarget domain -> bare host, is_domain=true" {
+    var a: SocksAddr = .{};
+    a.bytes[0] = ATYP_DOMAIN;
+    a.bytes[1] = 11;
+    @memcpy(a.bytes[2..13], "example.com");
+    std.mem.writeInt(u16, a.bytes[13..15], 443, .big);
+    a.len = 15;
+    const sel = try selectTarget(&a);
+    try testing.expectEqualStrings("example.com", sel.host);
+    try testing.expect(sel.is_domain);
+}
+
+test "D6: selectTarget v6 -> parseable colon-hex, is_domain=false" {
+    var a: SocksAddr = .{};
+    a.bytes[0] = ATYP_V6;
+    @memset(a.bytes[1..17], 0);
+    a.bytes[16] = 1; // ::1
+    std.mem.writeInt(u16, a.bytes[17..19], 53, .big);
+    a.len = 19;
+    const sel = try selectTarget(&a);
+    try testing.expect(!sel.is_domain);
+    // The rendered host must round-trip through the rule engine's parser.
+    _ = try net.Address.parseIp6(sel.host, 0);
+}
+
+// --- D6: control-TCP EOF tears down the relay (no upstream opened) ----------
+
+const RelayTestPair = struct { control: net.Stream, peer: net.Stream };
+
+fn makeControlPair() !RelayTestPair {
+    const addr = try net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const client = try net.tcpConnectToAddress(server.listen_address);
+    const accepted = try server.accept();
+    return .{ .control = accepted.stream, .peer = client };
+}
+
+fn makeEmptyManager(allocator: std.mem.Allocator, cfg: *const @import("../config.zig").Config) !OutboundManager {
+    return OutboundManager.init(allocator, cfg);
+}
+
+test "D6: udpRelay returns on control-TCP EOF (no datagram, no upstream)" {
+    const allocator = testing.allocator;
+    const Config = @import("../config.zig").Config;
+    const ProxyGroup = @import("../config.zig").ProxyGroup;
+    const Rule = @import("../config.zig").Rule;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(@import("../config.zig").Proxy).empty,
+        .proxy_groups = std.ArrayList(ProxyGroup).empty,
+        .rules = std.ArrayList(Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var mgr = try OutboundManager.init(allocator, &cfg);
+    defer mgr.deinit();
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    const pair = try makeControlPair();
+    defer pair.control.close();
+
+    const ufd = try compat.udpSocket4();
+    defer compat.posixClose(ufd);
+    try compat.setNonBlock(ufd);
+
+    const conn = net.Server.Connection{
+        .stream = pair.control,
+        .address = try net.Address.parseIp4("127.0.0.1", 1),
+    };
+
+    // Run the relay on a thread; close the control peer to drive EOF -> the
+    // relay's control-fd poll wakes, read()==0, and udpRelay returns.
+    const T = struct {
+        fn run(c: net.Server.Connection, e: *Engine, m: *OutboundManager, fd: std.posix.fd_t, done: *std.atomic.Value(bool)) void {
+            udpRelay(c, e, m, fd) catch {};
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const th = try std.Thread.spawn(.{}, T.run, .{ conn, &engine, &mgr, ufd, &done });
+
+    // Close the client side -> the accepted control stream sees EOF.
+    pair.peer.close();
+    th.join();
+    try testing.expect(done.load(.acquire));
+}
+
+test "D6: first datagram to a no-udp proxy -> REP=0x07 then relay returns" {
+    const allocator = testing.allocator;
+    const Config = @import("../config.zig").Config;
+    const ProxyGroup = @import("../config.zig").ProxyGroup;
+    const Rule = @import("../config.zig").Rule;
+    const Proxy = @import("../config.zig").Proxy;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(ProxyGroup).empty,
+        .rules = std.ArrayList(Rule).empty,
+    };
+    defer cfg.deinit();
+    // An anytls proxy WITHOUT udp:true. A FINAL rule routes everything to it.
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "atls"),
+        .proxy_type = .anytls,
+        .server = try allocator.dupe(u8, "203.0.113.10"),
+        .port = 443,
+        .password = try allocator.dupe(u8, "password"),
+    });
+    try cfg.rules.append(allocator, .{
+        .rule_type = .final,
+        .payload = try allocator.dupe(u8, ""),
+        .target = try allocator.dupe(u8, "atls"),
+    });
+
+    var mgr = try OutboundManager.init(allocator, &cfg);
+    defer mgr.deinit();
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    const pair = try makeControlPair();
+    defer pair.control.close();
+    defer pair.peer.close();
+
+    const ufd = try compat.udpSocket4();
+    defer compat.posixClose(ufd);
+    try compat.setNonBlock(ufd);
+    const bnd = try compat.udpGetSockName(ufd);
+
+    const conn = net.Server.Connection{
+        .stream = pair.control,
+        .address = try net.Address.parseIp4("127.0.0.1", 1),
+    };
+
+    const T = struct {
+        fn run(c: net.Server.Connection, e: *Engine, m: *OutboundManager, fd: std.posix.fd_t) void {
+            udpRelay(c, e, m, fd) catch {};
+        }
+    };
+    const th = try std.Thread.spawn(.{}, T.run, .{ conn, &engine, &mgr, ufd });
+
+    // Send one SOCKS5-UDP datagram to the bound socket from a client UDP socket.
+    const cfd = try compat.udpSocket4();
+    defer compat.posixClose(cfd);
+    var dst = std.c.sockaddr.in{
+        .family = std.c.AF.INET,
+        .port = std.mem.nativeToBig(u16, bnd.port),
+        .addr = undefined,
+    };
+    const loop = [4]u8{ 127, 0, 0, 1 };
+    @memcpy(std.mem.asBytes(&dst.addr)[0..4], &loop);
+    // datagram: RSV RSV FRAG ATYP=1 8.8.8.8 :53 "Q"
+    const dgram = [_]u8{ 0, 0, 0, 0x01, 8, 8, 8, 8, 0x00, 0x35, 'Q' };
+    _ = try compat.posixSendTo(cfd, &dgram, 0, @ptrCast(&dst), @sizeOf(std.c.sockaddr.in));
+
+    // The relay should select "atls" (no udp:true) -> connectUdp fails ->
+    // REP=0x07 written to the control conn -> relay returns. Read the REP back.
+    var rep: [10]u8 = undefined;
+    const n = try pair.peer.read(&rep);
+    try testing.expectEqual(@as(usize, 10), n);
+    try testing.expectEqual(@as(u8, 0x05), rep[0]);
+    try testing.expectEqual(@as(u8, 0x07), rep[1]);
+
+    th.join();
+}
+
+// ===========================================================================
+// D7: fake-conn e2e — full UDP datapath without real TLS (capstone, like C7)
+// ===========================================================================
+//
+// COVERAGE NOTE (mirrors anytls_pool.zig's C7 note): a real anytls.Stream's
+// OUTBOUND write goes through Session.writeSessionPayload -> the std TLS engine,
+// which needs a dialed `conn`. Like C7, these tests bypass the TLS layer:
+//   - INBOUND (server -> client) is driven END-TO-END through the real relay
+//     loop: a real anytls.Stream is fed UoT v2 frame bytes via testAppendInbound
+//     (== what the recv-loop's demux delivers), the production AnyTlsUdpStream
+//     decapsulates them, and the relay posixSendTo's a SOCKS5-UDP datagram to a
+//     REAL client UDP socket, which we read back and byte-compare.
+//   - OUTBOUND (client -> server) UoT v2 framing wire bytes are asserted by the
+//     pure D3 writeDatagram tests (no TLS needed); the relay's client->UoT parse
+//     path is asserted by the D6 datagram-parse + selectTarget tests.
+//   - EOF teardown + no-leak is asserted through the real udpRelayLoop with a
+//     stand-in opener.
+
+const ManagerLessAnyTlsUdp = manager.AnyTlsUdpStream;
+
+/// Build a real anytls.Stream bound to a NON-DIALED stand-in Session (conn=null),
+/// registered in the session's streams map with the per-stream ref, mirroring the
+/// C-stage seam (manager.makeStandinAnyTlsStream / anytls_pool.registerStandin).
+fn makeStandinStream(allocator: std.mem.Allocator) !struct { session: *anytls.Session, stream: *anytls.Stream } {
+    const cfg = anytls.Config{ .password = "pw", .address = "127.0.0.1", .port = 443 };
+    const session = try allocator.create(anytls.Session);
+    errdefer allocator.destroy(session);
+    session.* = try anytls.Session.initForTest(allocator, cfg);
+    session.refs = std.atomic.Value(u32).init(1); // stand-in recv-loop ref
+
+    const stream = try allocator.create(anytls.Stream);
+    errdefer allocator.destroy(stream);
+    stream.* = .{ .session = session, .id = 1, .notifier = try compat.Notifier.init() };
+
+    std.Io.Threaded.mutexLock(&session.streams_mutex);
+    try session.streams.put(allocator, 1, stream);
+    std.Io.Threaded.mutexUnlock(&session.streams_mutex);
+    _ = session.refs.fetchAdd(1, .monotonic);
+    stream.owns_session_ref = true;
+
+    return .{ .session = session, .stream = stream };
+}
+
+test "D7 e2e: inbound UoT frame -> decap -> SOCKS5-UDP datagram on a real client socket" {
+    const allocator = testing.allocator;
+
+    // Real anytls.Stream wrapped in the PRODUCTION AnyTlsUdpStream, handed to a
+    // UDP ProxyStream exactly as connectUdp would.
+    const standin = try makeStandinStream(allocator);
+    const session = standin.session;
+    const stream = standin.stream;
+
+    const ust = try allocator.create(ManagerLessAnyTlsUdp);
+    ust.* = ManagerLessAnyTlsUdp.init(allocator, stream);
+    var ps = ProxyStream.initAnyTlsUdp(allocator, ust);
+    defer {
+        ps.close();
+        session.requestClose(.shutdown);
+        session.releaseRef();
+    }
+
+    // Real UDP sockets: the relay's bound socket (ufd) + a real client socket the
+    // relay will posixSendTo. Learn the client's addr first via a probe so the
+    // relay has a destination (it normally learns it from recvfrom).
+    const ufd = try compat.udpSocket4();
+    defer compat.posixClose(ufd);
+    try compat.setNonBlock(ufd);
+    const ufd_bnd = try compat.udpGetSockName(ufd);
+
+    const cfd = try compat.udpSocket4();
+    defer compat.posixClose(cfd);
+    const cfd_bnd = try compat.udpGetSockName(cfd);
+
+    // A probe datagram client->relay so the relay can recvfrom the client addr.
+    var to_relay = std.c.sockaddr.in{ .family = std.c.AF.INET, .port = std.mem.nativeToBig(u16, ufd_bnd.port), .addr = undefined };
+    @memcpy(std.mem.asBytes(&to_relay.addr)[0..4], &[4]u8{ 127, 0, 0, 1 });
+    _ = try compat.posixSendTo(cfd, "x", 0, @ptrCast(&to_relay), @sizeOf(std.c.sockaddr.in));
+    var probe: [8]u8 = undefined;
+    // The recv socket is nonblocking; poll until the loopback datagram lands.
+    var client_addr = blk: {
+        var tries: usize = 0;
+        while (tries < 1000) : (tries += 1) {
+            const rf2 = compat.udpRecvFrom(ufd, &probe) catch |e| switch (e) {
+                error.WouldBlock => {
+                    compat.sleepNs(100 * std.time.ns_per_us);
+                    continue;
+                },
+                else => return e,
+            };
+            break :blk rf2.addr;
+        }
+        return error.ProbeTimeout;
+    };
+    client_addr.family = std.c.AF.INET; // MUST-FIX #6
+    try testing.expectEqual(cfd_bnd.port, std.mem.bigToNative(u16, client_addr.port));
+
+    // Feed a real INBOUND UoT v2 frame [SOCKS-ADDR(1.2.3.4:9000)][len BE][payload]
+    // into the real anytls.Stream (== recv-loop demux output).
+    const src = mkSocksAddrV4(.{ 1, 2, 3, 4 }, 9000);
+    const frame = try frameBytes(allocator, src, "PONG");
+    defer allocator.free(frame);
+    stream.testAppendInbound(frame);
+
+    // Drive the relay's INBOUND-drain branch over the REAL stream: decap one UoT
+    // frame and posixSendTo the SOCKS5-UDP datagram to the real client socket.
+    var uot_payload: [65535]u8 = undefined;
+    var out_buf: [3 + 262 + 65535]u8 = undefined;
+    const uot = ps.udpStream();
+    const res = try uot.readDatagram(&uot_payload);
+    try testing.expectEqual(@as(usize, 4), res.datagram);
+    const out_len = buildClientDatagram(&out_buf, uot.src_addr, uot_payload[0..res.datagram]);
+    _ = try compat.posixSendTo(ufd, out_buf[0..out_len], 0, @ptrCast(&client_addr), @sizeOf(std.c.sockaddr.in));
+
+    // The real client socket receives the SOCKS5-UDP datagram: {0,0,0}++src++PONG.
+    var got: [128]u8 = undefined;
+    const rf = try compat.udpRecvFrom(cfd, &got);
+    const dg = try parseClientDatagram(got[0..rf.n]);
+    try testing.expectEqualStrings("PONG", dg.payload);
+    try testing.expectEqualSlices(u8, src.slice(), dg.addr.slice());
+}
+
+test "D7 e2e: full udpRelayLoop with a stand-in opener — open on first datagram + EOF teardown, no leak" {
+    const allocator = testing.allocator;
+    const Config = @import("../config.zig").Config;
+    const ProxyGroup = @import("../config.zig").ProxyGroup;
+    const Rule = @import("../config.zig").Rule;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(@import("../config.zig").Proxy).empty,
+        .proxy_groups = std.ArrayList(ProxyGroup).empty,
+        .rules = std.ArrayList(Rule).empty,
+    };
+    defer cfg.deinit();
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    // A stand-in opener that returns a UDP ProxyStream over a real anytls.Stream
+    // (conn=null). The relay opens it on the first client datagram, then the
+    // outbound writeDatagram surfaces error.StreamClosed (no conn) -> the relay
+    // tears down via its `writeDatagram catch return`. We assert: (1) the opener
+    // WAS invoked (lazy open happened on the first datagram), (2) the relay
+    // returns, (3) no leak/UAF — close frees the UotStream + routes Stream.close.
+    const StandinOpener = struct {
+        allocator: std.mem.Allocator,
+        opened: *bool,
+        session_out: **anytls.Session,
+        fn open(self: @This(), proxy_name: []const u8) anyerror!ProxyStream {
+            _ = proxy_name;
+            self.opened.* = true;
+            const s = try makeStandinStream(self.allocator);
+            self.session_out.* = s.session;
+            const u = try self.allocator.create(ManagerLessAnyTlsUdp);
+            u.* = ManagerLessAnyTlsUdp.init(self.allocator, s.stream);
+            return ProxyStream.initAnyTlsUdp(self.allocator, u);
+        }
+    };
+
+    const pair = try makeControlPair();
+    defer pair.control.close();
+    defer pair.peer.close();
+    const ufd = try compat.udpSocket4();
+    defer compat.posixClose(ufd);
+    try compat.setNonBlock(ufd);
+    const bnd = try compat.udpGetSockName(ufd);
+
+    const conn = net.Server.Connection{ .stream = pair.control, .address = try net.Address.parseIp4("127.0.0.1", 1) };
+
+    var opened = false;
+    var session_ptr: *anytls.Session = undefined;
+    const opener = StandinOpener{ .allocator = allocator, .opened = &opened, .session_out = &session_ptr };
+
+    const T = struct {
+        fn run(o: StandinOpener, c: net.Server.Connection, e: *Engine, fd: std.posix.fd_t, done: *std.atomic.Value(bool)) void {
+            udpRelayLoop(o, c, e, fd) catch {};
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const th = try std.Thread.spawn(.{}, T.run, .{ opener, conn, &engine, ufd, &done });
+
+    // Send the first client datagram -> lazy open. The stand-in outbound write
+    // then fails (no conn) -> relay returns. (If the platform delivers the write
+    // error slower, the control-EOF below still guarantees teardown.)
+    const cfd = try compat.udpSocket4();
+    defer compat.posixClose(cfd);
+    var dst = std.c.sockaddr.in{ .family = std.c.AF.INET, .port = std.mem.nativeToBig(u16, bnd.port), .addr = undefined };
+    @memcpy(std.mem.asBytes(&dst.addr)[0..4], &[4]u8{ 127, 0, 0, 1 });
+    const dgram = [_]u8{ 0, 0, 0, 0x01, 8, 8, 8, 8, 0x00, 0x35, 'Q' };
+    _ = try compat.posixSendTo(cfd, &dgram, 0, @ptrCast(&dst), @sizeOf(std.c.sockaddr.in));
+
+    // The stand-in outbound write (no conn) fails synchronously on the first
+    // datagram -> the relay returns. The deferred pair.peer.close() (above)
+    // additionally guarantees a control EOF if any platform buffers differently.
+    th.join();
+    try testing.expect(done.load(.acquire));
+    try testing.expect(opened); // lazy open fired on the first datagram
+
+    // The opener's stand-in session was returned to the relay, which closed its
+    // Stream (return-to-pool / discard since pool=null). Drive the recv-loop-exit
+    // teardown to free the Session (the relay's ProxyStream.close already freed
+    // the UotStream wrapper + dropped the stream refs).
+    session_ptr.requestClose(.shutdown);
+    session_ptr.releaseRef();
 }

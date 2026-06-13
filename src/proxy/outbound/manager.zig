@@ -8,6 +8,12 @@ const meta = @import("../../meta.zig");
 const ss = @import("shadowsocks.zig");
 const anytls = @import("../../protocol/anytls.zig");
 const anytls_pool = @import("anytls_pool.zig");
+const udp_uot = @import("../udp_uot.zig");
+
+/// The production UoT v2 codec instantiated over a real borrowed anytls.Stream.
+/// The ProxyStream UDP arm owns a heap instance of this; the relay (D6) drives
+/// writeDatagram/readDatagram on it via ProxyStream.udpStream().
+pub const AnyTlsUdpStream = udp_uot.UotStream(anytls.Stream);
 const crypto = std.crypto;
 const vmess = @import("../../protocol/vmess.zig");
 const trojan = @import("../../protocol/trojan.zig");
@@ -25,6 +31,12 @@ pub const ProxyStream = struct {
     /// the Session here (that is the pool's drain in §13).
     owned_anytls_stream: ?*anytls.Stream = null,
     owned_trojan_client: ?*trojan.Client = null,
+    /// AnyTLS UoT v2 UDP arm (D5). A heap `AnyTlsUdpStream` wrapping a borrowed
+    /// anytls.Stream opened to the magic UoT dest. Produced ONLY by connectUdp;
+    /// it NEVER flows through relay(). Only close/getHandle/udpStream/move are
+    /// valid — the byte-stream methods @panic (MUST-FIX #5). close() frees the
+    /// UotStream and routes the inner Stream.close (returns the Session to pool).
+    owned_anytls_udp: ?*AnyTlsUdpStream = null,
     is_closed: bool = false,
 
     pub fn initDirect(stream: net.Stream) ProxyStream {
@@ -73,6 +85,18 @@ pub const ProxyStream = struct {
         };
     }
 
+    /// Wrap a heap AnyTlsUdpStream (UoT v2 over a borrowed anytls.Stream) as a
+    /// UDP-only ProxyStream (D5). base_stream is the fd=-1 sentinel; the byte
+    /// methods @panic. The relay drives I/O through udpStream(); close() frees
+    /// the UotStream + routes the inner Stream.close.
+    pub fn initAnyTlsUdp(allocator: std.mem.Allocator, ust: *AnyTlsUdpStream) ProxyStream {
+        return .{
+            .base_stream = .{ .handle = -1 },
+            .allocator = allocator,
+            .owned_anytls_udp = ust,
+        };
+    }
+
     pub fn move(self: *ProxyStream) ProxyStream {
         const moved = self.*;
         self.base_stream = .{ .handle = -1 };
@@ -80,11 +104,19 @@ pub const ProxyStream = struct {
         self.owned_ss_client = null;
         self.owned_anytls_stream = null;
         self.owned_trojan_client = null;
+        self.owned_anytls_udp = null;
         self.is_closed = true;
         return moved;
     }
 
+    /// Accessor for the relay (D6). The UDP arm exposes ONLY this + close +
+    /// getHandle + move; the byte-stream methods @panic on a UDP ProxyStream.
+    pub fn udpStream(self: *ProxyStream) *AnyTlsUdpStream {
+        return self.owned_anytls_udp.?;
+    }
+
     pub fn write(self: *ProxyStream, data: []const u8) !void {
+        if (self.owned_anytls_udp != null) @panic("ProxyStream.write called on a UDP (UoT) arm");
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             try client.write(data);
@@ -98,6 +130,7 @@ pub const ProxyStream = struct {
     }
 
     pub fn read(self: *ProxyStream, buf: []u8) !usize {
+        if (self.owned_anytls_udp != null) @panic("ProxyStream.read called on a UDP (UoT) arm");
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             return try client.read(buf);
@@ -116,6 +149,7 @@ pub const ProxyStream = struct {
     /// non-anytls type this is a plain read — byte-for-byte the prior behavior of
     /// the no-poll pump (direct/ss/trojan/vless took the same blocking read).
     pub fn readBlocking(self: *ProxyStream, buf: []u8) !usize {
+        if (self.owned_anytls_udp != null) @panic("ProxyStream.readBlocking called on a UDP (UoT) arm");
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_anytls_stream) |stream| {
             return try stream.readBlocking(buf);
@@ -127,6 +161,17 @@ pub const ProxyStream = struct {
         if (self.is_closed) return;
         self.is_closed = true;
 
+        if (self.owned_anytls_udp) |u| {
+            // UDP arm teardown (D5). Route the inner Stream.close (FIN + return
+            // the Session to the pool's idle list / discard + drop the relay
+            // borrow ref) exactly like the TCP anytls arm, then free the
+            // UotStream (deinit frees its rx buffer) and the heap wrapper.
+            self.owned_anytls_udp = null;
+            u.stream.close();
+            u.deinit();
+            self.allocator.?.destroy(u);
+            return;
+        }
         if (self.owned_ss_client) |client| {
             self.owned_ss_client = null;
             client.deinit();
@@ -152,6 +197,7 @@ pub const ProxyStream = struct {
     }
 
     pub fn hasPendingRead(self: *const ProxyStream) bool {
+        if (self.owned_anytls_udp != null) @panic("ProxyStream.hasPendingRead called on a UDP (UoT) arm");
         if (self.is_closed) return false;
         if (self.owned_ss_client) |client| {
             return client.hasPendingRead();
@@ -167,6 +213,11 @@ pub const ProxyStream = struct {
 
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
         if (self.is_closed) return -1;
+        if (self.owned_anytls_udp) |u| {
+            // The UDP relay (D6) polls the inner anytls Stream's notifier fd for
+            // inbound UoT frames exactly as the TCP relay polls a stream fd.
+            return u.stream.getHandle();
+        }
         if (self.owned_anytls_stream) |stream| {
             // The per-stream notifier read fd: the plain CONNECT relay polls this
             // for readiness exactly as it would a socket fd.
@@ -181,6 +232,7 @@ pub const ProxyStream = struct {
     /// compat.shutdownWrite(getHandle()) — byte-for-byte what shutdownTargetWrite
     /// did before (direct/ss/trojan/vless all shut down the real socket fd).
     pub fn shutdownWrite(self: *ProxyStream) !void {
+        if (self.owned_anytls_udp != null) @panic("ProxyStream.shutdownWrite called on a UDP (UoT) arm");
         if (self.is_closed) return;
         if (self.owned_anytls_stream) |stream| {
             stream.shutdownWrite();
@@ -429,6 +481,66 @@ pub const OutboundManager = struct {
             return error.ProxyNotFound;
         };
         return try self.connectToProxy(proxy, target, port);
+    }
+
+    /// Open a UoT v2 UDP path through `proxy_name` (D5). Mirrors connect()'s
+    /// group-resolution prologue but with NO concrete target (the magic UoT dest
+    /// is the stream-open address; per-datagram targets travel inside the frames).
+    ///
+    /// MUST-FIX #7 — DIRECT/REJECT semantics match the TCP path AFTER group
+    /// resolution: DIRECT (or a group resolving to a .direct proxy) ->
+    /// error.UdpNotSupportedForDirect (a direct UDP path is out of scope);
+    /// REJECT (literal or a group resolving to REJECT/.reject) ->
+    /// error.ConnectionRejected; a non-anytls proxy or an anytls proxy without
+    /// udp:true -> error.UdpNotSupportedByProxy.
+    pub fn connectUdp(self: *OutboundManager, proxy_name: []const u8) !ProxyStream {
+        if (std.mem.eql(u8, proxy_name, "DIRECT")) return error.UdpNotSupportedForDirect;
+        if (std.mem.eql(u8, proxy_name, "REJECT")) return error.ConnectionRejected;
+
+        // Resolve nested proxy groups exactly like connect() (lines 416-424).
+        var current_name = proxy_name;
+        var resolved_name: ?[]const u8 = undefined;
+        var iter: usize = 0;
+        while (iter < 10) : (iter += 1) {
+            resolved_name = self.resolveProxyGroup(current_name);
+            if (resolved_name) |next| {
+                current_name = next;
+            } else {
+                break;
+            }
+        }
+
+        // A group may resolve to the literal DIRECT/REJECT names.
+        if (std.mem.eql(u8, current_name, "DIRECT")) return error.UdpNotSupportedForDirect;
+        if (std.mem.eql(u8, current_name, "REJECT")) return error.ConnectionRejected;
+
+        const proxy = self.findProxy(current_name) orelse return error.ProxyNotFound;
+        return try self.connectAnyTlsUdp(proxy);
+    }
+
+    /// Open the single UoT v2 stream for an association: gate on the proxy being
+    /// anytls + udp:true, then check out a Stream to the magic UoT dest via the
+    /// SAME SessionPool the TCP path uses (shared poolKey). Wrap it in a heap
+    /// AnyTlsUdpStream owned by the returned ProxyStream's UDP arm.
+    fn connectAnyTlsUdp(self: *OutboundManager, proxy: *const Proxy) !ProxyStream {
+        switch (proxy.proxy_type) {
+            .direct => return error.UdpNotSupportedForDirect,
+            .reject => return error.ConnectionRejected,
+            .anytls => {},
+            else => return error.UdpNotSupportedByProxy,
+        }
+        if (!proxy.udp) return error.UdpNotSupportedByProxy;
+
+        const key = try self.poolKey(proxy);
+        defer self.allocator.free(key);
+        const pool = try self.getOrCreatePool(key, proxy);
+        const stream = try pool.createStream(udp_uot.MAGIC_DOMAIN, udp_uot.MAGIC_PORT);
+        errdefer stream.close();
+
+        const ust = try self.allocator.create(AnyTlsUdpStream);
+        errdefer self.allocator.destroy(ust);
+        ust.* = AnyTlsUdpStream.init(self.allocator, stream);
+        return ProxyStream.initAnyTlsUdp(self.allocator, ust);
     }
 
     /// 连接到一个具体的代理
@@ -947,4 +1059,167 @@ test "connect bypasses proxy groups for loopback targets" {
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("ok", buf[0..n]);
     try std.testing.expect(stream.owned_ss_client == null);
+}
+
+// ===========================================================================
+// D5: manager UDP path (connectUdp / connectAnyTlsUdp + ProxyStream UDP arm)
+// ===========================================================================
+
+const ConfigZ = @import("../../config.zig");
+
+/// Build a Config carrying exactly the proxies/groups passed in. Caller owns the
+/// returned Config (deinit frees the duped scalars; the proxies/groups passed by
+/// the caller must already hold duped strings since cfg.deinit frees them).
+fn makeUdpTestConfig(allocator: std.mem.Allocator) !Config {
+    return Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(ConfigZ.ProxyGroup).empty,
+        .rules = std.ArrayList(ConfigZ.Rule).empty,
+    };
+}
+
+test "D5: connectUdp(DIRECT) -> error.UdpNotSupportedForDirect" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeUdpTestConfig(allocator);
+    defer cfg.deinit();
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    try std.testing.expectError(error.UdpNotSupportedForDirect, manager.connectUdp("DIRECT"));
+}
+
+test "D5: connectUdp(REJECT) -> error.ConnectionRejected" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeUdpTestConfig(allocator);
+    defer cfg.deinit();
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    try std.testing.expectError(error.ConnectionRejected, manager.connectUdp("REJECT"));
+}
+
+test "D5: connectUdp on anytls WITHOUT udp:true -> error.UdpNotSupportedByProxy" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeUdpTestConfig(allocator);
+    defer cfg.deinit();
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "atls"),
+        .proxy_type = .anytls,
+        .server = try allocator.dupe(u8, "203.0.113.10"),
+        .port = 443,
+        .password = try allocator.dupe(u8, "password"),
+        // udp defaults to false
+    });
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    try std.testing.expectError(error.UdpNotSupportedByProxy, manager.connectUdp("atls"));
+}
+
+test "D5: connectUdp on a non-anytls proxy (ss) -> error.UdpNotSupportedByProxy" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeUdpTestConfig(allocator);
+    defer cfg.deinit();
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "ss-udp"),
+        .proxy_type = .ss,
+        .server = try allocator.dupe(u8, "203.0.113.10"),
+        .port = 8388,
+        .password = try allocator.dupe(u8, "password"),
+        .cipher = try allocator.dupe(u8, "aes-128-gcm"),
+        .udp = true, // udp:true ignored for non-anytls
+    });
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    try std.testing.expectError(error.UdpNotSupportedByProxy, manager.connectUdp("ss-udp"));
+}
+
+test "D5: connectUdp resolves a group to a no-udp anytls -> error.UdpNotSupportedByProxy" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeUdpTestConfig(allocator);
+    defer cfg.deinit();
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "atls"),
+        .proxy_type = .anytls,
+        .server = try allocator.dupe(u8, "203.0.113.10"),
+        .port = 443,
+        .password = try allocator.dupe(u8, "password"),
+    });
+    var group = ConfigZ.ProxyGroup{
+        .name = try allocator.dupe(u8, "G"),
+        .group_type = .select,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+    try group.proxies.append(allocator, try allocator.dupe(u8, "atls"));
+    try cfg.proxy_groups.append(allocator, group);
+
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    // The group resolves to "atls" (no udp:true) -> UdpNotSupportedByProxy.
+    try std.testing.expectError(error.UdpNotSupportedByProxy, manager.connectUdp("G"));
+}
+
+// MUST-FIX #5: the byte-stream methods (write/read/readBlocking/hasPendingRead/
+// shutdownWrite) on a UDP ProxyStream arm @panic. Zig 0.16's std.testing has no
+// expectPanic, so this is verified by code inspection + the @panic guards added
+// at the top of each method; the close/getHandle/udpStream/move paths ARE
+// exercised by the test below. (A panic in a unit test would abort the runner,
+// so we cannot positively assert it without a child-process harness.)
+
+test "D5: ProxyStream UDP arm close frees the UotStream + returns Session to idle (no leak/UAF)" {
+    // Stand-in mirrors the C-stage seam: a real anytls.Stream bound to a
+    // non-dialed Session, wrapped in the production AnyTlsUdpStream, then handed
+    // to a UDP ProxyStream. close() must route Stream.close (FIN swallowed on a
+    // conn==null stand-in; drops the relay-borrow ref) AND free the UotStream
+    // (its rx ArrayList) + the heap wrapper — all under std.testing.allocator.
+    const allocator = std.testing.allocator;
+
+    const standin = try makeStandinAnyTlsStream(allocator);
+    const session = standin.session;
+    const stream = standin.stream;
+
+    const ust = try allocator.create(AnyTlsUdpStream);
+    ust.* = AnyTlsUdpStream.init(allocator, stream);
+
+    var ps = ProxyStream.initAnyTlsUdp(allocator, ust);
+    // Accessors valid on the UDP arm.
+    try std.testing.expect(ps.udpStream() == ust);
+    try std.testing.expect(ps.getHandle() == stream.getHandle());
+
+    // close() frees the UotStream (rx) + wrapper, routes Stream.close.
+    ps.close();
+    try std.testing.expect(ps.is_closed);
+    try std.testing.expect(ps.owned_anytls_udp == null);
+
+    // Drive the rest of the stand-in teardown like a recv-loop exit would.
+    session.requestClose(.shutdown);
+    session.releaseRef();
+}
+
+test "D5: ProxyStream move transfers the UDP arm" {
+    const allocator = std.testing.allocator;
+
+    const standin = try makeStandinAnyTlsStream(allocator);
+    const session = standin.session;
+    const stream = standin.stream;
+
+    const ust = try allocator.create(AnyTlsUdpStream);
+    ust.* = AnyTlsUdpStream.init(allocator, stream);
+
+    var source = ProxyStream.initAnyTlsUdp(allocator, ust);
+    var moved = source.move();
+    try std.testing.expect(source.is_closed);
+    try std.testing.expect(source.owned_anytls_udp == null);
+    try std.testing.expect(moved.owned_anytls_udp == ust);
+
+    source.close(); // no-op (moved out)
+    moved.close(); // frees ust + routes Stream.close
+    session.requestClose(.shutdown);
+    session.releaseRef();
 }

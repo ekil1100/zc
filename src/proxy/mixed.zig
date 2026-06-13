@@ -9,6 +9,7 @@ const OutboundManager = outbound.OutboundManager;
 const aead = @import("../crypto/aead.zig");
 const ss = @import("outbound/shadowsocks.zig");
 const socket_options = @import("../socket_options.zig");
+const udp_uot = @import("udp_uot.zig");
 
 // macOS reserves 16MiB of virtual stack per pthread by default. The mixed
 // proxy creates one detached worker per accepted connection, so the default
@@ -131,7 +132,20 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
     const req_n = try conn.stream.read(&buf);
     if (req_n < 7) return error.InvalidRequest;
     if (buf[0] != 0x05) return error.InvalidVersion;
-    if (buf[1] != 0x01) return error.CommandNotSupported;
+    switch (buf[1]) {
+        0x01 => {}, // CONNECT: fall through to the existing path below (verbatim)
+        0x03 => {
+            // UDP ASSOCIATE: bind a client UDP socket, reply with the bound
+            // endpoint, and run the UoT relay for the association lifetime. The
+            // request DST is advisory (RFC1928) and ignored; proxy selection is
+            // deferred to the first datagram (FIRST-DATAGRAM-TARGET).
+            return udp_uot.handleSocks5Associate(conn, engine, manager);
+        },
+        else => {
+            try conn.stream.writeAll(&.{ 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+            return;
+        },
+    }
 
     const atyp = buf[3];
     var target_port: u16 = 0;
