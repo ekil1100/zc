@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added (AnyTLS protocol completion)
+- **Dynamic padding scheme**: parse the AnyTLS padding-scheme grammar (ranges + CheckMarks + `stop`), emit randomized multi-record framing per the scheme (replacing the old fixed shaping), and adopt server-pushed `update-padding-scheme` (cmd 6). The advertised `padding-md5` always matches the active scheme. Closes a static traffic-fingerprint gap.
+- **Session multiplexing + idle pool**: one authenticated TLS session is reused across connections (single-active-stream-per-session, anytls-go parity) instead of a full TLS+auth handshake per connection. A per-session background recv-loop demultiplexes frames; an idle-session pool with a reaper honors `idle-session-check-interval` / `idle-session-timeout` / `min-idle-session` (config keys, seconds; sub-5s values clamp to 30). SYN-DONE bounded wait on reused streams.
+- **UoT v2 UDP relay**: SOCKS5 UDP ASSOCIATE inbound bridged to sing UDP-over-TCP v2 over an AnyTLS stream. Per-proxy `udp: true` flag; routing picks the proxy by matching the first datagram's real target against the rule engine.
+- **Anti-fingerprint / correctness fixes**: omit SNI for IP-literal servers (an IP in ClientHello is an abnormal handshake); surface the server `alert` (cmd 5) reason instead of discarding it; bounded TCP keepalive on the upstream proxy socket; honor half-close (per-stream FIN) on the relay path.
+- Known TLS-stack limitations (uTLS fingerprint, ALPN, TLS-version control, mTLS, Reality) are documented in [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md) and [`docs/anytls/session-multiplexing-design.md`](docs/anytls/session-multiplexing-design.md).
+
 ### Added
 - `zc reload` for hot-reloading the current config into the running daemon (falls back to restart when hot reload is unavailable).
 - `zc start --foreground` for containers/systemd (no fork; `zclash.service`, `build-deb.sh`, and the podman e2e use it).

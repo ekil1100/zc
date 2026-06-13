@@ -49,7 +49,7 @@ Included:
 
 - daemon lifecycle through CLI: `start` (`up`), `stop` (`down`), `restart`, `reload`, `status`, `log`, `doctor`, with a uniform `--json` envelope on stdout and uniform exit codes (see [`cli/spec.md`](cli/spec.md));
 - default mixed inbound runtime;
-- AnyTLS TCP 出站;
+- AnyTLS 出站(动态 padding、session 多路复用 + 空闲池、UoT v2 UDP 中继;[设计](anytls/session-multiplexing-design.md) / [兼容与已知限制](compat/mihomo-clash.md));
 - non-production explicit port override via `zc start --port <port>`;
 - core rule matching and rule-provider expansion;
 - minimal REST API for version/proxies/rules/proxy selection;

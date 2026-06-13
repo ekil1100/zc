@@ -51,9 +51,21 @@ Runtime outbound support currently includes:
 | `vmess` | minimal | TCP-only style implementation; transport options are not fully wired. |
 | `trojan` | minimal | TLS + CONNECT style implementation. |
 | `vless` | minimal | TCP-only implementation. |
-| `anytls` | minimal | 基于 TLS 的 TCP stream 支持。已接入 `password`、`server`、`port`、`sni`、`skip-cert-verify`；暂不支持 UDP-over-TCP 和 Reality。 |
+| `anytls` | supported | 完整 AnyTLS：`password`/`server`/`port`/`sni`/`skip-cert-verify`/`udp`；动态 padding scheme（解析 + 随机化多 record 发送 + 采纳服务端 `update-padding-scheme`）；session 多路复用 + 空闲池（复用已认证会话避免重握手，单活动流/会话，与 anytls-go 一致，带 `idle-session-check-interval`/`idle-session-timeout`/`min-idle-session`）；SYN-DONE 超时；IP 字面量不发 SNI；UoT v2 UDP 中继（SOCKS5 UDP ASSOCIATE）。已知限制见 [AnyTLS 设计](../anytls/session-multiplexing-design.md) 与下方“AnyTLS 已知限制”。 |
 | `http` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
 | `socks5` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
+
+### AnyTLS 已知限制
+
+zc 的 AnyTLS 出站走 Zig 标准库的 `std.crypto.tls`（仅客户端 TLS 1.3）。以下能力受该 TLS 栈限制，**不支持**（不是缺陷，是底层约束），需要时应改用功能更全的客户端：
+
+- **uTLS / ClientHello 指纹模拟**：std TLS 发送固定的 ClientHello，无法模拟 Chrome 等浏览器指纹。
+- **ALPN 配置**：`std.crypto.tls.Client.Options` 无 alpn 字段，ClientHello 不发 ALPN 扩展。
+- **TLS 版本控制**：std 仅 TLS 1.3，无 min/max 版本旋钮。
+- **mTLS / 客户端证书**：std 客户端无客户端证书路径（且 AnyTLS 用 SHA-256 密码帧认证，本就不属于其协议）。
+- **Reality**：不属于 AnyTLS，且需要 std TLS 没有的自定义 X25519/伪造证书握手。
+
+其它行为说明：UDP 中继按“首包目标匹配路由规则”选代理（一次 ASSOCIATE 一条 UoT 流一个代理，IsConnect=0 非连接模式）；客户端侧 UDP socket 仅 IPv4（UoT 承载的目标可为 IPv6）；FRAG≠0 的 SOCKS5 UDP 数据报丢弃（不重组）。
 
 ## Proxy groups
 
