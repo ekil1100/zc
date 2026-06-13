@@ -1555,7 +1555,7 @@ fn appendFrame(
     try out.appendSlice(allocator, data);
 }
 
-fn encodeSocksAddr(allocator: std.mem.Allocator, host: []const u8, port: u16) ![]u8 {
+pub fn encodeSocksAddr(allocator: std.mem.Allocator, host: []const u8, port: u16) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 

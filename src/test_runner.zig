@@ -42,6 +42,7 @@ test "include zc test modules" {
     _ = @import("proxy/smart_group_test.zig");
     _ = @import("proxy/socks5.zig");
     _ = @import("proxy/socks5_test.zig");
+    _ = @import("proxy/udp_uot.zig");
     _ = @import("proxy/websocket_extended_test.zig");
     _ = @import("proxy/websocket_test.zig");
     _ = @import("rule/engine.zig");

@@ -117,6 +117,33 @@ test "parse AnyTLS proxy" {
     try testing.expect(proxy.skip_cert_verify);
 }
 
+test "D4: proxy udp flag parses true, absent defaults false" {
+    const allocator = testing.allocator;
+    const yaml =
+        \\proxies:
+        \\  - name: anytls-udp
+        \\    type: anytls
+        \\    server: anytls.example.com
+        \\    port: 443
+        \\    password: "secret"
+        \\    udp: true
+        \\  - name: anytls-noudp
+        \\    type: anytls
+        \\    server: anytls.example.com
+        \\    port: 443
+        \\    password: "secret"
+        \\rules:
+        \\  - MATCH,anytls-udp
+    ;
+
+    var config = try parseConfig(allocator, yaml);
+    defer config.deinit();
+
+    try testing.expectEqual(@as(usize, 2), config.proxies.items.len);
+    try testing.expect(config.proxies.items[0].udp);
+    try testing.expect(!config.proxies.items[1].udp); // absent -> false
+}
+
 test "Rule struct" {
     const allocator = testing.allocator;
 

@@ -290,6 +290,12 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 }
             },
         }
+
+        // udp:true is only honored for anytls proxies (UDP relay is anytls-only
+        // for now). Warn — and ignore — when set on any other proxy type.
+        if (proxy.udp and proxy.proxy_type != .anytls) {
+            try result.addWarning("Proxy '{s}': udp:true is only supported for anytls proxies; ignored", .{proxy.name});
+        }
     }
 }
 
@@ -631,4 +637,54 @@ test "C6: validator clamps defaults are valid (no clamp on the 30s default)" {
     // The 30s defaults are > 5 -> untouched.
     try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_check_interval);
     try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_timeout);
+}
+
+fn countUdpWarnings(result: *const ValidationResult) usize {
+    var c: usize = 0;
+    for (result.warnings.items) |w| {
+        if (std.mem.indexOf(u8, w.message, "udp:true") != null) c += 1;
+    }
+    return c;
+}
+
+test "D4: validator warns on non-anytls proxy with udp:true" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: ss-udp
+        \\    type: ss
+        \\    server: 1.2.3.4
+        \\    port: 8388
+        \\    password: pw
+        \\    cipher: aes-256-gcm
+        \\    udp: true
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), countUdpWarnings(&result));
+    try std.testing.expect(result.isValid()); // warning only, not an error
+}
+
+test "D4: validator does not warn on anytls proxy with udp:true" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: anytls-udp
+        \\    type: anytls
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    udp: true
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), countUdpWarnings(&result));
 }

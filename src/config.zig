@@ -28,6 +28,7 @@ pub const Proxy = struct {
     alter_id: u16 = 0, // VMess
     tls: bool = false,
     skip_cert_verify: bool = false,
+    udp: bool = false, // UDP relay (anytls-only for now; see config_validator)
     sni: ?[]const u8 = null,
     ws: bool = false, // WebSocket
     ws_path: ?[]const u8 = null,
@@ -423,6 +424,9 @@ fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValu
     }
     if (map.get("skip-cert-verify")) |v| {
         if (v == .boolean) proxy.skip_cert_verify = v.boolean;
+    }
+    if (map.get("udp")) |v| {
+        if (v == .boolean) proxy.udp = v.boolean;
     }
     if (map.get("sni")) |v| {
         if (v == .string) proxy.sni = try allocator.dupe(u8, v.string);

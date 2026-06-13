@@ -111,6 +111,60 @@ pub fn posixRecv(fd: std.posix.fd_t, buffer: []u8, flags: u32) !usize {
     return @intCast(rc);
 }
 
+// ---------------------------------------------------------------------------
+// D1: IPv4 UDP helpers (getsockname / recvfrom) for the UoT relay datapath.
+// ---------------------------------------------------------------------------
+
+/// A bound IPv4 endpoint: octets in network order ([0..4] order) + host-order port.
+pub const BoundAddr = struct { ip: [4]u8, port: u16 };
+
+/// One recvfrom result: bytes read + the raw IPv4 sender sockaddr.
+pub const RecvFrom = struct { n: usize, addr: std.c.sockaddr.in };
+
+/// getsockname on a bound IPv4 UDP socket. Returns the host-order port and the
+/// IPv4 octets. MUST-FIX #6: the returned family must be AF.INET; anything else
+/// (e.g. a v6 / unix fd handed to us by mistake) is a hard error rather than a
+/// silently mis-decoded address.
+pub fn udpGetSockName(fd: std.posix.fd_t) !BoundAddr {
+    var sa: std.c.sockaddr.in = undefined;
+    var sl: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(fd, @ptrCast(&sa), &sl) < 0) return error.GetSockNameFailed;
+    if (sa.family != std.c.AF.INET) return error.UnexpectedAddressFamily;
+    const port = std.mem.bigToNative(u16, sa.port); // sa.port is network-order
+    const ip: [4]u8 = @bitCast(sa.addr); // network-order octets, already [0..4]
+    return .{ .ip = ip, .port = port };
+}
+
+/// recvfrom one datagram, learning the peer (sender) IPv4 address.
+///
+/// Error mapping (MUST-FIX #3):
+///   EAGAIN/EWOULDBLOCK -> error.WouldBlock   (no data on a nonblocking socket)
+///   EINTR              -> retry              (spurious interrupt)
+///   EMSGSIZE / ECONNREFUSED / other non-fatal per-datagram errnos
+///                      -> error.PacketDropped (caller drops THIS datagram and
+///                         keeps the association alive — never folded into
+///                         error.InputOutput which would kill the relay)
+///   anything else      -> error.InputOutput
+pub fn udpRecvFrom(fd: std.posix.fd_t, buffer: []u8) !RecvFrom {
+    while (true) {
+        var sa: std.c.sockaddr.in = undefined;
+        var sl: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        const rc = std.c.recvfrom(fd, buffer.ptr, buffer.len, 0, @ptrCast(&sa), &sl);
+        if (rc < 0) {
+            switch (std.c.errno(rc)) {
+                .AGAIN => return error.WouldBlock,
+                .INTR => continue, // spurious interrupt: retry the syscall
+                // Per-datagram, non-fatal conditions. ECONNREFUSED is the
+                // ICMP port-unreachable that a prior sendto provoked; EMSGSIZE
+                // is an oversized datagram. Drop the packet, keep the relay up.
+                .MSGSIZE, .CONNREFUSED, .HOSTUNREACH, .NETUNREACH, .NOMEM => return error.PacketDropped,
+                else => return error.InputOutput,
+            }
+        }
+        return .{ .n = @intCast(rc), .addr = sa };
+    }
+}
+
 pub fn shutdownWrite(fd: std.posix.fd_t) !void {
     if (std.c.shutdown(fd, std.c.SHUT.WR) < 0) return error.InputOutput;
 }
@@ -689,4 +743,66 @@ test "Notifier: deinit sets fds to -1" {
     n.deinit();
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), n.read_fd);
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), n.write_fd);
+}
+
+// ---------------------------------------------------------------------------
+// D1: UDP helper tests
+// ---------------------------------------------------------------------------
+
+test "D1: udpGetSockName returns AF.INET + nonzero ephemeral port" {
+    const fd = try udpSocket4();
+    defer posixClose(fd);
+    const bnd = try udpGetSockName(fd);
+    try std.testing.expect(bnd.port != 0); // ephemeral bind resolved
+}
+
+test "D1: loopback sendto -> udpRecvFrom returns sender addr + payload bytes" {
+    const rx = try udpSocket4();
+    defer posixClose(rx);
+    const tx = try udpSocket4();
+    defer posixClose(tx);
+
+    const rx_bnd = try udpGetSockName(rx);
+
+    // Send to 127.0.0.1:rx_port from tx.
+    var dst: std.c.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, rx_bnd.port),
+        .addr = undefined,
+    };
+    dst.family = std.c.AF.INET;
+    const loopback = [4]u8{ 127, 0, 0, 1 };
+    @memcpy(std.mem.asBytes(&dst.addr)[0..4], &loopback);
+
+    const payload = "hello-uot";
+    _ = try posixSendTo(tx, payload, 0, @ptrCast(&dst), @sizeOf(std.c.sockaddr.in));
+
+    // Wait until the loopback datagram is readable so recvfrom can't block the
+    // whole test suite if delivery is momentarily delayed.
+    var pfds = [_]std.posix.pollfd{.{ .fd = rx, .events = std.posix.POLL.IN, .revents = 0 }};
+    _ = try std.posix.poll(&pfds, 2000);
+    try std.testing.expect((pfds[0].revents & std.posix.POLL.IN) != 0);
+
+    var buf: [64]u8 = undefined;
+    const rf = try udpRecvFrom(rx, &buf);
+    try std.testing.expectEqual(payload.len, rf.n);
+    try std.testing.expectEqualStrings(payload, buf[0..rf.n]);
+    // Sender addr is loopback IPv4 with a nonzero source port.
+    try std.testing.expectEqual(std.c.AF.INET, rf.addr.family);
+    const src_ip: [4]u8 = @bitCast(rf.addr.addr);
+    try std.testing.expectEqualSlices(u8, &loopback, &src_ip);
+    try std.testing.expect(std.mem.bigToNative(u16, rf.addr.port) != 0);
+}
+
+test "D1: udpRecvFrom on empty nonblocking socket -> error.WouldBlock" {
+    const fd = try udpSocket4();
+    defer posixClose(fd);
+    // udpSocket4 binds a BLOCKING dgram socket; mark it nonblocking so an empty
+    // socket surfaces EAGAIN instead of blocking forever (the relay will do the
+    // same before polling).
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.SetNonblockFailed;
+    const nb: c_int = flags | @as(c_int, @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))));
+    if (std.c.fcntl(fd, std.posix.F.SETFL, nb) < 0) return error.SetNonblockFailed;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, udpRecvFrom(fd, &buf));
 }
