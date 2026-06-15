@@ -276,6 +276,11 @@ pub const Session = struct {
     active_streams: u32 = 0,
     /// Monotonic-clock timestamp (ms, .boot) of when the session entered idle.
     idle_since_ms: i64 = 0,
+    /// Handshake-response deadline (ms, monotonic). Set in open() after dial;
+    /// cleared by dispatchFrame on server_settings or syn_ack. When this is
+    /// non-zero and the current monotonic clock exceeds it, the recv-loop tears
+    /// down the session. 0 = disabled / already completed.
+    handshake_deadline_ms: i64 = 0,
     /// Back-pointer to the owning pool, or null for a non-pooled session (the
     /// Client shim and the C2/C3 stand-in tests). When non-null, requestClose's
     /// die-hook removes this session from the pool (§12) before tearing down.
@@ -632,6 +637,7 @@ pub const Session = struct {
         // dial populated self.conn; from here teardown must close it.
         errdefer if (self.conn) |conn| self.deinitTlsConnection(conn);
 
+        self.handshake_deadline_ms = std.Io.Timestamp.now(compat.io(), .awake).toMilliseconds() + 15_000;
         self.refs.store(1, .monotonic); // recv-loop ref
         self.recv_thread = try std.Thread.spawn(.{}, recvLoopEntry, .{self});
         return self;
@@ -866,6 +872,7 @@ pub const Session = struct {
                     stream.markSynAck(body.len > 0);
                     stream.releaseStreamRef(); // drop transient ref
                 }
+                self.handshake_deadline_ms = 0; // handshake complete
             },
             .alert => {
                 var alert_buf: [max_alert_log_len]u8 = undefined;
@@ -880,6 +887,7 @@ pub const Session = struct {
                 self.lockTls();
                 defer self.unlockTls();
                 self.applyServerSettings(body);
+                self.handshake_deadline_ms = 0; // handshake complete
             },
             .update_padding_scheme => {
                 // padding is read by writeSessionPayload under tls_mutex; the
@@ -1030,9 +1038,13 @@ const TlsFrameSource = struct {
             // is already buffered in the TLS/socket reader (then go straight to
             // decode under the lock).
             session.lockTls();
+            // Only consider DECRYPTED application data for the buffered check.
+            // Raw TLS ciphertext in stream_reader (e.g. NewSessionTicket records)
+            // must NOT skip the poll path: TLS will consume those records
+            // internally without producing application data, and then block on
+            // readTlsExact waiting for more data that the server may never send.
             const buffered = if (session.conn) |conn|
-                conn.tls_client.reader.bufferedLen() > 0 or
-                    conn.stream_reader.interface.bufferedLen() > 0
+                conn.tls_client.reader.bufferedLen() > 0
             else
                 false;
             session.unlockTls();
@@ -1050,7 +1062,25 @@ const TlsFrameSource = struct {
                     .revents = 0,
                 }};
                 const ready = std.posix.poll(&fds, self.recv_poll_timeout_ms) catch return error.EndOfStream;
-                if (ready == 0) continue; // timeout: re-check dying, re-poll
+                if (ready == 0) {
+                    // Handshake deadline: if the server hasn't sent a valid
+                    // protocol frame (server_settings / syn_ack) within the
+                    // deadline, tear down the session so the relay doesn't hang.
+                    const now_ms = std.Io.Timestamp.now(compat.io(), .awake).toMilliseconds();
+                    if (session.handshake_deadline_ms > 0 and
+                        now_ms > session.handshake_deadline_ms)
+                    {
+                        // Shut down the socket to unblock the main thread which
+                        // may be holding tls_mutex while blocked in send() inside
+                        // flushTlsAndSocket -> writeSessionPayload. Without this
+                        // shutdown, requestClose(.eof) in recvLoopEntry would
+                        // deadlock waiting on tls_mutex while the main thread is
+                        // stuck in send() and never releases the lock.
+                        _ = std.c.shutdown(fd, std.c.SHUT.RDWR);
+                        return error.EndOfStream;
+                    }
+                    continue; // timeout: re-check dying, re-poll
+                }
                 if ((fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0 and
                     (fds[0].revents & std.posix.POLL.IN) == 0)
                 {
