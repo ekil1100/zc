@@ -223,28 +223,36 @@ pub const Client = struct {
         self.allocator.destroy(conn);
     }
 
+    /// Build the exact Trojan request wire frame into a caller-supplied buffer.
+    /// 格式: [密码哈希(56)]\r\n [命令(1)] [地址类型(1)] [地址] [端口(2)]\r\n
+    /// Pure in the required sense: no TLS/socket I/O — it only appends bytes into
+    /// `buf`, so the security-critical frame layout is testable in isolation.
+    fn buildRequest(self: *Client, buf: *std.ArrayList(u8), cmd: Command, host: []const u8, port: u16) !void {
+        // 1. 密码哈希 + CRLF
+        try buf.appendSlice(self.allocator, &self.password_hash);
+        try buf.appendSlice(self.allocator, "\r\n");
+
+        // 2. 命令
+        try buf.append(self.allocator, @intFromEnum(cmd));
+
+        // 3. 地址类型和地址
+        try self.encodeAddress(buf, host);
+
+        // 4. 端口 (2 bytes, big endian)
+        try buf.append(self.allocator, @intCast(port >> 8));
+        try buf.append(self.allocator, @intCast(port & 0xFF));
+
+        // 5. CRLF
+        try buf.appendSlice(self.allocator, "\r\n");
+    }
+
     /// Trojan 握手协议
     /// 格式: [密码哈希(56)]\r\n [命令(1)] [地址类型(1)] [地址] [端口(2)]\r\n
     fn handshake(self: *Client, conn: *TlsConnection, target_host: []const u8, target_port: u16) !void {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
-        // 1. 密码哈希 + CRLF
-        try buf.appendSlice(self.allocator, &self.password_hash);
-        try buf.appendSlice(self.allocator, "\r\n");
-
-        // 2. 命令 (CONNECT)
-        try buf.append(self.allocator, @intFromEnum(Command.connect));
-
-        // 3. 地址类型和地址
-        try self.encodeAddress(&buf, target_host);
-
-        // 4. 端口 (2 bytes, big endian)
-        try buf.append(self.allocator, @intCast(target_port >> 8));
-        try buf.append(self.allocator, @intCast(target_port & 0xFF));
-
-        // 5. CRLF
-        try buf.appendSlice(self.allocator, "\r\n");
+        try self.buildRequest(&buf, .connect, target_host, target_port);
 
         // 发送握手
         try conn.tls_client.writer.writeAll(buf.items);
@@ -714,4 +722,93 @@ test "Trojan caOption disables verification only when skip_cert_verify is set" {
 
     const result = Client.caOption(true, dummy_bundle);
     try testing.expectEqual(std.meta.Tag(Client.CaOptions).no_verification, std.meta.activeTag(result));
+}
+
+test "Trojan buildRequest emits exact wire frame for IPv4 target" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+    });
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try client.buildRequest(&buf, .connect, "192.168.1.1", 443);
+
+    // password_hash(56)
+    try testing.expectEqualSlices(u8, &client.password_hash, buf.items[0..56]);
+    // CRLF
+    try testing.expectEqualSlices(u8, "\r\n", buf.items[56..58]);
+    // command CONNECT
+    try testing.expectEqual(@as(u8, 0x01), buf.items[58]);
+    // ATYP IPv4 + 4-byte address
+    try testing.expectEqual(@as(u8, 0x01), buf.items[59]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, buf.items[60..64]);
+    // port 443 big-endian
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0xBB }, buf.items[64..66]);
+    // trailing CRLF
+    try testing.expectEqualSlices(u8, "\r\n", buf.items[66..68]);
+    try testing.expectEqual(@as(usize, 68), buf.items.len);
+}
+
+test "Trojan buildRequest emits exact wire frame for IPv6 target" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+    });
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try client.buildRequest(&buf, .connect, "2001:db8::1", 8080);
+
+    // password_hash(56) + CRLF + command
+    try testing.expectEqualSlices(u8, &client.password_hash, buf.items[0..56]);
+    try testing.expectEqualSlices(u8, "\r\n", buf.items[56..58]);
+    try testing.expectEqual(@as(u8, 0x01), buf.items[58]);
+    // ATYP IPv6 + 16-byte parsed address
+    try testing.expectEqual(@as(u8, 0x04), buf.items[59]);
+    var expected_ipv6: [16]u8 = undefined;
+    try testing.expect(parseIpv6("2001:db8::1", &expected_ipv6));
+    try testing.expectEqualSlices(u8, &expected_ipv6, buf.items[60..76]);
+    // port 8080 big-endian
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x1F, 0x90 }, buf.items[76..78]);
+    // trailing CRLF
+    try testing.expectEqualSlices(u8, "\r\n", buf.items[78..80]);
+    try testing.expectEqual(@as(usize, 80), buf.items.len);
+}
+
+test "Trojan buildRequest emits exact wire frame for domain target" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+    });
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try client.buildRequest(&buf, .connect, "example.com", 80);
+
+    // password_hash(56) + CRLF + command
+    try testing.expectEqualSlices(u8, &client.password_hash, buf.items[0..56]);
+    try testing.expectEqualSlices(u8, "\r\n", buf.items[56..58]);
+    try testing.expectEqual(@as(u8, 0x01), buf.items[58]);
+    // ATYP domain + length byte + host bytes
+    try testing.expectEqual(@as(u8, 0x03), buf.items[59]);
+    try testing.expectEqual(@as(u8, 0x0B), buf.items[60]);
+    try testing.expectEqualSlices(u8, "example.com", buf.items[61..72]);
+    // port 80 big-endian
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x50 }, buf.items[72..74]);
+    // trailing CRLF
+    try testing.expectEqualSlices(u8, "\r\n", buf.items[74..76]);
+    try testing.expectEqual(@as(usize, 76), buf.items.len);
 }
