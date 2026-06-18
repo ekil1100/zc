@@ -33,7 +33,6 @@ pub const Client = struct {
         stream_reader: net.Stream.Reader,
         stream_writer: net.Stream.Writer,
         tls_client: tls.Client,
-        ca_bundle: ?Certificate.Bundle = null,
         socket_read_buffer: [tls.Client.min_buffer_len]u8,
         socket_write_buffer: [tls.Client.min_buffer_len]u8,
         tls_read_buffer: [tls.Client.min_buffer_len]u8,
@@ -66,9 +65,6 @@ pub const Client = struct {
         if (self.tls_conn) |conn| {
             _ = conn.tls_client.end() catch {};
             conn.stream.close();
-            if (conn.ca_bundle) |*ca_bundle| {
-                ca_bundle.deinit(self.allocator);
-            }
             self.allocator.destroy(conn);
             self.tls_conn = null;
         }
@@ -145,7 +141,6 @@ pub const Client = struct {
         errdefer self.allocator.destroy(conn);
 
         conn.stream = stream;
-        conn.ca_bundle = null;
         conn.socket_read_buffer = undefined;
         conn.socket_write_buffer = undefined;
         conn.tls_read_buffer = undefined;
@@ -184,13 +179,7 @@ pub const Client = struct {
             &conn.stream_reader.interface,
             &conn.stream_writer.interface,
             options,
-        ) catch |err| {
-            if (conn.ca_bundle) |*ca_bundle| {
-                ca_bundle.deinit(self.allocator);
-                conn.ca_bundle = null;
-            }
-            return err;
-        };
+        ) catch |err| return err;
 
         return conn;
     }
@@ -202,9 +191,6 @@ pub const Client = struct {
     fn deinitTlsConnection(self: *Client, conn: *TlsConnection) void {
         _ = conn.tls_client.end() catch {};
         conn.stream.close();
-        if (conn.ca_bundle) |*ca_bundle| {
-            ca_bundle.deinit(self.allocator);
-        }
         self.allocator.destroy(conn);
     }
 
