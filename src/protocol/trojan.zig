@@ -37,6 +37,14 @@ pub const Client = struct {
         socket_write_buffer: [tls.Client.min_buffer_len]u8,
         tls_read_buffer: [tls.Client.min_buffer_len]u8,
         tls_write_buffer: [tls.Client.min_buffer_len]u8,
+        /// True once handshake() has staged the Trojan request into the TLS
+        /// writer buffer WITHOUT sealing it into its own record. The request is
+        /// flushed exactly once, on whichever of write()/read() runs first, so
+        /// the request header and the first relayed payload coalesce into a
+        /// single TLS record (killing the small-record-then-payload fingerprint)
+        /// while a server-speaks-first peer still receives the request before we
+        /// block on a read (no extra round-trip, no hang).
+        request_pending_flush: bool,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
@@ -94,12 +102,24 @@ pub const Client = struct {
 
     pub fn write(self: *Client, data: []const u8) !void {
         const conn = self.tls_conn orelse return error.NotConnected;
+        // Append the payload behind any staged-but-unflushed request, then flush
+        // once: on the first write this seals request+payload into a single TLS
+        // record. takePendingFlush clears the flag (bookkeeping) — the lone flush
+        // below already drains the staged request, so it is never double-flushed.
         try conn.tls_client.writer.writeAll(data);
+        _ = takePendingFlush(&conn.request_pending_flush);
         try flushTlsAndSocket(conn);
     }
 
     pub fn read(self: *Client, buf: []u8) !usize {
         const conn = self.tls_conn orelse return error.NotConnected;
+        // Read-first / server-speaks-first path: if handshake() staged the
+        // request but no write() has flushed it yet, flush it now so the server
+        // actually receives the request before we block waiting for its reply.
+        // Flushed exactly once (flag cleared), so no extra round-trip, no hang.
+        if (takePendingFlush(&conn.request_pending_flush)) {
+            try flushTlsAndSocket(conn);
+        }
         return readTlsApplicationData(&conn.tls_client.reader, buf) catch |err| {
             // TLS truncation without close_notify is a clean EOF for trojan tunnels.
             // Fatal TLS errors (bad record MAC, alert) still propagate.
@@ -141,6 +161,7 @@ pub const Client = struct {
         errdefer self.allocator.destroy(conn);
 
         conn.stream = stream;
+        conn.request_pending_flush = false;
         conn.socket_read_buffer = undefined;
         conn.socket_write_buffer = undefined;
         conn.tls_read_buffer = undefined;
@@ -254,14 +275,32 @@ pub const Client = struct {
 
         try self.buildRequest(&buf, .connect, target_host, target_port);
 
-        // 发送握手
+        // Stage the request into the TLS writer buffer WITHOUT flushing: the
+        // ~90-byte writeAll stays buffered (tls_write_buffer is min_buffer_len,
+        // multi-KB, so it does not auto-drain). The first write() or read()
+        // performs the single flush, coalescing the request with the first
+        // payload into one TLS record instead of emitting a tiny standalone one.
         try conn.tls_client.writer.writeAll(buf.items);
-        try flushTlsAndSocket(conn);
+        conn.request_pending_flush = true;
     }
 
     fn flushTlsAndSocket(conn: *TlsConnection) !void {
         try conn.tls_client.writer.flush();
         try conn.stream_writer.interface.flush();
+    }
+
+    /// Flush-once gate for the staged Trojan request: returns true exactly once
+    /// (when `pending` was set), clearing it so a subsequent write()/read() will
+    /// not flush the request a second time. The caller flushes iff this returns
+    /// true. Extracting this keeps the "request flushed exactly once, on
+    /// whichever of write/read happens first" invariant in one tested place and
+    /// guarantees no double-flush (extra record) and no missed-flush (hang).
+    fn takePendingFlush(pending: *bool) bool {
+        if (pending.*) {
+            pending.* = false;
+            return true;
+        }
+        return false;
     }
 
     fn readTlsApplicationData(reader: *std.Io.Reader, out: []u8) !usize {
@@ -592,6 +631,27 @@ test "Trojan pending read flags buffered TLS or socket bytes" {
     try testing.expect(Client.hasPendingBufferedRead(0, 1));
     try testing.expect(Client.hasPendingBufferedRead(1, 1));
     try testing.expect(!Client.hasPendingBufferedRead(0, 0));
+}
+
+test "Trojan takePendingFlush flushes the staged request exactly once" {
+    // After handshake() stages the request it sets request_pending_flush=true so
+    // the request coalesces with the first payload into one TLS record instead of
+    // a tiny standalone one. Whichever of write()/read() runs first must flush it
+    // exactly once: the first call flushes (true) and clears the flag, every
+    // later call is a no-op (false). This is the no-double-flush (no extra
+    // record) AND no-missed-flush (no hang on a server-speaks-first peer)
+    // guarantee, pinned without a live TLS server.
+    var pending = true;
+    try testing.expect(Client.takePendingFlush(&pending)); // first caller flushes
+    try testing.expect(!pending); // ...and the flag is cleared
+    try testing.expect(!Client.takePendingFlush(&pending)); // second caller is a no-op
+    try testing.expect(!Client.takePendingFlush(&pending)); // ...and stays a no-op
+
+    // A connection whose request was already flushed (e.g. flag never staged)
+    // never spuriously re-flushes.
+    var already = false;
+    try testing.expect(!Client.takePendingFlush(&already));
+    try testing.expect(!already);
 }
 
 test "Trojan read uses TLS buffered short-read semantics" {
