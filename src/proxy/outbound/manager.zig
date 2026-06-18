@@ -814,6 +814,63 @@ test "ProxyStream move transfers shadowsocks ownership" {
     try std.testing.expect(moved.owned_ss_client == ss_client);
 }
 
+test "ProxyStream move transfers trojan ownership" {
+    const allocator = std.testing.allocator;
+
+    // trojan.Client.init only hashes the password — it does NOT dial — so
+    // tls_conn stays null and the close path below is a no-op deinit + destroy.
+    const trojan_client = try allocator.create(trojan.Client);
+    errdefer allocator.destroy(trojan_client);
+    trojan_client.* = try trojan.Client.init(allocator, .{
+        .password = "password",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+
+    var source = ProxyStream.initTrojan(allocator, .{ .handle = -1 }, trojan_client);
+    var moved = source.move();
+    defer moved.close();
+    source.close();
+
+    try std.testing.expect(source.is_closed);
+    try std.testing.expect(source.owned_trojan_client == null);
+    try std.testing.expect(moved.owned_trojan_client == trojan_client);
+}
+
+test "connectToProxy(trojan) without password -> error.MissingPassword" {
+    const allocator = std.testing.allocator;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    // password defaults to null; the `orelse return error.MissingPassword` guard
+    // fires before client.connect(), so no dial occurs and the heap-create at the
+    // top of the trojan arm is reclaimed by its errdefer (leak-clean).
+    const proxy = Proxy{
+        .name = "t",
+        .proxy_type = .trojan,
+        .server = "127.0.0.1",
+        .port = 443,
+        .password = null,
+    };
+
+    try std.testing.expectError(
+        error.MissingPassword,
+        manager.connectToProxy(&proxy, "example.com", 80),
+    );
+}
+
 // KNOWN GAP (TODO C7): a real end-to-end loopback test — manager.connect(.anytls)
 // -> real dial -> relay, asserting "one dial on reuse" — needs a TLS + anytls-
 // protocol fake server. Deferred to C7; here we cover the ProxyStream ownership
