@@ -156,7 +156,7 @@ pub const Client = struct {
         defer root_bundle.deinit(self.allocator);
         var ca_lock: std.Io.RwLock = .init;
         var options = tls.Client.Options{
-            .host = .{ .explicit = self.tlsHost() },
+            .host = if (self.shouldOmitSni()) .{ .no_verification = {} } else .{ .explicit = self.tlsHost() },
             .ca = .{ .no_verification = {} },
             .allow_truncation_attacks = true,
             .read_buffer = &conn.tls_read_buffer,
@@ -186,6 +186,17 @@ pub const Client = struct {
 
     fn tlsHost(self: *const Client) []const u8 {
         return self.config.sni orelse self.config.address;
+    }
+
+    /// Decide whether to omit the SNI extension and skip hostname verification.
+    /// Mirrors anytls's shouldOmitSni but gated by the stricter trojan intent:
+    /// omit only when tlsHost() is a raw-IP literal AND no explicit sni was set.
+    /// Sending an IP as the SNI is a fingerprint and forces hostname matching
+    /// against an IP string (breaks domain-only certs). Keeping config.sni guards
+    /// real hostnames and any explicitly-configured sni (which keep .explicit).
+    /// CA-chain verification is unaffected — it is driven independently by options.ca.
+    fn shouldOmitSni(self: *const Client) bool {
+        return self.config.sni == null and isIpLiteral(self.config.address);
     }
 
     fn deinitTlsConnection(self: *Client, conn: *TlsConnection) void {
@@ -384,6 +395,16 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
     return true;
 }
 
+/// Returns true when `host` is a raw IPv4 or IPv6 literal (not a hostname).
+/// Reuses the existing parseIpv4/parseIpv6 parsers.
+fn isIpLiteral(host: []const u8) bool {
+    var ipv4: [4]u8 = undefined;
+    if (parseIpv4(host, &ipv4)) return true;
+    var ipv6: [16]u8 = undefined;
+    if (parseIpv6(host, &ipv6)) return true;
+    return false;
+}
+
 /// 测试
 const testing = std.testing;
 
@@ -472,6 +493,58 @@ test "Trojan TLS host falls back to server address when sni is absent" {
     });
 
     try testing.expectEqualStrings("server.example.com", client.tlsHost());
+}
+
+test "Trojan omits SNI for IP-literal server without explicit sni" {
+    const allocator = testing.allocator;
+
+    const v4 = try Client.init(allocator, .{
+        .password = "test",
+        .address = "192.168.1.2",
+        .port = 443,
+    });
+    try testing.expect(v4.shouldOmitSni());
+
+    const v6 = try Client.init(allocator, .{
+        .password = "test",
+        .address = "2001:db8::1",
+        .port = 443,
+    });
+    try testing.expect(v6.shouldOmitSni());
+}
+
+test "Trojan keeps SNI for hostname server" {
+    const allocator = testing.allocator;
+
+    const client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+    });
+
+    try testing.expect(!client.shouldOmitSni());
+}
+
+test "Trojan keeps explicit sni even when address is an IP" {
+    const allocator = testing.allocator;
+
+    const client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "8.8.8.8",
+        .port = 443,
+        .sni = "m.ctrip.com",
+    });
+
+    try testing.expect(!client.shouldOmitSni());
+    try testing.expectEqualStrings("m.ctrip.com", client.tlsHost());
+}
+
+test "Trojan isIpLiteral classifies literals vs hostnames" {
+    try testing.expect(isIpLiteral("8.8.8.8"));
+    try testing.expect(isIpLiteral("::1"));
+    try testing.expect(isIpLiteral("::ffff:192.168.0.1"));
+    try testing.expect(!isIpLiteral("example.com"));
+    try testing.expect(!isIpLiteral("localhost"));
 }
 
 test "Trojan hasPendingRead returns false when not connected" {
