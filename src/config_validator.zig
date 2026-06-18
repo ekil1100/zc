@@ -278,6 +278,12 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 if (proxy.udp) {
                     try result.addError("Trojan proxy '{s}': udp:true is not supported (Trojan UDP ASSOCIATE is not implemented)", .{proxy.name});
                 }
+                // Disabling cert verification is a real security downgrade; make
+                // it visible in validation output (warning, not error — isValid()
+                // stays true).
+                if (proxy.skip_cert_verify) {
+                    try result.addWarning("Trojan proxy '{s}': skip-cert-verify=true disables TLS certificate verification", .{proxy.name});
+                }
             },
             .vless => {
                 if (proxy.server.len == 0) {
@@ -759,4 +765,114 @@ test "udp-reject: trojan proxy without udp stays valid" {
     // Guards against the new udp check firing on the default udp=false.
     try std.testing.expect(result.isValid());
     try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
+}
+
+// Counts trojan skip-cert-verify warnings (substring-scoped, mirrors
+// countUdpWarnings) so happy-path tests can assert "clean" precisely without
+// depending on the total warning count.
+fn countTrojanCertWarnings(result: *const ValidationResult) usize {
+    var c: usize = 0;
+    for (result.warnings.items) |w| {
+        if (std.mem.indexOf(u8, w.message, "skip-cert-verify") != null) c += 1;
+    }
+    return c;
+}
+
+test "validator-hardening: trojan happy-path validates clean with no skip-cert warning" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-ok
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), countTrojanCertWarnings(&result));
+}
+
+test "validator-hardening: trojan empty server produces error" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-noserver
+        \\    type: trojan
+        \\    server: ""
+        \\    port: 443
+        \\    password: secret
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(&result, "server cannot be empty"));
+}
+
+test "validator-hardening: trojan port 0 is rejected at parse time" {
+    const allocator = std.testing.allocator;
+    // The parser guards invalid ports before validation runs: a server-bearing
+    // proxy with port 0 fails config_mod.parse with error.InvalidProxyPort, so
+    // the validator's isValidPort branch is never reached via YAML. Assert the
+    // actual rejection point (parse) rather than the unreachable validator arm.
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-badport
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 0
+        \\    password: secret
+    ;
+    try std.testing.expectError(error.InvalidProxyPort, config_mod.parse(allocator, yaml_config));
+}
+
+test "validator-hardening: trojan missing password produces error" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-nopw
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(&result, "password is required"));
+}
+
+test "validator-hardening: trojan skip-cert-verify=true emits one warning and stays valid" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-skipcert
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    skip-cert-verify: true
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Warning, not error: config stays valid.
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 1), countTrojanCertWarnings(&result));
 }
