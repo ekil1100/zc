@@ -104,7 +104,14 @@ pub const Client = struct {
 
     pub fn read(self: *Client, buf: []u8) !usize {
         const conn = self.tls_conn orelse return error.NotConnected;
-        return try readTlsApplicationData(&conn.tls_client.reader, buf);
+        return readTlsApplicationData(&conn.tls_client.reader, buf) catch |err| {
+            // TLS truncation without close_notify is a clean EOF for trojan tunnels.
+            // Fatal TLS errors (bad record MAC, alert) still propagate.
+            if (err != error.ReadFailed) return err;
+            const tls_err = conn.tls_client.read_err orelse return err;
+            if (tls_err == error.TlsConnectionTruncated) return 0;
+            return err;
+        };
     }
 
     pub fn hasPendingRead(self: *const Client) bool {
@@ -119,6 +126,18 @@ pub const Client = struct {
 
     fn hasPendingBufferedRead(tls_buffered: usize, socket_buffered: usize) bool {
         return tls_buffered > 0 or socket_buffered > 0;
+    }
+
+    /// Diagnostic: the most recent underlying std.crypto.tls read error, if any.
+    /// A relay teardown surfaces only `error.ReadFailed`; this exposes the real
+    /// cause so logs can tell a benign `TlsConnectionTruncated` (upstream dropped
+    /// the TCP mid-record without close_notify — the suspected brew-download
+    /// failure) apart from a genuinely fatal `TlsBadRecordMac`/`TlsAlert`.
+    pub fn lastReadError(self: *const Client) ?anyerror {
+        if (self.tls_conn) |conn| {
+            if (conn.tls_client.read_err) |e| return e;
+        }
+        return null;
     }
 
     fn initTlsConnection(self: *Client, stream: net.Stream) !*TlsConnection {

@@ -179,6 +179,12 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
     var name_set = std.StringHashMap(void).init(allocator);
     defer name_set.deinit();
 
+    // udp:true is anytls-only; subscriptions often set it on every node. Count
+    // the offenders and emit a single rolled-up warning after the loop instead
+    // of one line per proxy (which floods ~90 lines on a typical airport sub).
+    var udp_ignored_count: usize = 0;
+    var udp_ignored_first: []const u8 = "";
+
     for (config.proxies.items, 0..) |proxy, i| {
         // 检查名称是否为空
         if (proxy.name.len == 0) {
@@ -292,10 +298,18 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
         }
 
         // udp:true is only honored for anytls proxies (UDP relay is anytls-only
-        // for now). Warn — and ignore — when set on any other proxy type.
+        // for now). Tally — and ignore — when set on any other proxy type; the
+        // rolled-up warning is emitted once after the loop.
         if (proxy.udp and proxy.proxy_type != .anytls) {
-            try result.addWarning("Proxy '{s}': udp:true is only supported for anytls proxies; ignored", .{proxy.name});
+            if (udp_ignored_count == 0) udp_ignored_first = proxy.name;
+            udp_ignored_count += 1;
         }
+    }
+
+    if (udp_ignored_count == 1) {
+        try result.addWarning("Proxy '{s}': udp:true is only supported for anytls proxies; ignored", .{udp_ignored_first});
+    } else if (udp_ignored_count > 1) {
+        try result.addWarning("udp:true is set on {d} non-anytls proxies (e.g. '{s}'); anytls-only, ignored", .{ udp_ignored_count, udp_ignored_first });
     }
 }
 

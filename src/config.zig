@@ -305,6 +305,9 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
                     if (isProxyGroupType(item.map)) {
                         const group = try parseProxyGroup(allocator, item.map);
                         try config.proxy_groups.append(allocator, group);
+                    } else if (isSubscriptionInfoNode(item.map)) {
+                        // Skip airport quota/expiry pseudo-nodes (see isSubscriptionInfoNode).
+                        continue;
                     } else {
                         const proxy = try parseProxy(allocator, item.map);
                         try config.proxies.append(allocator, proxy);
@@ -359,6 +362,45 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
     }
 
     return config;
+}
+
+/// Clash airport subscriptions inject pseudo "nodes" that aren't dialable
+/// servers — they exist only to surface quota/expiry in a client's proxy
+/// selector (e.g. "Traffic: 167.74 GB | 400 GB", "Expire: 2026-07-20",
+/// "剩余流量：…", "套餐到期：…"). They carry a real `type`, so they would
+/// otherwise parse as genuine proxies, flood validation warnings, and waste a
+/// dial/latency probe on a junk server.
+fn isSubscriptionInfoNode(map: std.StringHashMap(yaml.YamlValue)) bool {
+    const nm = map.get("name") orelse return false;
+    if (nm != .string) return false;
+    return isSubscriptionInfoNodeName(nm.string);
+}
+
+fn isSubscriptionInfoNodeName(name: []const u8) bool {
+    const markers = [_][]const u8{
+        "Traffic:",     "Expire:",      "剩余流量",
+        "套餐到期",     "距离下次重置", "过期时间",
+        "到期时间",
+    };
+    for (markers) |m| {
+        if (m.len <= name.len and std.mem.eql(u8, name[0..m.len], m)) return true;
+    }
+    return false;
+}
+
+test "isSubscriptionInfoNodeName matches quota/expiry banners, not real nodes" {
+    const t = std.testing;
+    try t.expect(isSubscriptionInfoNodeName("Traffic: 167.74 GB | 400 GB"));
+    try t.expect(isSubscriptionInfoNodeName("Expire: 2026-07-20"));
+    try t.expect(isSubscriptionInfoNodeName("剩余流量：232 GB"));
+    try t.expect(isSubscriptionInfoNodeName("套餐到期：2026-07-20"));
+    // Real proxy names must NOT be filtered.
+    try t.expect(!isSubscriptionInfoNodeName("🇸🇬 新加坡高级 IEPL 专线 1"));
+    try t.expect(!isSubscriptionInfoNodeName("🇭🇰 香港实验性 IEPL 专线 1"));
+    try t.expect(!isSubscriptionInfoNodeName("US-Premium-01"));
+    // Would have been false positives with substring matching (§22 review fix).
+    try t.expect(!isSubscriptionInfoNodeName("Traffic-Singapore-01"));
+    try t.expect(!isSubscriptionInfoNodeName("剩余流量优化节点"));
 }
 
 fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValue)) !Proxy {
@@ -509,6 +551,11 @@ fn parseProxyGroup(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.Yam
         if (proxies == .array) {
             for (proxies.array.items) |*item| {
                 if (item.* == .string) {
+                    // Skip dangling references to dropped info-nodes.
+                    if (isSubscriptionInfoNodeName(item.string)) {
+                        std.log.scoped(.config).info("proxy-group '{s}': skipping subscription info-node reference '{s}'", .{ name.string, item.string });
+                        continue;
+                    }
                     const p = try allocator.dupe(u8, item.string);
                     try group.proxies.append(allocator, p);
                 }

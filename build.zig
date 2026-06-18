@@ -44,8 +44,15 @@ pub fn build(b: *std.Build) void {
     test_mod.link_libc = true;
     test_mod.addOptions("build_options", options);
 
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Only run tests whose name contains the given substring (repeatable)",
+    ) orelse &[_][]const u8{};
+
     const exe_unit_tests = b.addTest(.{
         .root_module = test_mod,
+        .filters = test_filters,
     });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);

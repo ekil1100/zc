@@ -211,6 +211,16 @@ pub const ProxyStream = struct {
         return false;
     }
 
+    /// Diagnostic: most recent underlying TLS read error for a trojan target,
+    /// or null. Lets the relay log distinguish a benign mid-record truncation
+    /// from a fatal TLS error when a read surfaces `error.ReadFailed`.
+    /// Returns null for non-trojan protocols (anytls, shadowsocks, plain TCP).
+    pub fn lastTlsReadError(self: *const ProxyStream) ?anyerror {
+        if (self.is_closed) return null;
+        if (self.owned_trojan_client) |client| return client.lastReadError();
+        return null;
+    }
+
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
         if (self.is_closed) return -1;
         if (self.owned_anytls_udp) |u| {

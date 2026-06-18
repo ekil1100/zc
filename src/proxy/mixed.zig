@@ -942,9 +942,20 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
                     closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
                     continue;
                 }
+                // Genuinely unexpected target error: the error unwinds out of
+                // relay() and the handler's defers close both sockets abruptly.
+                // Rare now that truncation/RST are classified as orderly closes;
+                // logged because it shouldn't normally happen.
+                relayLog("target read FATAL (unexpected, abrupt close): {} tls_err={?} down={}B up={}B", .{ err, target_stream.lastTlsReadError(), down_bytes, up_bytes });
                 return err;
             };
             if (n == 0) {
+                // Quiet on a normal clean EOF; leave a single breadcrumb only when
+                // the upstream truncated mid-stream (TLS close_notify never came) —
+                // the shape behind a downstream curl "unexpected eof".
+                if (target_stream.lastTlsReadError()) |tls_err| {
+                    relayLog("target upstream-truncated (graceful half-close): {} down={}B up={}B", .{ tls_err, down_bytes, up_bytes });
+                }
                 closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
             } else {
                 const delivered = try writeClientChunk(
@@ -1045,6 +1056,10 @@ fn drainTargetPending(
                 closeTargetReadSide(target_read_open, client_stream, client_write_shutdown);
                 return;
             }
+            // Genuinely unexpected error while draining buffered records (same
+            // abrupt-teardown path as relay()); rare now that truncation/RST are
+            // orderly closes. tls_err disambiguates the cause.
+            relayLog("drainTargetPending FATAL (unexpected, abrupt close): {} tls_err={?} down={}B", .{ err, target_stream.lastTlsReadError(), down_bytes.* });
             return err;
         };
         if (n == 0) break;
