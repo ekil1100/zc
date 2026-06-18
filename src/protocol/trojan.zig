@@ -480,15 +480,56 @@ const testing = std.testing;
 test "Trojan password hash" {
     const allocator = testing.allocator;
 
+    // The wire-critical password_hash is the lowercase-hex SHA-224 of the
+    // password. Pin the EXACT digest (verified out-of-band with sha224sum), not
+    // just its 56-byte length: a fabricated/placeholder hash would silently send
+    // the wrong credential. "password123" mixes hex nibbles both >9 (d,9,b,e,f)
+    // and <9 (3,4,0,1,2,5), exercising both arms of the init() hex loop.
     const client = try Client.init(allocator, .{
         .password = "password123",
         .address = "127.0.0.1",
         .port = 443,
     });
+    try testing.expectEqualStrings(
+        "3d45597256050bb1e93bd9c10aee4c8716f8774f5a48c995bf0cf860",
+        &client.password_hash,
+    );
 
-    // Password should be hashed to SHA-224
-    // password123 -> f6f4689e0a6e9e36e1c25c6e6e1f1c5e9e4a8e9b9a0b8c7
-    try testing.expectEqual(@as(usize, 56), client.password_hash.len);
+    // Second vector, independently verified, re-exercises the hex loop.
+    const client2 = try Client.init(allocator, .{
+        .password = "Test",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+    try testing.expectEqualStrings(
+        "3606346815fd4d491a92649905a40da025d8cf15f095136b19f37923",
+        &client2.password_hash,
+    );
+}
+
+test "Trojan connect rejects an already-connected client" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+
+    // Simulate a client that has already established a TLS session: the guard at
+    // the top of connect() (`if (self.tls_conn != null) return error.AlreadyConnected`)
+    // must fire BEFORE touching any field, so this stub never needs valid buffers.
+    const stub = try testing.allocator.create(Client.TlsConnection);
+    stub.* = undefined;
+    client.tls_conn = stub;
+
+    try testing.expectError(error.AlreadyConnected, client.connect("example.com", 80));
+
+    // Teardown WITHOUT client.deinit(): deinit would close stub.stream (an
+    // undefined fd) and destroy via the Client's allocator. Detach + destroy the
+    // stub directly so testing.allocator stays leak-clean.
+    client.tls_conn = null;
+    testing.allocator.destroy(stub);
 }
 
 test "Trojan encodeAddress IPv4" {
@@ -537,6 +578,47 @@ test "Trojan parseIpv6 ipv4-mapped" {
     try testing.expectEqual(@as(u8, 168), out[13]);
     try testing.expectEqual(@as(u8, 1), out[14]);
     try testing.expectEqual(@as(u8, 1), out[15]);
+}
+
+test "Trojan parseIpv6 negatives" {
+    var out: [16]u8 = undefined;
+    // 9 groups: the full-form loop trips `part_count >= 8` on the 9th group.
+    try testing.expect(!parseIpv6("1:2:3:4:5:6:7:8:9", &out));
+    // Two "::" — the split after the first "::" yields an empty part (len==0).
+    try testing.expect(!parseIpv6("1::2::3", &out));
+    // Non-hex group — parseInt(base 16) fails.
+    try testing.expect(!parseIpv6("gggg::1", &out));
+    // Group longer than 4 hex digits — `part.len > 4`.
+    try testing.expect(!parseIpv6("12345::1", &out));
+    // IPv4-mapped branch with an out-of-range octet — parseIpv4 rejects 999.
+    try testing.expect(!parseIpv6("::ffff:999.0.0.1", &out));
+}
+
+test "Trojan encodeAddress domain and IPv6" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+
+    // Domain branch: 0x03, length prefix, raw host bytes.
+    var dbuf = std.ArrayList(u8).empty;
+    defer dbuf.deinit(allocator);
+    try client.encodeAddress(&dbuf, "example.com");
+    try testing.expectEqual(@as(u8, 0x03), dbuf.items[0]);
+    try testing.expectEqual(@as(u8, 11), dbuf.items[1]);
+    try testing.expectEqualStrings("example.com", dbuf.items[2..][0..11]);
+    try testing.expectEqual(@as(usize, 13), dbuf.items.len);
+
+    // IPv6 branch: 0x04 + 16-byte parsed address; "::1" ends in 0x01.
+    var v6buf = std.ArrayList(u8).empty;
+    defer v6buf.deinit(allocator);
+    try client.encodeAddress(&v6buf, "::1");
+    try testing.expectEqual(@as(u8, 0x04), v6buf.items[0]);
+    try testing.expectEqual(@as(usize, 17), v6buf.items.len);
+    try testing.expectEqual(@as(u8, 0x01), v6buf.items[16]);
 }
 
 test "Trojan TLS host prefers configured sni" {
