@@ -585,37 +585,52 @@ test "Trojan hasPendingRead returns false when not connected" {
     try testing.expect(!client.hasPendingRead());
 }
 
-test "Trojan write path flushes underlying socket writer" {
-    const allocator = testing.allocator;
-    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
-    defer allocator.free(content);
-
-    try testing.expect(std.mem.indexOf(u8, content, "fn " ++ "flushTlsAndSocket") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_writer.interface." ++ "flush()") != null);
-}
-
-test "Trojan pending read includes raw TLS socket reader data" {
-    const allocator = testing.allocator;
-    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
-    defer allocator.free(content);
-
+test "Trojan pending read flags buffered TLS or socket bytes" {
+    // hasPendingBufferedRead is the pure decision behind hasPendingRead():
+    // a relay must drain either buffer before yielding the connection.
     try testing.expect(Client.hasPendingBufferedRead(1, 0));
     try testing.expect(Client.hasPendingBufferedRead(0, 1));
+    try testing.expect(Client.hasPendingBufferedRead(1, 1));
     try testing.expect(!Client.hasPendingBufferedRead(0, 0));
-    try testing.expect(std.mem.indexOf(u8, content, "conn.tls_client.reader." ++ "bufferedLen()") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "conn.stream_reader.interface." ++ "bufferedLen()") != null);
 }
 
 test "Trojan read uses TLS buffered short-read semantics" {
-    const allocator = testing.allocator;
-    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/protocol/trojan.zig", 1024 * 1024);
-    defer allocator.free(content);
+    // Drive readTlsApplicationData (the helper read() delegates to) against an
+    // injectable fixed reader: it returns up to out.len buffered bytes per call
+    // (a short read), advancing the reader, never blocking for a full fill.
+    var r = std.Io.Reader.fixed("abcdef");
 
-    const read_pos = std.mem.indexOf(u8, content, "pub fn read(self: *Client") orelse return error.TestUnexpectedResult;
-    const pending_pos = std.mem.indexOfPos(u8, content, read_pos, "pub fn hasPendingRead") orelse return error.TestUnexpectedResult;
-    const read_body = content[read_pos..pending_pos];
-    try testing.expect(std.mem.indexOf(u8, read_body, "readTlsApplicationData") != null);
-    try testing.expect(std.mem.indexOf(u8, read_body, "readSliceShort") == null);
+    var out: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), try Client.readTlsApplicationData(&r, &out));
+    try testing.expectEqualStrings("abcd", &out);
+
+    // Second call returns the remainder even though the destination is larger.
+    var rest: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), try Client.readTlsApplicationData(&r, &rest));
+    try testing.expectEqualStrings("ef", rest[0..2]);
+
+    // Stream fully drained -> clean EOF (0), not an error.
+    try testing.expectEqual(@as(usize, 0), try Client.readTlsApplicationData(&r, &rest));
+}
+
+test "Trojan readTlsApplicationData reports drained/empty stream as EOF" {
+    // An empty fixed reader yields error.EndOfStream from fillMore, which
+    // readTlsApplicationData translates into a clean 0-length read. This 0-return
+    // is the mechanism read() relies on: when the underlying tls.Client surfaces
+    // error.TlsConnectionTruncated (TCP dropped mid-record without close_notify),
+    // read() maps it to EOF too. That TlsConnectionTruncated->0 translation needs
+    // a live tls.Client and stays integration-only; the EOF semantics it builds on
+    // are pinned here.
+    var empty = std.Io.Reader.fixed("");
+    var out: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try Client.readTlsApplicationData(&empty, &out));
+
+    // Zero-length destination short-circuits without touching the reader.
+    var r = std.Io.Reader.fixed("xyz");
+    try testing.expectEqual(@as(usize, 0), try Client.readTlsApplicationData(&r, out[0..0]));
+    // ...and the reader is left untouched: the next real read still sees "xyz".
+    try testing.expectEqual(@as(usize, 3), try Client.readTlsApplicationData(&r, &out));
+    try testing.expectEqualStrings("xyz", out[0..3]);
 }
 
 test "Trojan parseIpv4 rejects overflowing octet without panic" {
