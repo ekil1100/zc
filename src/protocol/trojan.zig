@@ -165,15 +165,20 @@ pub const Client = struct {
             .realtime_now = now,
         };
 
+        // Build the verifying CA value (rescanning the real root bundle) only when
+        // verification is enabled; the pure `caOption` seam then selects between it
+        // and `.no_verification` so the branch is testable in isolation.
+        var ca_value: CaOptions = .{ .no_verification = {} };
         if (!self.config.skip_cert_verify) {
             try root_bundle.rescan(self.allocator, compat.io(), now);
-            options.ca = .{ .bundle = .{
+            ca_value = .{ .bundle = .{
                 .gpa = self.allocator,
                 .io = compat.io(),
                 .lock = &ca_lock,
                 .bundle = &root_bundle,
             } };
         }
+        options.ca = caOption(self.config.skip_cert_verify, ca_value);
 
         conn.tls_client = tls.Client.init(
             &conn.stream_reader.interface,
@@ -186,6 +191,19 @@ pub const Client = struct {
 
     fn tlsHost(self: *const Client) []const u8 {
         return self.config.sni orelse self.config.address;
+    }
+
+    /// The anonymous `union(enum)` of `tls.Client.Options.ca` — there is no public
+    /// type name for it, so it must be referenced via `@FieldType`.
+    const CaOptions = @FieldType(tls.Client.Options, "ca");
+
+    /// Pure CA-options decision: when `skip_cert_verify` is set, return
+    /// `.no_verification`; otherwise return the caller-built `bundle` value
+    /// (which carries the live allocator/io/lock/bundle pointers).
+    /// Extracting this branch makes an accidental inversion — silently disabling
+    /// TLS verification — fail a test instead of slipping through unnoticed.
+    fn caOption(skip_cert_verify: bool, bundle: CaOptions) CaOptions {
+        return if (skip_cert_verify) .{ .no_verification = {} } else bundle;
     }
 
     /// Decide whether to omit the SNI extension and skip hostname verification.
@@ -667,4 +685,33 @@ test "Trojan encodeAddress rejects over-long domain" {
     try client.encodeAddress(&buf2, max_host);
     try testing.expectEqual(@as(u8, 0x03), buf2.items[0]);
     try testing.expectEqual(@as(u8, 255), buf2.items[1]);
+}
+
+test "Trojan caOption uses real bundle when verification is enabled" {
+    var lock: std.Io.RwLock = .init;
+    var empty_bundle: Certificate.Bundle = .empty;
+    // Tag-only inspection: no rescan/allocation, so nothing to deinit.
+    const dummy_bundle: Client.CaOptions = .{ .bundle = .{
+        .gpa = testing.allocator,
+        .io = compat.io(),
+        .lock = &lock,
+        .bundle = &empty_bundle,
+    } };
+
+    const result = Client.caOption(false, dummy_bundle);
+    try testing.expectEqual(std.meta.Tag(Client.CaOptions).bundle, std.meta.activeTag(result));
+}
+
+test "Trojan caOption disables verification only when skip_cert_verify is set" {
+    var lock: std.Io.RwLock = .init;
+    var empty_bundle: Certificate.Bundle = .empty;
+    const dummy_bundle: Client.CaOptions = .{ .bundle = .{
+        .gpa = testing.allocator,
+        .io = compat.io(),
+        .lock = &lock,
+        .bundle = &empty_bundle,
+    } };
+
+    const result = Client.caOption(true, dummy_bundle);
+    try testing.expectEqual(std.meta.Tag(Client.CaOptions).no_verification, std.meta.activeTag(result));
 }
