@@ -289,14 +289,23 @@ fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     var parts: [4]u8 = undefined;
     var part_idx: usize = 0;
     var current: u16 = 0;
+    var digits: usize = 0;
+    var first_char: u8 = 0;
 
     for (str) |c| {
         if (c == '.') {
-            if (part_idx >= 4) return false;
+            if (part_idx >= 3) return false; // too many octets
+            if (digits == 0) return false; // empty octet (leading/doubled dot)
             parts[part_idx] = @intCast(current);
             part_idx += 1;
             current = 0;
+            digits = 0;
         } else if (c >= '0' and c <= '9') {
+            if (digits == 0) first_char = c;
+            digits += 1;
+            if (digits > 3) return false; // octet longer than 3 digits
+            // inet_pton strictness: reject any octet of length>1 starting with '0'.
+            if (digits > 1 and first_char == '0') return false;
             current = current * 10 + (c - '0');
             if (current > 255) return false;
         } else {
@@ -304,7 +313,8 @@ fn parseIpv4(str: []const u8, out: *[4]u8) bool {
         }
     }
 
-    if (part_idx != 3) return false;
+    if (part_idx != 3) return false; // too few octets
+    if (digits == 0) return false; // empty trailing octet (trailing dot / empty string)
     parts[3] = @intCast(current);
 
     @memcpy(out, &parts);
@@ -532,6 +542,48 @@ test "Trojan parseIpv4 rejects overflowing octet without panic" {
     try testing.expect(parseIpv4("10.0.0.255", &out));
     try testing.expectEqual(@as(u8, 10), out[0]);
     try testing.expectEqual(@as(u8, 255), out[3]);
+}
+
+test "Trojan parseIpv4 strict: rejects empty octet, leading zero, trailing dot" {
+    var out: [4]u8 = undefined;
+    // Empty octets (doubled/leading/trailing dots) must be rejected, not silently
+    // accepted as 0 — this agrees with the strict stdlib parser the bypass guard uses.
+    try testing.expect(!parseIpv4("1..2.3", &out));
+    try testing.expect(!parseIpv4(".1.2.3", &out));
+    try testing.expect(!parseIpv4("1.2.3.", &out));
+    // Leading-zero octets (length>1 starting with '0') are rejected by inet_pton too.
+    try testing.expect(!parseIpv4("010.0.0.1", &out));
+    try testing.expect(!parseIpv4("1.2.3.04", &out));
+    // Wrong octet count.
+    try testing.expect(!parseIpv4("1.2.3", &out)); // too few
+    try testing.expect(!parseIpv4("1.2.3.4.5", &out)); // too many
+    try testing.expect(!parseIpv4("", &out)); // empty string
+    // Positive controls: well-formed addresses (including lone-'0' octets) still parse.
+    try testing.expect(parseIpv4("0.0.0.0", &out));
+    try testing.expect(parseIpv4("192.168.1.1", &out));
+    try testing.expectEqual(@as(u8, 192), out[0]);
+}
+
+test "Trojan encodeAddress: malformed quad falls through to domain" {
+    const allocator = testing.allocator;
+
+    var client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    // "010.0.0.1" is no longer a valid IPv4 literal — it must fall through to
+    // domain (0x03) encoding rather than being mis-encoded as a 0x01 IPv4 target.
+    const host = "010.0.0.1";
+    try client.encodeAddress(&buf, host);
+
+    try testing.expectEqual(@as(u8, 0x03), buf.items[0]); // domain
+    try testing.expectEqual(@as(u8, host.len), buf.items[1]); // length prefix
+    try testing.expectEqualStrings(host, buf.items[2..][0..host.len]);
 }
 
 test "Trojan encodeAddress rejects over-long domain" {
