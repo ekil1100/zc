@@ -933,6 +933,12 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         }
 
         if (target_read_open and (poll_fds[1].revents & std.posix.POLL.IN != 0)) {
+            // Accepted blocking-path limitation (M5): for the blocking trojan/ss
+            // target path, poll() above only guarantees ciphertext readiness, so this
+            // poll-ready read() can still block until the in-flight TLS record finishes
+            // arriving (a record may span several TCP segments), briefly stalling the
+            // client->target direction. Documented at trojan.zig:readTlsApplicationData;
+            // a non-blocking rewrite is performance-gated per AGENTS.md.
             const n = target_stream.read(&buf) catch |err| {
                 // A buffered protocol (e.g. shadowsocks) returns WouldBlock when
                 // only part of a frame is in yet. Don't tear down — go back to

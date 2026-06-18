@@ -127,6 +127,19 @@ pub const Client = struct {
         return readTlsApplicationData(&conn.tls_client.reader, buf) catch |err| {
             // TLS truncation without close_notify is a clean EOF for trojan tunnels.
             // Fatal TLS errors (bad record MAC, alert) still propagate.
+            //
+            // Residual M1 exposure: a trojan tunnel carries an UNFRAMED byte stream,
+            // so at the byte level this read CANNOT distinguish a malicious on-path
+            // truncation (attacker injects FIN/RST mid-record) from a legitimate
+            // close — both surface here as a clean 0-length EOF. This is a deliberate
+            // tradeoff: see initTlsConnection's `.allow_truncation_attacks = true`
+            // note for why we accept it (the brew-download mid-record-drop case).
+            // The abnormal close is NOT lost, though: the underlying TlsConnectionTruncated
+            // stays observable out-of-band via lastReadError() here and
+            // ProxyStream.lastTlsReadError() in the relay, which logs it as an
+            // "upstream-truncated (graceful half-close)" breadcrumb. Contrast anytls:
+            // its framed payloads let it reject a short final frame, which an
+            // unframed trojan tunnel structurally cannot do.
             if (err != error.ReadFailed) return err;
             const tls_err = conn.tls_client.read_err orelse return err;
             if (tls_err == error.TlsConnectionTruncated) return 0;
@@ -183,6 +196,16 @@ pub const Client = struct {
         var options = tls.Client.Options{
             .host = if (self.shouldOmitSni()) .{ .no_verification = {} } else .{ .explicit = self.tlsHost() },
             .ca = .{ .no_verification = {} },
+            // Deliberate (M1): tell std.crypto.tls NOT to raise TlsConnectionTruncated
+            // as fatal when the peer drops the TCP mid-record without close_notify.
+            // This accepts a residual on-path truncation exposure — an attacker who
+            // can inject FIN/RST truncates an unframed trojan tunnel and it reads as a
+            // clean EOF (see read()) — in exchange for tolerating benign mid-record
+            // drops, the brew-download truncation case the recent commits targeted.
+            // The abnormal close is NOT swallowed silently: it stays visible via
+            // read_err / lastReadError() / ProxyStream.lastTlsReadError(). Contrast
+            // anytls's framed model, which can reject a short final frame; an unframed
+            // trojan tunnel cannot. Do NOT flip this flag — that regresses the case above.
             .allow_truncation_attacks = true,
             .read_buffer = &conn.tls_read_buffer,
             .write_buffer = &conn.tls_write_buffer,
@@ -307,6 +330,17 @@ pub const Client = struct {
         return false;
     }
 
+    // M5 (accepted blocking-trojan-path limitation): the relay polls the trojan
+    // handle for POLL.IN and only calls read() — hence this helper — once it is
+    // ready. But poll() guarantees only that at least one byte of CIPHERTEXT is
+    // available; a single TLS record can span multiple TCP segments. The fillMore()
+    // below is a BLOCKING socket read, so it can block waiting for the rest of an
+    // in-flight record even though the handle polled ready. While the relay thread
+    // is parked here it cannot service the opposite (client->target) direction —
+    // that direction stalls until this inbound record completes. A non-blocking
+    // rearchitecture is performance-gated per AGENTS.md, so we document rather than
+    // rewrite, mirroring anytls's recorded "mid-frame blocking read" residual risk
+    // (docs/anytls/session-multiplexing-design.md §18.1).
     fn readTlsApplicationData(reader: *std.Io.Reader, out: []u8) !usize {
         if (out.len == 0) return 0;
 
