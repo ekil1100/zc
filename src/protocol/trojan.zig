@@ -9,6 +9,10 @@ const socket_options = @import("../socket_options.zig");
 /// Trojan 命令类型
 pub const Command = enum(u8) {
     connect = 0x01,
+    /// Defined-but-unwired: this client is CONNECT-only. handshake() always
+    /// sends Command.connect (see buildRequest call below); Trojan UDP ASSOCIATE
+    /// is not implemented, and config_validator rejects udp:true for trojan.
+    /// The variant is kept (no other references) to mirror the protocol spec.
     udp_associate = 0x03,
 };
 

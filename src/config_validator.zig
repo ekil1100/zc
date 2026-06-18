@@ -270,6 +270,14 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 if (proxy.password == null or proxy.password.?.len == 0) {
                     try result.addError("Trojan proxy '{s}': password is required", .{proxy.name});
                 }
+                // Trojan client is CONNECT-only (handshake() always sends
+                // Command.connect); UDP ASSOCIATE is unimplemented. Fail config
+                // validation early instead of deferring to a connect-time
+                // error.UdpNotSupportedByProxy. (The shared udp roll-up warning
+                // below ALSO fires for trojan; the error dominates isValid().)
+                if (proxy.udp) {
+                    try result.addError("Trojan proxy '{s}': udp:true is not supported (Trojan UDP ASSOCIATE is not implemented)", .{proxy.name});
+                }
             },
             .vless => {
                 if (proxy.server.len == 0) {
@@ -701,4 +709,54 @@ test "D4: validator does not warn on anytls proxy with udp:true" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), countUdpWarnings(&result));
+}
+
+fn hasErrorContaining(result: *const ValidationResult, needle: []const u8) bool {
+    for (result.errors.items) |e| {
+        if (std.mem.indexOf(u8, e.message, needle) != null) return true;
+    }
+    return false;
+}
+
+test "udp-reject: trojan proxy with udp:true produces a validation error and isValid()==false" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-udp
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    udp: true
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Trojan UDP ASSOCIATE is unimplemented: udp:true must be a hard error.
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(&result, "udp:true is not supported"));
+}
+
+test "udp-reject: trojan proxy without udp stays valid" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-plain
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Guards against the new udp check firing on the default udp=false.
+    try std.testing.expect(result.isValid());
+    try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
 }
