@@ -449,9 +449,12 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
             var it = std.mem.splitScalar(u8, str[0..dc_pos], ':');
             while (it.next()) |part| {
                 if (part.len == 0 or part.len > 4) return false;
+                // Bound BEFORE the indexed store: `parts` is [8]u16, so a 9th
+                // group must be rejected without writing parts[8] (an OOB write
+                // that panics in safe builds, corrupts the stack otherwise).
+                if (part_count >= 8) return false;
                 parts[part_count] = std.fmt.parseInt(u16, part, 16) catch return false;
                 part_count += 1;
-                if (part_count > 8) return false;
             }
         }
 
@@ -463,9 +466,11 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
             var it = std.mem.splitScalar(u8, after, ':');
             while (it.next()) |part| {
                 if (part.len == 0 or part.len > 4) return false;
+                // Same OOB guard as the before-:: loop: reject the 9th group
+                // before it can write after_parts[8].
+                if (after_count >= 8) return false;
                 after_parts[after_count] = std.fmt.parseInt(u16, part, 16) catch return false;
                 after_count += 1;
-                if (after_count > 8) return false;
             }
         }
 
@@ -626,6 +631,24 @@ test "Trojan parseIpv6 negatives" {
     try testing.expect(!parseIpv6("12345::1", &out));
     // IPv4-mapped branch with an out-of-range octet — parseIpv4 rejects 999.
     try testing.expect(!parseIpv6("::ffff:999.0.0.1", &out));
+}
+
+test "Trojan parseIpv6 rejects >8 groups around :: without OOB write" {
+    var out: [16]u8 = undefined;
+    // Regression: the compressed-form loops used to store parts[part_count]
+    // BEFORE checking the bound (and checked `> 8`, not `>= 8`), so a 9th group
+    // on either side of "::" wrote one past the end of the [8]u16 backing array —
+    // a panic in safe builds, a stack OOB write otherwise. `host` reaches here
+    // straight from the relayed CONNECT target (encodeAddress -> parseIpv6), so
+    // this was a peer-triggerable crash. All four must return false, never panic.
+    try testing.expect(!parseIpv6("1:2:3:4:5:6:7:8:9::1", &out)); // 9 before ::
+    try testing.expect(!parseIpv6("1:2:3:4:5:6:7:8:9::", &out)); // 9 before, empty after
+    try testing.expect(!parseIpv6("::1:2:3:4:5:6:7:8:9", &out)); // 9 after ::
+    try testing.expect(!parseIpv6("1::2:3:4:5:6:7:8:9", &out)); // 1 before, 9 after
+    // The exact boundary still parses: 7 groups + "::" (one implied zero group).
+    try testing.expect(parseIpv6("1:2:3:4:5:6:7::", &out));
+    try testing.expectEqual(@as(u8, 0), out[14]);
+    try testing.expectEqual(@as(u8, 0), out[15]);
 }
 
 test "Trojan encodeAddress domain and IPv6" {
