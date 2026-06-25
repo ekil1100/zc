@@ -221,11 +221,11 @@ pub const Client = struct {
         }
         options.ca = caOption(self.config.skip_cert_verify, ca_value);
 
-        conn.tls_client = tls.Client.init(
+        conn.tls_client = try tls.Client.init(
             &conn.stream_reader.interface,
             &conn.stream_writer.interface,
             options,
-        ) catch |err| return err;
+        );
 
         return conn;
     }
