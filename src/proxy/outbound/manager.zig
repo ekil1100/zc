@@ -837,6 +837,31 @@ test "ProxyStream move transfers trojan ownership" {
     try std.testing.expect(moved.owned_trojan_client == trojan_client);
 }
 
+test "ProxyStream.lastTlsReadError null for non-trojan, unconnected trojan, and closed streams" {
+    const allocator = std.testing.allocator;
+
+    // The diagnostic is trojan-only: a non-trojan (direct) stream returns null.
+    var direct = ProxyStream.initDirect(.{ .handle = -1 });
+    try std.testing.expectEqual(@as(?anyerror, null), direct.lastTlsReadError());
+
+    // trojan.Client.init only hashes (no dial), so tls_conn stays null and the
+    // underlying read_err is null -> lastReadError() -> null.
+    const client = try allocator.create(trojan.Client);
+    client.* = try trojan.Client.init(allocator, .{
+        .password = "password",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+    var ts = ProxyStream.initTrojan(allocator, .{ .handle = -1 }, client);
+    defer ts.close(); // idempotent (is_closed guard); frees the client exactly once
+    try std.testing.expectEqual(@as(?anyerror, null), ts.lastTlsReadError());
+
+    // After close the is_closed guard returns null WITHOUT dereferencing the freed
+    // client (no UAF) — the breadcrumb contract the relay logging depends on.
+    ts.close();
+    try std.testing.expectEqual(@as(?anyerror, null), ts.lastTlsReadError());
+}
+
 test "connectToProxy(trojan) without password -> error.MissingPassword" {
     const allocator = std.testing.allocator;
 

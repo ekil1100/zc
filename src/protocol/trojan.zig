@@ -770,6 +770,19 @@ test "Trojan isIpLiteral classifies literals vs hostnames" {
     try testing.expect(!isIpLiteral("localhost"));
 }
 
+test "Trojan lastReadError is null before any TLS connection" {
+    const allocator = testing.allocator;
+    const client = try Client.init(allocator, .{
+        .password = "test",
+        .address = "127.0.0.1",
+        .port = 443,
+    });
+    // tls_conn stays null until connect() dials, so there is no underlying
+    // read_err to surface. This pins the breadcrumb the M1/M5 docs lean on:
+    // a regression that always returned a non-null/garbage error would fail here.
+    try testing.expectEqual(@as(?anyerror, null), client.lastReadError());
+}
+
 test "Trojan hasPendingRead returns false when not connected" {
     const allocator = testing.allocator;
 
