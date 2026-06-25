@@ -377,13 +377,21 @@ fn isSubscriptionInfoNode(map: std.StringHashMap(yaml.YamlValue)) bool {
 }
 
 fn isSubscriptionInfoNodeName(name: []const u8) bool {
-    const markers = [_][]const u8{
-        "Traffic:",     "Expire:",      "剩余流量",
+    // A banner has the shape "<label><colon><value>" (e.g. "Traffic: 167 GB",
+    // "剩余流量：232 GB"). Match the label as a prefix AND require a colon
+    // separator (half- or full-width) immediately after it, so a real node whose
+    // name merely BEGINS with a label word — "剩余流量优化节点",
+    // "Traffic-Singapore-01" — is not mistaken for a banner.
+    const labels = [_][]const u8{
+        "Traffic",      "Expire",       "剩余流量",
         "套餐到期",     "距离下次重置", "过期时间",
         "到期时间",
     };
-    for (markers) |m| {
-        if (m.len <= name.len and std.mem.eql(u8, name[0..m.len], m)) return true;
+    for (labels) |label| {
+        if (label.len > name.len) continue;
+        if (!std.mem.eql(u8, name[0..label.len], label)) continue;
+        const rest = name[label.len..];
+        if (std.mem.startsWith(u8, rest, ":") or std.mem.startsWith(u8, rest, "：")) return true;
     }
     return false;
 }
