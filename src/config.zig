@@ -1852,6 +1852,96 @@ pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_
     }
 }
 
+/// `config delete` 的结果（key 为 caller 所有，was_active 供 JSON 渲染）。
+pub const DeleteOutcome = struct {
+    key: []const u8,
+    /// 删除的是当前 active 配置时为 true（调用方据此提示下一步）。
+    was_active: bool,
+
+    pub fn deinit(self: *DeleteOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+    }
+};
+
+/// 删除配置：移除 configs/{key}.yaml、meta.json 中的 entry，以及该配置
+/// 托管的持久化 override 脚本（仅当脚本位于托管 override 目录内 —— 用户
+/// 自己路径在配置目录外的脚本绝不删）。
+/// 找不到目标（既不在 meta 中，configs/ 下也没有对应文件）返回
+/// error.ConfigNotFound（envelope 由调用方渲染）。
+/// 删除当前 active 配置时清空 meta.active —— 运行中的 daemon 已把配置载入
+/// 内存，不受影响，直到下次 reload/restart（届时回退到内置默认）。
+pub fn deleteConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_output.Output) !DeleteOutcome {
+    // target 可能带 .yaml 后缀（与 use/update/download 共用同一套归一化）。
+    const key = normalizeConfigKey(target);
+
+    const configs_dir = try meta.getConfigsDir(allocator) orelse return error.ConfigNotFound;
+    defer allocator.free(configs_dir);
+
+    const yaml_name = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
+    defer allocator.free(yaml_name);
+
+    const file_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_name });
+    defer allocator.free(file_path);
+
+    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    defer meta_data.deinit();
+
+    const in_meta = meta_data.configs.contains(key);
+    const file_exists = if (compat.fs.accessAbsolute(file_path, .{})) |_| true else |_| false;
+
+    // 既无 meta entry 又无文件 —— 没有可删的东西。
+    if (!in_meta and !file_exists) return error.ConfigNotFound;
+
+    // 1) 删除托管的持久化 override 脚本（失败不阻断后续删除：脚本只是缓存，
+    //    残留也不致命，而配置删除本身必须推进）。
+    if (meta_data.configs.getPtr(key)) |cm| {
+        if (cm.override_script) |script_path| {
+            if (try getOverrideScriptsDir(allocator)) |overrides_dir| {
+                defer allocator.free(overrides_dir);
+                const managed = isManagedOverrideScriptPath(allocator, script_path, overrides_dir) catch false;
+                if (managed) compat.fs.deleteFileAbsolute(script_path) catch {};
+            }
+        }
+    }
+
+    // 2) 删除 yaml 文件（删除前已被别的进程删掉则视为成功）。
+    if (file_exists) {
+        compat.fs.deleteFileAbsolute(file_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    // 3) 从 meta 移除 entry（key 与 value 都需释放，否则泄漏）。
+    if (meta_data.configs.fetchRemove(key)) |kv| {
+        allocator.free(kv.key);
+        var removed = kv.value;
+        removed.deinit(allocator);
+    }
+
+    // 4) 删的是 active？清空 active（避免悬空指针指向已删配置）。
+    var was_active = false;
+    if (meta_data.active) |active| {
+        if (std.mem.eql(u8, active, key)) {
+            was_active = true;
+            allocator.free(active);
+            meta_data.active = null;
+        }
+    }
+
+    try meta.save(allocator, &meta_data);
+
+    if (out.mode == .text) {
+        try out.print("Deleted config: {s}\n", .{key});
+        if (was_active) {
+            try out.print("This was the active config; run `zc config use <name>` to pick another\n", .{});
+        }
+        try out.flush();
+    }
+
+    return .{ .key = try allocator.dupe(u8, key), .was_active = was_active };
+}
+
 test "config parsing" {
     const allocator = std.testing.allocator;
 
@@ -2327,4 +2417,175 @@ test "makeManagedOverrideScriptPathForKey keeps source extension" {
 
     try std.testing.expect(std.mem.startsWith(u8, path, "/tmp/zc-override/abc123-"));
     try std.testing.expect(std.mem.endsWith(u8, path, ".lua"));
+}
+
+// 测试用：在隔离 HOME（build.zig 设为 .zig-cache/zc-test-home）的真实
+// configs/ 目录里造一个配置文件并登记到 meta，返回绝对文件路径（caller free）。
+fn testSeedConfig(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    try meta.ensureConfigsDir(allocator);
+    const configs_dir = (try meta.getConfigsDir(allocator)).?;
+    defer allocator.free(configs_dir);
+
+    const yaml_name = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
+    defer allocator.free(yaml_name);
+    const file_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_name });
+    errdefer allocator.free(file_path);
+
+    const f = try compat.fs.createFileAbsolute(file_path, .{});
+    defer f.close(compat.io());
+    try compat.fileWriteAll(f, "mixed-port: 7899\n");
+    return file_path;
+}
+
+fn testPathExists(file_path: []const u8) bool {
+    return if (compat.fs.accessAbsolute(file_path, .{})) |_| true else |_| false;
+}
+
+test "deleteConfig removes file + meta entry and clears active when active" {
+    const allocator = std.testing.allocator;
+
+    const key = "zc-delete-unit-active";
+    const file_path = try testSeedConfig(allocator, key);
+    defer allocator.free(file_path);
+
+    // 登记到 meta 并设为 active。
+    {
+        var md = meta.load(allocator) catch meta.MetaData.init(allocator);
+        defer md.deinit();
+        _ = try ensureConfigMetaEntry(allocator, &md, key);
+        if (md.active) |old| allocator.free(old);
+        md.active = try allocator.dupe(u8, key);
+        try meta.save(allocator, &md);
+    }
+
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(allocator);
+    defer err_w.deinit();
+    var out = cli_output.Output.init(.text, "config delete", false, false, &out_w.writer, &err_w.writer);
+
+    // 带 .yaml 后缀也应归一化命中。
+    var outcome = try deleteConfig(allocator, "zc-delete-unit-active.yaml", &out);
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqualStrings(key, outcome.key);
+    try std.testing.expect(outcome.was_active);
+    try std.testing.expect(!testPathExists(file_path));
+
+    {
+        var md = meta.load(allocator) catch meta.MetaData.init(allocator);
+        defer md.deinit();
+        try std.testing.expect(!md.configs.contains(key));
+        try std.testing.expect(md.active == null);
+    }
+
+    // 再次删除（文件与 entry 都没了）-> ConfigNotFound。
+    try std.testing.expectError(error.ConfigNotFound, deleteConfig(allocator, key, &out));
+}
+
+test "deleteConfig removes managed override script and leaves a different active untouched" {
+    const allocator = std.testing.allocator;
+
+    const key = "zc-delete-unit-ovr";
+    const file_path = try testSeedConfig(allocator, key);
+    defer allocator.free(file_path);
+
+    // 造一个托管 override 脚本（位于托管 override 目录内）。
+    const overrides_dir = (try getOverrideScriptsDir(allocator)).?;
+    defer allocator.free(overrides_dir);
+    compat.fs.cwd().makePath(overrides_dir) catch {};
+    const script_path = try compat.fs.path.join(allocator, &.{ overrides_dir, "zc-delete-unit-ovr-1.lua" });
+    defer allocator.free(script_path);
+    {
+        const f = try compat.fs.createFileAbsolute(script_path, .{});
+        f.close(compat.io());
+    }
+
+    // 登记 entry（绑定托管脚本），并把 active 指向另一个配置。
+    {
+        var md = meta.load(allocator) catch meta.MetaData.init(allocator);
+        defer md.deinit();
+        const cm = try ensureConfigMetaEntry(allocator, &md, key);
+        if (cm.override_script) |old| allocator.free(old);
+        cm.override_script = try allocator.dupe(u8, script_path);
+        if (md.active) |old| allocator.free(old);
+        md.active = try allocator.dupe(u8, "zc-delete-unit-other");
+        try meta.save(allocator, &md);
+    }
+
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(allocator);
+    defer err_w.deinit();
+    var out = cli_output.Output.init(.text, "config delete", false, false, &out_w.writer, &err_w.writer);
+
+    var outcome = try deleteConfig(allocator, key, &out);
+    defer outcome.deinit(allocator);
+
+    try std.testing.expect(!outcome.was_active);
+    try std.testing.expect(!testPathExists(file_path));
+    try std.testing.expect(!testPathExists(script_path)); // 托管脚本随配置删除
+
+    {
+        var md = meta.load(allocator) catch meta.MetaData.init(allocator);
+        defer md.deinit();
+        try std.testing.expect(!md.configs.contains(key));
+        try std.testing.expect(md.active != null);
+        try std.testing.expectEqualStrings("zc-delete-unit-other", md.active.?);
+    }
+
+    // 清理 active，避免给后续测试留下悬空 active。
+    {
+        var md = meta.load(allocator) catch meta.MetaData.init(allocator);
+        defer md.deinit();
+        if (md.active) |old| allocator.free(old);
+        md.active = null;
+        meta.save(allocator, &md) catch {};
+    }
+}
+
+test "deleteConfig handles orphan meta entry (no file) and orphan file (no meta entry)" {
+    const allocator = std.testing.allocator;
+
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(allocator);
+    defer err_w.deinit();
+    var out = cli_output.Output.init(.text, "config delete", false, false, &out_w.writer, &err_w.writer);
+
+    // 分支 A：meta 中有 entry 但 configs/ 下没有文件（孤儿 entry）。
+    // deleteConfig 仍应成功并移除 entry（不报 ConfigNotFound）。
+    {
+        const key = "zc-delete-orphan-meta";
+        try meta.ensureConfigsDir(allocator);
+        var md = meta.load(allocator) catch meta.MetaData.init(allocator);
+        _ = try ensureConfigMetaEntry(allocator, &md, key);
+        try meta.save(allocator, &md);
+        md.deinit();
+
+        var outcome = try deleteConfig(allocator, key, &out);
+        defer outcome.deinit(allocator);
+        try std.testing.expect(!outcome.was_active);
+
+        var after = meta.load(allocator) catch meta.MetaData.init(allocator);
+        defer after.deinit();
+        try std.testing.expect(!after.configs.contains(key));
+    }
+
+    // 分支 B：configs/ 下有文件但 meta 中没有 entry（孤儿文件，例如手动放进去的）。
+    // deleteConfig 应删掉文件并成功。注意 meta.load 的 syncFromDisk 会先为该
+    // 文件补一个空 entry，所以这里同时覆盖了“文件存在”这一删除路径。
+    {
+        const key = "zc-delete-orphan-file";
+        const file_path = try testSeedConfig(allocator, key);
+        defer allocator.free(file_path);
+
+        var outcome = try deleteConfig(allocator, key, &out);
+        defer outcome.deinit(allocator);
+        try std.testing.expect(!testPathExists(file_path));
+
+        var after = meta.load(allocator) catch meta.MetaData.init(allocator);
+        defer after.deinit();
+        try std.testing.expect(!after.configs.contains(key));
+    }
 }

@@ -155,6 +155,14 @@ pub const table = [_]Command{
         .examples = &.{"zc config use myconfig.yaml"},
     },
     .{
+        .path = "config delete",
+        .aliases = &.{ "config rm", "config remove" },
+        .args = "<name>",
+        .summary = "Delete a config file and its metadata (clears active if it was active)",
+        .flags = &.{json_flag},
+        .examples = &.{ "zc config delete myconfig", "zc config rm myconfig.yaml" },
+    },
+    .{
         .path = "config dump",
         .summary = "Print merged config (YAML; bare JSON document with --json)",
         .flags = &([_]Flag{

@@ -978,6 +978,38 @@ fn runConfigCommand(
         return;
     }
 
+    if (std.mem.eql(u8, subcmd, "delete") or std.mem.eql(u8, subcmd, "rm") or std.mem.eql(u8, subcmd, "remove")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigDeleteHelp();
+            return;
+        }
+        if (args.len < 4 or args[3].len == 0 or args[3][0] == '-') {
+            printCliError(json_output, "CONFIG_DELETE_NAME_REQUIRED", "missing <name> for config delete", "use `zc config delete <name>`; run `zc config list` to see candidates");
+            std.process.exit(cli_output.exit_usage);
+        }
+        if (hasUnexpectedArgs(args, 4)) {
+            printCliError(json_output, "CONFIG_DELETE_ARGUMENT_INVALID", "unknown or unexpected argument for `config delete`", "use `zc config delete <name>`");
+            std.process.exit(cli_output.exit_usage);
+        }
+
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        var outcome = config.deleteConfig(allocator, args[3], &out) catch |err| {
+            switch (err) {
+                error.ConfigNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
+                else => printCliError(json_output, "CONFIG_DELETE_FAILED", "failed to delete config", "verify file permission and retry"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer outcome.deinit(allocator);
+
+        // 决策 D8 同款：delete 绝不自动 apply 到运行中的 daemon。
+        if (json_output) {
+            out.success(.{ .name = outcome.key, .deleted = true, .was_active = outcome.was_active }) catch {};
+        }
+        return;
+    }
+
     if (std.mem.eql(u8, subcmd, "dump")) {
         if (containsHelpArg(args, 3)) {
             try printConfigDumpHelp();
@@ -2232,6 +2264,10 @@ fn printConfigUpdateHelp() !void {
 
 fn printConfigUseHelp() !void {
     _ = try printTopicHelpStdout(&.{ "config", "use" });
+}
+
+fn printConfigDeleteHelp() !void {
+    _ = try printTopicHelpStdout(&.{ "config", "delete" });
 }
 
 fn printConfigDumpHelp() !void {
