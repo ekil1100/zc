@@ -122,11 +122,23 @@ pub const Client = struct {
             // "upstream-truncated (graceful half-close)" breadcrumb. Contrast anytls:
             // its framed payloads let it reject a short final frame, which an
             // unframed trojan tunnel structurally cannot do.
-            if (err != error.ReadFailed) return err;
-            const tls_err = conn.tls_client.read_err orelse return err;
-            if (tls_err == error.TlsConnectionTruncated) return 0;
+            if (isTruncationEof(err, conn.tls_client.read_err)) return 0;
             return err;
         };
+    }
+
+    /// Pure M1 decision: should a readTlsApplicationData failure be treated as a
+    /// clean EOF (return 0) or propagated? Only an unframed TLS truncation —
+    /// surfaced as `error.ReadFailed` with `read_err == TlsConnectionTruncated` —
+    /// maps to EOF; any other failure (bad record MAC, alert, or a ReadFailed with
+    /// no recorded tls read_err) propagates. Extracting this keeps the
+    /// security-relevant discrimination in one tested place: an accidental
+    /// inversion (swallowing a fatal alert as EOF, or propagating a benign
+    /// truncation) fails a unit test instead of slipping through to the relay.
+    fn isTruncationEof(err: anyerror, read_err: ?anyerror) bool {
+        if (err != error.ReadFailed) return false;
+        const tls_err = read_err orelse return false;
+        return tls_err == error.TlsConnectionTruncated;
     }
 
     pub fn hasPendingRead(self: *const Client) bool {
@@ -796,6 +808,21 @@ test "Trojan read uses TLS buffered short-read semantics" {
 
     // Stream fully drained -> clean EOF (0), not an error.
     try testing.expectEqual(@as(usize, 0), try Client.readTlsApplicationData(&r, &rest));
+}
+
+test "Trojan isTruncationEof maps only a TLS truncation to EOF" {
+    // The M1 decision read()'s catch arm relies on: a truncation (ReadFailed with
+    // read_err == TlsConnectionTruncated) is a clean EOF; everything else
+    // propagates. Pinned so an inversion fails here instead of in the relay.
+    try testing.expect(Client.isTruncationEof(error.ReadFailed, error.TlsConnectionTruncated));
+    // Fatal TLS errors must propagate, NOT be swallowed as EOF.
+    try testing.expect(!Client.isTruncationEof(error.ReadFailed, error.TlsBadRecordMac));
+    try testing.expect(!Client.isTruncationEof(error.ReadFailed, error.TlsAlert));
+    // ReadFailed with no recorded tls read_err -> cannot prove truncation -> propagate.
+    try testing.expect(!Client.isTruncationEof(error.ReadFailed, null));
+    // A non-ReadFailed error is never EOF, even if a truncation was also recorded.
+    try testing.expect(!Client.isTruncationEof(error.ConnectionResetByPeer, error.TlsConnectionTruncated));
+    try testing.expect(!Client.isTruncationEof(error.WouldBlock, null));
 }
 
 test "Trojan readTlsApplicationData reports drained/empty stream as EOF" {
