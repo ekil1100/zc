@@ -418,12 +418,11 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
         if (dc_pos > 0) {
             var it = std.mem.splitScalar(u8, str[0..dc_pos], ':');
             while (it.next()) |part| {
-                if (part.len == 0 or part.len > 4) return false;
                 // Bound BEFORE the indexed store: `parts` is [8]u16, so a 9th
                 // group must be rejected without writing parts[8] (an OOB write
                 // that panics in safe builds, corrupts the stack otherwise).
                 if (part_count >= 8) return false;
-                parts[part_count] = std.fmt.parseInt(u16, part, 16) catch return false;
+                parts[part_count] = parseHextet(part) orelse return false;
                 part_count += 1;
             }
         }
@@ -435,11 +434,10 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
         if (after.len > 0) {
             var it = std.mem.splitScalar(u8, after, ':');
             while (it.next()) |part| {
-                if (part.len == 0 or part.len > 4) return false;
                 // Same OOB guard as the before-:: loop: reject the 9th group
                 // before it can write after_parts[8].
                 if (after_count >= 8) return false;
-                after_parts[after_count] = std.fmt.parseInt(u16, part, 16) catch return false;
+                after_parts[after_count] = parseHextet(part) orelse return false;
                 after_count += 1;
             }
         }
@@ -456,9 +454,8 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
         // Full form: exactly 8 parts
         var it = std.mem.splitScalar(u8, str, ':');
         while (it.next()) |part| {
-            if (part.len == 0 or part.len > 4) return false;
             if (part_count >= 8) return false;
-            parts[part_count] = std.fmt.parseInt(u16, part, 16) catch return false;
+            parts[part_count] = parseHextet(part) orelse return false;
             part_count += 1;
         }
         if (part_count != 8) return false;
@@ -471,6 +468,19 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
     }
 
     return true;
+}
+
+/// Parse one IPv6 hextet: 1–4 pure hex digits, no sign. std.fmt.parseInt accepts
+/// a leading '+'/'-' (e.g. "+ff", "-0"), which would let "2001:+db8::1" or "::-0"
+/// masquerade as IP literals — inconsistent with the strict parseIpv4 and the rule
+/// engine's IPv6 parser. Reject any non-hex-digit byte first, then parse.
+fn parseHextet(part: []const u8) ?u16 {
+    if (part.len == 0 or part.len > 4) return null;
+    for (part) |c| {
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!is_hex) return null;
+    }
+    return std.fmt.parseInt(u16, part, 16) catch null;
 }
 
 /// Returns true when `host` is a raw IPv4 or IPv6 literal (not a hostname).
@@ -601,6 +611,29 @@ test "Trojan parseIpv6 negatives" {
     try testing.expect(!parseIpv6("12345::1", &out));
     // IPv4-mapped branch with an out-of-range octet — parseIpv4 rejects 999.
     try testing.expect(!parseIpv6("::ffff:999.0.0.1", &out));
+}
+
+test "Trojan parseIpv6 rejects sign-prefixed hextets (parity with strict parseIpv4)" {
+    var out: [16]u8 = undefined;
+    // std.fmt.parseInt(u16, "+ff"/"-0", 16) succeeds, so a bare parseInt would
+    // accept these as IP literals. parseHextet rejects any non-hex-digit byte, so
+    // a sign prefix is refused on every branch: before-::, after-::, and full form.
+    try testing.expect(!parseIpv6("2001:+db8::1", &out)); // '+' before ::
+    try testing.expect(!parseIpv6("::-0", &out)); // '-' after ::
+    try testing.expect(!parseIpv6("2001:db8::-1", &out)); // '-' after ::
+    try testing.expect(!parseIpv6("+2001:db8:0:0:0:0:0:1", &out)); // '+' full form
+    // The unsigned forms these would-be-tricks shadow still parse correctly.
+    try testing.expect(parseIpv6("2001:db8::1", &out));
+    try testing.expect(parseIpv6("::1", &out));
+
+    // parseHextet unit checks: pure hex only, 1–4 digits.
+    try testing.expectEqual(@as(?u16, 0x00ff), parseHextet("ff"));
+    try testing.expectEqual(@as(?u16, 0xabcd), parseHextet("ABCD"));
+    try testing.expectEqual(@as(?u16, null), parseHextet("+ff"));
+    try testing.expectEqual(@as(?u16, null), parseHextet("-0"));
+    try testing.expectEqual(@as(?u16, null), parseHextet("")); // empty
+    try testing.expectEqual(@as(?u16, null), parseHextet("12345")); // > 4 digits
+    try testing.expectEqual(@as(?u16, null), parseHextet("g")); // non-hex
 }
 
 test "Trojan parseIpv6 rejects >8 groups around :: without OOB write" {
