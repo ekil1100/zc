@@ -2162,13 +2162,28 @@ test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cache
         .modify_timestamp = .{ .new = .{ .nanoseconds = @intCast(stale_ns) } },
     });
 
-    var server = try (try compat.net.Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    var server = try compat.net.listenReuseAddr(try compat.net.Address.parseIp4("127.0.0.1", 0));
     var hits = std.atomic.Value(u32).init(0);
+    var stop_flag = std.atomic.Value(bool).init(false);
     const response_body = "example.net\n";
     const thread = try std.Thread.spawn(.{}, struct {
-        fn run(http_server: *compat.net.Server, request_hits: *std.atomic.Value(u32), body: []const u8) void {
+        fn run(http_server: *compat.net.ReuseAddrListener, request_hits: *std.atomic.Value(u32), stop: *std.atomic.Value(bool), body: []const u8) void {
             while (true) {
-                var conn = http_server.accept() catch return;
+                if (stop.load(.seq_cst)) return;
+                // Poll with a timeout instead of a bare blocking accept() so the
+                // teardown can stop this thread by setting stop_flag. Closing the
+                // listener fd does NOT reliably wake a blocked accept() on Linux
+                // (it hangs, or races into EBADF) — the root of this test's flaky
+                // full-suite deadlock. This test expects ZERO hits, so the accept
+                // path normally never runs; an unexpected fetch still bumps hits.
+                var fds = [_]std.posix.pollfd{.{
+                    .fd = http_server.fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&fds, 100) catch return;
+                if (ready == 0) continue;
+                var conn = http_server.accept() catch continue;
                 defer conn.stream.close();
                 _ = request_hits.fetchAdd(1, .monotonic);
 
@@ -2184,10 +2199,11 @@ test "prepareRuleProvidersForRuntime missing-only policy skips refresh for cache
                 conn.stream.writeAll(response) catch {};
             }
         }
-    }.run, .{ &server, &hits, response_body });
+    }.run, .{ &server, &hits, &stop_flag, response_body });
     defer {
-        server.deinit();
+        stop_flag.store(true, .seq_cst);
         thread.join();
+        server.deinit();
     }
 
     const provider_abs = try testTmpPathAlloc(allocator, &tmp, "direct.txt");

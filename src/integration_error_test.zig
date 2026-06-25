@@ -364,7 +364,7 @@ test "integration: zc test --json succeeds against a local responder (same probe
     defer allocator.free(cfg_path);
 
     var responder = try HttpResponder.start();
-    defer responder.stop(allocator);
+    defer responder.stop();
 
     var port_buf: [8]u8 = undefined;
     const port_text = try std.fmt.bufPrint(&port_buf, "{d}", .{responder.port()});
@@ -507,12 +507,14 @@ const HttpResponder = struct {
         return self.listener.listen_address.getPort();
     }
 
-    fn stop(self: *HttpResponder, allocator: std.mem.Allocator) void {
+    fn stop(self: *HttpResponder) void {
+        // serveLoop polls the listener with a timeout and re-checks stop_flag, so
+        // setting the flag is enough to make it return — no need to wake a blocking
+        // accept() with a self-connect. The old self-connect wake was best-effort
+        // (其错误被 else |_| 吞掉); under full-suite load it could fail to wake the
+        // accept(), leaving this join() deadlocked forever (worker parked in
+        // inet_csk_accept, main in join). Flag + bounded poll removes that race.
         self.stop_flag.store(true, .seq_cst);
-        // 自连接唤醒阻塞中的 accept。
-        if (compat.net.tcpConnectToHost(allocator, "127.0.0.1", self.port())) |stream| {
-            stream.close();
-        } else |_| {}
         self.thread.join();
         self.listener.deinit();
         std.heap.page_allocator.destroy(self);
@@ -520,11 +522,17 @@ const HttpResponder = struct {
 
     fn serveLoop(self: *HttpResponder) void {
         while (true) {
-            const conn = self.listener.accept() catch return;
-            if (self.stop_flag.load(.seq_cst)) {
-                conn.stream.close();
-                return;
-            }
+            if (self.stop_flag.load(.seq_cst)) return;
+            // Wait for a pending connection with a 100ms timeout instead of a bare
+            // blocking accept(), so a concurrent stop() is noticed within one tick.
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.listener.fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&fds, 100) catch return;
+            if (ready == 0) continue; // timeout: loop back and re-check stop_flag
+            const conn = self.listener.accept() catch continue;
             var buf: [4096]u8 = undefined;
             _ = conn.stream.read(&buf) catch {};
             conn.stream.writeAll("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
