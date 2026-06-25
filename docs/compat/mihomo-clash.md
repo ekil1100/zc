@@ -49,11 +49,16 @@ Runtime outbound support currently includes:
 | `reject` | supported | Fails connection intentionally. |
 | `ss` | partially supported | AEAD ciphers: `aes-128-gcm`, `aes-256-gcm`, `chacha20-poly1305`, `chacha20-ietf-poly1305`. |
 | `vmess` | minimal | TCP-only style implementation; transport options are not fully wired. |
-| `trojan` | minimal | TLS + CONNECT style implementation. |
+| `trojan` | minimal | TLS + CONNECT 实现：支持 `password`/`server`/`port`/`sni`/`skip-cert-verify`。仅 CONNECT（TCP）——`udp:true` 在配置校验阶段被拒绝（Trojan UDP ASSOCIATE 未实现）；`skip-cert-verify:true` 触发校验告警；IP 字面量服务器不发 SNI 并跳过主机名校验。已知限制（M1 截断暴露 / M5 阻塞读）见下方“Trojan 已知限制”。 |
 | `vless` | minimal | TCP-only implementation. |
 | `anytls` | supported | 完整 AnyTLS：`password`/`server`/`port`/`sni`/`skip-cert-verify`/`udp`；动态 padding scheme（解析 + 随机化多 record 发送 + 采纳服务端 `update-padding-scheme`）；session 多路复用 + 空闲池（复用已认证会话避免重握手，单活动流/会话，与 anytls-go 一致，带 `idle-session-check-interval`/`idle-session-timeout`/`min-idle-session`）；SYN-DONE 超时；IP 字面量不发 SNI；UoT v2 UDP 中继（SOCKS5 UDP ASSOCIATE）。已知限制见 [AnyTLS 设计](../anytls/session-multiplexing-design.md) 与下方“AnyTLS 已知限制”。 |
 | `http` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
 | `socks5` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
+
+### Trojan 已知限制
+
+- **M1（TLS 截断暴露）**：Trojan 隧道承载*无帧*字节流，`read()` 在字节层面无法区分恶意的链路中途截断（攻击者注入 FIN/RST）与正常关闭——两者都呈现为干净的 0 长度 EOF。这是刻意权衡（`allow_truncation_attacks = true`），以容忍良性的 record 中途丢弃（brew 下载截断场景）。异常关闭不会被静默吞掉：底层 `TlsConnectionTruncated` 仍可经 `lastReadError()` / `ProxyStream.lastTlsReadError()` 观测，中继日志据此打点。对比 anytls 的有帧模型可拒绝过短的末帧，无帧的 Trojan 隧道在结构上做不到。
+- **M5（阻塞读限制）**：中继按 `POLL.IN` 轮询 Trojan 句柄，但 poll 只保证至少一字节*密文*就绪；单个 TLS record 可能跨多个 TCP 段，故 poll-ready 的 `read()` 仍可能阻塞到整条 in-flight record 到齐，期间另一方向（client→target）短暂停顿。非阻塞改写受 AGENTS.md 性能门禁约束，暂按现状记录。
 
 ### AnyTLS 已知限制
 
