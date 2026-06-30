@@ -271,13 +271,12 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                     try result.addError("Trojan proxy '{s}': password is required", .{proxy.name});
                 }
                 // Trojan client is CONNECT-only (handshake() always sends
-                // Command.connect); UDP ASSOCIATE is unimplemented. Fail config
-                // validation early instead of deferring to a connect-time
-                // error.UdpNotSupportedByProxy. (The shared udp roll-up warning
-                // below ALSO fires for trojan; the error dominates isValid().)
-                if (proxy.udp) {
-                    try result.addError("Trojan proxy '{s}': udp:true is not supported (Trojan UDP ASSOCIATE is not implemented)", .{proxy.name});
-                }
+                // Command.connect); UDP ASSOCIATE is unimplemented, so udp:true
+                // is accepted (config stays valid) but UDP relay fails at
+                // runtime — see the rolled-up non-anytls udp warning below.
+                // mihomo treats udp:true as a capability declaration, not a
+                // config error; rejecting it would break real-world trojan
+                // subscriptions where nearly every node sets udp:true.
                 // Disabling cert verification is a real security downgrade; make
                 // it visible in validation output (warning, not error — isValid()
                 // stays true).
@@ -312,11 +311,9 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
         }
 
         // udp:true is only honored for anytls proxies (UDP relay is anytls-only
-        // for now). Tally — and ignore — when set on any other proxy type, except
-        // trojan whose udp:true already produces a hard error above; counting it
-        // here would emit a contradictory "ignored" warning for invalid config.
-        // The rolled-up warning is emitted once after the loop.
-        if (proxy.udp and proxy.proxy_type != .anytls and proxy.proxy_type != .trojan) {
+        // for now). Tally — and ignore — when set on any other proxy type; the
+        // rolled-up warning is emitted once after the loop.
+        if (proxy.udp and proxy.proxy_type != .anytls) {
             if (udp_ignored_count == 0) udp_ignored_first = proxy.name;
             udp_ignored_count += 1;
         }
@@ -726,7 +723,7 @@ fn hasErrorContaining(result: *const ValidationResult, needle: []const u8) bool 
     return false;
 }
 
-test "udp-reject: trojan proxy with udp:true produces a validation error and isValid()==false" {
+test "trojan proxy with udp:true stays valid (mihomo-compat: udp is a runtime concern, not a config error)" {
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
@@ -743,17 +740,18 @@ test "udp-reject: trojan proxy with udp:true produces a validation error and isV
     var result = try validate(allocator, &cfg);
     defer result.deinit();
 
-    // Trojan UDP ASSOCIATE is unimplemented: udp:true must be a hard error.
-    try std.testing.expect(!result.isValid());
-    try std.testing.expect(hasErrorContaining(&result, "udp:true is not supported"));
-
-    // Trojan udp:true is a hard error, not a soft "ignored" warning: the
-    // rolled-up non-anytls udp warning must NOT also fire — it would contradict
-    // the "not supported" error above (invalid config is not "ignored").
-    try std.testing.expectEqual(@as(usize, 0), countUdpWarnings(&result));
+    // mihomo treats udp:true as a capability declaration, not a config error.
+    // Real-world trojan subscriptions almost always carry udp:true (90/90 nodes
+    // on a real Flower subscription); rejecting it makes zc unable to load
+    // mainstream airport configs. zc does not implement Trojan UDP relay, so
+    // we warn (rolled up with other non-anytls proxies) but keep config valid —
+    // UDP traffic fails at runtime instead of blocking config load.
+    try std.testing.expect(result.isValid());
+    try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
+    try std.testing.expectEqual(@as(usize, 1), countUdpWarnings(&result));
 }
 
-test "udp-reject: trojan proxy without udp stays valid" {
+test "trojan proxy without udp stays valid" {
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
@@ -769,9 +767,49 @@ test "udp-reject: trojan proxy without udp stays valid" {
     var result = try validate(allocator, &cfg);
     defer result.deinit();
 
-    // Guards against the new udp check firing on the default udp=false.
+    // Guards against the udp check firing on the default udp=false.
     try std.testing.expect(result.isValid());
     try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
+}
+
+test "regression: real-world trojan subscription (udp:true + skip-cert-verify on every node) loads valid" {
+    // 机场订阅里 trojan 节点几乎都带 udp:true 和 skip-cert-verify:true
+    // (真实 Flower 订阅 90/90 节点如此). Such a config MUST load — udp:true is
+    // a capability declaration, not a config error — otherwise zc cannot be used
+    // with mainstream airport subscriptions at all.
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: HK-1
+        \\    type: trojan
+        \\    server: hk1.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    sni: m.ctrip.com
+        \\    skip-cert-verify: true
+        \\    udp: true
+        \\  - name: JP-1
+        \\    type: trojan
+        \\    server: jp1.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    sni: m.ctrip.com
+        \\    skip-cert-verify: true
+        \\    udp: true
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Must NOT be rejected: udp:true on trojan is valid config.
+    try std.testing.expect(result.isValid());
+    try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
+    // 2 trojan udp:true nodes -> 1 rolled-up udp warning (not 2, not an error).
+    try std.testing.expectEqual(@as(usize, 1), countUdpWarnings(&result));
+    // 2 skip-cert-verify nodes -> 2 cert warnings (warnings, not errors).
+    try std.testing.expectEqual(@as(usize, 2), countTrojanCertWarnings(&result));
 }
 
 // Counts trojan skip-cert-verify warnings (substring-scoped, mirrors
