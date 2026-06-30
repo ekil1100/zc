@@ -383,8 +383,11 @@ fn isSubscriptionInfoNodeName(name: []const u8) bool {
     // name merely BEGINS with a label word — "剩余流量优化节点",
     // "Traffic-Singapore-01" — is not mistaken for a banner.
     const labels = [_][]const u8{
-        "Traffic",      "Expire",       "剩余流量",
-        "套餐到期",     "距离下次重置", "过期时间",
+        "Traffic", "Expire",
+        "剩余流量",
+        "套餐到期",
+        "距离下次重置",
+        "过期时间",
         "到期时间",
     };
     for (labels) |label| {
