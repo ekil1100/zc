@@ -312,9 +312,11 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
         }
 
         // udp:true is only honored for anytls proxies (UDP relay is anytls-only
-        // for now). Tally — and ignore — when set on any other proxy type; the
-        // rolled-up warning is emitted once after the loop.
-        if (proxy.udp and proxy.proxy_type != .anytls) {
+        // for now). Tally — and ignore — when set on any other proxy type, except
+        // trojan whose udp:true already produces a hard error above; counting it
+        // here would emit a contradictory "ignored" warning for invalid config.
+        // The rolled-up warning is emitted once after the loop.
+        if (proxy.udp and proxy.proxy_type != .anytls and proxy.proxy_type != .trojan) {
             if (udp_ignored_count == 0) udp_ignored_first = proxy.name;
             udp_ignored_count += 1;
         }
@@ -744,6 +746,11 @@ test "udp-reject: trojan proxy with udp:true produces a validation error and isV
     // Trojan UDP ASSOCIATE is unimplemented: udp:true must be a hard error.
     try std.testing.expect(!result.isValid());
     try std.testing.expect(hasErrorContaining(&result, "udp:true is not supported"));
+
+    // Trojan udp:true is a hard error, not a soft "ignored" warning: the
+    // rolled-up non-anytls udp warning must NOT also fire — it would contradict
+    // the "not supported" error above (invalid config is not "ignored").
+    try std.testing.expectEqual(@as(usize, 0), countUdpWarnings(&result));
 }
 
 test "udp-reject: trojan proxy without udp stays valid" {
