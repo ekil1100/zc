@@ -619,7 +619,11 @@ pub const OutboundManager = struct {
                 return ProxyStream.initDirect(stream);
             },
             else => {
-                std.debug.print("Proxy type not implemented yet\n", .{});
+                // Unsupported outbound (e.g. http/socks5): validator warns at
+                // config-load (P0-2) so zc test / doctor surface it before any
+                // runtime attempt. This is the runtime fallback if such a proxy
+                // reaches connect anyway (e.g. config loaded without running
+                // validation).
                 return error.NotImplemented;
             },
         }

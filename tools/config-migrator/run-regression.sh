@@ -463,22 +463,31 @@ else
 fi
 
 # R28 validation (UNSUPPORTED_PROXY_TYPE_CHECK)
+# P0-2: http/socks5/socks outbound are now warn-level (accepted-but-unimplemented),
+# while truly unknown types (snell/tuic/hysteria) stay error-level. PASS
+# requires BOTH branches present plus the actionable suggested next-step.
 R28_OUT="$REPORT_DIR/r28-regression.lint.json"
 if bash "$BASE/run.sh" lint "$BASE/examples/r28-unsupported-types.yaml" > "$R28_OUT" 2>/dev/null || true; then
-  if grep -q '"rule":"UNSUPPORTED_PROXY_TYPE_CHECK"' "$R28_OUT"; then
-    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"PASS\",\"diff\":\"\",\"hint\":\"unsupported proxy types detected\"}")
+  if grep -q '"rule":"UNSUPPORTED_PROXY_TYPE_CHECK"' "$R28_OUT" \
+    && grep -q '"level":"error"' "$R28_OUT" \
+    && grep -q '"level":"warn"' "$R28_OUT" \
+    && grep -q '"suggested":"ss/vmess/trojan/vless/anytls or remove this proxy"' "$R28_OUT"; then
+    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"PASS\",\"diff\":\"\",\"hint\":\"unsupported + unimplemented-outbound types detected (error+warn)\"}")
   else
     failed_rules+=("UNSUPPORTED_PROXY_TYPE_CHECK")
     failed_samples+=("R28_UNSUPPORTED_PROXY_TYPE_CHECK")
-    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"FAIL\",\"diff\":\"\",\"hint\":\"expected UNSUPPORTED_PROXY_TYPE_CHECK errors\"}")
+    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"FAIL\",\"diff\":\"\",\"hint\":\"expected UNSUPPORTED_PROXY_TYPE_CHECK error+warn with suggested next-step\"}")
   fi
 else
-  if grep -q '"rule":"UNSUPPORTED_PROXY_TYPE_CHECK"' "$R28_OUT" 2>/dev/null; then
-    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"PASS\",\"diff\":\"\",\"hint\":\"unsupported proxy types detected\"}")
+  if grep -q '"rule":"UNSUPPORTED_PROXY_TYPE_CHECK"' "$R28_OUT" 2>/dev/null \
+    && grep -q '"level":"error"' "$R28_OUT" 2>/dev/null \
+    && grep -q '"level":"warn"' "$R28_OUT" 2>/dev/null \
+    && grep -q '"suggested":"ss/vmess/trojan/vless/anytls or remove this proxy"' "$R28_OUT" 2>/dev/null; then
+    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"PASS\",\"diff\":\"\",\"hint\":\"unsupported + unimplemented-outbound types detected (error+warn)\"}")
   else
     failed_rules+=("UNSUPPORTED_PROXY_TYPE_CHECK")
     failed_samples+=("R28_UNSUPPORTED_PROXY_TYPE_CHECK")
-    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"FAIL\",\"diff\":\"\",\"hint\":\"expected UNSUPPORTED_PROXY_TYPE_CHECK errors\"}")
+    results+=("{\"sample_id\":\"R28_UNSUPPORTED_PROXY_TYPE_CHECK\",\"input\":\"tools/config-migrator/examples/r28-unsupported-types.yaml\",\"result\":\"FAIL\",\"diff\":\"\",\"hint\":\"expected UNSUPPORTED_PROXY_TYPE_CHECK error+warn with suggested next-step\"}")
   fi
 fi
 

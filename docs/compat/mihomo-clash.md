@@ -52,8 +52,8 @@ Runtime outbound support currently includes:
 | `trojan` | minimal | TLS + CONNECT 实现：支持 `password`/`server`/`port`/`sni`/`skip-cert-verify`。仅 CONNECT（TCP）——`udp:true` 在配置校验阶段被拒绝（Trojan UDP ASSOCIATE 未实现）；`skip-cert-verify:true` 触发校验告警；IP 字面量服务器不发 SNI 并跳过主机名校验。已知限制（M1 截断暴露 / M5 阻塞读）见下方“Trojan 已知限制”。 |
 | `vless` | minimal | TCP-only implementation. |
 | `anytls` | supported | 完整 AnyTLS：`password`/`server`/`port`/`sni`/`skip-cert-verify`/`udp`；动态 padding scheme（解析 + 随机化多 record 发送 + 采纳服务端 `update-padding-scheme`）；session 多路复用 + 空闲池（复用已认证会话避免重握手，单活动流/会话，与 anytls-go 一致，带 `idle-session-check-interval`/`idle-session-timeout`/`min-idle-session`）；SYN-DONE 超时；IP 字面量不发 SNI；UoT v2 UDP 中继（SOCKS5 UDP ASSOCIATE）。已知限制见 [AnyTLS 设计](../anytls/session-multiplexing-design.md) 与下方“AnyTLS 已知限制”。 |
-| `http` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
-| `socks5` | blocker | Parser accepts it, but outbound connect is not implemented yet. Must be implemented or rejected before GA. |
+| `http` | unsupported | Parser accepts; validator warns (config stays valid) that HTTP outbound is not implemented in zc v1.0 — connections fail at runtime with `NotImplemented`. Use ss/vmess/trojan/vless/anytls or remove the proxy. |
+| `socks5` | unsupported | Parser accepts; validator warns (config stays valid) that SOCKS5 outbound is not implemented in zc v1.0 — connections fail at runtime with `NotImplemented`. Use ss/vmess/trojan/vless/anytls or remove the proxy. |
 
 ### Trojan 已知限制
 

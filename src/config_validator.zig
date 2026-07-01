@@ -211,6 +211,13 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 if (!isValidPort(proxy.port)) {
                     try result.addError("HTTP proxy '{s}': invalid port {d}", .{ proxy.name, proxy.port });
                 }
+                // P0-2: HTTP outbound is not implemented in zc v1.0. Parser
+                // accepts the node (so legacy configs still load), but any
+                // connection through it fails at runtime with NotImplemented.
+                // Warn at config-load so zc test / doctor --json surface it
+                // BEFORE a runtime attempt; isValid() stays true (warning only,
+                // mirroring the trojan skip-cert-verify precedent).
+                try result.addWarning("HTTP proxy '{s}': outbound not implemented in zc v1.0; connections will fail at runtime; use ss/vmess/trojan/vless/anytls or remove this proxy", .{proxy.name});
             },
             .socks5 => {
                 if (proxy.server.len == 0) {
@@ -219,6 +226,9 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 if (!isValidPort(proxy.port)) {
                     try result.addError("SOCKS5 proxy '{s}': invalid port {d}", .{ proxy.name, proxy.port });
                 }
+                // P0-2: SOCKS5 outbound is not implemented in zc v1.0 (see the
+                // .http case above for rationale). Warn, keep config valid.
+                try result.addWarning("SOCKS5 proxy '{s}': outbound not implemented in zc v1.0; connections will fail at runtime; use ss/vmess/trojan/vless/anytls or remove this proxy", .{proxy.name});
             },
             .ss => {
                 if (proxy.server.len == 0) {
@@ -920,4 +930,127 @@ test "validator-hardening: trojan skip-cert-verify=true emits one warning and st
     // Warning, not error: config stays valid.
     try std.testing.expect(result.isValid());
     try std.testing.expectEqual(@as(usize, 1), countTrojanCertWarnings(&result));
+}
+
+// P0-2: http/socks5 outbound are accepted by the parser but their outbound
+// connect is not implemented in zc v1.0. The validator must warn (naming the
+// proxy + an actionable next-step) while keeping isValid() true, so zc test /
+// doctor --json surface the limitation BEFORE a runtime NotImplemented. These
+// helpers mirror hasErrorContaining / countTrojanCertWarnings so assertions
+// stay substring-scoped and independent of total warning count.
+fn hasWarningContaining(result: *const ValidationResult, needle: []const u8) bool {
+    for (result.warnings.items) |w| {
+        if (std.mem.indexOf(u8, w.message, needle) != null) return true;
+    }
+    return false;
+}
+
+fn countUnsupportedOutboundWarnings(result: *const ValidationResult) usize {
+    var c: usize = 0;
+    for (result.warnings.items) |w| {
+        if (std.mem.indexOf(u8, w.message, "not implemented") != null) c += 1;
+    }
+    return c;
+}
+
+test "P0-2: http outbound proxy emits unsupported warning and stays valid" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: http-node
+        \\    type: http
+        \\    server: proxy.example.com
+        \\    port: 8080
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Warning only: config stays valid so legacy configs still parse.
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), countUnsupportedOutboundWarnings(&result));
+    // Names the proxy + type.
+    try std.testing.expect(hasWarningContaining(&result, "HTTP proxy"));
+    // Declares unsupported.
+    try std.testing.expect(hasWarningContaining(&result, "not implemented"));
+    // Actionable next-step.
+    try std.testing.expect(hasWarningContaining(&result, "ss/vmess/trojan/vless/anytls"));
+}
+
+test "P0-2: socks5 outbound proxy emits unsupported warning and stays valid" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: socks5-node
+        \\    type: socks5
+        \\    server: proxy.example.com
+        \\    port: 1080
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), countUnsupportedOutboundWarnings(&result));
+    try std.testing.expect(hasWarningContaining(&result, "SOCKS5 proxy"));
+    try std.testing.expect(hasWarningContaining(&result, "not implemented"));
+    try std.testing.expect(hasWarningContaining(&result, "ss/vmess/trojan/vless/anytls"));
+}
+
+test "P0-2: mixed http+ss config warns only on http, ss stays clean" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: http-node
+        \\    type: http
+        \\    server: proxy.example.com
+        \\    port: 8080
+        \\  - name: ss-node
+        \\    type: ss
+        \\    server: 1.2.3.4
+        \\    port: 8388
+        \\    password: pw
+        \\    cipher: aes-256-gcm
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Warning is scoped to http only; ss contributes no unsupported warning.
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), countUnsupportedOutboundWarnings(&result));
+    try std.testing.expect(hasWarningContaining(&result, "HTTP proxy"));
+    try std.testing.expect(!hasWarningContaining(&result, "Shadowsocks"));
+}
+
+test "P0-2: http outbound with empty server errors AND warns (coexist)" {
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: http-noserver
+        \\    type: http
+        \\    server: ""
+        \\    port: 8080
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    // Empty server is a hard error (invalid), but the unsupported-outbound
+    // warning still fires alongside it — the warning is independent of the
+    // server-validity check.
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(&result, "server cannot be empty"));
+    try std.testing.expectEqual(@as(usize, 1), countUnsupportedOutboundWarnings(&result));
 }

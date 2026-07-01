@@ -15,3 +15,11 @@ proxies:
     type: hysteria
     server: example.com
     port: 443
+  - name: "http-node"
+    type: http
+    server: proxy.example.com
+    port: 8080
+  - name: "socks5-node"
+    type: socks5
+    server: proxy.example.com
+    port: 1080

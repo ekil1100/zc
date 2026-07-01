@@ -97,12 +97,22 @@ collect_issues() {
   fi
 
   # R28: UNSUPPORTED_PROXY_TYPE_CHECK
-  local supported_types="direct|reject|ss|ss-plugin|vmess|trojan|vless|anytls|http|socks5|socks"
+  # - http/socks5/socks are accepted by the parser but their outbound connect
+  #   is not implemented in zc v1.0 (runtime NotImplemented). Warn (config
+  #   stays valid, lint ok=true) and give an actionable next-step, mirroring
+  #   the validator warning (config_validator.zig P0-2).
+  # - Truly unknown types (snell/tuic/hysteria/...) stay error-level.
+  local supported_types="direct|reject|ss|ss-plugin|vmess|trojan|vless|anytls"
+  local unsupported_outbound_types="http|socks5|socks"
   while IFS= read -r line; do
     local t=$(echo "$line" | sed -E 's/^[[:space:]]*type:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
     if [[ -n "$t" ]] && ! echo "$t" | grep -Eq "^($supported_types)$"; then
       local name=$(grep -B5 "type:[[:space:]]*$t" "$file" | grep "name:" | tail -1 | sed -E 's/.*name:[[:space:]]*"?([^"]*)"?.*/\1/')
-      issues+=("{\"rule\":\"UNSUPPORTED_PROXY_TYPE_CHECK\",\"level\":\"error\",\"path\":\"proxies[$name].type\",\"message\":\"proxy type '$t' is not supported by zclash\",\"fixable\":false}")
+      if echo "$t" | grep -Eq "^($unsupported_outbound_types)$"; then
+        issues+=("{\"rule\":\"UNSUPPORTED_PROXY_TYPE_CHECK\",\"level\":\"warn\",\"path\":\"proxies[$name].type\",\"message\":\"outbound proxy type '$t' is not implemented in zc v1.0; connections will fail at runtime\",\"fixable\":false,\"suggested\":\"ss/vmess/trojan/vless/anytls or remove this proxy\"}")
+      else
+        issues+=("{\"rule\":\"UNSUPPORTED_PROXY_TYPE_CHECK\",\"level\":\"error\",\"path\":\"proxies[$name].type\",\"message\":\"proxy type '$t' is not supported by zclash\",\"fixable\":false}")
+      fi
     fi
   done < <(grep -E '^[[:space:]]*type:' "$file")
 
