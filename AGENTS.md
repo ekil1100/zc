@@ -3,8 +3,8 @@
 ## 目标
 
 zc 以 mihomo/clash 为基线，优先做好这几件事：
-- CLI 直觉、默认值合理、错误可操作
-- CLI / minimal API 概念一致
+- command line 符合直觉、默认值合理、报错合理
+- API 和 command line 概念一致
 - 不做 TUI
 - 关键路径可观测、稳定、性能可回归
 - 兼容主流配置与生态
@@ -13,17 +13,24 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 
 ## 技术约束
 
-- Zig 版本要求 `0.16.0+`
-- CI 使用 `0.16.0`
-- 本地开发默认使用 `0.16.0`
-- 不降级到低于 `0.16.0` 的版本
+- Zig `0.16.0+`，不降级（`build.zig.zon` 锁定 `minimum_zig_version`，CI 显式使用 `0.16.0`）
+
+## 构建与验证
+
+```bash
+zig build -Dcpu=baseline                       # 构建（与 CI 一致）
+zig build test -Dcpu=baseline --summary all    # 全量测试
+bash scripts/run-full-validation.sh            # 全链路门禁：install + migrator + beta-gate
+```
+
+- 提交前至少跑通相关测试；改动涉及 install / migrator / 默认运行行为时跑全链路门禁。
 
 ## 工程规则
 
 - 先测后改：改动前补测试，改动后跑回归
 - 小步提交：一个 commit 只做一个逻辑变更
 - 可回滚：高风险改动必须能撤回
-- 文档同更：用户可感知行为变化同步更新文档
+- 文档同更：用户可感知行为变化同步更新 `docs/`
 - 性能门禁：关键路径性能劣化不能直接合入
 
 以下变更必须同步更新 `docs/` 下相关文档：
@@ -45,15 +52,7 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 
 ## 开发流程
 
-- 本地开发启动 `zc` 时不要使用 `7899`，该端口保留给生产环境；优先提供 `zc start --port <port>` 这类显式入口，端口冲突时只报错并拒绝启动，避免误启动到其他端口
-- 实现完成后用 [iterative-review-fix skill](./.agents/skills/iterative-review-fix/SKILL.md) 检视代码
-- 完成验证后提交 commit，并合并回 `main`；合并完成后清理本地分支
-
-## Git 规范
-
-- 提交信息清晰，优先使用 Conventional Commits
-- 提交前确保该范围内可用，至少相关测试通过
-
-## 工作方式
-
-先统一模型，再统一接口，再打磨体验，用数据证明更好、更快。
+- 本地启动 `zc` 不要使用 `7899`，该端口保留给生产环境；优先 `zc start --port <port>` 显式入口，端口冲突时只报错并拒绝启动
+- 实现完成后用 `iterative-review-fix` skill 检视代码
+- 提交信息优先 Conventional Commits（`feat` / `fix` / `docs` / `test` / `refactor` …）
+- 完成验证后提交 commit，合并回 `main`，合并后清理本地分支
