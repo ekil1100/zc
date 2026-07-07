@@ -607,4 +607,42 @@ test "domain suffix matching honors label boundaries" {
     try std.testing.expectEqualStrings("PROXY", engine.match("badexample.com", true).?);
 }
 
+test "DST-PORT: matchCtx with target_port matches, match() with port=0 does not" {
+    const allocator = std.testing.allocator;
+
+    var rules = std.ArrayList(Rule).empty;
+    defer deinitTestRules(allocator, &rules);
+    // DST-PORT 443 -> PROXY group; MATCH -> DIRECT (fallback).
+    try appendTestRule(allocator, &rules, .dst_port, "443", "PROXY");
+    try appendTestRule(allocator, &rules, .final, "", "DIRECT");
+
+    var engine = try Engine.init(allocator, &rules);
+    defer engine.deinit();
+
+    // (1) matchCtx with target_port=443 hits the DST-PORT rule -> PROXY.
+    try std.testing.expectEqualStrings(
+        "PROXY",
+        engine.matchCtx(.{
+            .target_host = "example.com",
+            .target_port = 443,
+            .is_domain = true,
+        }).?,
+    );
+
+    // (2) match() wrapper leaves target_port=0, so the DST-PORT guard
+    // (ctx.target_port > 0) never fires and we fall through to MATCH -> DIRECT.
+    try std.testing.expectEqualStrings("DIRECT", engine.match("example.com", true).?);
+
+    // (2b) matchCtx with target_port=0 also falls through to MATCH -> DIRECT,
+    // proving the gap is the missing port, not the call shape.
+    try std.testing.expectEqualStrings(
+        "DIRECT",
+        engine.matchCtx(.{
+            .target_host = "example.com",
+            .target_port = 0,
+            .is_domain = true,
+        }).?,
+    );
+}
+
 // ============ Simplified Match Interface ============

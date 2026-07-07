@@ -549,7 +549,11 @@ fn handleHttpConnect(_: std.mem.Allocator, conn: net.Server.Connection, request:
     std.debug.print("[Mixed] CONNECT {s}:{d}\n", .{ host, port });
 
     // 通过 outbound manager 连接
-    const proxy_name = engine.match(host, true) orelse "DIRECT";
+    const proxy_name = engine.matchCtx(.{
+        .target_host = host,
+        .target_port = port,
+        .is_domain = true,
+    }) orelse "DIRECT";
     std.debug.print("[Mixed] CONNECT route: {s}:{d} -> {s}\n", .{ host, port, proxy_name });
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
         logConnectionFailure(host, port, proxy_name, err);
@@ -597,7 +601,11 @@ fn handleHttpRequest(allocator: std.mem.Allocator, conn: net.Server.Connection, 
 
     std.debug.print("[Mixed] HTTP {s}:{d}\n", .{ forward.host, forward.port });
 
-    const proxy_name = engine.match(forward.host, true) orelse "DIRECT";
+    const proxy_name = engine.matchCtx(.{
+        .target_host = forward.host,
+        .target_port = forward.port,
+        .is_domain = true,
+    }) orelse "DIRECT";
     std.debug.print("[Mixed] HTTP route: {s}:{d} -> {s}\n", .{ forward.host, forward.port, proxy_name });
     var target_stream = manager.connect(proxy_name, forward.host, forward.port) catch |err| {
         logConnectionFailure(forward.host, forward.port, proxy_name, err);
@@ -628,7 +636,11 @@ fn handleHttpsForwardRequest(
 ) !void {
     std.debug.print("[Mixed] HTTPS forward {s}:{d}\n", .{ forward.host, forward.port });
 
-    const proxy_name = engine.match(forward.host, true) orelse "DIRECT";
+    const proxy_name = engine.matchCtx(.{
+        .target_host = forward.host,
+        .target_port = forward.port,
+        .is_domain = true,
+    }) orelse "DIRECT";
     std.debug.print("[Mixed] HTTPS forward route: {s}:{d} -> {s}\n", .{ forward.host, forward.port, proxy_name });
 
     var target_stream = manager.connect(proxy_name, forward.host, forward.port) catch |err| {

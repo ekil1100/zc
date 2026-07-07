@@ -71,7 +71,11 @@ fn handleConnect(conn: net.Server.Connection, request: []const u8, engine: *Engi
 
     std.debug.print("[HTTP] CONNECT {s}:{d}\n", .{ host, port });
 
-    const proxy_name = engine.match(host, true) orelse "DIRECT";
+    const proxy_name = engine.matchCtx(.{
+        .target_host = host,
+        .target_port = port,
+        .is_domain = true,
+    }) orelse "DIRECT";
     std.debug.print("[HTTP] Rule matched: {s}\n", .{proxy_name});
 
     var target_stream = manager.connect(proxy_name, host, port) catch |err| {
@@ -91,6 +95,10 @@ fn handleHttp(conn: net.Server.Connection, request: []const u8, engine: *Engine,
 
     std.debug.print("[HTTP] {s} {s} (Host: {s})\n", .{ request[0..std.mem.indexOf(u8, request, " ").?], uri, host });
 
+    // DST-PORT rules cannot fire here: the port is parsed from `host` only
+    // after this match call (see the `port` block below). Wiring the port into
+    // matchCtx requires reordering the parse, which is out of scope for the
+    // DST-PORT commit. Tracked separately.
     const proxy_name = engine.match(host, true) orelse "DIRECT";
     std.debug.print("[HTTP] Rule matched: {s}\n", .{proxy_name});
 
