@@ -494,6 +494,102 @@ fn collectStatusSelectedProxies(allocator: std.mem.Allocator, active_config: ?[]
     return try runtime_selection.collectSelectedProxies(allocator, &cfg, active_config);
 }
 
+/// daemon GET /status 返回的实际运行时状态。status 经 IPC 读取以反映 daemon
+/// 真实状态（config_key + 内存 selections），而非 meta.json[用户指针]——后者
+/// 在 config_key 与 active_config 错位（配置切换未重启 daemon）时读到空，误报
+/// default。
+const DaemonStatus = struct {
+    config_key: ?[]const u8 = null,
+    selected_proxies: []runtime_selection.SelectedProxy = &[_]runtime_selection.SelectedProxy{},
+
+    fn deinit(self: *DaemonStatus, allocator: std.mem.Allocator) void {
+        if (self.config_key) |k| allocator.free(k);
+        runtime_selection.deinitSelectedProxies(allocator, self.selected_proxies);
+    }
+};
+
+/// 解析 daemon GET /status 的 JSON body 为 DaemonStatus。纯函数（不起 socket），
+/// 便于测试。失败（非 JSON / 缺字段）返回 null，调用方回退到文件路径。
+fn parseDaemonStatusJson(allocator: std.mem.Allocator, body: []const u8) !?DaemonStatus {
+    const StatusProxy = struct {
+        group: []const u8 = "",
+        proxy: ?[]const u8 = null,
+        source: []const u8 = "default",
+    };
+    const StatusResp = struct {
+        config_key: ?[]const u8 = null,
+        selected_proxies: []const StatusProxy = &.{},
+    };
+
+    var parsed = std.json.parseFromSlice(StatusResp, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+
+    const resp = parsed.value;
+
+    var config_key: ?[]const u8 = null;
+    if (resp.config_key) |k| config_key = try allocator.dupe(u8, k);
+
+    var selections = std.ArrayList(runtime_selection.SelectedProxy).empty;
+    errdefer {
+        for (selections.items) |*sp| sp.deinit(allocator);
+        selections.deinit(allocator);
+        if (config_key) |k| allocator.free(k);
+    }
+
+    for (resp.selected_proxies) |item| {
+        const group = allocator.dupe(u8, item.group) catch continue;
+        const proxy: ?[]const u8 = if (item.proxy) |pr| (allocator.dupe(u8, pr) catch null) else null;
+        const source: runtime_selection.SelectionSource = if (std.mem.eql(u8, item.source, "persisted")) .persisted else .default;
+        selections.append(allocator, .{ .group_name = group, .proxy_name = proxy, .source = source }) catch {
+            allocator.free(group);
+            if (proxy) |pr| allocator.free(pr);
+            continue;
+        };
+    }
+
+    return DaemonStatus{
+        .config_key = config_key,
+        .selected_proxies = try selections.toOwnedSlice(allocator),
+    };
+}
+
+/// 经 IPC（external_controller）读取 daemon 实际运行时状态。daemon 不可达
+/// 或响应异常时返回 null，调用方回退到 meta.json 文件路径。
+fn fetchDaemonStatusOverIpc(allocator: std.mem.Allocator) !?DaemonStatus {
+    var cfg = config.loadDefaultQuiet(allocator) catch return null;
+    defer cfg.deinit();
+    const ec = cfg.external_controller orelse return null;
+    return try fetchDaemonStatusOverIpcEc(allocator, ec);
+}
+
+fn fetchDaemonStatusOverIpcEc(allocator: std.mem.Allocator, ec: []const u8) !?DaemonStatus {
+    const colon = std.mem.lastIndexOf(u8, ec, ":") orelse return null;
+    const port = std.fmt.parseInt(u16, ec[colon + 1 ..], 10) catch return null;
+    const host = ec[0..colon];
+
+    const stream = compat.net.tcpConnectToHost(allocator, host, port) catch return null;
+    defer stream.close();
+
+    const req = std.fmt.allocPrint(allocator, "GET /status HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ec}) catch return null;
+    defer allocator.free(req);
+    stream.writeAll(req) catch return null;
+
+    // daemon 返回的 JSON 可能较大（多节点），循环读到 EOF。
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = stream.read(&chunk) catch break;
+        if (n == 0) break;
+        buf.appendSlice(allocator, chunk[0..n]) catch break;
+    }
+
+    if (!std.mem.startsWith(u8, buf.items, "HTTP/1.1 200") and !std.mem.startsWith(u8, buf.items, "HTTP/1.0 200")) return null;
+
+    const body = if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |hdr_end| buf.items[hdr_end + 4 ..] else buf.items;
+    return try parseDaemonStatusJson(allocator, body);
+}
+
 fn collectStatusSnapshotAtPaths(
     allocator: std.mem.Allocator,
     pid_file: []const u8,
@@ -869,6 +965,27 @@ pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, a
 pub fn getStatus(allocator: std.mem.Allocator, out: *cli_output.Output) !void {
     var snapshot = try collectStatusSnapshot(allocator);
     defer snapshot.deinit(allocator);
+
+    // daemon 在跑时，经 IPC 读其实际运行时状态（config_key + 内存 selections）
+    // 覆盖文件路径的 selections。避免 config_key 与 active_config 错位（配置
+    // 切换未重启 daemon）时 status 读 meta.json[用户指针] 误报 default。
+    if (snapshot.pid != null) {
+        if (try fetchDaemonStatusOverIpc(allocator)) |ds_val| {
+            var ds = ds_val;
+            defer ds.deinit(allocator); // 转移后字段为空，no-op
+            if (ds.config_key) |_| {
+                if (snapshot.active_config) |old| allocator.free(old);
+                snapshot.active_config = ds.config_key;
+                ds.config_key = null;
+            }
+            if (ds.selected_proxies.len > 0) {
+                runtime_selection.deinitSelectedProxies(allocator, snapshot.selected_proxies);
+                snapshot.selected_proxies = ds.selected_proxies;
+                ds.selected_proxies = &.{};
+            }
+        }
+    }
+
     try emitStatus(allocator, out, &snapshot);
 }
 
@@ -1370,4 +1487,33 @@ test "status text output goes to stdout with state tokens" {
     try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "state: stopped") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "detail: stale_pid_file") != null);
     try std.testing.expectEqualStrings("", err_aw.written());
+}
+
+test "parseDaemonStatusJson: config_key + persisted/default selections" {
+    const allocator = std.testing.allocator;
+    const body = "{\"config_key\":\"Flower_Trojan\",\"selected_proxies\":[{\"group\":\"Proxies\",\"proxy\":\"SG-1\",\"source\":\"persisted\"},{\"group\":\"HK\",\"proxy\":\"HK-1\",\"source\":\"default\"}]}";
+    var ds = (try parseDaemonStatusJson(allocator, body)).?;
+    defer ds.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Flower_Trojan", ds.config_key.?);
+    try std.testing.expectEqual(@as(usize, 2), ds.selected_proxies.len);
+    try std.testing.expectEqualStrings("Proxies", ds.selected_proxies[0].group_name);
+    try std.testing.expectEqualStrings("SG-1", ds.selected_proxies[0].proxy_name.?);
+    try std.testing.expectEqual(runtime_selection.SelectionSource.persisted, ds.selected_proxies[0].source);
+    try std.testing.expectEqual(runtime_selection.SelectionSource.default, ds.selected_proxies[1].source);
+}
+
+test "parseDaemonStatusJson: null config_key and empty selections" {
+    const allocator = std.testing.allocator;
+    const body = "{\"config_key\":null,\"selected_proxies\":[]}";
+    var ds = (try parseDaemonStatusJson(allocator, body)).?;
+    defer ds.deinit(allocator);
+    try std.testing.expect(ds.config_key == null);
+    try std.testing.expectEqual(@as(usize, 0), ds.selected_proxies.len);
+}
+
+test "parseDaemonStatusJson: malformed JSON returns null" {
+    const allocator = std.testing.allocator;
+    const ds = try parseDaemonStatusJson(allocator, "not json");
+    try std.testing.expect(ds == null);
 }

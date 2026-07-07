@@ -9,6 +9,7 @@ const ss = @import("shadowsocks.zig");
 const anytls = @import("../../protocol/anytls.zig");
 const anytls_pool = @import("anytls_pool.zig");
 const udp_uot = @import("../udp_uot.zig");
+const runtime_selection = @import("../../runtime_selection.zig");
 
 /// The production UoT v2 codec instantiated over a real borrowed anytls.Stream.
 /// The ProxyStream UDP arm owns a heap instance of this; the relay (D6) drives
@@ -373,6 +374,43 @@ pub const OutboundManager = struct {
     /// 注意：存储 config 中的稳定字符串引用，而非调用者的临时切片
     pub fn selectProxy(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8) void {
         self.selectProxyInternal(group_name, proxy_name, true);
+    }
+
+    /// daemon 实际加载的配置 key（启动时设定）。status 经 IPC 读取此值而非
+    /// 用户指针 getCurrentConfigName，避免配置切换未重启 daemon 时的错位。
+    pub fn configKey(self: *const OutboundManager) ?[]const u8 {
+        return self.config_key;
+    }
+
+    /// 拷贝当前 group_selections 的快照（group → proxy，owned）。status 经 IPC
+    /// 读取 daemon 运行时内存状态，而非 meta.json 持久化层——后者在
+    /// config_key 与 active_config 错位时会读到空，显示 default 而与实际不符。
+    pub fn snapshotSelections(self: *OutboundManager, allocator: std.mem.Allocator) ![]runtime_selection.SelectionEntry {
+        self.lockSelections();
+        defer self.unlockSelections();
+
+        var entries = std.ArrayList(runtime_selection.SelectionEntry).empty;
+        errdefer {
+            for (entries.items) |e| {
+                allocator.free(e.group);
+                allocator.free(e.proxy);
+            }
+            entries.deinit(allocator);
+        }
+        var it = self.group_selections.iterator();
+        while (it.next()) |entry| {
+            const group = allocator.dupe(u8, entry.key_ptr.*) catch continue;
+            const proxy = allocator.dupe(u8, entry.value_ptr.*) catch {
+                allocator.free(group);
+                continue;
+            };
+            entries.append(allocator, .{ .group = group, .proxy = proxy }) catch {
+                allocator.free(group);
+                allocator.free(proxy);
+                continue;
+            };
+        }
+        return entries.toOwnedSlice(allocator);
     }
 
     fn selectProxyInternal(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8, persist: bool) void {
@@ -1079,6 +1117,47 @@ test "selectProxyInternal with persist=false skips persist" {
 
     mgr.selectProxyInternal("G1", "P1", false);
     try std.testing.expectEqual(@as(usize, 0), mgr.persist_invocations);
+}
+
+test "configKey and snapshotSelections expose daemon runtime state" {
+    const allocator = std.testing.allocator;
+
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var gp = @import("../../config.zig").ProxyGroup{
+        .name = try allocator.dupe(u8, "G1"),
+        .group_type = .select,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+    try gp.proxies.append(allocator, try allocator.dupe(u8, "P1"));
+    try gp.proxies.append(allocator, try allocator.dupe(u8, "P2"));
+    try cfg.proxy_groups.append(allocator, gp);
+
+    var mgr = try OutboundManager.initWithKey(allocator, &cfg, "runtimkey");
+    defer mgr.deinit();
+
+    // configKey reflects the init key; empty selections -> empty snapshot.
+    try std.testing.expectEqualStrings("runtimkey", mgr.configKey().?);
+    const snap0 = try mgr.snapshotSelections(allocator);
+    defer runtime_selection.freeSelectionEntries(allocator, snap0);
+    try std.testing.expectEqual(@as(usize, 0), snap0.len);
+
+    // Select P2 in G1 (persist=false: no meta.json writes) -> snapshot reflects it.
+    mgr.selectProxyInternal("G1", "P2", false);
+    const snap1 = try mgr.snapshotSelections(allocator);
+    defer runtime_selection.freeSelectionEntries(allocator, snap1);
+    try std.testing.expectEqual(@as(usize, 1), snap1.len);
+    try std.testing.expectEqualStrings("G1", snap1[0].group);
+    try std.testing.expectEqualStrings("P2", snap1[0].proxy);
 }
 
 test "shouldBypassProxyForTarget detects loopback and private targets" {

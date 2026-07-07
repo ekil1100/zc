@@ -6,6 +6,7 @@ const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = @import("../proxy/outbound/manager.zig").OutboundManager;
 const build_options = @import("build_options");
 const socket_options = @import("../socket_options.zig");
+const runtime_selection = @import("../runtime_selection.zig");
 
 /// REST API 服务器
 pub const ApiServer = struct {
@@ -86,6 +87,8 @@ pub const ApiServer = struct {
                 try self.handleGetProxies(conn);
             } else if (std.mem.eql(u8, path, "/rules")) {
                 try self.handleGetRules(conn);
+            } else if (std.mem.eql(u8, path, "/status")) {
+                try self.handleGetStatus(conn);
             } else if (std.mem.eql(u8, path, "/version")) {
                 try self.sendJson(conn, comptime std.fmt.comptimePrint("{{\"version\":\"{s}\"}}", .{build_options.version}));
             } else {
@@ -132,6 +135,40 @@ pub const ApiServer = struct {
 
         try json.appendSlice(self.allocator, "]}");
         try self.sendJsonRaw(conn, json.items);
+    }
+
+    fn handleGetStatus(self: *ApiServer, conn: net.Server.Connection) !void {
+        const json_str = try ApiServer.buildStatusJson(self.allocator, self.manager, self.config);
+        defer self.allocator.free(json_str);
+        try self.sendJsonRaw(conn, json_str);
+    }
+
+    /// 返回 daemon 实际运行时状态 JSON：{config_key, selected_proxies:[...]}。
+    /// status 经 IPC 读此端点而非 meta.json——后者在 config_key 与 active_config
+    /// 错位（配置切换未重启）时读到空，显示 default 而与实际不符。纯函数，不起 socket。
+    pub fn buildStatusJson(
+        allocator: std.mem.Allocator,
+        manager: *OutboundManager,
+        cfg: *const Config,
+    ) ![]u8 {
+        const cfg_key = manager.configKey();
+        const entries = try manager.snapshotSelections(allocator);
+        defer runtime_selection.freeSelectionEntries(allocator, entries);
+        const selections = try runtime_selection.collectSelectedProxiesFromSnapshot(allocator, cfg, entries);
+        defer runtime_selection.deinitSelectedProxies(allocator, selections);
+
+        const Resp = struct {
+            config_key: ?[]const u8,
+            selected_proxies: []const runtime_selection.SelectedProxy,
+        };
+        var w: std.Io.Writer.Allocating = .init(allocator);
+        defer w.deinit();
+        try std.json.Stringify.value(
+            Resp{ .config_key = cfg_key, .selected_proxies = selections },
+            .{ .whitespace = .minified },
+            &w.writer,
+        );
+        return try allocator.dupe(u8, w.written());
     }
 
     fn handleGetRules(self: *ApiServer, conn: net.Server.Connection) !void {

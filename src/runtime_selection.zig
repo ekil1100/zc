@@ -92,6 +92,57 @@ fn collectSelectedProxiesFromMetaData(
     return selections.toOwnedSlice(allocator);
 }
 
+/// 内存中的选择快照条目（group → proxy），来自 daemon 的
+/// OutboundManager.group_selections。用于 status 经 IPC 读取 daemon 实际
+/// 运行时状态，而非 meta.json 持久化层——后者在 config_key 与 active_config
+/// 错位（配置切换未重启 daemon）时会读到空，显示 default 而与实际不符。
+pub const SelectionEntry = struct {
+    group: []const u8,
+    proxy: []const u8,
+};
+
+pub fn freeSelectionEntries(allocator: std.mem.Allocator, entries: []SelectionEntry) void {
+    for (entries) |e| {
+        allocator.free(e.group);
+        allocator.free(e.proxy);
+    }
+    if (entries.len > 0) allocator.free(entries);
+}
+
+/// 从内存快照生成 SelectedProxy 列表：遍历 cfg 的 select 组，快照命中 →
+/// persisted，否则 firstGroupProxy → default。快照里不在 cfg 的条目忽略。
+pub fn collectSelectedProxiesFromSnapshot(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    entries: []const SelectionEntry,
+) ![]SelectedProxy {
+    var selections = std.ArrayList(SelectedProxy).empty;
+    errdefer {
+        for (selections.items) |*selection| selection.deinit(allocator);
+        selections.deinit(allocator);
+    }
+    for (cfg.proxy_groups.items) |group| {
+        if (group.group_type != .select) continue;
+        const persisted_proxy = findSnapshotEntry(entries, group.name);
+        const selected_proxy = persisted_proxy orelse firstGroupProxy(&group);
+        try appendSelectedProxy(
+            allocator,
+            &selections,
+            group.name,
+            selected_proxy,
+            if (persisted_proxy != null) .persisted else .default,
+        );
+    }
+    return selections.toOwnedSlice(allocator);
+}
+
+fn findSnapshotEntry(entries: []const SelectionEntry, group_name: []const u8) ?[]const u8 {
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.group, group_name)) return e.proxy;
+    }
+    return null;
+}
+
 fn appendSelectedProxy(
     allocator: std.mem.Allocator,
     selections: *std.ArrayList(SelectedProxy),
@@ -234,6 +285,41 @@ test "collectSelectedProxies prefers valid persisted selection" {
     try std.testing.expectEqual(@as(usize, 1), selections.len);
     try std.testing.expectEqualStrings("B", selections[0].proxy_name.?);
     try std.testing.expectEqual(SelectionSource.persisted, selections[0].source);
+}
+
+test "collectSelectedProxiesFromSnapshot prefers runtime override over default" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeConfigWithSelectGroup(allocator);
+    defer cfg.deinit();
+
+    const entries = [_]SelectionEntry{
+        .{ .group = try allocator.dupe(u8, "Proxy"), .proxy = try allocator.dupe(u8, "B") },
+    };
+    defer for (entries) |e| {
+        allocator.free(e.group);
+        allocator.free(e.proxy);
+    };
+
+    const selections = try collectSelectedProxiesFromSnapshot(allocator, &cfg, &entries);
+    defer deinitSelectedProxies(allocator, selections);
+
+    try std.testing.expectEqual(@as(usize, 1), selections.len);
+    try std.testing.expectEqualStrings("Proxy", selections[0].group_name);
+    try std.testing.expectEqualStrings("B", selections[0].proxy_name.?);
+    try std.testing.expectEqual(SelectionSource.persisted, selections[0].source);
+}
+
+test "collectSelectedProxiesFromSnapshot falls back to default with empty snapshot" {
+    const allocator = std.testing.allocator;
+    var cfg = try makeConfigWithSelectGroup(allocator);
+    defer cfg.deinit();
+
+    const selections = try collectSelectedProxiesFromSnapshot(allocator, &cfg, &[_]SelectionEntry{});
+    defer deinitSelectedProxies(allocator, selections);
+
+    try std.testing.expectEqual(@as(usize, 1), selections.len);
+    try std.testing.expectEqualStrings("A", selections[0].proxy_name.?);
+    try std.testing.expectEqual(SelectionSource.default, selections[0].source);
 }
 
 test "appendSelectedProxiesJson writes node info with frozen keys" {

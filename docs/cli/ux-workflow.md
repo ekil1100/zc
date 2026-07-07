@@ -58,6 +58,7 @@
 - 错误码字符串（`docs/api/error-codes.md` + integration tests 中已断言的全部 `*_FAILED` / `*_UNKNOWN` 等）。
 - `state` 取值：`running` / `stopped` / `selected` 等；`detail` 取值：`already_running`、`already_stopped`、`stale_pid_file`、`lock_held_pid_untracked`。
 - JSON 字段名：`action`、`state`、`pid`、`uptime_seconds`、`active_config`、`selected_proxies`、`paths`、`daemon_state`、`proxy_reachable`、`group`、`proxy`、`source`。
+- `active_config` / `selected_proxies` 反映 **daemon 实际运行时状态**：daemon 在跑时经 IPC `GET /status` 读 daemon 内存 `group_selections` + 实际 `config_key`，而非用户配置指针/`meta.json`（避免配置切换未重启 daemon 时指针与 daemon 错位、误报 default）；daemon 不可达（停机/旧二进制无端点）时回退到 `meta.json` 文件路径。
 - doctor 文本标签：`Config:`、`Daemon:`、`PID:`、`Port:`、`Connection:`；健康输出含 `OK`/`valid`。
 - 字段**顺序**不再保证：测试改为解析 JSON 后断言（淘汰子串顺序断言）。
 

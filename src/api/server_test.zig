@@ -131,3 +131,46 @@ test "JSON response format" {
     try testing.expect(std.mem.indexOf(u8, result, "\"proxies\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "\"name\":\"Proxy1\"") != null);
 }
+
+test "buildStatusJson returns daemon config_key and runtime selections" {
+    // status 经 IPC 读 daemon 实际状态：config_key + 内存 group_selections，
+    // 而非 meta.json[用户指针]（错位时读到空 → 误报 default）。
+    const allocator = testing.allocator;
+    const manager_mod = @import("../proxy/outbound/manager.zig");
+
+    var cfg = config.Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+    defer cfg.deinit();
+
+    var gp = config.ProxyGroup{
+        .name = try allocator.dupe(u8, "Proxy"),
+        .group_type = .select,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+    try gp.proxies.append(allocator, try allocator.dupe(u8, "A"));
+    try gp.proxies.append(allocator, try allocator.dupe(u8, "B"));
+    try cfg.proxy_groups.append(allocator, gp);
+
+    var mgr = try manager_mod.OutboundManager.initWithKey(allocator, &cfg, "runtimkey");
+    defer mgr.deinit();
+    // Select B (persist no-ops: meta.json has no "runtimkey" entry -> getPtr null).
+    mgr.selectProxy("Proxy", "B");
+
+    const json = try server.ApiServer.buildStatusJson(allocator, &mgr, &cfg);
+    defer allocator.free(json);
+
+    // config_key reflects daemon's actual loaded key (not the user pointer).
+    try testing.expect(std.mem.indexOf(u8, json, "\"config_key\":\"runtimkey\"") != null);
+    // runtime override (B) surfaces as persisted, not the default (A).
+    try testing.expect(std.mem.indexOf(u8, json, "\"group\":\"Proxy\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"proxy\":\"B\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source\":\"persisted\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"proxy\":\"A\"") == null);
+}
