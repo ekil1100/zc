@@ -114,7 +114,7 @@ collect_issues() {
         issues+=("{\"rule\":\"UNSUPPORTED_PROXY_TYPE_CHECK\",\"level\":\"error\",\"path\":\"proxies[$name].type\",\"message\":\"proxy type '$t' is not supported by zclash\",\"fixable\":false}")
       fi
     fi
-  done < <(grep -E '^[[:space:]]*type:' "$file")
+  done < <(awk '/^proxies:/{found=1; next} found && /^[^[:space:]]/{exit} found{print}' "$file" | grep -E '^[[:space:]]*type:')
 
   # R27: TLS_SNI_CHECK
   if grep -Eq '^[[:space:]]*tls:[[:space:]]*true' "$file"; then
@@ -578,7 +578,7 @@ $line"
       if [[ -n "$raw_type" ]] && ! echo "$raw_type" | grep -Eq "^($valid_types)$"; then
         issues+=("{\"rule\":\"PROXY_GROUP_TYPE_CHECK\",\"level\":\"error\",\"path\":\"proxy-groups[].type\",\"message\":\"unknown proxy group type: $raw_type\",\"fixable\":false,\"suggested\":\"select\"}")
       fi
-    done < <(grep -E '^[[:space:]]*type:[[:space:]]*"?[A-Za-z-]+"?' "$file")
+    done < <(awk '/^[[:space:]]*proxy-groups:/{found=1; next} found && /^[^[:space:]]/{exit} found{print}' "$file" | grep -E '^[[:space:]]*type:[[:space:]]*"?[A-Za-z-]+"?')
   fi
 
   # R4: DNS_FIELD_CHECK
