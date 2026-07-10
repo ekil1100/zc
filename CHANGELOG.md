@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc5] - 2026-07-10
+
+### Changed
+- Migrate release actions to Node.js 24 and replace the retired Intel macOS 13 runner with `macos-15-intel`.
+
 ## [1.0.0-rc4] - 2026-07-10
 
 ### Added (AnyTLS protocol completion)

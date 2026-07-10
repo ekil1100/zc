@@ -19,16 +19,16 @@ jobs:
           - os: macos-latest
             target_os: macos
             target_arch: arm64
-          - os: macos-13
+          - os: macos-15-intel
             target_os: macos
             target_arch: amd64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: step-security/setup-zig@v2.2.2
         with:
           version: 0.16.0
 
@@ -60,7 +60,7 @@ jobs:
           fi
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target_os }}-${{ matrix.target_arch }}
           path: dist/*.tar.gz*
@@ -70,10 +70,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -90,7 +90,7 @@ jobs:
           EOF
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           body_path: dist/release-notes.md
@@ -103,7 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout homebrew-tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ekil1100/homebrew-tap
           token: ${{ secrets.TAP_TOKEN }}
