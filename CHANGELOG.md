@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc4] - 2026-07-10
+
 ### Added (AnyTLS protocol completion)
 - **Dynamic padding scheme**: parse the AnyTLS padding-scheme grammar (ranges + CheckMarks + `stop`), emit randomized multi-record framing per the scheme (replacing the old fixed shaping), and adopt server-pushed `update-padding-scheme` (cmd 6). The advertised `padding-md5` always matches the active scheme. Closes a static traffic-fingerprint gap.
 - **Session multiplexing + idle pool**: one authenticated TLS session is reused across connections (single-active-stream-per-session, anytls-go parity) instead of a full TLS+auth handshake per connection. A per-session background recv-loop demultiplexes frames; an idle-session pool with a reaper honors `idle-session-check-interval` / `idle-session-timeout` / `min-idle-session` (config keys, seconds; sub-5s values clamp to 30). SYN-DONE bounded wait on reused streams.

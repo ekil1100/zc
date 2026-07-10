@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="${SCRIPT_DIR}/.test-install-$$"
 INSTALL_DIR="${TEST_DIR}/install"
 CONFIG_DIR="${TEST_DIR}/.config/zc"
-VERSION="${1:-v1.0.0-rc1}"
+VERSION="${1:-v1.0.0-rc4}"
 REPO="ekil1100/zc"
 
 # zc 二进制路径

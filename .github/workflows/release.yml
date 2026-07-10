@@ -19,6 +19,9 @@ jobs:
           - os: macos-latest
             target_os: macos
             target_arch: arm64
+          - os: macos-13
+            target_os: macos
+            target_arch: amd64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -110,19 +113,52 @@ jobs:
         run: |
           cd homebrew-tap
           VERSION="${{ github.ref_name }}"
-          # Download macOS ARM64
+          VERSION_NO_V="${VERSION#v}"
+
           curl -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-arm64.tar.gz" -o macos-arm64.tar.gz
-          # Download Linux AMD64
+          curl -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-amd64.tar.gz" -o macos-amd64.tar.gz
           curl -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-amd64.tar.gz" -o linux-amd64.tar.gz
-          # Calculate SHA256
-          MACOS_SHA=$(sha256sum macos-arm64.tar.gz | cut -d' ' -f1)
-          LINUX_SHA=$(sha256sum linux-amd64.tar.gz | cut -d' ' -f1)
-          # Update formula
-          sed -i "s/version \".*\"/version \"${VERSION#v}\"/" zc.rb
-          sed -i "s/sha256 \"c704101c409af5ba562c814db2762826ee47962833c684a1beae21602d3e23e2\"/sha256 \"${MACOS_SHA}\"/" zc.rb
-          sed -i "s/sha256 \"fdf5b6a70e562947af7d056d860d78107db2a420225e094ff674fa7ff6063d18\"/sha256 \"${LINUX_SHA}\"/" zc.rb
-          # Cleanup
-          rm -f macos-arm64.tar.gz linux-amd64.tar.gz
+
+          MACOS_ARM64_SHA=$(sha256sum macos-arm64.tar.gz | cut -d' ' -f1)
+          MACOS_AMD64_SHA=$(sha256sum macos-amd64.tar.gz | cut -d' ' -f1)
+          LINUX_AMD64_SHA=$(sha256sum linux-amd64.tar.gz | cut -d' ' -f1)
+
+          cat > zc.rb <<EOF
+          class Zc < Formula
+            desc "Lightweight network tool built with Zig"
+            homepage "https://github.com/ekil1100/zc"
+            version "${VERSION_NO_V}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/ekil1100/zc/releases/download/v#{version}/zc-v#{version}-macos-arm64.tar.gz"
+                sha256 "${MACOS_ARM64_SHA}"
+              end
+              on_intel do
+                url "https://github.com/ekil1100/zc/releases/download/v#{version}/zc-v#{version}-macos-amd64.tar.gz"
+                sha256 "${MACOS_AMD64_SHA}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/ekil1100/zc/releases/download/v#{version}/zc-v#{version}-linux-amd64.tar.gz"
+                sha256 "${LINUX_AMD64_SHA}"
+              end
+            end
+
+            def install
+              bin.install "zc"
+            end
+
+            test do
+              system "#{bin}/zc", "--help"
+            end
+          end
+          EOF
+
+          rm -f macos-arm64.tar.gz macos-amd64.tar.gz linux-amd64.tar.gz
 
       - name: Commit and push
         run: |
@@ -130,5 +166,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add zc.rb
-          git commit -m "Update zc to ${{ github.ref_name }}"
-          git push
+          if git diff --cached --quiet; then
+            echo "Homebrew formula already up to date"
+          else
+            git commit -m "Update zc to ${{ github.ref_name }}"
+            git push
+          fi

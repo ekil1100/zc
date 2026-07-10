@@ -24,7 +24,7 @@ bash scripts/install/oc-run.sh install --target-dir /tmp/zc-install
 bash scripts/install/oc-run.sh verify --target-dir /tmp/zc-install
 
 # Upgrade requires an explicit version
-bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.0-rc3
+bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.0-rc4
 
 # Optional rollback cleanup
 bash scripts/install/oc-run.sh rollback --target-dir /tmp/zc-install
