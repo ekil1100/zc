@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-05-03
+> 最近更新：2026-07-14
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -15,8 +15,9 @@
 2. ~~**CLI `test --json` 不生效**~~（已解决：全 CLI 输出契约对齐落地，`test --json` 走统一 envelope + `CHECKS_FAILED` 语义，见 `docs/cli/spec.md`）。
 3. **API v1 仍是最小 REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
+5. **代理选择仍存在多状态源与回归风险**：CLI、daemon 内存和 `meta.json` 可能分裂；持久化错误可被吞掉，外部 `-c`/controller identity 也可能错位。当前还没有本地配置进入托管库的 `config import`。
 
-因此，v1.0 roadmap 现在应聚焦：**关闭 HTTP/SOCKS5 outbound 策略这一 P0（`zc test --json` 契约已随全 CLI 输出对齐关闭），再做最终 smoke gate 和 GA tag 判断。**
+因此，v1.0 roadmap 现在应聚焦：**关闭 HTTP/SOCKS5 outbound 策略 P0，并完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import，再做最终 smoke gate 和 GA tag 判断。**
 
 ---
 
@@ -29,25 +30,27 @@ zig version
 # 0.16.0
 
 cat build.zig.zon
-# .version = "1.0.0-rc3"
+# .version = "1.0.0-rc5"
 # .minimum_zig_version = "0.16.0"
 ```
 
-结果：本机是 Zig 0.16.0；包版本为 `1.0.0-rc3`；`build.zig.zon` 的 minimum zig 已对齐为 `0.16.0`。
+结果：2026-07-14 本机是 Zig 0.16.0；包版本为 `1.0.0-rc5`；`build.zig.zon` 的 minimum zig 已对齐为 `0.16.0`。
 
 ### Zig 测试与 ReleaseFast 构建
 
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 63/63 tests passed
+# 514/515 tests passed (1 skipped)
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
-# succeeded
+# 4/4 steps succeeded
 ```
 
-结果：当前代码在本机 Zig 0.16.0 下可构建、单测通过。
+结果：2026-07-14 当前代码在本机 Zig 0.16.0 下可构建、单测通过（1 项显式 skip）。
 
-### 迁移与安装回归
+### 迁移与安装回归（最近一次完整记录：2026-05）
+
+以下历史结果尚未在 2026-07-14 计划更新中重跑；P0-7 必须重新验证。
 
 ```bash
 bash tools/config-migrator/run-all.sh
@@ -67,30 +70,18 @@ bash scripts/run-full-validation.sh
 ### CLI smoke
 
 ```bash
-./zig-out/bin/zc --help
-# zc v1.0.0-rc3
+./zig-out/bin/zc --version
+# zc 1.0.0-rc5
 
 ./zig-out/bin/zc status --json
-# ok=true, state=stopped
-
-./zig-out/bin/zc doctor --json
-# ok=true, config_ok=true, daemon_running=false
-
-./zig-out/bin/zc start --port 29001 -c testdata/config/minimal.yaml --json
-./zig-out/bin/zc status --json
-./zig-out/bin/zc stop --json
-# start/status/stop 成功
+# valid JSON envelope
 ```
 
-结果：daemon 基础生命周期在非生产端口 smoke 通过。
+结果：2026-07-14 只执行了无副作用的 version/status smoke；当前机器已有 tracked daemon，未干扰其端口或生命周期。完整 29001 start/status/stop smoke 保留到 P0-7 最终 gate。
 
-### 发现的 CLI 契约问题
+### 已关闭的 CLI 契约问题
 
-```bash
-./zig-out/bin/zc test -c testdata/config/minimal.yaml --json
-```
-
-实际输出仍为文本报告，而非 JSON。代码路径：`src/main.zig` 的 `test` 分支无论 `json_output` 如何，最终都调用 `test_cli.testProxy()`。
+`zc test --json` 已走统一 JSON envelope、`CHECKS_FAILED` 和非零退出语义；当前契约见 `docs/cli/spec.md`。
 
 ---
 
@@ -102,14 +93,14 @@ bash scripts/run-full-validation.sh
 
 已实现命令：
 
-- `help`
-- `tui`（已决定从 v1.0 范围砍掉；当前只是代码事实，后续需要移除）
-- `start [-c <config>] [--port <port>]`
-- `stop`
+- `help` / `version`
+- `start|up [-c <config>] [--port <port>] [--foreground]`
+- `stop|down`
 - `restart [-c <config>]`
+- `reload`
 - `status`
 - `log [-n <lines>] [-f|--no-follow]`
-- `config list|ls|download|update|use|dump|override`
+- `config list|ls|download|update|use|delete|dump|override`
 - `proxy list|ls|select|test`
 - `profile list|ls|select|test`
 - `test [-c <config>]`
@@ -264,22 +255,13 @@ bash scripts/run-full-validation.sh
 - HTTP parser 是手写最小实现，一次 read 4096 bytes，未覆盖通用 HTTP server 边界。
 - 错误结构是 `{"error":"..."}`，并非 CLI 中的 `code/message/hint` 结构。
 
-### 2.6 TUI（v1.0 已砍，需清理）
-
-代码入口：`src/tui.zig`
+### 2.6 TUI（v1.0 已完成 de-scope）
 
 事实判断：
 
-- 当前代码仍存在 terminal raw mode / alternate screen / mouse / tab state / render loop。
-- `src/main.zig` 仍导入 `tui.zig`，并暴露 `zc tui` 命令与 help 文案。
-- 有状态结构、日志高亮、代理组展示与选择相关逻辑。
-- 连接列表、速度、延迟等数据更多是 TUI 本地状态；未看到完整 runtime metrics 采集链路。
-
-v1.0 决策：
-
-- **砍掉 TUI 功能，不作为 v1.0 发布能力。**
-- 需要清理对应代码，而不是仅在文档中标 unsupported。
-- 清理范围至少包括：`src/tui.zig`、`src/main.zig` 的 import/command dispatch/help 文案、TUI 相关 docs/README 入口、测试或 roadmap 中的 TUI 承诺。
+- 当前 `src/main.zig` / `src/cli/commands.zig` 不再暴露 `zc tui`。
+- v1.0 active docs 不再承诺 TUI；历史资料只允许位于 `docs/archive/`。
+- TUI 不参与本计划，也不得因 selection/connection tracking 工作重新引入。
 
 ### 2.7 日志
 
@@ -343,7 +325,9 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 
 ## 4. v1.0 发布阻塞项（P0）
 
-### P0-1：修正 CI / Release Zig 版本链路
+### P0-1：修正 CI / Release Zig 版本链路 — Done
+
+状态：代码、CI/release workflow 与 package minimum 已统一到 Zig 0.16.0；保留以下 DoD 作为发布回归。
 
 范围：
 
@@ -401,7 +385,9 @@ B. parser / validator / docs / migrator 明确把 HTTP / SOCKS5 outbound 标为 
 
 后续扩展（已完成）：全 CLI 输出契约对齐已落地 —— 全命令 stdout 统一 `{"ok","command","data"|"error"}` envelope、退出码 0/1/2 统一、生成式帮助、`zc reload`/`up`/`down`/`version`/`--foreground`/`--no-color`、`test`/`doctor` 失败 `CHECKS_FAILED` + 非零退出、移除 ps/pgrep 全局 daemon 发现（D12）。契约见 `docs/cli/spec.md`，验收记录见 `docs/cli/ux-workflow.md`，事实基线见 `.agents/cli-ux-baseline.md`。该项不解除其余 GA gate（P0-2 outbound 策略与最终 smoke gate 仍未关闭）。
 
-### P0-4：TUI de-scope 与代码清理
+### P0-4：TUI de-scope 与代码清理 — Done
+
+状态：`zc tui` 已从当前代码入口、生成式 help 和 active docs 移除；以下范围与验收保留为回归记录。
 
 决策：v1.0 砍掉 TUI，不发布 `zc tui`。
 
@@ -421,7 +407,9 @@ B. parser / validator / docs / migrator 明确把 HTTP / SOCKS5 outbound 标为 
 - `zig build test --summary all` 通过。
 - `zig build -Doptimize=ReleaseFast --summary all` 通过。
 
-### P0-5：历史无用文档清理与归档
+### P0-5：历史无用文档清理与归档 — Done
+
+状态：旧根目录 roadmap/tasks 和 TUI/完整 API 草案已删除或归档，当前入口已收敛；以下清单保留为回归记录。
 
 目标：v1.0 发布前，只保留与当前 code-first 结论一致、用户可执行、用户可验证的文档。
 
@@ -465,7 +453,37 @@ docs/
 - `grep -R "ROADMAP.md\|TASKS.md" -n README.md docs AGENTS.md .agents/zc-v1.0-roadmap.md` 不再把旧根目录文件描述为当前 canonical 计划源。
 - 文档清理后重新跑 `bash scripts/run-full-validation.sh`，确认脚本文档引用未断。
 
-### P0-6：发布前最终 smoke gate
+### P0-6：revisioned config identity、可靠代理选择与本地 config import
+
+状态：**Planned，尚未实现**。
+
+目标：
+
+- durable desired selection 成为唯一权威状态，daemon runtime 通过 generation 对账；
+- 配置 identity 从不稳定的 key/path 推导升级为 `managed key + revision`；
+- `proxy select` 明确区分 persisted、runtime applied 和连接关闭结果；
+- 新增 CLI-only `zc config import <path>`，把本地完整配置及 source root 内依赖复制为托管 immutable bundle；
+- 所有 transport 接入 owner-safe flow tracking 后，才开放显式 `--close-connections`；
+- 不新增 TUI、配置上传 API、`profile import` 或隐式 reload/restart。
+
+冻结契约、分批实施、回滚点、测试矩阵与性能门禁见：
+
+- [`.agents/proxy-selection-config-import-plan.md`](proxy-selection-config-import-plan.md)
+
+关键验收：
+
+- CLI → daemon → manager → durable state → restart 的选择回归通过；
+- daemon 启动在开放监听前完成 desired/runtime 对账；
+- 离线、其他 key、旧 revision、identity unverified、apply failed 均有稳定 exit/JSON 语义；
+- desired/runtime/selected/resolved 可同时观测，旧字段仅作兼容投影；
+- `config import` 默认不 active、不 apply；force active key 只推进 active revision，旧 runtime 不自动切换；
+- 主配置 16 MiB 边界、bundle containment、symlink、离线验证、remote provider 零网络和 fault atomicity 有自动化证据；
+- `--close-connections` 精确覆盖旧 generation 的 TCP/UDP/逻辑 flow，不误关共享物理连接，恢复时不重放；
+- 默认连接路径、flow registry、close storm 和控制面事务通过真实 ReleaseFast 性能门禁。
+
+文档策略：规划阶段只更新 roadmap；`docs/cli/spec.md`、minimal API 和错误码当前契约必须等行为测试通过后在同一逻辑 commit 更新。
+
+### P0-7：发布前最终 smoke gate
 
 范围：
 
@@ -581,22 +599,25 @@ v1.0 建议：
 - workflow grep 不再出现 `0.15.2`。
 - 协议兼容声明和代码行为一致。
 
-### RC5：运行时一致性与低噪声
+### RC5：配置 identity、选择一致性与本地导入
 
-目标：让核心运行时语义可信。
+目标：先让 managed config 与代理选择状态可信，再开放本地导入和显式连接关闭。
 
 任务：
 
-1. `DST-PORT` 在 mixed HTTP CONNECT/forward 路径补齐 `target_port`。
-2. running 状态下 `status --json` 字段语义收敛。
-3. 热路径 debug print 降噪。
-4. API 文档降级为 minimal API 或补齐实际 OpenAPI。
+1. 按 P0-6 计划建立 transactional authority、immutable config revision 与 legacy rollback mirror。
+2. 所有 managed config reader/writer 切换到 exact identity，tracked daemon 发布实际 endpoint 与 revision。
+3. 落地 CLI-only `config import`，默认不 active、不 apply。
+4. `proxy select` 改为 durable-first generation commit，并统一 CLI/minimal API/status adapter。
+5. route snapshot、FlowRegistry 和全 transport owner-safe cancellation 通过后，才开放 `--close-connections`。
+6. `DST-PORT` 在 mixed HTTP CONNECT/forward 路径补齐 `target_port`。
+7. 热路径 debug print 降噪。
 
 退出标准：
 
-- 新增规则上下文回归测试通过。
+- P0-6 验收矩阵、崩溃恢复与性能门禁全部通过。
 - `zc start/status/doctor/test/proxy list --json` 行为可回归。
-- ReleaseFast smoke 无明显热路径噪声。
+- ReleaseFast smoke 无明显热路径噪声或关键路径性能回退。
 
 ### GA：v1.0.0 tag
 
@@ -634,9 +655,10 @@ git push origin v1.0.0
 按风险排序：
 
 1. **决定 HTTP/SOCKS5 outbound 策略**：实现还是标 unsupported；建议先标 unsupported，并同步 validator / doctor / migrator / README。
-2. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
-3. **复跑最终 smoke gate**：确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
-4. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。
+2. **执行 P0-6 Batch 1**：先以 TDD 建立 transactional authority，保持生产行为不变，再按计划小步迁移 identity/import/selection/flow。
+3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
+4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
+5. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。
 
 ---
 
@@ -645,16 +667,17 @@ git push origin v1.0.0
 当前 main 分支：
 
 - ✅ Zig 0.16 本地构建通过
-- ✅ 单测 63/63 通过
-- ✅ full validation 通过
-- ✅ 非生产端口 daemon start/status/stop smoke 通过
+- ✅ 2026-07-14 单测 514/515 通过（1 项显式 skip）
+- ⚠️ migrator/install/full validation 最近完整记录来自 2026-05，2026-07-14 未重跑，待 P0-7 验证
+- ⚠️ 2026-07-14 仅完成 version/status 无副作用 smoke；29001 daemon start/status/stop 待 P0-7 验证
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
 - ❌ 部分配置可接受但运行时未实现
+- ❌ `proxy select` 的 durable/runtime identity 与失败语义尚未收敛，`config import` 尚未实现
 - ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档
 
 结论：
 
-> **暂不建议立即打 `v1.0.0` tag。CLI JSON 契约（含 `zc test --json`）已关闭；先关闭 HTTP/SOCKS5 outbound 策略这一 P0，再进入最终 GA gate。**
+> **暂不建议立即打 `v1.0.0` tag。先关闭 HTTP/SOCKS5 outbound 策略 P0，并按 P0-6 完成可靠代理选择和本地 config import，再进入最终 GA gate。**

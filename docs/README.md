@@ -6,15 +6,17 @@ For a first read, start with the root [`README.md`](../README.md). It contains t
 
 ## Current status
 
-zc is in **v1.0 release-candidate cleanup**, not final GA. The current release plan is code-first:
+zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当前发布计划以代码事实为准：
 
-1. fix toolchain/release workflow drift,
-2. align documented capabilities with implemented code,
-3. remove the TUI from the v1.0 scope,
-4. clean stale documentation,
-5. pass the final smoke gate before tagging `v1.0.0`.
+1. 修复工具链与 release workflow 漂移；
+2. 让文档声明与已实现能力一致；
+3. 从 v1.0 范围移除 TUI；
+4. 清理过期文档；
+5. 让代理选择具备持久、revision-aware 的一致语义；
+6. 增加经过验证、仅 CLI 可用的本地 config import；
+7. 通过最终 smoke gate 后再标记 `v1.0.0`。
 
-See [`roadmap/v1.0.md`](roadmap/v1.0.md) for the public v1.0 roadmap.
+公开 v1.0 roadmap 见 [`roadmap/v1.0.md`](roadmap/v1.0.md)。可靠持久选择与 `config import` 当前均为**计划能力，尚未实现**；当前命令契约仍以 [`cli/spec.md`](cli/spec.md) 为准。
 
 ## v1.0 documentation map
 
