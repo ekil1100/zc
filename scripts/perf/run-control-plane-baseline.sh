@@ -99,12 +99,11 @@ if [[ -s "$provenance_tmp/replacements" ]]; then
   echo "refusing provenance with git replacement refs" >&2
   exit 2
 fi
-GIT_DIR="$(git -C "$ROOT_DIR" rev-parse --git-dir)" || {
-  echo "unable to locate git metadata" >&2
+GRAFTS_PATH="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-path info/grafts)" || {
+  echo "unable to locate git grafts" >&2
   exit 2
 }
-[[ "$GIT_DIR" == /* ]] || GIT_DIR="$ROOT_DIR/$GIT_DIR"
-if [[ -s "$GIT_DIR/info/grafts" ]]; then
+if [[ -s "$GRAFTS_PATH" ]]; then
   echo "refusing provenance with git grafts" >&2
   exit 2
 fi
@@ -182,9 +181,55 @@ cleanup_measurement() {
 }
 trap cleanup_measurement EXIT
 
+verify_checkout() {
+  local checkout_root="$1"
+  local expected_commit="$2"
+  local checkout_head
+  checkout_head="$(git -C "$checkout_root" rev-parse HEAD)" || return 1
+  [[ "$checkout_head" == "$expected_commit" ]] || return 1
+
+  if ! git -C "$checkout_root" status --porcelain --untracked-files=all >"$build_parent/checkout-status"; then
+    return 1
+  fi
+  [[ ! -s "$build_parent/checkout-status" ]] || return 1
+  if ! git -C "$checkout_root" ls-files -v >"$build_parent/checkout-index-flags"; then
+    return 1
+  fi
+  if grep -Eq '^[a-zS]' "$build_parent/checkout-index-flags"; then
+    return 1
+  fi
+  if ! git -C "$ROOT_DIR" ls-tree -r -z "$expected_commit" >"$build_parent/expected-tree"; then
+    return 1
+  fi
+
+  while IFS= read -r -d '' entry; do
+    local metadata="${entry%%$'\t'*}"
+    local path="${entry#*$'\t'}"
+    local mode type expected_hash actual_hash
+    read -r mode type expected_hash <<<"$metadata"
+    [[ "$type" == "blob" ]] || return 1
+    [[ -e "$checkout_root/$path" || -L "$checkout_root/$path" ]] || return 1
+    if [[ "$mode" == "120000" ]]; then
+      local link_target
+      link_target="$(readlink "$checkout_root/$path")" || return 1
+      actual_hash="$(printf '%s' "$link_target" | git -C "$ROOT_DIR" hash-object --stdin)" || return 1
+    else
+      actual_hash="$(git -C "$ROOT_DIR" hash-object --no-filters -- "$checkout_root/$path")" || return 1
+      if [[ "$mode" == "100755" ]]; then
+        [[ -x "$checkout_root/$path" ]] || return 1
+      fi
+    fi
+    [[ "$actual_hash" == "$expected_hash" ]] || return 1
+  done <"$build_parent/expected-tree"
+}
+
 # Build from the verified commit, not from the caller's mutable worktree.
-git -C "$ROOT_DIR" worktree add --detach --quiet "$build_root" "$HARNESS_COMMIT"
+git -c core.hooksPath=/dev/null -C "$ROOT_DIR" worktree add --detach --quiet "$build_root" "$HARNESS_COMMIT"
 build_registered=true
+verify_checkout "$build_root" "$HARNESS_COMMIT" || {
+  echo "isolated benchmark checkout does not match harness-commit" >&2
+  exit 2
+}
 (
   cd "$build_root"
   env ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/zig-cache}" \
