@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+# Git's -C does not override repository-changing GIT_* variables. Remove them
+# before resolving either provenance or the isolated build worktree.
+while IFS='=' read -r name _; do
+  [[ "$name" == GIT_* ]] && unset "$name"
+done < <(env)
+
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd -P)"
 SAMPLES=9
 ITERATIONS=200
 FIXTURE_BYTES=$((64 * 1024))
-SUBJECT_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
-HARNESS_COMMIT="$SUBJECT_COMMIT"
+SUBJECT_COMMIT=""
+HARNESS_COMMIT=""
 MACHINE="$(hostname)"
 OUTPUT=""
 
@@ -60,6 +66,15 @@ done
 
 provenance_tmp="$(mktemp -d "${TMPDIR:-/tmp}/zc-perf-provenance.XXXXXX")"
 trap 'rm -rf "$provenance_tmp"' EXIT
+if ! git -C "$ROOT_DIR" rev-parse --show-toplevel >"$provenance_tmp/toplevel"; then
+  echo "unable to resolve repository root" >&2
+  exit 2
+fi
+REPORTED_ROOT="$(cd "$(cat "$provenance_tmp/toplevel")" && pwd -P)"
+if [[ "$REPORTED_ROOT" != "$ROOT_DIR" ]]; then
+  echo "resolved git repository does not match the benchmark source" >&2
+  exit 2
+fi
 if ! git -C "$ROOT_DIR" status --porcelain --untracked-files=all >"$provenance_tmp/status"; then
   echo "unable to verify worktree provenance" >&2
   exit 2
@@ -94,16 +109,18 @@ if [[ -s "$GIT_DIR/info/grafts" ]]; then
   exit 2
 fi
 
+ACTUAL_HEAD="$(git -C "$ROOT_DIR" rev-parse HEAD)" || {
+  echo "unable to resolve HEAD" >&2
+  exit 2
+}
+[[ -n "$SUBJECT_COMMIT" ]] || SUBJECT_COMMIT="$ACTUAL_HEAD"
+[[ -n "$HARNESS_COMMIT" ]] || HARNESS_COMMIT="$ACTUAL_HEAD"
 SUBJECT_COMMIT="$(git -C "$ROOT_DIR" rev-parse "${SUBJECT_COMMIT}^{commit}" 2>/dev/null)" || {
   echo "subject-commit is not a commit" >&2
   exit 2
 }
 HARNESS_COMMIT="$(git -C "$ROOT_DIR" rev-parse "${HARNESS_COMMIT}^{commit}" 2>/dev/null)" || {
   echo "harness-commit is not a commit" >&2
-  exit 2
-}
-ACTUAL_HEAD="$(git -C "$ROOT_DIR" rev-parse HEAD)" || {
-  echo "unable to resolve HEAD" >&2
   exit 2
 }
 [[ "$HARNESS_COMMIT" == "$ACTUAL_HEAD" ]] || {
@@ -153,10 +170,23 @@ esac
 
 mkdir -p "$(dirname "$OUTPUT")"
 tmp_output="${OUTPUT}.tmp.$$"
-trap 'rm -f "$tmp_output"' EXIT
+build_parent="$(mktemp -d "${TMPDIR:-/tmp}/zc-perf-build.XXXXXX")"
+build_root="$build_parent/source"
+build_registered=false
+cleanup_measurement() {
+  rm -f "$tmp_output"
+  if [[ "$build_registered" == true ]]; then
+    git -C "$ROOT_DIR" worktree remove --force "$build_root" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$build_parent"
+}
+trap cleanup_measurement EXIT
 
+# Build from the verified commit, not from the caller's mutable worktree.
+git -C "$ROOT_DIR" worktree add --detach --quiet "$build_root" "$HARNESS_COMMIT"
+build_registered=true
 (
-  cd "$ROOT_DIR"
+  cd "$build_root"
   env ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/zig-cache}" \
     zig build perf -- \
       --samples "$SAMPLES" \
@@ -185,6 +215,9 @@ jq -e \
    ([.benchmarks[] | has("pass")] | all(. == false))' \
   "$tmp_output" >/dev/null
 
+git -C "$ROOT_DIR" worktree remove --force "$build_root" >/dev/null
+build_registered=false
+rm -rf "$build_parent"
 mv "$tmp_output" "$OUTPUT"
 trap - EXIT
 

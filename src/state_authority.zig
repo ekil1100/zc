@@ -50,6 +50,8 @@ const max_state_bytes = 4 * 1024 * 1024;
 const state_file_name = "state-v2.json";
 const lock_file_name = "state-v2.lock";
 
+extern "c" fn mkfifoat(c_int, [*:0]const u8, std.posix.mode_t) c_int;
+
 fn ownerOnlyPermissions() std.Io.File.Permissions {
     if (builtin.os.tag == .windows) return .default_file;
     return std.Io.File.Permissions.fromMode(0o600);
@@ -201,28 +203,12 @@ pub const Authority = struct {
     }
 
     fn loadUnlocked(self: Authority) !Snapshot {
-        const path_handle = self.dir.openFile(compat.io(), state_file_name, .{
-            .path_only = true,
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
+        const file = self.openStateFile() catch |err| switch (err) {
             error.FileNotFound => return Snapshot.init(self.allocator),
-            error.SymLinkLoop, error.IsDir => return error.CorruptState,
-            else => return err,
-        };
-        defer path_handle.close(compat.io());
-        const path_stat = try path_handle.stat(compat.io());
-        if (path_stat.kind != .file) return error.CorruptState;
-
-        const file = self.dir.openFile(compat.io(), state_file_name, .{
-            .allow_directory = false,
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
-            error.FileNotFound, error.SymLinkLoop, error.IsDir => return error.CorruptState,
+            error.SymLinkLoop, error.IsDir, error.InvalidStateFile => return error.CorruptState,
             else => return err,
         };
         defer file.close(compat.io());
-        const file_stat = try file.stat(compat.io());
-        if (file_stat.kind != .file or file_stat.inode != path_stat.inode) return error.CorruptState;
 
         const content = try compat.fileReadBoundedAlloc(file, self.allocator, max_state_bytes);
         defer self.allocator.free(content);
@@ -246,6 +232,34 @@ pub const Authority = struct {
             try snapshot.profiles.put(key, revision);
         }
         return snapshot;
+    }
+
+    fn openStateFile(self: Authority) !std.Io.File {
+        if (builtin.os.tag == .windows) {
+            const file = try self.dir.openFile(compat.io(), state_file_name, .{
+                .allow_directory = false,
+                .follow_symlinks = false,
+            });
+            errdefer file.close(compat.io());
+            const stat = try file.stat(compat.io());
+            if (stat.kind != .file) return error.InvalidStateFile;
+            return file;
+        }
+
+        const fd = try std.posix.openat(self.dir.handle, state_file_name, .{
+            .ACCMODE = .RDONLY,
+            .NONBLOCK = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0);
+        const file: std.Io.File = .{
+            .handle = fd,
+            .flags = .{ .nonblocking = true },
+        };
+        errdefer file.close(compat.io());
+        const stat = try file.stat(compat.io());
+        if (stat.kind != .file) return error.InvalidStateFile;
+        return file;
     }
 
     fn writeUnlocked(self: Authority, snapshot: *const Snapshot) !?anyerror {
@@ -518,6 +532,13 @@ test "StateAuthority rejects state symlinks and special paths" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         _ = try tmp.dir.createDir(compat.io(), state_file_name, .default_dir);
+        const authority = Authority.init(std.testing.allocator, tmp.dir);
+        try std.testing.expectError(error.CorruptState, authority.observe());
+    }
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        if (mkfifoat(tmp.dir.handle, state_file_name, 0o600) != 0) return error.SkipZigTest;
         const authority = Authority.init(std.testing.allocator, tmp.dir);
         try std.testing.expectError(error.CorruptState, authority.observe());
     }
