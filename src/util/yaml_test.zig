@@ -120,6 +120,178 @@ test "YAML empty key does not leak" {
     try testing.expectEqualStrings("value", doc.map.get("name").?.string);
 }
 
+test "YAML strict document rejects duplicate and malformed content" {
+    const allocator = testing.allocator;
+
+    try testing.expectError(error.DuplicateKey, yaml.parseDocument(allocator,
+        \\port: 7890
+        \\port: 1080
+    ));
+    try testing.expectError(error.DuplicateKey, yaml.parseDocument(allocator,
+        \\provider:
+        \\  path: first
+        \\  path: second
+    ));
+    try testing.expectError(error.DuplicateKey, yaml.parseDocument(allocator,
+        \\"port": 7890
+        \\port: 1080
+    ));
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(allocator,
+        \\port: 7890
+        \\not-a-mapping
+    ));
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(allocator,
+        \\name: "unterminated
+    ));
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(allocator,
+        \\provider: {path: rules.yaml
+    ));
+}
+
+test "YAML strict document distinguishes null from quoted strings" {
+    const allocator = testing.allocator;
+    const content =
+        "\xEF\xBB\xBF" ++
+        \\missing: null
+        \\short: ~
+        \\upper: NULL
+        \\quoted: "null"
+        \\quoted_bool: "true"
+        \\quoted_int: '42'
+        \\quoted_hash: "https://example.test/rules#v1"
+        \\unicode_escape: "a\u003Ab"
+        \\single_escape: 'Alice''s'
+        \\quoted_escape: "say \"hi\""
+        \\plain_hash: https://example.test/rules#v1
+        \\apostrophe: Alice's node
+        \\Alice's key: accepted
+        \\empty:
+        \\# trailing comment
+        ;
+
+    var doc = try yaml.parseDocument(allocator, content);
+    defer doc.deinit(allocator);
+
+    try testing.expect(doc.map.get("missing").? == .null);
+    try testing.expect(doc.map.get("short").? == .null);
+    try testing.expect(doc.map.get("upper").? == .null);
+    try testing.expect(doc.map.get("empty").? == .null);
+    try testing.expectEqualStrings("null", doc.map.get("quoted").?.string);
+    try testing.expectEqualStrings("true", doc.map.get("quoted_bool").?.string);
+    try testing.expectEqualStrings("42", doc.map.get("quoted_int").?.string);
+    try testing.expectEqualStrings(
+        "https://example.test/rules#v1",
+        doc.map.get("quoted_hash").?.string,
+    );
+    try testing.expectEqualStrings("a:b", doc.map.get("unicode_escape").?.string);
+    try testing.expectEqualStrings("Alice's", doc.map.get("single_escape").?.string);
+    try testing.expectEqualStrings("say \"hi\"", doc.map.get("quoted_escape").?.string);
+    try testing.expectEqualStrings(
+        "https://example.test/rules#v1",
+        doc.map.get("plain_hash").?.string,
+    );
+    try testing.expectEqualStrings("Alice's node", doc.map.get("apostrophe").?.string);
+    try testing.expectEqualStrings("accepted", doc.map.get("Alice's key").?.string);
+}
+
+test "YAML strict document handles CRLF while legacy comments remain unchanged" {
+    const allocator = testing.allocator;
+    var strict = try yaml.parseDocument(allocator, "\r\nport: 7890\r\n\r\nname: node # comment\r\n");
+    defer strict.deinit(allocator);
+    try testing.expectEqual(@as(i64, 7890), strict.map.get("port").?.integer);
+    try testing.expectEqualStrings("node", strict.map.get("name").?.string);
+
+    var legacy = try yaml.parse(allocator, "name: Alice's node # comment\n");
+    defer legacy.deinit(allocator);
+    try testing.expectEqualStrings("Alice's node", legacy.map.get("name").?.string);
+}
+
+test "YAML strict inline maps reject duplicates and preserve scalar types" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.DuplicateKey, yaml.parseDocument(allocator,
+        \\items:
+        \\  - {name: first, name: second}
+    ));
+    try testing.expectError(error.DuplicateKey, yaml.parseDocument(allocator,
+        \\items:
+        \\  - {outer: {name: first, name: second}}
+    ));
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(allocator,
+        \\items:
+        \\  - {name: first} trailing-garbage
+    ));
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(allocator,
+        \\items:
+        \\  - {outer: {name value}}
+    ));
+
+    var profile_doc = try yaml.parseDocument(allocator,
+        \\---
+        \\profile: {store-selected: true, name: "a\"b", names: [DIRECT, "Proxy, One"], missing: NULL}
+        \\empty: []
+        \\...
+    );
+    defer profile_doc.deinit(allocator);
+    const profile = profile_doc.map.get("profile").?.map;
+    try testing.expect(profile.get("store-selected").?.boolean);
+    try testing.expectEqualStrings("a\"b", profile.get("name").?.string);
+    try testing.expect(profile.get("missing").? == .null);
+    try testing.expectEqualStrings("DIRECT", profile.get("names").?.array.items[0].string);
+    try testing.expectEqualStrings("Proxy, One", profile.get("names").?.array.items[1].string);
+    try testing.expectEqual(@as(usize, 0), profile_doc.map.get("empty").?.array.items.len);
+
+    var root_flow = try yaml.parseDocument(allocator, "{\"a:b\": 1, mixed-port: 7890}\n");
+    defer root_flow.deinit(allocator);
+    try testing.expectEqual(@as(i64, 1), root_flow.map.get("a:b").?.integer);
+    try testing.expectEqual(@as(i64, 7890), root_flow.map.get("mixed-port").?.integer);
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(
+        allocator,
+        "{\"junk: 1, mixed-port: 7890}\n",
+    ));
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(
+        allocator,
+        "{local: {type: file, extension: one missing-comma: two}}\n",
+    ));
+
+    var spaced_sequence = try yaml.parseDocument(allocator,
+        \\rules:
+        \\  - DOMAIN,one.test,DIRECT
+        \\# a comment between entries
+        \\
+        \\  - MATCH,DIRECT
+    );
+    defer spaced_sequence.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), spaced_sequence.map.get("rules").?.array.items.len);
+
+    var doc = try yaml.parseDocument(allocator,
+        \\items:
+        \\  - {missing: null, quoted: "null", enabled: "true"}
+    );
+    defer doc.deinit(allocator);
+    const item = doc.map.get("items").?.array.items[0].map;
+    try testing.expect(item.get("missing").? == .null);
+    try testing.expectEqualStrings("null", item.get("quoted").?.string);
+    try testing.expectEqualStrings("true", item.get("enabled").?.string);
+}
+
+test "YAML strict rejects over-indented sequence items and excessive nesting" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(allocator,
+        \\rules:
+        \\  - DOMAIN,one.test,DIRECT
+        \\    - DOMAIN,two.test,REJECT
+    ));
+
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(allocator);
+    try source.appendSlice(allocator, "root: ");
+    for (0..140) |_| try source.appendSlice(allocator, "{x: ");
+    try source.appendSlice(allocator, "value");
+    for (0..140) |_| try source.append(allocator, '}');
+    try source.append(allocator, '\n');
+    try testing.expectError(error.YamlNestingTooDeep, yaml.parseDocument(allocator, source.items));
+}
+
 test "YAML parse nested map" {
     const allocator = testing.allocator;
 

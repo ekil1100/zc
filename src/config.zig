@@ -217,101 +217,182 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
     var root = try yaml.parse(allocator, content);
     defer root.deinit(allocator);
+    return parseRoot(allocator, &root, false);
+}
+
+/// Parses one complete managed configuration document.
+/// This additive entry point rejects duplicate keys and malformed tails.
+pub fn parseDocument(allocator: std.mem.Allocator, content: []const u8) !Config {
+    var root = try yaml.parseDocument(allocator, content);
+    defer root.deinit(allocator);
+    return parseRoot(allocator, &root, true);
+}
+
+fn replaceOwnedString(
+    allocator: std.mem.Allocator,
+    destination: *[]const u8,
+    source: []const u8,
+) !void {
+    const replacement = try allocator.dupe(u8, source);
+    const previous = destination.*;
+    destination.* = replacement;
+    allocator.free(previous);
+}
+
+fn parseRoot(
+    allocator: std.mem.Allocator,
+    root: *yaml.YamlValue,
+    managed: bool,
+) !Config {
+    const default_mode = try allocator.dupe(u8, "rule");
+    var mode_owned = true;
+    errdefer if (mode_owned) allocator.free(default_mode);
+    const default_log_level = try allocator.dupe(u8, "info");
+    var log_level_owned = true;
+    errdefer if (log_level_owned) allocator.free(default_log_level);
+    const default_bind_address = try allocator.dupe(u8, "*");
+    var bind_address_owned = true;
+    errdefer if (bind_address_owned) allocator.free(default_bind_address);
 
     var config = Config{
         .allocator = allocator,
-        .mode = try allocator.dupe(u8, "rule"),
-        .log_level = try allocator.dupe(u8, "info"),
-        .bind_address = try allocator.dupe(u8, "*"),
+        .mode = default_mode,
+        .log_level = default_log_level,
+        .bind_address = default_bind_address,
         .proxies = std.ArrayList(Proxy).empty,
         .proxy_groups = std.ArrayList(ProxyGroup).empty,
         .rule_providers = std.ArrayList(RuleProvider).empty,
         .rules = std.ArrayList(Rule).empty,
     };
+    mode_owned = false;
+    log_level_owned = false;
+    bind_address_owned = false;
     errdefer config.deinit();
 
-    if (root != .map) {
+    if (root.* != .map) {
         return error.InvalidConfig;
     }
 
     // 解析基础配置
     if (root.map.get("port")) |v| {
-        if (v == .integer) {
-            const port = v.integer;
-            if (port > 0 and port <= 65535) {
-                config.port = @intCast(port);
-            }
+        if (v != .integer or v.integer < 0 or v.integer > 65535) {
+            if (managed) return error.InvalidConfig;
+        } else {
+            config.port = @intCast(v.integer);
         }
     }
     if (root.map.get("socks-port")) |v| {
-        if (v == .integer) {
-            const port = v.integer;
-            if (port > 0 and port <= 65535) {
-                config.socks_port = @intCast(port);
-            }
+        if (v != .integer or v.integer < 0 or v.integer > 65535) {
+            if (managed) return error.InvalidConfig;
+        } else {
+            config.socks_port = @intCast(v.integer);
         }
     }
     if (root.map.get("mixed-port")) |v| {
-        if (v == .integer) {
-            const port = v.integer;
-            if (port > 0 and port <= 65535) {
-                config.mixed_port = @intCast(port);
-            }
+        if (v != .integer or v.integer < 0 or v.integer > 65535) {
+            if (managed) return error.InvalidConfig;
+        } else {
+            config.mixed_port = @intCast(v.integer);
+        }
+    }
+    if (managed) {
+        if (root.map.get("redir-port")) |v| {
+            if (v != .integer or v.integer < 0 or v.integer > 65535) return error.InvalidConfig;
+            config.redir_port = @intCast(v.integer);
+        }
+        if (root.map.get("tproxy-port")) |v| {
+            if (v != .integer or v.integer < 0 or v.integer > 65535) return error.InvalidConfig;
+            config.tproxy_port = @intCast(v.integer);
         }
     }
     if (root.map.get("allow-lan")) |v| {
-        if (v == .boolean) config.allow_lan = v.boolean;
+        if (v == .boolean) {
+            config.allow_lan = v.boolean;
+        } else if (managed) return error.InvalidConfig;
+    }
+    if (managed) {
+        if (root.map.get("ipv6")) |v| {
+            if (v != .boolean) return error.InvalidConfig;
+            config.ipv6 = v.boolean;
+        }
     }
     if (root.map.get("bind-address")) |v| {
         if (v == .string) {
-            allocator.free(config.bind_address);
-            config.bind_address = try allocator.dupe(u8, v.string);
-        }
+            try replaceOwnedString(allocator, &config.bind_address, v.string);
+        } else if (managed) return error.InvalidConfig;
     }
     if (root.map.get("mode")) |v| {
         if (v == .string) {
-            allocator.free(config.mode);
-            config.mode = try allocator.dupe(u8, v.string);
-        }
+            try replaceOwnedString(allocator, &config.mode, v.string);
+        } else if (managed) return error.InvalidConfig;
     }
     if (root.map.get("log-level")) |v| {
         if (v == .string) {
-            allocator.free(config.log_level);
-            config.log_level = try allocator.dupe(u8, v.string);
-        }
+            try replaceOwnedString(allocator, &config.log_level, v.string);
+        } else if (managed) return error.InvalidConfig;
     }
-    if (root.map.get("external-controller")) |v| {
-        if (v == .string) config.external_controller = try allocator.dupe(u8, v.string);
+    if (root.map.get("external-controller")) |v| switch (v) {
+        .string => config.external_controller = try allocator.dupe(u8, v.string),
+        .null => {},
+        else => if (managed) return error.InvalidConfig,
+    };
+    if (managed) {
+        if (root.map.get("external-ui")) |v| switch (v) {
+            .string => config.external_ui = try allocator.dupe(u8, v.string),
+            .null => {},
+            else => return error.InvalidConfig,
+        };
+        if (root.map.get("secret")) |v| switch (v) {
+            .string => config.secret = try allocator.dupe(u8, v.string),
+            .null => {},
+            else => return error.InvalidConfig,
+        };
     }
 
     // AnyTLS idle session pool tunables (§15). Optional; defaults stay when
     // absent. Stored raw (seconds); config_validator clamps the two intervals.
     if (root.map.get("idle-session-check-interval")) |v| {
-        if (v == .integer) config.idle_session_check_interval = v.integer;
+        if (v == .integer) {
+            config.idle_session_check_interval = v.integer;
+        } else if (managed) return error.InvalidConfig;
     }
     if (root.map.get("idle-session-timeout")) |v| {
-        if (v == .integer) config.idle_session_timeout = v.integer;
+        if (v == .integer) {
+            config.idle_session_timeout = v.integer;
+        } else if (managed) return error.InvalidConfig;
     }
     if (root.map.get("min-idle-session")) |v| {
-        if (v == .integer and v.integer >= 0) config.min_idle_session = @intCast(v.integer);
+        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+            config.min_idle_session = @intCast(v.integer);
+        } else if (managed) return error.InvalidConfig;
     }
 
     // 解析代理列表
     if (root.map.get("proxies")) |proxies| {
-        if (proxies == .array) {
+        if (proxies != .array) {
+            if (managed) return error.InvalidConfig;
+        } else {
             for (proxies.array.items) |*item| {
-                if (item.* == .map) {
-                    // 检查是否是代理组类型（select, url-test等）
-                    if (isProxyGroupType(item.map)) {
-                        const group = try parseProxyGroup(allocator, item.map);
-                        try config.proxy_groups.append(allocator, group);
-                    } else if (isSubscriptionInfoNode(item.map)) {
-                        // Skip airport quota/expiry pseudo-nodes (see isSubscriptionInfoNode).
-                        continue;
-                    } else {
-                        const proxy = try parseProxy(allocator, item.map);
-                        try config.proxies.append(allocator, proxy);
-                    }
+                if (item.* != .map) {
+                    if (managed) return error.InvalidConfig;
+                    continue;
+                }
+                // 检查是否是代理组类型（select, url-test等）
+                if (isProxyGroupType(item.map)) {
+                    var group = try parseProxyGroup(allocator, item.map, managed);
+                    config.proxy_groups.append(allocator, group) catch |err| {
+                        group.deinit(allocator);
+                        return err;
+                    };
+                } else if (isSubscriptionInfoNode(item.map)) {
+                    // Skip airport quota/expiry pseudo-nodes (see isSubscriptionInfoNode).
+                    continue;
+                } else {
+                    var proxy = try parseProxy(allocator, item.map, managed);
+                    config.proxies.append(allocator, proxy) catch |err| {
+                        proxy.deinit(allocator);
+                        return err;
+                    };
                 }
             }
         }
@@ -319,46 +400,75 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
 
     // 解析代理组
     if (root.map.get("proxy-groups")) |groups| {
-        if (groups == .array) {
+        if (groups != .array) {
+            if (managed) return error.InvalidConfig;
+        } else {
             for (groups.array.items) |*item| {
-                if (item.* == .map) {
-                    const group = try parseProxyGroup(allocator, item.map);
-                    try config.proxy_groups.append(allocator, group);
+                if (item.* != .map) {
+                    if (managed) return error.InvalidConfig;
+                    continue;
                 }
+                var group = try parseProxyGroup(allocator, item.map, managed);
+                config.proxy_groups.append(allocator, group) catch |err| {
+                    group.deinit(allocator);
+                    return err;
+                };
             }
         }
     }
 
     if (root.map.get("rule-providers")) |providers| {
-        if (providers == .map) {
+        if (providers != .map) {
+            if (managed) return error.InvalidConfig;
+        } else {
             var it = providers.map.iterator();
             while (it.next()) |entry| {
                 if (entry.value_ptr.* != .map) return error.InvalidConfig;
-                const provider = try parseRuleProvider(allocator, entry.key_ptr.*, entry.value_ptr.*.map);
-                try config.rule_providers.append(allocator, provider);
+                var provider = try parseRuleProvider(
+                    allocator,
+                    entry.key_ptr.*,
+                    entry.value_ptr.*.map,
+                    managed,
+                );
+                config.rule_providers.append(allocator, provider) catch |err| {
+                    provider.deinit(allocator);
+                    return err;
+                };
             }
         }
     }
 
     // 解析规则
     if (root.map.get("rules")) |rules| {
-        if (rules == .array) {
+        if (rules != .array) {
+            if (managed) return error.InvalidConfig;
+        } else {
             for (rules.array.items) |*item| {
-                if (item.* == .string) {
-                    const rule = try parseRule(allocator, item.string);
-                    try config.rules.append(allocator, rule);
+                if (item.* != .string) {
+                    if (managed) return error.InvalidConfig;
+                    continue;
                 }
+                var rule = try parseRule(allocator, item.string);
+                config.rules.append(allocator, rule) catch |err| {
+                    rule.deinit(allocator);
+                    return err;
+                };
             }
         }
     }
 
     // 如果没有规则，添加默认 MATCH 规则
     if (config.rules.items.len == 0) {
-        try config.rules.append(allocator, .{
-            .rule_type = .final,
-            .payload = try allocator.dupe(u8, ""),
-            .target = try allocator.dupe(u8, "DIRECT"),
-        });
+        const payload = try allocator.dupe(u8, "");
+        var payload_owned = true;
+        errdefer if (payload_owned) allocator.free(payload);
+        const target = try allocator.dupe(u8, "DIRECT");
+        var rule = Rule{ .rule_type = .final, .payload = payload, .target = target };
+        payload_owned = false;
+        config.rules.append(allocator, rule) catch |err| {
+            rule.deinit(allocator);
+            return err;
+        };
     }
 
     return config;
@@ -414,7 +524,11 @@ test "isSubscriptionInfoNodeName matches quota/expiry banners, not real nodes" {
     try t.expect(!isSubscriptionInfoNodeName("剩余流量优化节点"));
 }
 
-fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValue)) !Proxy {
+fn parseProxy(
+    allocator: std.mem.Allocator,
+    map: std.StringHashMap(yaml.YamlValue),
+    managed: bool,
+) !Proxy {
     const name = map.get("name") orelse return error.MissingProxyName;
     const proxy_type = map.get("type") orelse return error.MissingProxyType;
 
@@ -458,46 +572,64 @@ fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValu
 
     // 协议特定字段
     if (map.get("password")) |v| {
-        if (v == .string) proxy.password = try allocator.dupe(u8, v.string);
+        if (v == .string) {
+            proxy.password = try allocator.dupe(u8, v.string);
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("cipher")) |v| {
-        if (v == .string) proxy.cipher = try allocator.dupe(u8, v.string);
+        if (v == .string) {
+            proxy.cipher = try allocator.dupe(u8, v.string);
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("uuid")) |v| {
-        if (v == .string) proxy.uuid = try allocator.dupe(u8, v.string);
+        if (v == .string) {
+            proxy.uuid = try allocator.dupe(u8, v.string);
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("alterId")) |v| {
         if (v == .integer) {
             if (v.integer < 0 or v.integer > std.math.maxInt(u16)) return error.InvalidAlterId;
             proxy.alter_id = @intCast(v.integer);
-        }
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("tls")) |v| {
-        if (v == .boolean) proxy.tls = v.boolean;
+        if (v == .boolean) {
+            proxy.tls = v.boolean;
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("skip-cert-verify")) |v| {
-        if (v == .boolean) proxy.skip_cert_verify = v.boolean;
+        if (v == .boolean) {
+            proxy.skip_cert_verify = v.boolean;
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("udp")) |v| {
-        if (v == .boolean) proxy.udp = v.boolean;
+        if (v == .boolean) {
+            proxy.udp = v.boolean;
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("sni")) |v| {
-        if (v == .string) proxy.sni = try allocator.dupe(u8, v.string);
+        if (v == .string) {
+            proxy.sni = try allocator.dupe(u8, v.string);
+        } else if (managed) return error.InvalidProxyFormat;
     }
     if (map.get("ws-opts")) |v| {
         if (v == .map) {
             proxy.ws = true;
             if (v.map.get("path")) |p| {
-                if (p == .string) proxy.ws_path = try allocator.dupe(u8, p.string);
+                if (p == .string) {
+                    proxy.ws_path = try allocator.dupe(u8, p.string);
+                } else if (managed) return error.InvalidProxyFormat;
             }
             if (v.map.get("headers")) |h| {
                 if (h == .map) {
                     if (h.map.get("Host")) |host| {
-                        if (host == .string) proxy.ws_host = try allocator.dupe(u8, host.string);
+                        if (host == .string) {
+                            proxy.ws_host = try allocator.dupe(u8, host.string);
+                        } else if (managed) return error.InvalidProxyFormat;
                     }
-                }
+                } else if (managed) return error.InvalidProxyFormat;
             }
-        }
+        } else if (managed) return error.InvalidProxyFormat;
     }
 
     // VLESS 必填字段校验
@@ -535,13 +667,17 @@ fn parseProxy(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValu
                     }
                 }
             }
-        }
+        } else if (managed) return error.InvalidProxyFormat;
     }
 
     return proxy;
 }
 
-fn parseProxyGroup(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.YamlValue)) !ProxyGroup {
+fn parseProxyGroup(
+    allocator: std.mem.Allocator,
+    map: std.StringHashMap(yaml.YamlValue),
+    managed: bool,
+) !ProxyGroup {
     const name = map.get("name") orelse return error.MissingGroupName;
     const gtype = map.get("type") orelse return error.MissingGroupType;
 
@@ -561,36 +697,43 @@ fn parseProxyGroup(allocator: std.mem.Allocator, map: std.StringHashMap(yaml.Yam
     if (map.get("proxies")) |proxies| {
         if (proxies == .array) {
             for (proxies.array.items) |*item| {
-                if (item.* == .string) {
-                    // Skip dangling references to dropped info-nodes.
-                    if (isSubscriptionInfoNodeName(item.string)) {
-                        std.log.scoped(.config).info("proxy-group '{s}': skipping subscription info-node reference '{s}'", .{ name.string, item.string });
-                        continue;
-                    }
-                    const p = try allocator.dupe(u8, item.string);
-                    try group.proxies.append(allocator, p);
+                if (item.* != .string) {
+                    if (managed) return error.InvalidGroupFormat;
+                    continue;
                 }
+                // Skip dangling references to dropped info-nodes.
+                if (isSubscriptionInfoNodeName(item.string)) {
+                    std.log.scoped(.config).info("proxy-group '{s}': skipping subscription info-node reference '{s}'", .{ name.string, item.string });
+                    continue;
+                }
+                const proxy_name = try allocator.dupe(u8, item.string);
+                errdefer allocator.free(proxy_name);
+                try group.proxies.append(allocator, proxy_name);
             }
-        }
+        } else if (managed) return error.InvalidGroupFormat;
     }
 
     if (map.get("url")) |v| {
-        if (v == .string) group.url = try allocator.dupe(u8, v.string);
+        if (v == .string) {
+            group.url = try allocator.dupe(u8, v.string);
+        } else if (managed) return error.InvalidGroupFormat;
     }
     if (map.get("interval")) |v| {
         if (v == .integer) {
             if (v.integer < 0 or v.integer > std.math.maxInt(u32)) return error.InvalidGroupInterval;
             group.interval = @intCast(v.integer);
-        }
+        } else if (managed) return error.InvalidGroupFormat;
     }
     if (map.get("tolerance")) |v| {
         if (v == .integer) {
             if (v.integer < 0 or v.integer > std.math.maxInt(u16)) return error.InvalidGroupTolerance;
             group.tolerance = @intCast(v.integer);
-        }
+        } else if (managed) return error.InvalidGroupFormat;
     }
     if (map.get("lazy")) |v| {
-        if (v == .boolean) group.lazy = v.boolean;
+        if (v == .boolean) {
+            group.lazy = v.boolean;
+        } else if (managed) return error.InvalidGroupFormat;
     }
 
     return group;
@@ -600,6 +743,7 @@ fn parseRuleProvider(
     allocator: std.mem.Allocator,
     name: []const u8,
     map: std.StringHashMap(yaml.YamlValue),
+    managed: bool,
 ) !RuleProvider {
     const type_val = map.get("type") orelse return error.MissingRuleProviderType;
     const behavior_val = map.get("behavior") orelse return error.MissingRuleProviderBehavior;
@@ -609,26 +753,60 @@ fn parseRuleProvider(
         return error.InvalidRuleProviderFormat;
     }
 
-    var provider = RuleProvider{
-        .name = try allocator.dupe(u8, name),
-        .provider_type = try allocator.dupe(u8, type_val.string),
-        .behavior = parseRuleProviderBehavior(behavior_val.string) orelse return error.InvalidRuleProviderBehavior,
-        .path = try allocator.dupe(u8, path_val.string),
+    const behavior = parseRuleProviderBehavior(behavior_val.string) orelse
+        return error.InvalidRuleProviderBehavior;
+    var url: ?[]const u8 = null;
+    if (map.get("url")) |value| switch (value) {
+        .string => url = value.string,
+        .null => if (!managed) return error.InvalidRuleProviderFormat,
+        else => return error.InvalidRuleProviderFormat,
+    };
+    var interval: u32 = 86400;
+    if (map.get("interval")) |value| {
+        if (value != .integer or value.integer <= 0 or value.integer > std.math.maxInt(u32)) {
+            return error.InvalidRuleProviderFormat;
+        }
+        interval = @intCast(value.integer);
+    }
+    if (managed) {
+        if ((!std.mem.eql(u8, type_val.string, "http") and
+            !std.mem.eql(u8, type_val.string, "file")) or path_val.string.len == 0)
+        {
+            return error.InvalidRuleProviderFormat;
+        }
+        if (url) |remote_url| {
+            if (!isHttpUrl(remote_url)) return error.InvalidRuleProviderFormat;
+        }
+    }
+
+    const name_copy = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_copy);
+    const type_copy = try allocator.dupe(u8, type_val.string);
+    errdefer allocator.free(type_copy);
+    const path_copy = try allocator.dupe(u8, path_val.string);
+    errdefer allocator.free(path_copy);
+    const url_copy = if (url) |remote_url| try allocator.dupe(u8, remote_url) else null;
+    errdefer if (url_copy) |value| allocator.free(value);
+
+    return .{
+        .name = name_copy,
+        .provider_type = type_copy,
+        .behavior = behavior,
+        .path = path_copy,
+        .url = url_copy,
+        .interval = interval,
         .entries = std.ArrayList([]const u8).empty,
     };
-    errdefer provider.deinit(allocator);
+}
 
-    if (map.get("url")) |v| {
-        if (v != .string) return error.InvalidRuleProviderFormat;
-        provider.url = try allocator.dupe(u8, v.string);
+fn isHttpUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) {
+        return false;
     }
-    if (map.get("interval")) |v| {
-        if (v != .integer) return error.InvalidRuleProviderFormat;
-        if (v.integer <= 0 or v.integer > std.math.maxInt(u32)) return error.InvalidRuleProviderFormat;
-        provider.interval = @intCast(v.integer);
-    }
-
-    return provider;
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = uri.getHost(&host_buffer) catch return false;
+    return host.bytes.len != 0;
 }
 
 fn parseRule(allocator: std.mem.Allocator, rule_str: []const u8) !Rule {
@@ -661,10 +839,13 @@ fn parseRule(allocator: std.mem.Allocator, rule_str: []const u8) !Rule {
 
     const rule_type = parseRuleType(type_str) orelse return error.UnknownRuleType;
 
-    return Rule{
+    const payload_copy = try allocator.dupe(u8, std.mem.trim(u8, payload, " \t"));
+    errdefer allocator.free(payload_copy);
+    const target_copy = try allocator.dupe(u8, std.mem.trim(u8, target, " \t"));
+    return .{
         .rule_type = rule_type,
-        .payload = try allocator.dupe(u8, std.mem.trim(u8, payload, " \t")),
-        .target = try allocator.dupe(u8, std.mem.trim(u8, target, " \t")),
+        .payload = payload_copy,
+        .target = target_copy,
         .no_resolve = no_resolve,
     };
 }
@@ -842,6 +1023,19 @@ pub fn prepareRuleProvidersForRuntimeWithPolicy(
     clearRuleProviderEntries(allocator, cfg);
 }
 
+/// Prepares captured local rule providers without filesystem or network access.
+/// Remote providers remain declarations and their RULE-SET rules stay unexpanded.
+pub fn prepareRuleProvidersOffline(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    resolver: anytype,
+) !void {
+    defer clearRuleProviderEntries(allocator, cfg);
+    try loadRuleProviderEntriesOffline(allocator, cfg, resolver);
+    try validateOfflineProviderEntries(allocator, cfg);
+    try expandLocalRuleSetRules(allocator, cfg);
+}
+
 fn clearRuleProviderEntries(allocator: std.mem.Allocator, cfg: *Config) void {
     for (cfg.rule_providers.items) |*provider| {
         provider.clearEntries(allocator);
@@ -977,12 +1171,185 @@ fn loadRuleProviderEntries(
         const content = try compat.fileReadToEndAlloc(file, allocator, 8 * 1024 * 1024);
         defer allocator.free(content);
 
-        var it = std.mem.splitScalar(u8, content, '\n');
-        while (it.next()) |raw_line| {
-            const normalized = normalizeRuleProviderLine(raw_line) orelse continue;
-            try provider.entries.append(allocator, try allocator.dupe(u8, normalized));
+        try appendRuleProviderEntriesLegacy(allocator, provider, content);
+    }
+}
+
+fn loadRuleProviderEntriesOffline(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    resolver: anytype,
+) !void {
+    for (cfg.rule_providers.items) |*provider| {
+        provider.clearEntries(allocator);
+        if (provider.url != null) continue;
+        const content = try resolver.resolveLocal(provider.path);
+        try appendRuleProviderEntriesOffline(allocator, provider, content);
+    }
+}
+
+fn appendRuleProviderEntriesLegacy(
+    allocator: std.mem.Allocator,
+    provider: *RuleProvider,
+    content: []const u8,
+) !void {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw_line| {
+        const normalized = normalizeRuleProviderLine(raw_line) orelse continue;
+        try appendRuleProviderEntry(allocator, provider, normalized);
+    }
+}
+
+fn appendRuleProviderEntriesOffline(
+    allocator: std.mem.Allocator,
+    provider: *RuleProvider,
+    content: []const u8,
+) !void {
+    const inspected = if (std.mem.startsWith(u8, content, "\xEF\xBB\xBF")) content[3..] else content;
+    if (provider.behavior == .classical and looksLikeRawClassicalProvider(inspected)) {
+        return appendRuleProviderEntriesLegacy(allocator, provider, inspected);
+    }
+    var document = yaml.parseDocument(allocator, inspected) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            if (looksLikeProviderDocument(inspected)) return error.InvalidRuleProviderDocument;
+            return appendRuleProviderEntriesLegacy(allocator, provider, inspected);
+        },
+    };
+    defer document.deinit(allocator);
+
+    if (document != .map) {
+        if (document == .array) return error.InvalidRuleProviderDocument;
+        return appendRuleProviderEntriesLegacy(allocator, provider, inspected);
+    }
+    const payload = document.map.get("payload") orelse return error.InvalidRuleProviderDocument;
+    if (payload != .array) return error.InvalidRuleProviderDocument;
+    for (payload.array.items) |item| {
+        if (item != .string) return error.InvalidRuleProviderDocument;
+        try appendRuleProviderEntry(allocator, provider, item.string);
+    }
+}
+
+fn looksLikeRawClassicalProvider(content: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        const comma = std.mem.indexOfScalar(u8, trimmed, ',') orelse return false;
+        return parseRuleType(std.mem.trim(u8, trimmed[0..comma], " \t")) != null;
+    }
+    return false;
+}
+
+fn looksLikeProviderDocument(content: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        if (std.mem.eql(u8, trimmed, "---") or std.mem.eql(u8, trimmed, "...")) return true;
+        if (trimmed[0] == '{' or hasBlockMappingIndicator(trimmed)) return true;
+    }
+    return false;
+}
+
+fn hasBlockMappingIndicator(line: []const u8) bool {
+    for (line, 0..) |byte, index| {
+        if (byte != ':') continue;
+        const next = index + 1;
+        if (next == line.len or line[next] == ' ' or line[next] == '\t') return true;
+    }
+    return false;
+}
+
+fn appendRuleProviderEntry(
+    allocator: std.mem.Allocator,
+    provider: *RuleProvider,
+    entry_text: []const u8,
+) !void {
+    const entry = try allocator.dupe(u8, entry_text);
+    errdefer allocator.free(entry);
+    try provider.entries.append(allocator, entry);
+}
+
+fn validateOfflineProviderEntries(allocator: std.mem.Allocator, cfg: *const Config) !void {
+    for (cfg.rule_providers.items) |provider| {
+        if (provider.url != null) continue;
+        for (provider.entries.items) |entry| switch (provider.behavior) {
+            .classical => {
+                var parsed = try parseClassicalProviderEntry(allocator, entry, "DIRECT");
+                defer parsed.deinit(allocator);
+                if (!isValidClassicalProviderRule(parsed)) return error.InvalidRuleProviderEntry;
+            },
+            .domain => {
+                const domain = normalizeDomainProviderEntry(entry) orelse
+                    return error.InvalidRuleProviderEntry;
+                if (domain.len == 0 or std.mem.indexOfAny(u8, domain, " \t\r\n,") != null) {
+                    return error.InvalidRuleProviderEntry;
+                }
+            },
+            .ipcidr => {
+                const cidr = normalizeIpCidrProviderEntry(entry) orelse
+                    return error.InvalidRuleProviderEntry;
+                if (!isValidRuleProviderCidr(cidr)) return error.InvalidRuleProviderEntry;
+            },
+        };
+    }
+}
+
+fn isValidClassicalProviderRule(rule: Rule) bool {
+    return switch (rule.rule_type) {
+        .ip_cidr, .src_ip_cidr => isValidRuleProviderCidrFamily(rule.payload, false),
+        .ip_cidr6 => isValidRuleProviderCidrFamily(rule.payload, true),
+        .dst_port, .src_port => isValidRuleProviderPortRange(rule.payload),
+        .rule_set => false,
+        .final => rule.payload.len == 0,
+        else => rule.payload.len != 0,
+    };
+}
+
+fn isValidRuleProviderCidr(cidr: []const u8) bool {
+    return isValidRuleProviderCidrFamily(
+        cidr,
+        std.mem.indexOfScalar(u8, cidr, ':') != null,
+    );
+}
+
+fn isValidRuleProviderCidrFamily(cidr: []const u8, ipv6: bool) bool {
+    const slash = std.mem.indexOfScalar(u8, cidr, '/') orelse return false;
+    if (std.mem.indexOfScalarPos(u8, cidr, slash + 1, '/') != null) return false;
+    const ip = cidr[0..slash];
+    const mask_text = cidr[slash + 1 ..];
+    if (ip.len == 0 or mask_text.len == 0) return false;
+    const mask = std.fmt.parseInt(u8, mask_text, 10) catch return false;
+
+    if (ipv6) {
+        if (mask > 128 or std.mem.indexOfScalar(u8, ip, ':') == null) return false;
+        _ = compat.net.Address.parseIp6(ip, 0) catch return false;
+        return true;
+    }
+    if (mask > 32 or std.mem.indexOfScalar(u8, ip, ':') != null) return false;
+    _ = compat.net.Address.parseIp4(ip, 0) catch return false;
+    return true;
+}
+
+fn isValidRuleProviderPortRange(payload: []const u8) bool {
+    var items = std.mem.splitScalar(u8, payload, ',');
+    var seen = false;
+    while (items.next()) |item_raw| {
+        const item = std.mem.trim(u8, item_raw, " \t");
+        if (item.len == 0) return false;
+        seen = true;
+        if (std.mem.indexOfScalar(u8, item, '-')) |dash| {
+            if (std.mem.indexOfScalarPos(u8, item, dash + 1, '-') != null) return false;
+            const start = std.fmt.parseInt(u16, item[0..dash], 10) catch return false;
+            const end = std.fmt.parseInt(u16, item[dash + 1 ..], 10) catch return false;
+            if (start == 0 or end == 0 or start > end) return false;
+        } else {
+            const port = std.fmt.parseInt(u16, item, 10) catch return false;
+            if (port == 0) return false;
         }
     }
+    return seen;
 }
 
 fn normalizeRuleProviderLine(raw_line: []const u8) ?[]const u8 {
@@ -1026,7 +1393,7 @@ fn expandRuleSetRules(allocator: std.mem.Allocator, cfg: *Config) !void {
 
     for (cfg.rules.items) |rule| {
         if (rule.rule_type != .rule_set) {
-            try expanded.append(allocator, try cloneRule(allocator, rule));
+            try appendClonedRule(allocator, &expanded, rule);
             continue;
         }
 
@@ -1035,6 +1402,32 @@ fn expandRuleSetRules(allocator: std.mem.Allocator, cfg: *Config) !void {
     }
 
     for (cfg.rules.items) |*r| r.deinit(allocator);
+    cfg.rules.deinit(allocator);
+    cfg.rules = expanded;
+}
+
+fn expandLocalRuleSetRules(allocator: std.mem.Allocator, cfg: *Config) !void {
+    var expanded = std.ArrayList(Rule).empty;
+    errdefer {
+        for (expanded.items) |*rule| rule.deinit(allocator);
+        expanded.deinit(allocator);
+    }
+
+    for (cfg.rules.items) |rule| {
+        if (rule.rule_type != .rule_set) {
+            try appendClonedRule(allocator, &expanded, rule);
+            continue;
+        }
+
+        const provider = findRuleProvider(cfg, rule.payload) orelse return error.RuleProviderNotFound;
+        if (provider.url != null) {
+            try appendClonedRule(allocator, &expanded, rule);
+            continue;
+        }
+        try appendRulesFromProvider(allocator, &expanded, provider, rule.target, rule.no_resolve);
+    }
+
+    for (cfg.rules.items) |*rule| rule.deinit(allocator);
     cfg.rules.deinit(allocator);
     cfg.rules = expanded;
 }
@@ -1050,12 +1443,13 @@ fn appendRulesFromProvider(
         .domain => {
             for (provider.entries.items) |entry| {
                 const payload = normalizeDomainProviderEntry(entry) orelse continue;
-                var rule = Rule{
-                    .rule_type = .domain_suffix,
-                    .payload = try allocator.dupe(u8, payload),
-                    .target = try allocator.dupe(u8, target),
-                    .no_resolve = inherit_no_resolve,
-                };
+                var rule = try makeOwnedRule(
+                    allocator,
+                    .domain_suffix,
+                    payload,
+                    target,
+                    inherit_no_resolve,
+                );
                 errdefer rule.deinit(allocator);
                 try out.append(allocator, rule);
             }
@@ -1064,12 +1458,13 @@ fn appendRulesFromProvider(
             for (provider.entries.items) |entry| {
                 const payload = normalizeIpCidrProviderEntry(entry) orelse continue;
                 const rule_type: RuleType = if (std.mem.indexOfScalar(u8, payload, ':') != null) .ip_cidr6 else .ip_cidr;
-                var rule = Rule{
-                    .rule_type = rule_type,
-                    .payload = try allocator.dupe(u8, payload),
-                    .target = try allocator.dupe(u8, target),
-                    .no_resolve = inherit_no_resolve,
-                };
+                var rule = try makeOwnedRule(
+                    allocator,
+                    rule_type,
+                    payload,
+                    target,
+                    inherit_no_resolve,
+                );
                 errdefer rule.deinit(allocator);
                 try out.append(allocator, rule);
             }
@@ -1083,6 +1478,24 @@ fn appendRulesFromProvider(
             }
         },
     }
+}
+
+fn makeOwnedRule(
+    allocator: std.mem.Allocator,
+    rule_type: RuleType,
+    payload: []const u8,
+    target: []const u8,
+    no_resolve: bool,
+) !Rule {
+    const payload_copy = try allocator.dupe(u8, payload);
+    errdefer allocator.free(payload_copy);
+    const target_copy = try allocator.dupe(u8, target);
+    return .{
+        .rule_type = rule_type,
+        .payload = payload_copy,
+        .target = target_copy,
+        .no_resolve = no_resolve,
+    };
 }
 
 fn parseClassicalProviderEntry(
@@ -1105,7 +1518,6 @@ fn parseClassicalProviderEntry(
         if (payload.len == 0) return error.InvalidRuleProviderEntry;
     }
 
-    var target: []const u8 = default_target;
     var no_resolve = false;
     while (parts_it.next()) |opt_raw| {
         const opt = std.mem.trim(u8, opt_raw, " \t");
@@ -1114,15 +1526,10 @@ fn parseClassicalProviderEntry(
             no_resolve = true;
             continue;
         }
-        target = opt;
+        return error.InvalidRuleProviderEntry;
     }
 
-    return .{
-        .rule_type = rule_type,
-        .payload = try allocator.dupe(u8, payload),
-        .target = try allocator.dupe(u8, target),
-        .no_resolve = no_resolve,
-    };
+    return makeOwnedRule(allocator, rule_type, payload, default_target, no_resolve);
 }
 
 fn normalizeDomainProviderEntry(entry: []const u8) ?[]const u8 {
@@ -1178,11 +1585,24 @@ fn findRuleProvider(cfg: *const Config, name: []const u8) ?*const RuleProvider {
     return null;
 }
 
+fn appendClonedRule(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Rule),
+    source: Rule,
+) !void {
+    var cloned = try cloneRule(allocator, source);
+    errdefer cloned.deinit(allocator);
+    try out.append(allocator, cloned);
+}
+
 fn cloneRule(allocator: std.mem.Allocator, rule: Rule) !Rule {
+    const payload = try allocator.dupe(u8, rule.payload);
+    errdefer allocator.free(payload);
+    const target = try allocator.dupe(u8, rule.target);
     return .{
         .rule_type = rule.rule_type,
-        .payload = try allocator.dupe(u8, rule.payload),
-        .target = try allocator.dupe(u8, rule.target),
+        .payload = payload,
+        .target = target,
         .no_resolve = rule.no_resolve,
     };
 }

@@ -6,6 +6,7 @@ const ProxyType = @import("config.zig").ProxyType;
 const Rule = @import("config.zig").Rule;
 const RuleType = @import("config.zig").RuleType;
 const parseConfig = @import("config.zig").parse;
+const parseConfigDocument = @import("config.zig").parseDocument;
 const fetchConfig = @import("config.zig").fetchConfig;
 const DownloadResult = @import("config.zig").DownloadResult;
 
@@ -247,6 +248,138 @@ test "parseProxy rejects negative port" {
 }
 
 // Regression: alterId beyond u16 must be rejected, not @intCast-truncated/panicked.
+test "managed config document accepts explicit null provider URL" {
+    const allocator = testing.allocator;
+    const source =
+        \\rule-providers:
+        \\  local:
+        \\    type: http
+        \\    behavior: domain
+        \\    path: rules.yaml
+        \\    url: null
+    ;
+
+    var config = try parseConfigDocument(allocator, source);
+    defer config.deinit();
+
+    try testing.expectEqual(@as(usize, 1), config.rule_providers.items.len);
+    try testing.expect(config.rule_providers.items[0].url == null);
+}
+
+test "managed config document rejects duplicate keys" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.DuplicateKey, parseConfigDocument(allocator,
+        \\port: 7890
+        \\port: 7891
+    ));
+}
+
+test "managed config document rejects known fields with invalid shapes" {
+    const allocator = testing.allocator;
+    const invalid_documents = [_][]const u8{
+        "mixed-port: nope\n",
+        "mixed-port: 70000\n",
+        "allow-lan: yes\n",
+        "ipv6: definitely-not-a-bool\n",
+        "redir-port: nope\n",
+        "tproxy-port: 70000\n",
+        "external-ui: 42\n",
+        "secret: false\n",
+        "rules: definitely-not-a-list\n",
+        "rules:\n  - 42\n",
+        "proxies: definitely-not-a-list\n",
+        "proxies:\n  - definitely-not-a-map\n",
+        "proxy-groups: definitely-not-a-list\n",
+        "rule-providers: definitely-not-a-map\n",
+        "min-idle-session: -1\n",
+    };
+    for (invalid_documents) |document| {
+        try testing.expectError(error.InvalidConfig, parseConfigDocument(allocator, document));
+    }
+    const invalid_providers = [_][]const u8{
+        "rule-providers:\n  p:\n    type: ftp\n    behavior: domain\n    path: rules.yaml\n",
+        "rule-providers:\n  p:\n    type: file\n    behavior: domain\n    path: \"\"\n",
+        "rule-providers:\n  p:\n    type: http\n    behavior: domain\n    path: rules.yaml\n    url: ftp://example.test/rules\n",
+        "rule-providers:\n  p:\n    type: http\n    behavior: domain\n    path: rules.yaml\n    url: http:///missing-host\n",
+    };
+    for (invalid_providers) |document| {
+        try testing.expectError(error.InvalidRuleProviderFormat, parseConfigDocument(allocator, document));
+    }
+
+    var config = try parseConfigDocument(allocator,
+        \\mixed-port: 7890
+        \\redir-port: 7892
+        \\tproxy-port: 7893
+        \\ipv6: false
+        \\external-ui: ui
+        \\secret: token
+        \\unknown-extension: accepted
+    );
+    defer config.deinit();
+    try testing.expectEqual(@as(u16, 7890), config.mixed_port);
+    try testing.expectEqual(@as(u16, 7892), config.redir_port);
+    try testing.expectEqual(@as(u16, 7893), config.tproxy_port);
+    try testing.expect(!config.ipv6);
+    try testing.expectEqualStrings("ui", config.external_ui.?);
+    try testing.expectEqualStrings("token", config.secret.?);
+}
+
+test "managed-only fields do not change the legacy parser during shadow rollout" {
+    const allocator = testing.allocator;
+    var config = try parseConfig(allocator,
+        \\redir-port: 7892
+        \\tproxy-port: 7893
+        \\ipv6: false
+        \\external-ui: ui
+        \\secret: token
+    );
+    defer config.deinit();
+
+    try testing.expectEqual(@as(u16, 0), config.redir_port);
+    try testing.expectEqual(@as(u16, 0), config.tproxy_port);
+    try testing.expect(config.ipv6);
+    try testing.expect(config.external_ui == null);
+    try testing.expect(config.secret == null);
+}
+
+fn parseManagedAllocationFixture(allocator: std.mem.Allocator) !void {
+    var config = try parseConfigDocument(allocator,
+        \\mixed-port: 7890
+        \\bind-address: 127.0.0.1
+        \\mode: rule
+        \\log-level: debug
+        \\external-ui: ui
+        \\secret: token
+        \\proxies:
+        \\  - name: proxy
+        \\    type: ss
+        \\    server: example.test
+        \\    port: 443
+        \\    cipher: aes-128-gcm
+        \\    password: password
+        \\proxy-groups:
+        \\  - name: group
+        \\    type: select
+        \\    proxies: [proxy]
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: rules.yaml
+        \\rules:
+        \\  - MATCH,group
+    );
+    config.deinit();
+}
+
+test "managed config parser releases every allocation failure path" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        parseManagedAllocationFixture,
+        .{},
+    );
+}
+
 test "parseProxy rejects out-of-range alterId" {
     const allocator = testing.allocator;
     const yaml =

@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
+const compat = @import("compat.zig");
 const Config = @import("config.zig").Config;
 const ProxyType = @import("config.zig").ProxyType;
 const RuleType = @import("config.zig").RuleType;
@@ -44,11 +45,13 @@ pub const ValidationResult = struct {
 
     fn addError(self: *ValidationResult, comptime fmt: []const u8, args: anytype) !void {
         const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+        errdefer self.allocator.free(msg);
         try self.errors.append(self.allocator, .{ .message = msg });
     }
 
     fn addWarning(self: *ValidationResult, comptime fmt: []const u8, args: anytype) !void {
         const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+        errdefer self.allocator.free(msg);
         try self.warnings.append(self.allocator, .{ .message = msg });
     }
 };
@@ -372,9 +375,14 @@ fn validateRules(allocator: std.mem.Allocator, config: *const Config, result: *V
 
         // 根据规则类型校验 payload
         switch (rule.rule_type) {
-            .ip_cidr, .ip_cidr6, .src_ip_cidr => {
-                if (!isValidCIDR(rule.payload)) {
-                    try result.addError("Rule #{d}: invalid CIDR format '{s}'", .{ i + 1, rule.payload });
+            .ip_cidr, .src_ip_cidr => {
+                if (!isValidCIDR(rule.payload, false)) {
+                    try result.addError("Rule #{d}: invalid IPv4 CIDR format '{s}'", .{ i + 1, rule.payload });
+                }
+            },
+            .ip_cidr6 => {
+                if (!isValidCIDR(rule.payload, true)) {
+                    try result.addError("Rule #{d}: invalid IPv6 CIDR format '{s}'", .{ i + 1, rule.payload });
                 }
             },
             .dst_port, .src_port => {
@@ -488,39 +496,22 @@ fn isValidUUID(uuid: []const u8) bool {
     return true;
 }
 
-fn isValidCIDR(cidr: []const u8) bool {
-    // 简单检查：包含 / 且前后都有内容
-    const slash_pos = std.mem.indexOf(u8, cidr, "/");
-    if (slash_pos == null) return false;
+fn isValidCIDR(cidr: []const u8, ipv6: bool) bool {
+    const slash = std.mem.indexOfScalar(u8, cidr, '/') orelse return false;
+    if (std.mem.indexOfScalarPos(u8, cidr, slash + 1, '/') != null) return false;
+    const ip = cidr[0..slash];
+    const mask_text = cidr[slash + 1 ..];
+    if (ip.len == 0 or mask_text.len == 0) return false;
+    const mask = std.fmt.parseInt(u8, mask_text, 10) catch return false;
 
-    const ip_part = cidr[0..slash_pos.?];
-    const mask_part = cidr[slash_pos.? + 1 ..];
-
-    if (ip_part.len == 0 or mask_part.len == 0) return false;
-
-    // 检查掩码是否是数字
-    const mask = std.fmt.parseInt(u8, mask_part, 10) catch return false;
-
-    // 检查是否是 IPv4 或 IPv6
-    if (std.mem.indexOf(u8, ip_part, ".") != null) {
-        // IPv4
-        if (mask > 32) return false;
-        // 简单检查四段 IP
-        var parts_count: u8 = 0;
-        var it = std.mem.splitScalar(u8, ip_part, '.');
-        while (it.next()) |part| {
-            if (part.len == 0) return false;
-            const num = std.fmt.parseInt(u8, part, 10) catch return false;
-            if (num > 255) return false;
-            parts_count += 1;
-        }
-        return parts_count == 4;
-    } else if (std.mem.indexOf(u8, ip_part, ":") != null) {
-        // IPv6
-        return mask <= 128;
+    if (ipv6) {
+        if (mask > 128 or std.mem.indexOfScalar(u8, ip, ':') == null) return false;
+        _ = compat.net.Address.parseIp6(ip, 0) catch return false;
+        return true;
     }
-
-    return false;
+    if (mask > 32 or std.mem.indexOfScalar(u8, ip, ':') != null) return false;
+    _ = compat.net.Address.parseIp4(ip, 0) catch return false;
+    return true;
 }
 
 fn isValidPortRange(range: []const u8) bool {
@@ -533,6 +524,7 @@ fn isValidPortRange(range: []const u8) bool {
             var range_it = std.mem.splitScalar(u8, trimmed, '-');
             const start = range_it.next() orelse return false;
             const end = range_it.next() orelse return false;
+            if (range_it.next() != null) return false;
             const start_port = std.fmt.parseInt(u16, start, 10) catch return false;
             const end_port = std.fmt.parseInt(u16, end, 10) catch return false;
             if (start_port == 0 or end_port == 0 or start_port > end_port) return false;
