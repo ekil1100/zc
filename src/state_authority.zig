@@ -201,11 +201,28 @@ pub const Authority = struct {
     }
 
     fn loadUnlocked(self: Authority) !Snapshot {
-        const file = self.dir.openFile(compat.io(), state_file_name, .{}) catch |err| switch (err) {
+        const path_handle = self.dir.openFile(compat.io(), state_file_name, .{
+            .path_only = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
             error.FileNotFound => return Snapshot.init(self.allocator),
+            error.SymLinkLoop, error.IsDir => return error.CorruptState,
+            else => return err,
+        };
+        defer path_handle.close(compat.io());
+        const path_stat = try path_handle.stat(compat.io());
+        if (path_stat.kind != .file) return error.CorruptState;
+
+        const file = self.dir.openFile(compat.io(), state_file_name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.SymLinkLoop, error.IsDir => return error.CorruptState,
             else => return err,
         };
         defer file.close(compat.io());
+        const file_stat = try file.stat(compat.io());
+        if (file_stat.kind != .file or file_stat.inode != path_stat.inode) return error.CorruptState;
 
         const content = try compat.fileReadBoundedAlloc(file, self.allocator, max_state_bytes);
         defer self.allocator.free(content);
@@ -476,6 +493,34 @@ test "StateAuthority rejects oversized state without parsing a prefix" {
     }
     const authority = Authority.init(std.testing.allocator, tmp.dir);
     try std.testing.expectError(error.FileTooLarge, authority.observe());
+}
+
+test "StateAuthority rejects state symlinks and special paths" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.symLink(compat.io(), "missing-target", state_file_name, .{});
+        const authority = Authority.init(std.testing.allocator, tmp.dir);
+        try std.testing.expectError(error.CorruptState, authority.observe());
+    }
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const target = try tmp.dir.createFile(compat.io(), "target", .{});
+        target.close(compat.io());
+        try tmp.dir.symLink(compat.io(), "target", state_file_name, .{});
+        const authority = Authority.init(std.testing.allocator, tmp.dir);
+        try std.testing.expectError(error.CorruptState, authority.observe());
+    }
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        _ = try tmp.dir.createDir(compat.io(), state_file_name, .default_dir);
+        const authority = Authority.init(std.testing.allocator, tmp.dir);
+        try std.testing.expectError(error.CorruptState, authority.observe());
+    }
 }
 
 test "StateAuthority rejects dangling and live lock symlinks" {
