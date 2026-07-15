@@ -655,7 +655,7 @@ git push origin v1.0.0
 按风险排序：
 
 1. **决定 HTTP/SOCKS5 outbound 策略**：实现还是标 unsupported；建议先标 unsupported，并同步 validator / doctor / migrator / README。
-2. **执行 P0-6 Batch 2**：Batch 1 transactional authority 已在 `b940f5d` 完成、`9492bbf` harden，且未接生产 caller；下一步以 TDD 建立 ConfigBundle shadow capture/resolver。
+2. **执行 P0-6 Batch 2**：Batch 1 transactional authority 已在 `b940f5d` 完成，并由 `9492bbf` / `f06de95` / `f21fa8d` 完成文件与 provenance hardening；仍未接生产 caller。下一步以 TDD 建立 ConfigBundle shadow capture/resolver。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
 5. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。

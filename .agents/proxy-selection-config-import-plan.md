@@ -25,7 +25,7 @@
 |---|---|---|
 | Batch 0 — 计划与基线 | Done | `2bd2567` |
 | Batch 1 — baseline harness | Done | `85880d8` |
-| Batch 1 — transactional authority | Done | `b940f5d`, hardening `9492bbf` |
+| Batch 1 — transactional authority | Done | `b940f5d`, hardening `9492bbf`, `f06de95`, `f21fa8d` |
 | Batch 2+ | Pending | 下一步：ConfigBundle shadow capture/resolver |
 
 Batch 1 authority 尚未接入 `main/config/meta/daemon/manager/API` 生产路径。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
@@ -359,7 +359,7 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 
 回滚：纯文档 revert。
 
-### Batch 1 — 真实 baseline harness 与 Durable authority 事务内核 — Done (`85880d8`, `b940f5d`, `9492bbf`)
+### Batch 1 — 真实 baseline harness 与 Durable authority 事务内核 — Done (`85880d8`, `b940f5d`, `9492bbf`, `f06de95`, `f21fa8d`)
 
 先在任何生产路径改动前新增可复现的 ReleaseFast benchmark harness，并在 `70f8c30` 上归档原始样本、机器/OS、Zig 版本、重复次数和统计方法：
 
