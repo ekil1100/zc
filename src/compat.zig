@@ -340,6 +340,75 @@ pub fn fileReadToEndAlloc(file: std.Io.File, allocator: std.mem.Allocator, max_b
     return out.toOwnedSlice(allocator);
 }
 
+/// Read a whole file up to an explicit limit. Unlike fileReadToEndAlloc, this
+/// probes past the limit and reports oversized input instead of truncating it.
+pub fn fileReadBoundedAlloc(file: std.Io.File, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var buf: [4096]u8 = undefined;
+    while (out.items.len < max_bytes) {
+        const limit = @min(buf.len, max_bytes - out.items.len);
+        const n = try fileRead(file, buf[0..limit]);
+        if (n == 0) return out.toOwnedSlice(allocator);
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+
+    var extra: [1]u8 = undefined;
+    if (try fileRead(file, &extra) != 0) return error.FileTooLarge;
+    return out.toOwnedSlice(allocator);
+}
+
+test "strict bounded file read accepts the limit and rejects one byte more" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile(io(), "exact", .{});
+        defer file.close(io());
+        try fileWriteAll(file, "1234");
+    }
+    {
+        const file = try tmp.dir.openFile(io(), "exact", .{});
+        defer file.close(io());
+        const bytes = try fileReadBoundedAlloc(file, std.testing.allocator, 4);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings("1234", bytes);
+    }
+    {
+        const file = try tmp.dir.openFile(io(), "exact", .{});
+        defer file.close(io());
+        try std.testing.expectError(error.FileTooLarge, fileReadBoundedAlloc(file, std.testing.allocator, 3));
+    }
+}
+
+test "strict bounded file read handles a zero byte limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile(io(), "empty", .{});
+        file.close(io());
+    }
+    {
+        const file = try tmp.dir.openFile(io(), "empty", .{});
+        defer file.close(io());
+        const bytes = try fileReadBoundedAlloc(file, std.testing.allocator, 0);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqual(@as(usize, 0), bytes.len);
+    }
+    {
+        const file = try tmp.dir.createFile(io(), "one", .{});
+        defer file.close(io());
+        try fileWriteAll(file, "x");
+    }
+    {
+        const file = try tmp.dir.openFile(io(), "one", .{});
+        defer file.close(io());
+        try std.testing.expectError(error.FileTooLarge, fileReadBoundedAlloc(file, std.testing.allocator, 0));
+    }
+}
+
 pub fn sleepNs(ns: u64) void {
     std.Io.sleep(io(), .fromNanoseconds(@intCast(ns)), .awake) catch {};
 }

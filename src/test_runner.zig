@@ -20,6 +20,7 @@ test "include zc test modules" {
     _ = @import("perf_stats.zig");
     _ = @import("runtime_selection.zig");
     _ = @import("socket_options.zig");
+    _ = @import("state_authority.zig");
     _ = @import("test_cli.zig");
     _ = @import("api/server_test.zig");
     _ = @import("crypto/aead.zig");

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const perf_stats = @import("perf_stats.zig");
+const state_authority = @import("state_authority.zig");
 
 const Options = struct {
     samples: usize = 9,
@@ -9,6 +10,7 @@ const Options = struct {
     fixture_bytes: usize = 64 * 1024,
     subject_commit: []const u8 = "unknown",
     harness_commit: []const u8 = "unknown",
+    machine: []const u8 = "unknown",
 };
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -18,6 +20,7 @@ fn parseArgs(args: []const []const u8) !Options {
     var seen_fixture = false;
     var seen_subject = false;
     var seen_harness = false;
+    var seen_machine = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -47,6 +50,11 @@ fn parseArgs(args: []const []const u8) !Options {
             seen_harness = true;
             i += 1;
             options.harness_commit = args[i];
+        } else if (std.mem.eql(u8, arg, "--machine")) {
+            if (seen_machine or i + 1 >= args.len) return error.InvalidArgument;
+            seen_machine = true;
+            i += 1;
+            options.machine = args[i];
         } else {
             return error.InvalidArgument;
         }
@@ -91,7 +99,9 @@ fn writeFixture(path: []const u8, size: usize) !void {
     try file.sync(compat.io());
 }
 
-fn measureLegacyBoundedRead(allocator: std.mem.Allocator, path: []const u8, options: Options) ![]perf_stats.Sample {
+const ReadMode = enum { legacy, strict };
+
+fn measureBoundedRead(allocator: std.mem.Allocator, path: []const u8, options: Options, mode: ReadMode) ![]perf_stats.Sample {
     const samples = try allocator.alloc(perf_stats.Sample, options.samples);
     errdefer allocator.free(samples);
 
@@ -103,7 +113,10 @@ fn measureLegacyBoundedRead(allocator: std.mem.Allocator, path: []const u8, opti
         while (iteration < options.iterations) : (iteration += 1) {
             const file = try compat.fs.cwd().openFile(path, .{});
             defer file.close(compat.io());
-            const bytes = try compat.fileReadToEndAlloc(file, allocator, options.fixture_bytes);
+            const bytes = switch (mode) {
+                .legacy => try compat.fileReadToEndAlloc(file, allocator, options.fixture_bytes),
+                .strict => try compat.fileReadBoundedAlloc(file, allocator, options.fixture_bytes),
+            };
             defer allocator.free(bytes);
             if (bytes.len != options.fixture_bytes) return error.ShortRead;
             checksum +%= bytes[0];
@@ -120,6 +133,78 @@ fn measureLegacyBoundedRead(allocator: std.mem.Allocator, path: []const u8, opti
             .ns_per_op = elapsed / options.iterations,
         };
     }
+    return samples;
+}
+
+fn revisionFromCounter(value: u128) state_authority.Revision {
+    return .{ .bytes = @bitCast(value) };
+}
+
+fn measureAuthorityCommits(
+    allocator: std.mem.Allocator,
+    options: Options,
+    profile_count: usize,
+) ![]perf_stats.Sample {
+    const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/perf/authority-{d}-{d}", .{ profile_count, compat.nanoTimestamp() });
+    defer allocator.free(dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.io(), dir_path) catch {};
+    const dir = try std.Io.Dir.cwd().createDirPathOpen(compat.io(), dir_path, .{});
+    defer dir.close(compat.io());
+    const authority = state_authority.Authority.init(allocator, dir);
+
+    var counter: u128 = 1;
+    var target_head: state_authority.Revision = undefined;
+    var profile_index: usize = 0;
+    while (profile_index < profile_count) : (profile_index += 1) {
+        var key_buffer: [32]u8 = undefined;
+        const key = if (profile_index == 0)
+            "target"
+        else
+            try std.fmt.bufPrint(&key_buffer, "profile-{d}", .{profile_index});
+        const revision = revisionFromCounter(counter);
+        counter += 1;
+        const outcome = try authority.commit(.{ .compare_exchange_head = .{
+            .key = key,
+            .expected = .missing,
+            .next = revision,
+        } });
+        if (outcome != .committed) return error.UnexpectedCommitOutcome;
+        if (profile_index == 0) target_head = revision;
+    }
+
+    const samples = try allocator.alloc(perf_stats.Sample, options.samples);
+    errdefer allocator.free(samples);
+    var sample_index: usize = 0;
+    while (sample_index <= options.samples) : (sample_index += 1) {
+        const started = std.Io.Timestamp.now(compat.io(), .awake).nanoseconds;
+        var iteration: u64 = 0;
+        while (iteration < options.iterations) : (iteration += 1) {
+            const next = revisionFromCounter(counter);
+            counter += 1;
+            const outcome = try authority.commit(.{ .compare_exchange_head = .{
+                .key = "target",
+                .expected = .{ .revision = target_head },
+                .next = next,
+            } });
+            switch (outcome) {
+                .committed => target_head = next,
+                else => return error.UnexpectedCommitOutcome,
+            }
+        }
+        const finished = std.Io.Timestamp.now(compat.io(), .awake).nanoseconds;
+        if (sample_index == 0) continue;
+        const elapsed: u64 = @intCast(finished - started);
+        samples[sample_index - 1] = .{
+            .iterations = options.iterations,
+            .elapsed_ns = elapsed,
+            .ns_per_op = elapsed / options.iterations,
+        };
+    }
+
+    var reopened = try authority.observe();
+    defer reopened.deinit();
+    if (reopened.profiles.count() != profile_count) return error.ProfileCountMismatch;
+    if (!reopened.head("target").?.eql(target_head)) return error.HeadMismatch;
     return samples;
 }
 
@@ -142,9 +227,22 @@ pub fn main(init: std.process.Init) !void {
     defer std.Io.Dir.cwd().deleteFile(compat.io(), fixture_path) catch {};
     try writeFixture(fixture_path, options.fixture_bytes);
 
-    const samples = try measureLegacyBoundedRead(allocator, fixture_path, options);
-    defer allocator.free(samples);
-    const summary = try perf_stats.summarize(allocator, samples);
+    const legacy_samples = try measureBoundedRead(allocator, fixture_path, options, .legacy);
+    defer allocator.free(legacy_samples);
+    const strict_samples = try measureBoundedRead(allocator, fixture_path, options, .strict);
+    defer allocator.free(strict_samples);
+    const authority_1_samples = try measureAuthorityCommits(allocator, options, 1);
+    defer allocator.free(authority_1_samples);
+    const authority_100_samples = try measureAuthorityCommits(allocator, options, 100);
+    defer allocator.free(authority_100_samples);
+    const authority_1000_samples = try measureAuthorityCommits(allocator, options, 1000);
+    defer allocator.free(authority_1000_samples);
+
+    const legacy_summary = try perf_stats.summarize(allocator, legacy_samples);
+    const strict_summary = try perf_stats.summarize(allocator, strict_samples);
+    const authority_1_summary = try perf_stats.summarize(allocator, authority_1_samples);
+    const authority_100_summary = try perf_stats.summarize(allocator, authority_100_samples);
+    const authority_1000_summary = try perf_stats.summarize(allocator, authority_1000_samples);
 
     const Benchmark = struct {
         name: []const u8,
@@ -158,6 +256,9 @@ pub fn main(init: std.process.Init) !void {
         optimize: []const u8,
         os: []const u8,
         arch: []const u8,
+        cpu_model: []const u8,
+        zig_version: []const u8,
+        machine: []const u8,
     };
     const Method = struct {
         warmup_runs: u8,
@@ -176,19 +277,44 @@ pub fn main(init: std.process.Init) !void {
         omitted: []const []const u8,
     };
 
-    const benchmarks = [_]Benchmark{.{
-        .name = "legacy_bounded_read",
-        .samples = samples,
-        .median_ns_per_op = summary.median_ns_per_op,
-        .p95_ns_per_op = summary.p95_ns_per_op,
-    }};
+    const benchmarks = [_]Benchmark{
+        .{
+            .name = "legacy_bounded_read",
+            .samples = legacy_samples,
+            .median_ns_per_op = legacy_summary.median_ns_per_op,
+            .p95_ns_per_op = legacy_summary.p95_ns_per_op,
+        },
+        .{
+            .name = "strict_bounded_read",
+            .samples = strict_samples,
+            .median_ns_per_op = strict_summary.median_ns_per_op,
+            .p95_ns_per_op = strict_summary.p95_ns_per_op,
+        },
+        .{
+            .name = "authority_commit_profiles_1",
+            .samples = authority_1_samples,
+            .median_ns_per_op = authority_1_summary.median_ns_per_op,
+            .p95_ns_per_op = authority_1_summary.p95_ns_per_op,
+        },
+        .{
+            .name = "authority_commit_profiles_100",
+            .samples = authority_100_samples,
+            .median_ns_per_op = authority_100_summary.median_ns_per_op,
+            .p95_ns_per_op = authority_100_summary.p95_ns_per_op,
+        },
+        .{
+            .name = "authority_commit_profiles_1000",
+            .samples = authority_1000_samples,
+            .median_ns_per_op = authority_1000_summary.median_ns_per_op,
+            .p95_ns_per_op = authority_1000_summary.p95_ns_per_op,
+        },
+    };
     const omitted = [_][]const u8{
         "connection_admission",
         "connection_throughput",
         "connection_latency_p99",
         "active_flow_rss",
         "config_import",
-        "authority_commit",
     };
     const report: Report = .{
         .schema_version = 1,
@@ -200,6 +326,9 @@ pub fn main(init: std.process.Init) !void {
             .optimize = @tagName(builtin.mode),
             .os = @tagName(builtin.os.tag),
             .arch = @tagName(builtin.cpu.arch),
+            .cpu_model = builtin.cpu.model.name,
+            .zig_version = builtin.zig_version_string,
+            .machine = options.machine,
         },
         .method = .{
             .warmup_runs = 1,
@@ -232,6 +361,8 @@ test "perf runner parses an explicit truthful measurement contract" {
         "abc123",
         "--harness-commit",
         "def456",
+        "--machine",
+        "ci-runner-1",
     };
     const options = try parseArgs(&args);
     try std.testing.expectEqual(@as(usize, 7), options.samples);
@@ -239,6 +370,7 @@ test "perf runner parses an explicit truthful measurement contract" {
     try std.testing.expectEqual(@as(usize, 4096), options.fixture_bytes);
     try std.testing.expectEqualStrings("abc123", options.subject_commit);
     try std.testing.expectEqualStrings("def456", options.harness_commit);
+    try std.testing.expectEqualStrings("ci-runner-1", options.machine);
 }
 
 test "perf runner rejects fewer than five samples and unknown arguments" {

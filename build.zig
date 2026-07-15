@@ -52,6 +52,24 @@ pub fn build(b: *std.Build) void {
     const perf_step = b.step("perf", "Record host-native ReleaseFast measurements");
     perf_step.dependOn(&perf_cmd.step);
 
+    const authority_process_mod = b.createModule(.{
+        .root_source_file = b.path("src/state_authority_process_test.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .Debug,
+    });
+    authority_process_mod.link_libc = true;
+    const authority_process_exe = b.addExecutable(.{
+        .name = "zc-state-authority-process-test",
+        .root_module = authority_process_mod,
+    });
+    const authority_process_cmd = b.addSystemCommand(&.{
+        "bash",
+        b.pathFromRoot("scripts/test-state-authority-process.sh"),
+    });
+    authority_process_cmd.addArtifactArg(authority_process_exe);
+    const authority_process_step = b.step("test-authority-process", "Run StateAuthority cross-process tests");
+    authority_process_step.dependOn(&authority_process_cmd.step);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_runner.zig"),
         .target = target,
@@ -82,8 +100,9 @@ pub fn build(b: *std.Build) void {
     run_exe_unit_tests.step.dependOn(&prepare_test_home.step);
     run_exe_unit_tests.setEnvironmentVariable("HOME", b.pathFromRoot(".zig-cache/zc-test-home"));
     run_exe_unit_tests.setEnvironmentVariable("XDG_RUNTIME_DIR", b.pathFromRoot(".zig-cache/zc-test-run"));
-    const test_step = b.step("test", "Run unit tests");
+    const test_step = b.step("test", "Run unit and StateAuthority process tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&authority_process_cmd.step);
 
     // Fuzz test
     const fuzz_mod = b.createModule(.{
