@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-07-14
+> 最近更新：2026-07-15
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -40,13 +40,13 @@ cat build.zig.zon
 
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 533/534 tests passed (1 skipped)
+# 573/574 tests passed (1 skipped)
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded
 ```
 
-结果：2026-07-15 当前代码在本机 Zig 0.16.0 下可构建、单测通过（1 项显式 skip）；默认 `zig build test` 已包含 StateAuthority 跨进程锁/CAS 测试。
+结果：2026-07-15 当前代码在本机 Zig 0.16.0 下可构建、单测通过（1 项显式 skip）；默认 `zig build test` 已包含 StateAuthority 跨进程锁/CAS 与 ConfigBundle 安全边界测试。
 
 ### 迁移与安装回归（最近一次完整记录：2026-05）
 
@@ -455,7 +455,7 @@ docs/
 
 ### P0-6：revisioned config identity、可靠代理选择与本地 config import
 
-状态：**Planned，尚未实现**。
+状态：**In Progress；Batch 0-2 内部基础已完成，用户可见能力尚未实现**。
 
 目标：
 
@@ -469,6 +469,14 @@ docs/
 冻结契约、分批实施、回滚点、测试矩阵与性能门禁见：
 
 - [`.agents/proxy-selection-config-import-plan.md`](proxy-selection-config-import-plan.md)
+
+当前内部证据：
+
+- Batch 1 transactional authority：`b940f5d`，hardening `9492bbf` / `f06de95` / `f21fa8d`；
+- Batch 2 managed parser/offline provider：`d4e2d84`；
+- Batch 2 descriptor-based ConfigBundle/resolver：`65337fc`；
+- 573/574 tests passed（1 skipped），ReleaseFast 4/4；
+- authority 与 ConfigBundle 均尚未接入 `main/meta/daemon/manager/API` 生产 caller；下一步为 Batch 3 legacy migration 与 exact revision identity。
 
 关键验收：
 
@@ -655,7 +663,7 @@ git push origin v1.0.0
 按风险排序：
 
 1. **决定 HTTP/SOCKS5 outbound 策略**：实现还是标 unsupported；建议先标 unsupported，并同步 validator / doctor / migrator / README。
-2. **执行 P0-6 Batch 2**：Batch 1 transactional authority 已在 `b940f5d` 完成，并由 `9492bbf` / `f06de95` / `f21fa8d` 完成文件与 provenance hardening；仍未接生产 caller。下一步以 TDD 建立 ConfigBundle shadow capture/resolver。
+2. **执行 P0-6 Batch 3**：Batch 1 authority 与 Batch 2 ConfigBundle 已完成但仍未接生产 caller；下一步以 TDD 实现 legacy migration、immutable revision layout 与 exact `managed key + revision` identity。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
 5. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。
@@ -667,14 +675,14 @@ git push origin v1.0.0
 当前 main 分支：
 
 - ✅ Zig 0.16 本地构建通过
-- ✅ 2026-07-15 单测 533/534 通过（1 项显式 skip，含 StateAuthority 跨进程测试）
+- ✅ 2026-07-15 单测 573/574 通过（1 项显式 skip，含 StateAuthority 跨进程与 ConfigBundle 安全边界测试）
 - ⚠️ migrator/install/full validation 最近完整记录来自 2026-05，2026-07-14 未重跑，待 P0-7 验证
 - ⚠️ 2026-07-14 仅完成 version/status 无副作用 smoke；29001 daemon start/status/stop 待 P0-7 验证
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
 - ❌ 部分配置可接受但运行时未实现
-- ❌ `proxy select` 的 durable/runtime identity 与失败语义尚未收敛，`config import` 尚未实现
+- ⚠️ transactional authority 与 ConfigBundle shadow 基础已完成但尚未接生产路径；`proxy select` durable/runtime identity 与 `config import` CLI 仍未实现
 - ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档
 

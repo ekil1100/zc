@@ -1,6 +1,6 @@
 # proxy selection 可靠性与本地 config import 实施计划
 
-> 状态：Planned（尚未实现）
+> 状态：In Progress（Batch 0-2 已完成；尚未接入生产路径）
 > 制定日期：2026-07-14
 > 基线提交：`70f8c30`
 > 工具链：Zig `0.16.0`
@@ -26,7 +26,9 @@
 | Batch 0 — 计划与基线 | Done | `2bd2567` |
 | Batch 1 — baseline harness | Done | `85880d8` |
 | Batch 1 — transactional authority | Done | `b940f5d`, hardening `9492bbf`, `f06de95`, `f21fa8d` |
-| Batch 2+ | Pending | 下一步：ConfigBundle shadow capture/resolver |
+| Batch 2 — strict managed parser / offline provider | Done | `d4e2d84` |
+| Batch 2 — ConfigBundle shadow capture / resolver | Done | `65337fc` |
+| Batch 3+ | Pending | 下一步：legacy migration 与 exact config identity |
 
 Batch 1 authority 尚未接入 `main/config/meta/daemon/manager/API` 生产路径。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
 
@@ -43,8 +45,11 @@ Batch 1 authority 尚未接入 `main/config/meta/daemon/manager/API` 生产路�
 zig version
 # 0.16.0
 
-env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 533/534 tests passed (1 skipped)
+zig build test --summary all
+# 573/574 tests passed (1 skipped)
+
+zig build -Doptimize=ReleaseFast --summary all
+# 4/4 steps succeeded
 ```
 
 已确认的现状：
@@ -421,7 +426,16 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 
 本批只 shadow-build bundle 并比较现有 loader 结果，不发布 revision、不切 reader/writer。
 
-建议 commit：`feat(config): capture and resolve immutable bundles offline`
+完成证据（2026-07-15）：
+
+- `d4e2d84` 新增 managed-only 完整文档 parser、离线 provider parser/validator，并保持 legacy parser 行为隔离；
+- `65337fc` 新增 descriptor-based `ConfigBundle`、immutable resolver、materialized source seam、deterministic manifest 与 shadow parity；
+- 自动化覆盖 16 MiB / 8 MiB / 64 MiB / 1024 边界、source/dependency symlink、containment、FIFO/目录/设备、stat identity mutation、source tree 删除后 load、remote hit-count 0、CRLF/flow/BOM/escape/depth 与 OOM 路径；
+- `zig build test --summary all` 为 573/574（1 skip），ReleaseFast 4/4；
+- control-plane ReleaseFast 1000-iteration measurement 中 legacy bounded read median `29,850 ns/op`、strict bounded read median `30,963 ns/op`；`config_import` 仍明确 omitted，待真实 publish path 建立后补测；
+- persisted override 的**执行**与 revision 持久关联属于 Batch 3 revision builder；本批只接收并冻结一次性 materialized 输出，runtime 多次 load 不重执行。
+
+实际 commits：`feat(config): add strict managed offline parsing`、`feat(config): capture immutable local bundles`。
 
 回滚：模块尚未对外暴露，可直接 revert。
 
