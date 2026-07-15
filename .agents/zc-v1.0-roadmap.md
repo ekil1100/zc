@@ -40,13 +40,13 @@ cat build.zig.zon
 
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 514/515 tests passed (1 skipped)
+# 533/534 tests passed (1 skipped)
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded
 ```
 
-结果：2026-07-14 当前代码在本机 Zig 0.16.0 下可构建、单测通过（1 项显式 skip）。
+结果：2026-07-15 当前代码在本机 Zig 0.16.0 下可构建、单测通过（1 项显式 skip）；默认 `zig build test` 已包含 StateAuthority 跨进程锁/CAS 测试。
 
 ### 迁移与安装回归（最近一次完整记录：2026-05）
 
@@ -655,7 +655,7 @@ git push origin v1.0.0
 按风险排序：
 
 1. **决定 HTTP/SOCKS5 outbound 策略**：实现还是标 unsupported；建议先标 unsupported，并同步 validator / doctor / migrator / README。
-2. **执行 P0-6 Batch 1**：先以 TDD 建立 transactional authority，保持生产行为不变，再按计划小步迁移 identity/import/selection/flow。
+2. **执行 P0-6 Batch 2**：Batch 1 transactional authority 已在 `b940f5d` 完成、`9492bbf` harden，且未接生产 caller；下一步以 TDD 建立 ConfigBundle shadow capture/resolver。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
 5. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。
@@ -667,7 +667,7 @@ git push origin v1.0.0
 当前 main 分支：
 
 - ✅ Zig 0.16 本地构建通过
-- ✅ 2026-07-14 单测 514/515 通过（1 项显式 skip）
+- ✅ 2026-07-15 单测 533/534 通过（1 项显式 skip，含 StateAuthority 跨进程测试）
 - ⚠️ migrator/install/full validation 最近完整记录来自 2026-05，2026-07-14 未重跑，待 P0-7 验证
 - ⚠️ 2026-07-14 仅完成 version/status 无副作用 smoke；29001 daemon start/status/stop 待 P0-7 验证
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0

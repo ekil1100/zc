@@ -19,14 +19,32 @@
 
 ## 2. 当前事实与基线
 
-2026-07-14 本机验证：
+### 2.1 实施进度
+
+| Batch | 状态 | Commit / 证据 |
+|---|---|---|
+| Batch 0 — 计划与基线 | Done | `2bd2567` |
+| Batch 1 — baseline harness | Done | `85880d8` |
+| Batch 1 — transactional authority | Done | `b940f5d`, hardening `9492bbf` |
+| Batch 2+ | Pending | 下一步：ConfigBundle shadow capture/resolver |
+
+Batch 1 authority 尚未接入 `main/config/meta/daemon/manager/API` 生产路径。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
+
+- `70f8c30` + harness：`legacy_bounded_read` median `28,852 ns/op`，p95 `32,493 ns/op`；
+- `b940f5d`：legacy median `30,795 ns/op`，strict median `30,577 ns/op`；
+- `b940f5d` authority commit median：1 profile `154,275 ns/op`、100 profiles `187,162 ns/op`、1000 profiles `535,435 ns/op`；
+- connection admission、flow RSS、config import 仍明确 omitted，不构造假值。
+
+### 2.2 当前验证
+
+2026-07-15 本机验证：
 
 ```bash
 zig version
 # 0.16.0
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 514/515 tests passed (1 skipped)
+# 533/534 tests passed (1 skipped)
 ```
 
 已确认的现状：
@@ -320,7 +338,7 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 
 每个批次先 RED、再 GREEN、再最窄回归；一个 commit 只做一个逻辑变更。高风险切换保留 legacy mirror 和明确回滚点。
 
-### Batch 0 — 计划与基线（本次）
+### Batch 0 — 计划与基线 — Done (`2bd2567`)
 
 目标：把冻结契约写入 canonical/public roadmap，但不把未实现能力写入当前 CLI/API spec。
 
@@ -341,7 +359,7 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 
 回滚：纯文档 revert。
 
-### Batch 1 — 真实 baseline harness 与 Durable authority 事务内核
+### Batch 1 — 真实 baseline harness 与 Durable authority 事务内核 — Done (`85880d8`, `b940f5d`, `9492bbf`)
 
 先在任何生产路径改动前新增可复现的 ReleaseFast benchmark harness，并在 `70f8c30` 上归档原始样本、机器/OS、Zig 版本、重复次数和统计方法：
 
