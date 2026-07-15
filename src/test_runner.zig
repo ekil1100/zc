@@ -7,6 +7,7 @@ test "include zc test modules" {
     _ = @import("cli/commands.zig");
     _ = @import("cli/output.zig");
     _ = @import("config_test.zig");
+    _ = @import("config_bundle_test.zig");
     _ = @import("config.zig");
     _ = @import("config_validator.zig");
     _ = @import("daemon.zig");
