@@ -35,6 +35,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    // Host-native ReleaseFast measurement harness. It reports raw samples only;
+    // regression thresholds are added after stable baselines exist.
+    const perf_mod = b.createModule(.{
+        .root_source_file = b.path("src/perf_runner.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .ReleaseFast,
+    });
+    perf_mod.link_libc = true;
+    const perf_exe = b.addExecutable(.{
+        .name = "zc-perf",
+        .root_module = perf_mod,
+    });
+    const perf_cmd = b.addRunArtifact(perf_exe);
+    if (b.args) |args| perf_cmd.addArgs(args);
+    const perf_step = b.step("perf", "Record host-native ReleaseFast measurements");
+    perf_step.dependOn(&perf_cmd.step);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_runner.zig"),
         .target = target,

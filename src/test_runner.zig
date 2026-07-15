@@ -16,6 +16,8 @@ test "include zc test modules" {
     _ = @import("meta.zig");
     _ = @import("mixed_repro_test.zig");
     _ = @import("override.zig");
+    _ = @import("perf_runner.zig");
+    _ = @import("perf_stats.zig");
     _ = @import("runtime_selection.zig");
     _ = @import("socket_options.zig");
     _ = @import("test_cli.zig");

@@ -1,5 +1,21 @@
 # Profiling & Regression Baseline Scaffold（P4-1.A）
 
+## 0) 当前证据状态
+
+`latest.json`、现有 `history/` 和 `scripts/perf/run-baseline.sh` 来自旧 placeholder scaffold：它们没有 raw samples，**不能作为真实性能基线或回归门禁证据**。
+
+P0-6 Batch 1 新增只记录事实、不宣称 PASS/FAIL 的 ReleaseFast 入口：
+
+```bash
+bash scripts/perf/run-control-plane-baseline.sh \
+  --samples 9 \
+  --output .zig-cache/perf/control-plane.json
+```
+
+新入口至少输出 5 份 raw samples、median、nearest-rank p95、subject/harness commit、OS/arch/optimize provenance；默认只写 `.zig-cache/perf/`，拒绝自动覆盖本目录 tracked report。当前仅测 `legacy_bounded_read`；connection admission、flow RSS、config import 和 authority commit 在对应 seam 落地前明确列为 omitted，禁止用 `0` 或环境变量假值代替。
+
+旧 `scripts/perf-regression.sh` 暂时保留兼容，但其 placeholder PASS 不得用于 P0-6 完成判断。
+
 ## 1) 目标
 
 建立 zc 性能回归最小脚手架，保证后续优化有统一口径：
