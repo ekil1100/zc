@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
 const yaml = @import("util/yaml.zig");
@@ -37,6 +38,11 @@ pub const CliOptions = struct {
             try out.append(allocator, try std.fmt.allocPrint(allocator, "{d}", .{self.timeout_ms}));
         }
     }
+};
+
+pub const ExecutionArgument = struct {
+    key: []const u8,
+    value: []const u8,
 };
 
 pub const Errors = error{
@@ -122,6 +128,35 @@ fn parseOverrideArg(allocator: std.mem.Allocator, pair: []const u8) !OverrideArg
     };
 }
 
+pub fn executeScriptPatch(
+    allocator: std.mem.Allocator,
+    script_path: []const u8,
+    arguments: []const ExecutionArgument,
+    timeout_ms: u32,
+    command_name: []const u8,
+    config_path: ?[]const u8,
+) ![]u8 {
+    var options = CliOptions{
+        .script_path = try allocator.dupe(u8, script_path),
+        .timeout_ms = timeout_ms,
+    };
+    defer options.deinit(allocator);
+    for (arguments) |argument| {
+        const key = try allocator.dupe(u8, argument.key);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, argument.value);
+        errdefer allocator.free(value);
+        try options.args.append(allocator, .{ .key = key, .value = value });
+    }
+    return executeOverrideScript(
+        allocator,
+        options.script_path.?,
+        &options,
+        command_name,
+        config_path,
+    );
+}
+
 pub fn apply(
     allocator: std.mem.Allocator,
     cfg: *config.Config,
@@ -133,14 +168,41 @@ pub fn apply(
         const patch_text = try executeOverrideScript(allocator, script_path, opts, command_name, config_path);
         defer allocator.free(patch_text);
 
-        const trimmed = std.mem.trim(u8, patch_text, " \t\r\n");
-        if (trimmed.len > 0) {
-            var root = yaml.parse(allocator, trimmed) catch return Errors.OverrideOutputInvalid;
-            defer root.deinit(allocator);
-            if (root != .map) return Errors.OverrideOutputInvalid;
-            applyMapOverride(allocator, cfg, &root.map) catch return Errors.OverrideMergeFailed;
-        }
+        try applyPatch(allocator, cfg, patch_text);
     }
+}
+
+pub fn applyPatch(
+    allocator: std.mem.Allocator,
+    cfg: *config.Config,
+    patch_text: []const u8,
+) !void {
+    const trimmed = std.mem.trim(u8, patch_text, " \t\r\n");
+    if (trimmed.len == 0) return;
+    var root = yaml.parse(allocator, trimmed) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return Errors.OverrideOutputInvalid,
+    };
+    defer root.deinit(allocator);
+    if (root != .map) return Errors.OverrideOutputInvalid;
+    applyMapOverride(allocator, cfg, &root.map) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return Errors.OverrideMergeFailed,
+    };
+}
+
+pub fn materializeSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    patch_text: []const u8,
+) ![]u8 {
+    if (std.mem.trim(u8, patch_text, " \t\r\n").len == 0) {
+        return allocator.dupe(u8, source);
+    }
+    var cfg = try config.parseDocument(allocator, source);
+    defer cfg.deinit();
+    try applyPatch(allocator, &cfg, patch_text);
+    return dumpEffectiveConfigYaml(allocator, &cfg);
 }
 
 fn executeOverrideScript(
@@ -214,7 +276,8 @@ fn executeOverrideScript(
 
 fn mapRunError(err: anyerror) anyerror {
     return switch (err) {
-        error.OverrideScriptTimeout => Errors.OverrideScriptTimeout,
+        error.OutOfMemory => error.OutOfMemory,
+        error.OverrideScriptTimeout, error.Timeout => Errors.OverrideScriptTimeout,
         error.FileNotFound => Errors.OverrideScriptNotFound,
         error.OverrideScriptExecFailed => Errors.OverrideScriptExecFailed,
         else => Errors.OverrideScriptExecFailed,
@@ -227,12 +290,19 @@ fn runCommandWithTimeout(
     env_map: *const std.process.Environ.Map,
     timeout_ms: u32,
 ) ![]u8 {
-    _ = timeout_ms;
+    const timeout: std.Io.Timeout = if (timeout_ms == 0)
+        .none
+    else
+        .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+        } };
     const result = try std.process.run(allocator, compat.io(), .{
         .argv = argv,
         .environ_map = env_map,
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .nothing,
+        .timeout = timeout,
     });
     defer allocator.free(result.stderr);
 
@@ -250,20 +320,6 @@ fn runCommandWithTimeout(
     }
 
     return result.stdout;
-}
-
-fn timeoutThread(
-    child: *std.process.Child,
-    done: *std.atomic.Value(bool),
-    timed_out: *std.atomic.Value(bool),
-    timeout_ms: u32,
-) void {
-    if (timeout_ms == 0) return;
-    compat.sleepNs(@as(u64, timeout_ms) * std.time.ns_per_ms);
-    if (!done.load(.seq_cst)) {
-        timed_out.store(true, .seq_cst);
-        _ = child.kill() catch {};
-    }
 }
 
 fn sanitizeEnvKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
@@ -643,6 +699,200 @@ fn writeYamlQuotedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
     try out.append(allocator, '"');
 }
 
+fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    try out.print(allocator, "port: {d}\n", .{cfg.port});
+    try out.print(allocator, "socks-port: {d}\n", .{cfg.socks_port});
+    try out.print(allocator, "mixed-port: {d}\n", .{cfg.mixed_port});
+    try out.print(allocator, "redir-port: {d}\n", .{cfg.redir_port});
+    try out.print(allocator, "tproxy-port: {d}\n", .{cfg.tproxy_port});
+    try out.appendSlice(allocator, "allow-lan: ");
+    try out.appendSlice(allocator, if (cfg.allow_lan) "true\n" else "false\n");
+    try out.appendSlice(allocator, "bind-address: ");
+    try writeYamlQuotedString(&out, allocator, cfg.bind_address);
+    try out.append(allocator, '\n');
+    try out.appendSlice(allocator, "mode: ");
+    try writeYamlQuotedString(&out, allocator, cfg.mode);
+    try out.append(allocator, '\n');
+    try out.appendSlice(allocator, "log-level: ");
+    try writeYamlQuotedString(&out, allocator, cfg.log_level);
+    try out.append(allocator, '\n');
+    try out.appendSlice(allocator, "ipv6: ");
+    try out.appendSlice(allocator, if (cfg.ipv6) "true\n" else "false\n");
+    if (cfg.external_controller) |value| {
+        try out.appendSlice(allocator, "external-controller: ");
+        try writeYamlQuotedString(&out, allocator, value);
+        try out.append(allocator, '\n');
+    }
+    if (cfg.external_ui) |value| {
+        try out.appendSlice(allocator, "external-ui: ");
+        try writeYamlQuotedString(&out, allocator, value);
+        try out.append(allocator, '\n');
+    }
+    if (cfg.secret) |value| {
+        try out.appendSlice(allocator, "secret: ");
+        try writeYamlQuotedString(&out, allocator, value);
+        try out.append(allocator, '\n');
+    }
+    try out.print(allocator, "idle-session-check-interval: {d}\n", .{cfg.idle_session_check_interval});
+    try out.print(allocator, "idle-session-timeout: {d}\n", .{cfg.idle_session_timeout});
+    try out.print(allocator, "min-idle-session: {d}\n", .{cfg.min_idle_session});
+
+    if (cfg.rule_providers.items.len == 0) {
+        try out.appendSlice(allocator, "rule-providers: {}\n");
+    } else {
+        try out.appendSlice(allocator, "rule-providers:\n");
+        for (cfg.rule_providers.items) |provider| {
+            try out.appendSlice(allocator, "  ");
+            try writeYamlQuotedString(&out, allocator, provider.name);
+            try out.appendSlice(allocator, ":\n");
+            try out.appendSlice(allocator, "    type: ");
+            try writeYamlQuotedString(&out, allocator, provider.provider_type);
+            try out.append(allocator, '\n');
+            try out.appendSlice(allocator, "    behavior: ");
+            try writeYamlQuotedString(&out, allocator, ruleProviderBehaviorString(provider.behavior));
+            try out.append(allocator, '\n');
+            if (provider.url) |url| {
+                try out.appendSlice(allocator, "    url: ");
+                try writeYamlQuotedString(&out, allocator, url);
+                try out.append(allocator, '\n');
+            }
+            try out.appendSlice(allocator, "    path: ");
+            try writeYamlQuotedString(&out, allocator, provider.path);
+            try out.append(allocator, '\n');
+            try out.print(allocator, "    interval: {d}\n", .{provider.interval});
+        }
+    }
+
+    if (cfg.proxies.items.len == 0) {
+        try out.appendSlice(allocator, "proxies: []\n");
+    } else {
+        try out.appendSlice(allocator, "proxies:\n");
+        for (cfg.proxies.items) |proxy| {
+            try out.appendSlice(allocator, "  - name: ");
+            try writeYamlQuotedString(&out, allocator, proxy.name);
+            try out.append(allocator, '\n');
+            try out.appendSlice(allocator, "    type: ");
+            try writeYamlQuotedString(&out, allocator, proxyTypeString(proxy.proxy_type));
+            try out.append(allocator, '\n');
+            if (proxy.proxy_type != .direct and proxy.proxy_type != .reject) {
+                try out.appendSlice(allocator, "    server: ");
+                try writeYamlQuotedString(&out, allocator, proxy.server);
+                try out.append(allocator, '\n');
+                try out.print(allocator, "    port: {d}\n", .{proxy.port});
+            }
+            if (proxy.password) |value| {
+                try out.appendSlice(allocator, "    password: ");
+                try writeYamlQuotedString(&out, allocator, value);
+                try out.append(allocator, '\n');
+            }
+            if (proxy.cipher) |value| {
+                try out.appendSlice(allocator, "    cipher: ");
+                try writeYamlQuotedString(&out, allocator, value);
+                try out.append(allocator, '\n');
+            }
+            if (proxy.uuid) |value| {
+                try out.appendSlice(allocator, "    uuid: ");
+                try writeYamlQuotedString(&out, allocator, value);
+                try out.append(allocator, '\n');
+            }
+            if (proxy.alter_id != 0) try out.print(allocator, "    alterId: {d}\n", .{proxy.alter_id});
+            if (proxy.tls) try out.appendSlice(allocator, "    tls: true\n");
+            if (proxy.skip_cert_verify) try out.appendSlice(allocator, "    skip-cert-verify: true\n");
+            if (proxy.udp) try out.appendSlice(allocator, "    udp: true\n");
+            if (proxy.sni) |value| {
+                try out.appendSlice(allocator, "    sni: ");
+                try writeYamlQuotedString(&out, allocator, value);
+                try out.append(allocator, '\n');
+            }
+            if (proxy.ws or proxy.ws_path != null or proxy.ws_host != null) {
+                if (proxy.ws_path == null and proxy.ws_host == null) {
+                    try out.appendSlice(allocator, "    ws-opts: {}\n");
+                } else {
+                    try out.appendSlice(allocator, "    ws-opts:\n");
+                }
+                if (proxy.ws_path) |value| {
+                    try out.appendSlice(allocator, "      path: ");
+                    try writeYamlQuotedString(&out, allocator, value);
+                    try out.append(allocator, '\n');
+                }
+                if (proxy.ws_host) |value| {
+                    try out.appendSlice(allocator, "      headers:\n        Host: ");
+                    try writeYamlQuotedString(&out, allocator, value);
+                    try out.append(allocator, '\n');
+                }
+            }
+            if (proxy.plugin) |value| {
+                try out.appendSlice(allocator, "    plugin: ");
+                try writeYamlQuotedString(&out, allocator, value);
+                try out.append(allocator, '\n');
+            }
+            if (proxy.obfs_mode != null or proxy.obfs_host != null) {
+                try out.appendSlice(allocator, "    plugin-opts:\n");
+                if (proxy.obfs_mode) |value| {
+                    try out.appendSlice(allocator, "      mode: ");
+                    try writeYamlQuotedString(&out, allocator, value);
+                    try out.append(allocator, '\n');
+                }
+                if (proxy.obfs_host) |value| {
+                    try out.appendSlice(allocator, "      host: ");
+                    try writeYamlQuotedString(&out, allocator, value);
+                    try out.append(allocator, '\n');
+                }
+            }
+        }
+    }
+
+    if (cfg.proxy_groups.items.len == 0) {
+        try out.appendSlice(allocator, "proxy-groups: []\n");
+    } else {
+        try out.appendSlice(allocator, "proxy-groups:\n");
+        for (cfg.proxy_groups.items) |group| {
+            try out.appendSlice(allocator, "  - name: ");
+            try writeYamlQuotedString(&out, allocator, group.name);
+            try out.append(allocator, '\n');
+            try out.appendSlice(allocator, "    type: ");
+            try writeYamlQuotedString(&out, allocator, proxyGroupTypeString(group.group_type));
+            try out.append(allocator, '\n');
+            if (group.proxies.items.len == 0) {
+                try out.appendSlice(allocator, "    proxies: []\n");
+            } else {
+                try out.appendSlice(allocator, "    proxies:\n");
+                for (group.proxies.items) |item| {
+                    try out.appendSlice(allocator, "      - ");
+                    try writeYamlQuotedString(&out, allocator, item);
+                    try out.append(allocator, '\n');
+                }
+            }
+            if (group.url) |url| {
+                try out.appendSlice(allocator, "    url: ");
+                try writeYamlQuotedString(&out, allocator, url);
+                try out.append(allocator, '\n');
+            }
+            try out.print(allocator, "    interval: {d}\n", .{group.interval});
+            try out.print(allocator, "    tolerance: {d}\n", .{group.tolerance});
+            try out.appendSlice(allocator, "    lazy: ");
+            try out.appendSlice(allocator, if (group.lazy) "true\n" else "false\n");
+        }
+    }
+
+    if (cfg.rules.items.len == 0) {
+        try out.appendSlice(allocator, "rules: []\n");
+    } else {
+        try out.appendSlice(allocator, "rules:\n");
+        for (cfg.rules.items) |rule| {
+            const text = try ruleToText(allocator, rule);
+            defer allocator.free(text);
+            try out.appendSlice(allocator, "  - ");
+            try writeYamlQuotedString(&out, allocator, text);
+            try out.append(allocator, '\n');
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -997,6 +1247,115 @@ test "dumpConfigJson emits parseable std.json with escaping and masked secrets" 
     try std.testing.expectEqualStrings("node \"HK\" 线路", proxy.get("name").?.string);
     try std.testing.expectEqualStrings("******", proxy.get("password").?.string);
     try std.testing.expectEqualStrings("MATCH,DIRECT", parsed.value.object.get("rules").?.array.items[0].string);
+}
+
+test "override materialization preserves runtime secrets in owner-only effective bytes" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\mixed-port: 7890
+        \\redir-port: 7892
+        \\tproxy-port: 7893
+        \\ipv6: false
+        \\external-ui: "/tmp/ui"
+        \\secret: "controller-secret"
+        \\rule-providers:
+        \\  "local rules":
+        \\    type: "file"
+        \\    behavior: "domain"
+        \\    path: "assets/rules.yaml"
+        \\proxies:
+        \\  - name: "node"
+        \\    type: "trojan"
+        \\    server: "example.com"
+        \\    port: 443
+        \\    password: "proxy-password"
+        \\    sni: "sni.example.com"
+        \\    udp: true
+        \\    ws-opts: {}
+        \\proxy-groups:
+        \\  - name: "Proxy"
+        \\    type: "select"
+        \\    proxies: ["node"]
+        \\rules:
+        \\  - "MATCH,Proxy"
+    ;
+    const patch = "mixed-port: 9000\nmode: global\n";
+    const effective = try materializeSource(allocator, source, patch);
+    defer allocator.free(effective);
+    try std.testing.expect(std.mem.indexOf(u8, effective, "******") == null);
+    try std.testing.expect(std.mem.indexOf(u8, effective, "controller-secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, effective, "proxy-password") != null);
+
+    var parsed = try config.parseDocument(allocator, effective);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 9000), parsed.mixed_port);
+    try std.testing.expectEqual(@as(u16, 7892), parsed.redir_port);
+    try std.testing.expectEqual(@as(u16, 7893), parsed.tproxy_port);
+    try std.testing.expect(!parsed.ipv6);
+    try std.testing.expectEqualStrings("global", parsed.mode);
+    try std.testing.expectEqualStrings("controller-secret", parsed.secret.?);
+    try std.testing.expectEqualStrings("proxy-password", parsed.proxies.items[0].password.?);
+    try std.testing.expect(parsed.proxies.items[0].udp);
+    try std.testing.expect(parsed.proxies.items[0].ws);
+    try std.testing.expectEqualStrings("local rules", parsed.rule_providers.items[0].name);
+    try std.testing.expectEqualStrings("assets/rules.yaml", parsed.rule_providers.items[0].path);
+}
+
+test "override materialization keeps original bytes for an empty patch and is deterministic" {
+    const allocator = std.testing.allocator;
+    const source = "mixed-port: 7890\n";
+    const unchanged = try materializeSource(allocator, source, " \r\n");
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings(source, unchanged);
+
+    const first = try materializeSource(allocator, source, "mixed-port: 9000\n");
+    defer allocator.free(first);
+    const second = try materializeSource(allocator, source, "mixed-port: 9000\n");
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
+}
+
+fn materializeAllocationFixture(allocator: std.mem.Allocator) !void {
+    const source =
+        \\mixed-port: 7890
+        \\secret: "secret"
+        \\proxies: []
+        \\proxy-groups: []
+        \\rules: []
+    ;
+    const effective = try materializeSource(allocator, source, "mixed-port: 9000\n");
+    allocator.free(effective);
+}
+
+test "override materialization releases every allocation failure path" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        materializeAllocationFixture,
+        .{},
+    );
+}
+
+test "override execution enforces the configured timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script = try tmp.dir.createFile(compat.io(), "slow.sh", .{});
+    try script.writeStreamingAll(compat.io(), "#!/bin/sh\nsleep 1\nprintf 'mixed-port: 9000\\n'\n");
+    try script.setPermissions(compat.io(), std.Io.File.Permissions.fromMode(0o700));
+    script.close(compat.io());
+    const script_path = try tmp.dir.realPathFileAlloc(compat.io(), "slow.sh", allocator);
+    defer allocator.free(script_path);
+
+    var cfg = try config.parseDocument(allocator, "mixed-port: 7890\n");
+    defer cfg.deinit();
+    var opts = CliOptions{ .script_path = try allocator.dupe(u8, script_path), .timeout_ms = 25 };
+    defer opts.deinit(allocator);
+    try std.testing.expectError(
+        Errors.OverrideScriptTimeout,
+        apply(allocator, &cfg, &opts, "test", null),
+    );
+    try std.testing.expectEqual(@as(u16, 7890), cfg.mixed_port);
 }
 
 test "override apply map supports scalar fields" {

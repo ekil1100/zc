@@ -34,6 +34,12 @@ pub const LocalAsset = struct {
     content: ContentIdentity,
 };
 
+pub const MemoryAsset = struct {
+    logical_path: []const u8,
+    canonical_relative_target: []const u8,
+    bytes: []const u8,
+};
+
 pub const RemoteProvider = struct {
     provider_name: []const u8,
     logical_path: []const u8,
@@ -91,7 +97,7 @@ pub const ConfigBundle = struct {
         source_path: []const u8,
         limits: CaptureLimits,
     ) !ConfigBundle {
-        return captureImpl(allocator, source_path, null, limits, null);
+        return captureImpl(allocator, std.Io.Dir.cwd(), source_path, false, null, limits, null);
     }
 
     /// Captures dependencies from a caller-provided, already-materialized config.
@@ -102,28 +108,253 @@ pub const ConfigBundle = struct {
         materialized_source: []const u8,
         limits: CaptureLimits,
     ) !ConfigBundle {
-        return captureImpl(allocator, source_path, materialized_source, limits, null);
+        return captureImpl(
+            allocator,
+            std.Io.Dir.cwd(),
+            source_path,
+            false,
+            materialized_source,
+            limits,
+            null,
+        );
+    }
+
+    /// Captures source bytes that have no trusted filesystem root, such as a
+    /// subscription response. Remote providers remain deferred; any local
+    /// provider is rejected instead of consulting ambient files.
+    pub fn captureMemory(
+        allocator: std.mem.Allocator,
+        source_bytes: []const u8,
+        materialized_source: ?[]const u8,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        return reconstructMemory(allocator, source_bytes, materialized_source, &.{}, limits);
+    }
+
+    /// Rebuilds a bundle exclusively from already-verified immutable records.
+    /// Only assets declared by the effective source are copied; missing assets
+    /// fail closed and extra records never leak into the new revision.
+    pub fn reconstructMemory(
+        allocator: std.mem.Allocator,
+        source_bytes: []const u8,
+        materialized_source: ?[]const u8,
+        available_assets: []const MemoryAsset,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        try limits.validate();
+        if (source_bytes.len > limits.max_source_bytes) return error.SourceTooLarge;
+        const source = try allocator.dupe(u8, source_bytes);
+        errdefer allocator.free(source);
+        var materialized: ?[]const u8 = null;
+        errdefer if (materialized) |bytes| allocator.free(bytes);
+        if (materialized_source) |bytes| {
+            if (bytes.len > limits.max_source_bytes) return error.MaterializedSourceTooLarge;
+            materialized = try allocator.dupe(u8, bytes);
+        }
+        var aggregate = try addToAggregate(0, source.len, limits.max_aggregate_bytes);
+        if (materialized) |bytes| aggregate = try addToAggregate(aggregate, bytes.len, limits.max_aggregate_bytes);
+        var parsed = try config_mod.parseDocument(allocator, materialized orelse source);
+        defer parsed.deinit();
+        var local_paths = std.ArrayList([]const u8).empty;
+        defer local_paths.deinit(allocator);
+        var seen_local = std.StringHashMap(void).init(allocator);
+        defer seen_local.deinit();
+        var remote_refs = std.ArrayList(ProviderRef).empty;
+        defer remote_refs.deinit(allocator);
+        for (parsed.rule_providers.items) |provider| {
+            if (provider.url == null) {
+                const gop = try seen_local.getOrPut(provider.path);
+                if (!gop.found_existing) try local_paths.append(allocator, provider.path);
+            } else try remote_refs.append(allocator, .{ .name = provider.name, .path = provider.path });
+        }
+        if (local_paths.items.len > limits.max_assets) return error.TooManyAssets;
+        std.mem.sort([]const u8, local_paths.items, {}, lessString);
+        std.mem.sort(ProviderRef, remote_refs.items, {}, lessProviderRef);
+        const assets = try allocator.alloc(CapturedAsset, local_paths.items.len);
+        var assets_initialized: usize = 0;
+        errdefer {
+            for (assets[0..assets_initialized]) |*asset| deinitAsset(allocator, asset);
+            allocator.free(assets);
+        }
+        for (local_paths.items, assets) |logical_path, *asset| {
+            var matched: ?MemoryAsset = null;
+            for (available_assets) |candidate| {
+                if (!std.mem.eql(u8, candidate.logical_path, logical_path)) continue;
+                if (matched != null) return error.DuplicateAssetRecord;
+                matched = candidate;
+            }
+            const input = matched orelse return error.AssetNotDeclared;
+            if (input.bytes.len > limits.max_asset_bytes) return error.AssetTooLarge;
+            aggregate = try addToAggregate(aggregate, input.bytes.len, limits.max_aggregate_bytes);
+            const logical_copy = try allocator.dupe(u8, input.logical_path);
+            errdefer allocator.free(logical_copy);
+            const target_copy = try allocator.dupe(u8, input.canonical_relative_target);
+            errdefer allocator.free(target_copy);
+            const bytes_copy = try allocator.dupe(u8, input.bytes);
+            asset.* = .{
+                .record = .{
+                    .logical_path = logical_copy,
+                    .canonical_relative_target = target_copy,
+                    .content = contentIdentity(bytes_copy),
+                },
+                .bytes = bytes_copy,
+                .initial_stat = undefined,
+            };
+            assets_initialized += 1;
+        }
+        const remotes = try allocator.alloc(RemoteProvider, remote_refs.items.len);
+        var remote_initialized: usize = 0;
+        errdefer {
+            for (remotes[0..remote_initialized]) |remote| {
+                allocator.free(remote.provider_name);
+                allocator.free(remote.logical_path);
+            }
+            allocator.free(remotes);
+        }
+        for (remote_refs.items, remotes) |provider, *remote| {
+            const name = try allocator.dupe(u8, provider.name);
+            errdefer allocator.free(name);
+            const path = try allocator.dupe(u8, provider.path);
+            remote.* = .{ .provider_name = name, .logical_path = path };
+            remote_initialized += 1;
+        }
+        const local_manifest = try allocator.alloc(LocalAsset, assets.len);
+        errdefer allocator.free(local_manifest);
+        for (assets, local_manifest) |asset, *record| record.* = asset.record;
+        return .{
+            .allocator = allocator,
+            .source_bytes = source,
+            .materialized_bytes = materialized,
+            .assets = assets,
+            .remote_providers = remotes,
+            .manifest_data = .{
+                .source = contentIdentity(source),
+                .materialized_source = if (materialized) |bytes| contentIdentity(bytes) else null,
+                .aggregate_bytes = aggregate,
+                .local_assets = local_manifest,
+                .remote_providers = remotes,
+            },
+        };
+    }
+
+    /// Captures a single-component source relative to a caller-held directory
+    /// descriptor. The descriptor is also the asset containment root, so no
+    /// source or dependency lookup can escape through a rebound pathname.
+    pub fn captureFromDir(
+        allocator: std.mem.Allocator,
+        source_dir: std.Io.Dir,
+        source_path: []const u8,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        return captureImpl(allocator, source_dir, source_path, true, null, limits, null);
+    }
+
+    pub fn readSourceFromDir(
+        allocator: std.mem.Allocator,
+        source_dir: std.Io.Dir,
+        source_path: []const u8,
+    ) ![]u8 {
+        if (!isSingleComponent(source_path)) return error.InvalidSourcePath;
+        const root = try dirCanonicalPathAlloc(allocator, source_dir);
+        defer allocator.free(root);
+        var source_capture = try openCapturedRegularFile(allocator, source_dir, source_path);
+        defer source_capture.deinit();
+        if (!isStrictDescendant(root, source_capture.canonical_path)) return error.PathOutsideSourceRoot;
+        const bytes = readCapturedFile(
+            allocator,
+            &source_capture,
+            CaptureLimits.defaults.max_source_bytes,
+        ) catch |err| switch (err) {
+            error.FileTooLarge => return error.SourceTooLarge,
+            else => return err,
+        };
+        errdefer allocator.free(bytes);
+
+        const root_after = try dirCanonicalPathAlloc(allocator, source_dir);
+        defer allocator.free(root_after);
+        if (!std.mem.eql(u8, root, root_after)) return error.SourceChanged;
+        var repeated = openCapturedRegularFile(allocator, source_dir, source_path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.SourceChanged,
+        };
+        defer repeated.deinit();
+        if (!std.mem.eql(u8, source_capture.canonical_path, repeated.canonical_path) or
+            !sameFileStat(source_capture.initial_stat, repeated.initial_stat))
+        {
+            return error.SourceChanged;
+        }
+        const repeated_bytes = readCapturedFile(
+            allocator,
+            &repeated,
+            CaptureLimits.defaults.max_source_bytes,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.SourceChanged,
+        };
+        defer allocator.free(repeated_bytes);
+        if (!std.mem.eql(u8, bytes, repeated_bytes)) return error.SourceChanged;
+        return bytes;
+    }
+
+    pub fn captureMaterializedFromDir(
+        allocator: std.mem.Allocator,
+        source_dir: std.Io.Dir,
+        source_path: []const u8,
+        materialized_source: []const u8,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        return captureImpl(
+            allocator,
+            source_dir,
+            source_path,
+            true,
+            materialized_source,
+            limits,
+            null,
+        );
     }
 
     fn captureImpl(
         allocator: std.mem.Allocator,
+        source_dir: std.Io.Dir,
         source_path: []const u8,
+        bind_source_dir_root: bool,
         materialized_source: ?[]const u8,
         limits: CaptureLimits,
         hook: ?CaptureHook,
     ) !ConfigBundle {
         try limits.validate();
-        var source_capture = try openCapturedRegularFile(allocator, std.Io.Dir.cwd(), source_path);
+        if (bind_source_dir_root and !isSingleComponent(source_path)) return error.InvalidSourcePath;
+        var source_capture = try openCapturedRegularFile(allocator, source_dir, source_path);
         defer source_capture.deinit();
-        const root_hint = compat.fs.path.dirname(source_capture.canonical_path) orelse
-            return error.InvalidSourcePath;
-        const root_dir = try compat.fs.openDirAbsolute(root_hint, .{ .follow_symlinks = false });
-        defer root_dir.close(compat.io());
+
+        var owned_root: ?std.Io.Dir = null;
+        defer if (owned_root) |dir| dir.close(compat.io());
+        const root_hint = if (bind_source_dir_root)
+            null
+        else
+            compat.fs.path.dirname(source_capture.canonical_path) orelse
+                return error.InvalidSourcePath;
+        const root_dir = if (bind_source_dir_root)
+            source_dir
+        else blk: {
+            owned_root = try compat.fs.openDirAbsolute(root_hint.?, .{ .follow_symlinks = false });
+            break :blk owned_root.?;
+        };
         const root = try dirCanonicalPathAlloc(allocator, root_dir);
         defer allocator.free(root);
-        if (!std.mem.eql(u8, root_hint, root)) return error.SourceChanged;
-        const source_basename = compat.fs.path.basename(source_capture.canonical_path);
-        var rooted_source = try openCapturedRegularFile(allocator, root_dir, source_basename);
+        if (bind_source_dir_root) {
+            if (!isStrictDescendant(root, source_capture.canonical_path)) {
+                return error.PathOutsideSourceRoot;
+            }
+        } else if (!std.mem.eql(u8, root_hint.?, root)) {
+            return error.SourceChanged;
+        }
+        const source_lookup = if (bind_source_dir_root)
+            source_path
+        else
+            compat.fs.path.basename(source_capture.canonical_path);
+        var rooted_source = try openCapturedRegularFile(allocator, root_dir, source_lookup);
         defer rooted_source.deinit();
         if (!std.mem.eql(u8, rooted_source.canonical_path, source_capture.canonical_path) or
             !sameFileStat(rooted_source.initial_stat, source_capture.initial_stat))
@@ -185,6 +416,9 @@ pub const ConfigBundle = struct {
         try assets.ensureTotalCapacity(allocator, local_paths.items.len);
 
         for (local_paths.items) |logical_path| {
+            if (bind_source_dir_root and compat.fs.path.isAbsolute(logical_path)) {
+                return error.AbsoluteAssetPathNotAllowed;
+            }
             const base_dir = if (compat.fs.path.isAbsolute(logical_path)) std.Io.Dir.cwd() else root_dir;
             var asset_capture = try openCapturedRegularFile(allocator, base_dir, logical_path);
             defer asset_capture.deinit();
@@ -230,7 +464,7 @@ pub const ConfigBundle = struct {
         defer allocator.free(root_after);
         if (!std.mem.eql(u8, root, root_after)) return error.SourceChanged;
 
-        var source_after_capture = openCapturedRegularFile(allocator, std.Io.Dir.cwd(), source_path) catch |err| switch (err) {
+        var source_after_capture = openCapturedRegularFile(allocator, source_dir, source_path) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.SourceChanged,
         };
@@ -371,6 +605,11 @@ fn lessProviderRef(_: void, left: ProviderRef, right: ProviderRef) bool {
     const name_order = std.mem.order(u8, left.name, right.name);
     if (name_order != .eq) return name_order == .lt;
     return std.mem.order(u8, left.path, right.path) == .lt;
+}
+
+fn isSingleComponent(path: []const u8) bool {
+    return path.len != 0 and !std.mem.eql(u8, path, ".") and !std.mem.eql(u8, path, "..") and
+        std.mem.indexOfAny(u8, path, "/\\") == null;
 }
 
 fn isStrictDescendant(root: []const u8, path: []const u8) bool {
@@ -558,7 +797,9 @@ test "capture rejects same-content asset replacement before final revalidation" 
     var context = Context{ .dir = tmp.dir };
     try testing.expectError(error.SourceChanged, ConfigBundle.captureImpl(
         testing.allocator,
+        std.Io.Dir.cwd(),
         resolved,
+        false,
         null,
         .{},
         .{ .context = &context, .run = Context.replace },

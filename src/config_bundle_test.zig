@@ -52,6 +52,172 @@ test "ConfigBundle preserves source bytes and enforces an inclusive source limit
     }));
 }
 
+test "ConfigBundle descriptor-relative capture ignores pathname rebinding" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "source", .default_dir);
+    try writeFile(tmp.dir, "source/config.yaml", "mixed-port: 7890\n");
+    const source_dir = try tmp.dir.openDir(compat.io(), "source", .{ .follow_symlinks = false });
+    defer source_dir.close(compat.io());
+
+    try tmp.dir.rename("source", tmp.dir, "moved", compat.io());
+    try tmp.dir.createDir(compat.io(), "source", .default_dir);
+    try writeFile(tmp.dir, "source/config.yaml", "mixed-port: 7891\n");
+
+    var bundle = try ConfigBundle.captureFromDir(allocator, source_dir, "config.yaml", .{});
+    defer bundle.deinit();
+    try testing.expectEqualStrings("mixed-port: 7890\n", bundle.sourceBytes());
+}
+
+test "ConfigBundle descriptor-relative capture rejects pathname escapes" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "source", .default_dir);
+    try writeFile(tmp.dir, "outside.yaml", "mixed-port: 7890\n");
+    tmp.dir.symLink(compat.io(), "../outside.yaml", "source/config.yaml", .{}) catch
+        return error.SkipZigTest;
+    const source_dir = try tmp.dir.openDir(compat.io(), "source", .{ .follow_symlinks = false });
+    defer source_dir.close(compat.io());
+    try testing.expectError(
+        error.PathOutsideSourceRoot,
+        ConfigBundle.captureFromDir(allocator, source_dir, "config.yaml", .{}),
+    );
+
+    const rules_path = try realPath(allocator, tmp.dir, "outside.yaml");
+    defer allocator.free(rules_path);
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: {s}\n",
+        .{rules_path},
+    );
+    defer allocator.free(source);
+    try writeFile(tmp.dir, "source/direct.yaml", source);
+    try testing.expectError(
+        error.AbsoluteAssetPathNotAllowed,
+        ConfigBundle.captureFromDir(allocator, source_dir, "direct.yaml", .{}),
+    );
+}
+
+test "ConfigBundle source-only descriptor read permits override to replace invalid dependencies" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "config.yaml", "rule-providers:\n  missing:\n    type: file\n    behavior: domain\n    path: absent.yaml\n");
+    const source = try ConfigBundle.readSourceFromDir(allocator, tmp.dir, "config.yaml");
+    defer allocator.free(source);
+    try testing.expect(std.mem.indexOf(u8, source, "absent.yaml") != null);
+
+    var bundle = try ConfigBundle.captureMaterializedFromDir(
+        allocator,
+        tmp.dir,
+        "config.yaml",
+        "mixed-port: 9000\n",
+        .{},
+    );
+    defer bundle.deinit();
+    try testing.expectEqualStrings(source, bundle.sourceBytes());
+    try testing.expectEqualStrings("mixed-port: 9000\n", bundle.effectiveSourceBytes());
+}
+
+test "ConfigBundle captures downloaded remote-only bytes without ambient filesystem fallback" {
+    const allocator = testing.allocator;
+    var bundle = try ConfigBundle.captureMemory(
+        allocator,
+        "mixed-port: 7890\nrule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: https://example.invalid/rules\n    path: missing.yaml\nrules:\n  - RULE-SET,remote,DIRECT\n",
+        null,
+        .{},
+    );
+    defer bundle.deinit();
+    try testing.expectEqual(@as(usize, 0), bundle.manifest().local_assets.len);
+    try testing.expectEqual(@as(usize, 1), bundle.manifest().remote_providers.len);
+    var loaded = try bundle.loadOffline(allocator);
+    defer loaded.deinit();
+    try testing.expect(loaded.validation.isValid());
+}
+
+test "ConfigBundle memory capture rejects ambient local asset lookup" {
+    try testing.expectError(error.AssetNotDeclared, ConfigBundle.captureMemory(
+        testing.allocator,
+        "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: ambient.yaml\nrules:\n  - RULE-SET,local,DIRECT\n",
+        null,
+        .{},
+    ));
+}
+
+test "ConfigBundle reconstructs exact local assets from immutable memory records" {
+    const assets = [_]bundle_mod.MemoryAsset{.{
+        .logical_path = "rules.yaml",
+        .canonical_relative_target = "rules.yaml",
+        .bytes = "payload:\n  - example.com\n",
+    }};
+    var bundle = try ConfigBundle.reconstructMemory(
+        testing.allocator,
+        "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: rules.yaml\nrules:\n  - RULE-SET,local,DIRECT\n",
+        null,
+        &assets,
+        .{},
+    );
+    defer bundle.deinit();
+    try testing.expectEqualStrings(assets[0].bytes, try bundle.resolveLocal("rules.yaml"));
+    var loaded = try bundle.loadOffline(testing.allocator);
+    defer loaded.deinit();
+    try testing.expectEqualStrings("example.com", loaded.config.rules.items[0].payload);
+}
+
+test "ConfigBundle reconstructed effective source cannot request an unavailable asset" {
+    try testing.expectError(error.AssetNotDeclared, ConfigBundle.reconstructMemory(
+        testing.allocator,
+        "mixed-port: 7890\n",
+        "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: new.yaml\n",
+        &.{},
+        .{},
+    ));
+}
+
+fn reconstructMemoryAllocationFixture(allocator: std.mem.Allocator) !void {
+    const assets = [_]bundle_mod.MemoryAsset{.{
+        .logical_path = "rules.yaml",
+        .canonical_relative_target = "rules.yaml",
+        .bytes = "payload:\n  - example.com\n",
+    }};
+    var bundle = try ConfigBundle.reconstructMemory(
+        allocator,
+        "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: rules.yaml\n",
+        null,
+        &assets,
+        .{},
+    );
+    bundle.deinit();
+}
+
+test "ConfigBundle memory reconstruction releases every allocation failure path" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        reconstructMemoryAllocationFixture,
+        .{},
+    );
+}
+
+fn captureMemoryAllocationFixture(allocator: std.mem.Allocator) !void {
+    var bundle = try ConfigBundle.captureMemory(
+        allocator,
+        "rule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: https://example.invalid/rules\n    path: remote.yaml\n",
+        null,
+        .{},
+    );
+    bundle.deinit();
+}
+
+test "ConfigBundle memory capture releases every allocation failure path" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        captureMemoryAllocationFixture,
+        .{},
+    );
+}
+
 test "ConfigBundle captures local providers and defers remote providers without file access" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});

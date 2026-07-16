@@ -1,6 +1,6 @@
 # proxy selection 可靠性与本地 config import 实施计划
 
-> 状态：In Progress（Batch 0-2 已完成；尚未接入生产路径）
+> 状态：In Progress（Batch 0-3 shadow 基础已完成；尚未接入生产路径）
 > 制定日期：2026-07-14
 > 基线提交：`70f8c30`
 > 工具链：Zig `0.16.0`
@@ -28,9 +28,11 @@
 | Batch 1 — transactional authority | Done | `b940f5d`, hardening `9492bbf`, `f06de95`, `f21fa8d` |
 | Batch 2 — strict managed parser / offline provider | Done | `d4e2d84` |
 | Batch 2 — ConfigBundle shadow capture / resolver | Done | `65337fc` |
-| Batch 3+ | Pending | 下一步：legacy migration 与 exact config identity |
+| Batch 3 — exact catalog / immutable revisions / legacy migration | Done (shadow) | `052610f`–`01646d1` |
+| Batch 4 — managed loader / tracked runtime identity | In Progress | shadow seams `041578b`–`ee690e7`；待生产接线 |
+| Batch 5 — managed writers through Authority | In Progress | typed mutation core `0684a88`, `90e21b7`；待 writer adapters |
 
-Batch 1 authority 尚未接入 `main/config/meta/daemon/manager/API` 生产路径。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
+Batch 1-5 内部模块尚未接入 `main/config/meta/daemon/manager/API` 生产路径。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
 
 - `70f8c30` + harness：`legacy_bounded_read` median `28,852 ns/op`，p95 `32,493 ns/op`；
 - `b940f5d`：legacy median `30,795 ns/op`，strict median `30,577 ns/op`；
@@ -46,7 +48,7 @@ zig version
 # 0.16.0
 
 zig build test --summary all
-# 573/574 tests passed (1 skipped)
+# 662/663 tests passed (1 skipped)
 
 zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded
@@ -460,7 +462,18 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 - mirror 是可重建导出物，不是第二提交点；
 - 首期禁止 GC。
 
-建议 commit：`feat(state): migrate managed bundles to exact revisions`
+完成证据（2026-07-15）：
+
+- exact identity / canonical schema 2 catalog：`8ee19ae`、`d906cac`、`5302257`；
+- descriptor-safe immutable `RevisionStore`、严格 reopen 与 override provenance：`052610f`、`be8fc37`、`fd1a738`；
+- legacy bootstrap、offline preflight、active exact head、desired generation 与 schema-1 proof：`ac6ac0d`；
+- override 单次 build 正常路径只执行一次并冻结 script / invocation / patch / effective source，revision reopen 不重执行：`5d65f7e`、`e84c74c`、`c44767c`；
+- v2 派生 legacy mirror、logical asset alias、collision fail-closed 与 bootstrap 后刷新：`232df13`、`01646d1`；
+- `zig build test --summary all`：629/630（1 skipped）；ReleaseFast 4/4；
+- 仍为 shadow-only：未接 `main/meta/daemon/manager/API` 生产 caller，未改变当前 CLI/API 契约；首期仍不做 revision GC；
+- 生产 cutover 前仍需让 writer 共享迁移锁，并决定 pre-commit crash 后 override 外部副作用的 journal / operator-retry 策略；当前保证的是 v2 可见状态只为完整旧/新、已发布 revision reopen 不重执行脚本。
+
+实际 commits 采用可回滚小步拆分，而非单一建议 commit。
 
 回滚：停止 daemon、取得全局锁、从 v2 导出并校验 legacy mirror，再停用 v2 reader；旧文件与 revisions 保留。
 
@@ -482,10 +495,14 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 - 新增 daemon-owned runtime descriptor；
 - `external-controller` 继续服务 minimal API，但不再承担 CLI discovery。
 
-建议拆成两个 commit：
+当前证据（2026-07-15，shadow seam）：
 
-1. `refactor(config): load exact managed bundle identities`
-2. `feat(daemon): publish tracked runtime identity`
+- exact managed head/active/older-revision loader、manifest-only local asset resolution、explicit unmanaged capture 且不回退 active：`041578b`、`05aa759`、`647c8f5`；
+- canonical `daemon.json` 模型包含 pid / nonce / actual endpoint / exact identity / generation，支持 nonce-CAS publish/remove、owner-only 权限、atomic replace、strict read 与 read-only observation：`4391639`、`ee690e7`；
+- OOM、stale daemon、symlink/noncanonical descriptor、同 key 不同 revision、local asset 与无写权限 discovery 测试已纳入全量 suite；
+- 仍待完成：daemon 启动固定 exact identity 并在实际 controller bind 后发布 descriptor，CLI discovery/handshake 改读 descriptor，启动开放 listener 前执行 generation reconcile。
+
+实际 commits 按 loader、identity 与 descriptor/fix 小步拆分。
 
 回滚：descriptor reader 可独立关闭；回滚 managed reader 前先执行并校验 legacy export。
 
@@ -514,6 +531,18 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 1. `refactor(config): route catalog and use through authority`
 2. `refactor(config): publish download and update as bundles`
 3. `refactor(config): revision override and delete mutations`
+
+当前证据（2026-07-15，typed mutation core）：
+
+- `StateAuthority.mutateCatalog` 在同一锁/atomic replace 下支持 exact profile publish、active、delete 与 desired generation CAS：`0684a88`；
+- revision head 在提交前必须通过 immutable `openVerified`；profile publication 显式选择 desired preserve/clear/replace 与 activate，active head 自动推进：`90e21b7`；
+- `CatalogService` 统一协调 immutable publish → authority commit → derived mirror refresh；state 已可见后的 parent-sync/mirror 错误作为 receipt 事实返回，不伪装成回滚：`b81227c`；
+- exact list/activate/delete command adapter 提供有界 CAS retry、immutable display metadata 与 derived mirror receipt：`ad4ce7f`；
+- downloaded source 可从内存构建 remote-only bundle，local provider 不会回退读取 ambient filesystem，为 download/update writer 提供安全输入 seam：`1c2eb78`；
+- downloaded create/update 已发布 exact revisions：首个 create 原子 active、update 保留 metadata、过滤失效 desired selections、active exact head 自动推进：`aabd81e`；
+- immutable `RevisionView` records 可无 filesystem fallback 重建新 bundle；override set/replace/clear 均创建 revision，update 对 frozen script 只执行一次并保留 script/invocation/patch/effective-source provenance：`cdf7497`、`62d8a1e`、single-execution 证据 `f2eb2b4`；
+- stale token、unpublished/corrupt head、identity/generation conflict、invalid desired、OOM、mirror collision 与所有 replace fault boundary 均 fail closed；
+- 尚未接现有 `list/use/download/update/delete/override` writer；在全部 writer 同批切换前不得让生产路径 bootstrap schema 2，避免 legacy writer 与 authority split-brain。
 
 门禁：
 
