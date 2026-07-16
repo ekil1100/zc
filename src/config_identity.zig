@@ -20,6 +20,15 @@ pub const Revision = struct {
     }
 };
 
+pub fn legacyRevision(key: []const u8) Revision {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("zc.legacy-key.v1");
+    hashLength(&hasher, key.len);
+    hasher.update(key);
+    const digest = hasher.finalResult();
+    return .{ .bytes = digest[0..16].* };
+}
+
 pub const ManagedIdentity = struct {
     key: []const u8,
     revision: Revision,
@@ -81,6 +90,8 @@ test "config identity uses canonical exact-byte encodings" {
         error.InvalidRevision,
         Revision.parseHex("00112233445566778899AABBCCDDEEFF"),
     );
+
+    try testing.expect(!legacyRevision("home").eql(legacyRevision("Home")));
 
     const storage_id = StorageId.derive("home");
     var storage_hex: [64]u8 = undefined;

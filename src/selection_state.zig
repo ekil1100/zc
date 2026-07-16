@@ -59,7 +59,7 @@ pub fn persistDefault(
     if (!metadata.configs.contains(key)) return error.ManagedProfileNotFound;
     try meta.setSelection(allocator, &metadata, key, group, proxy);
     try meta.save(allocator, &metadata);
-    return .{};
+    return .{ .identity = .{ .key = key, .revision = config_identity.legacyRevision(key) } };
 }
 
 pub fn loadDesiredDefault(
@@ -128,7 +128,10 @@ pub fn observeDefault(
             .identity = .{ .key = key, .revision = profile.head },
             .generation = profile.desired.generation,
         } else error.ManagedProfileNotFound,
-        .missing, .legacy_v1 => .{},
+        .missing, .legacy_v1 => .{
+            .identity = .{ .key = key, .revision = config_identity.legacyRevision(key) },
+            .generation = 0,
+        },
     };
 }
 
