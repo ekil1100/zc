@@ -16,7 +16,7 @@ zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当
 6. 增加经过验证、仅 CLI 可用的本地 config import；
 7. 通过最终 smoke gate 后再标记 `v1.0.0`。
 
-公开 v1.0 roadmap 见 [`roadmap/v1.0.md`](roadmap/v1.0.md)。该工作已进入内部基础实施阶段，但可靠持久选择与 `config import` 的用户可见命令仍**尚未实现**；当前命令契约仍以 [`cli/spec.md`](cli/spec.md) 为准。
+公开 v1.0 roadmap 见 [`roadmap/v1.0.md`](roadmap/v1.0.md)。可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)。
 
 ## v1.0 documentation map
 

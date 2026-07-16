@@ -100,9 +100,16 @@ pub fn build(b: *std.Build) void {
     run_exe_unit_tests.step.dependOn(&prepare_test_home.step);
     run_exe_unit_tests.setEnvironmentVariable("HOME", b.pathFromRoot(".zig-cache/zc-test-home"));
     run_exe_unit_tests.setEnvironmentVariable("XDG_RUNTIME_DIR", b.pathFromRoot(".zig-cache/zc-test-run"));
-    const test_step = b.step("test", "Run unit and StateAuthority process tests");
+    const config_flow_cmd = b.addSystemCommand(&.{
+        "bash",
+        b.pathFromRoot("scripts/test-config-load-selection.sh"),
+    });
+    config_flow_cmd.addArtifactArg(exe);
+
+    const test_step = b.step("test", "Run unit, process, and CLI flow tests");
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(&authority_process_cmd.step);
+    test_step.dependOn(&config_flow_cmd.step);
 
     // Fuzz test
     const fuzz_mod = b.createModule(.{

@@ -228,7 +228,7 @@ pub const ApiServer = struct {
         }
 
         std.debug.print("[API] Switch proxy: group={s}, proxy={s}\n", .{ group_name, proxy_name });
-        self.manager.selectProxy(group_name, proxy_name);
+        self.manager.applyPersistedSelection(group_name, proxy_name);
 
         // 响应体经 std.json 序列化（名称真实转义，禁止手拼 JSON）。
         var resp: std.Io.Writer.Allocating = .init(self.allocator);

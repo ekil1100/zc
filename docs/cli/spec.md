@@ -46,6 +46,7 @@ group help on stdout, exit 0. Every subcommand accepts `help`, `--help`, or
 
 | Command | Notes |
 | --- | --- |
+| `zc config load <path> [--json]` | Validates and imports a local YAML plus its root-contained local provider assets into an immutable revision, makes it active, and never applies it to an already-running daemon (`data.applied:false`). Duplicate exact basename keys fail closed. |
 | `zc config list [--json]` | Alias `zc config ls`. Lists configs + active one (`data.configs`, `data.active`). |
 | `zc config download <url> [-n <name>] [-d] [--json]` | `-d` sets the downloaded config as default. Missing `<url>` ⇒ `CONFIG_DOWNLOAD_URL_REQUIRED`, exit 2. |
 | `zc config update [name] [--apply auto\|hot\|restart] [--json]` | Re-downloads a previously downloaded config; applies to a running daemon per `--apply`（默认 auto）。JSON 单 envelope：`data.applied` / `data.apply_result`。 |
@@ -63,7 +64,7 @@ codes carry the family prefix (`PROXY_…` / `PROFILE_…`).
 | Command | Notes |
 | --- | --- |
 | `zc proxy list [-c <config>] [--json]` | Alias `zc proxy ls`. Groups + members + current selection（`data.groups[].now`），all names escaped via `std.json`。 |
-| `zc proxy select [-g <group>] [-p <proxy>] [-c <config>] [--json]` | `-g` 只匹配 select 类型组（命中非 select 组 ⇒ `PROXY_GROUP_NOT_SELECTABLE`）。With `-p`: applies the selection and notifies a running daemon（`data.applied` 反映是否真的通知到 daemon）。Interactive picker only when stdin is a TTY; non-TTY without `-p` ⇒ `PROXY_SELECT_NOT_INTERACTIVE`, exit 2（绝不静默选第一个节点）。JSON without `-p`: read-only listing of `data.choices`. Picker cancel (q/Esc) ⇒ no output, exit 0. |
+| `zc proxy select [-g <group>] [-p <proxy>] [-c <config>] [--json]` | `-g` 只匹配 select 类型组（命中非 select 组 ⇒ `PROXY_GROUP_NOT_SELECTABLE`）。With `-p`: first commits the desired selection and increments its generation, then applies only to a daemon running the exact same config revision. Offline/mismatched daemon keeps `data.applied:false` but the selection is restored before listeners open on the next start. Interactive picker only when stdin is a TTY; non-TTY without `-p` ⇒ `PROXY_SELECT_NOT_INTERACTIVE`, exit 2。JSON without `-p` is read-only. |
 | `zc proxy test [-c <config>] [--port <port>] [--json]` | Same probe path and `CHECKS_FAILED` semantics as `zc test`. |
 | `zc profile list / select / test` | Same as the `proxy` equivalents. |
 

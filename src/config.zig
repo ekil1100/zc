@@ -213,6 +213,15 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     return try parse(allocator, content);
 }
 
+/// Loads one strict managed YAML document from disk.
+pub fn loadDocument(allocator: std.mem.Allocator, path: []const u8) !Config {
+    const file = try compat.fs.cwd().openFile(path, .{});
+    defer file.close(compat.io());
+    const content = try compat.fileReadToEndAlloc(file, allocator, 16 * 1024 * 1024);
+    defer allocator.free(content);
+    return parseDocument(allocator, content);
+}
+
 /// 从 YAML 字符串解析配置
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
     var root = try yaml.parse(allocator, content);
@@ -968,6 +977,19 @@ pub fn loadDefault(allocator: std.mem.Allocator) !Config {
 /// 默认配置静默加载，用于已经有结构化输出契约的命令路径
 pub fn loadDefaultQuiet(allocator: std.mem.Allocator) !Config {
     return try loadDefaultWithLogging(allocator, false);
+}
+
+pub fn loadDefaultManaged(allocator: std.mem.Allocator, log_selection: bool) !Config {
+    if (try getDefaultConfigPath(allocator)) |path| {
+        defer allocator.free(path);
+        if (log_selection) std.debug.print("Loading config from: {s}\n", .{path});
+        if (try inferConfigKeyFromPath(allocator, path)) |key| {
+            allocator.free(key);
+            return loadDocument(allocator, path);
+        }
+        return load(allocator, path);
+    }
+    return loadDefaultWithLogging(allocator, log_selection);
 }
 
 fn loadDefaultWithLogging(allocator: std.mem.Allocator, log_selection: bool) !Config {
@@ -2048,7 +2070,7 @@ fn isManagedOverrideScriptPath(
     return isPathWithinDir(resolved_script, resolved_overrides);
 }
 
-fn inferConfigKeyFromPath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+pub fn inferConfigKeyFromPath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
     const configs_dir = try meta.getConfigsDir(allocator) orelse return null;
     defer allocator.free(configs_dir);
 

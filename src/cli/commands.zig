@@ -120,6 +120,13 @@ pub const table = [_]Command{
         .summary = "Print zc version",
     },
     .{
+        .path = "config load",
+        .args = "<path>",
+        .summary = "Import a local config bundle and make it active",
+        .flags = &.{json_flag},
+        .examples = &.{ "zc config load ./config.yaml", "zc config load ./config.yaml --json" },
+    },
+    .{
         .path = "config list",
         .aliases = &.{"config ls"},
         .summary = "List all available configs",
@@ -386,6 +393,7 @@ test "find resolves canonical paths and aliases" {
     try testing.expectEqualStrings("start", find("up").?.path);
     try testing.expectEqualStrings("stop", find("down").?.path);
     try testing.expectEqualStrings("config list", find("config ls").?.path);
+    try testing.expectEqualStrings("config load", find("config load").?.path);
     try testing.expect(find("nope") == null);
 }
 

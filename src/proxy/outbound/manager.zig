@@ -376,6 +376,11 @@ pub const OutboundManager = struct {
         self.selectProxyInternal(group_name, proxy_name, true);
     }
 
+    /// Applies a selection already committed by the CLI authority path.
+    pub fn applyPersistedSelection(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8) void {
+        self.selectProxyInternal(group_name, proxy_name, false);
+    }
+
     /// daemon 实际加载的配置 key（启动时设定）。status 经 IPC 读取此值而非
     /// 用户指针 getCurrentConfigName，避免配置切换未重启 daemon 时的错位。
     pub fn configKey(self: *const OutboundManager) ?[]const u8 {

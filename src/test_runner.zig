@@ -12,6 +12,7 @@ test "include zc test modules" {
     _ = @import("config_test.zig");
     _ = @import("config_bundle_test.zig");
     _ = @import("config_catalog_test.zig");
+    _ = @import("config_import_test.zig");
     _ = @import("config.zig");
     _ = @import("config_validator.zig");
     _ = @import("daemon.zig");
@@ -29,6 +30,7 @@ test "include zc test modules" {
     _ = @import("perf_stats.zig");
     _ = @import("runtime_selection.zig");
     _ = @import("runtime_descriptor_test.zig");
+    _ = @import("selection_state_test.zig");
     _ = @import("revision_store_test.zig");
     _ = @import("socket_options.zig");
     _ = @import("state_authority.zig");

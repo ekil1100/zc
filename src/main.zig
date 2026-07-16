@@ -1,6 +1,8 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
+const config_import = @import("config_import.zig");
+const config_identity = @import("config_identity.zig");
 const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
 const http_proxy = @import("proxy/http.zig");
@@ -13,6 +15,8 @@ const api = @import("api/server.zig");
 const daemon = @import("daemon.zig");
 const proxy_cli = @import("proxy_cli.zig");
 const runtime_selection = @import("runtime_selection.zig");
+const runtime_descriptor = @import("runtime_descriptor.zig");
+const selection_state = @import("selection_state.zig");
 const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
 const override = @import("override.zig");
@@ -824,6 +828,47 @@ fn runConfigCommand(
     }
     const subcmd = args[2];
 
+    if (std.mem.eql(u8, subcmd, "load")) {
+        if (containsHelpArg(args, 3)) {
+            try printConfigLoadHelp();
+            return;
+        }
+        if (args.len < 4 or args[3].len == 0 or args[3][0] == '-') {
+            printCliError(json_output, "CONFIG_LOAD_PATH_REQUIRED", "missing <path> for config load", "use `zc config load <path>`");
+            std.process.exit(cli_output.exit_usage);
+        }
+        if (hasUnexpectedArgs(args, 4)) {
+            printCliError(json_output, "CONFIG_LOAD_ARGUMENT_INVALID", "unknown or unexpected argument for `config load`", "use `zc config load <path>`");
+            std.process.exit(cli_output.exit_usage);
+        }
+        var receipt = config_import.loadDefault(allocator, args[3]) catch |err| {
+            switch (err) {
+                error.ManagedProfileAlreadyExists => printCliError(json_output, "CONFIG_ALREADY_EXISTS", "a config with this name already exists", "rename the file or delete the existing config first"),
+                error.InvalidConfig, error.InvalidConfigKey => printCliError(json_output, "CONFIG_LOAD_INVALID", "local config is invalid", "fix the config and retry"),
+                else => printCliError(json_output, "CONFIG_LOAD_FAILED", "failed to load local config", "check the path, local dependencies, and file permissions"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer receipt.deinit(allocator);
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        if (json_output) {
+            var revision_hex: [32]u8 = undefined;
+            out.success(.{
+                .action = "config_load",
+                .name = receipt.key,
+                .revision = receipt.revision.formatHex(&revision_hex),
+                .active = receipt.active,
+                .applied = false,
+            }) catch {};
+        } else {
+            out.print("Loaded local config: {s}\n", .{receipt.key}) catch {};
+            out.print("Config is active; run `zc reload` or `zc restart` to apply it\n", .{}) catch {};
+            out.flush() catch {};
+        }
+        return;
+    }
+
     if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
         if (containsHelpArg(args, 3)) {
             try printConfigListHelp();
@@ -1416,7 +1461,15 @@ fn runProxyFamilyCommand(
             // 非交互路径：两种模式同语义 —— 只在 select 组里解析、应用、
             // 通知 daemon（修复 JSON 模式 state:"selected" 假成功的无操作）。
             const group = proxy_cli.resolveSelectGroup(&cfg, parsed.group) catch |err| exitProxySelectError(json_output, err, text);
-            const applied = proxy_cli.applySelection(allocator, &cfg, group, proxy_name, &out) catch |err| exitProxySelectError(json_output, err, text);
+            const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
+            defer if (config_key) |key| allocator.free(key);
+            var persisted_identity: ?config_identity.ManagedIdentity = null;
+            if (config_key) |key| {
+                const receipt = selection_state.persistDefault(allocator, key, group.name, proxy_name) catch |err|
+                    exitProxySelectError(json_output, err, text);
+                persisted_identity = receipt.identity;
+            }
+            const applied = proxy_cli.applySelection(allocator, &cfg, group, proxy_name, persisted_identity, &out) catch |err| exitProxySelectError(json_output, err, text);
             if (json_output) {
                 // data.applied 反映是否真的通知到了运行中的 daemon（工作项 7）。
                 out.success(.{ .action = "proxy_select", .group = group.name, .proxy = proxy_name, .state = "selected", .applied = applied }) catch {};
@@ -1441,7 +1494,13 @@ fn runProxyFamilyCommand(
 
         const picked = proxy_cli.selectProxyInteractive(allocator, &cfg, parsed.group, selections, &out) catch |err| exitProxySelectError(json_output, err, text);
         if (picked) |selection| {
-            _ = proxy_cli.applySelection(allocator, &cfg, selection.group, selection.proxy, &out) catch |err| exitProxySelectError(json_output, err, text);
+            var persisted_identity: ?config_identity.ManagedIdentity = null;
+            if (config_key) |key| {
+                const receipt = selection_state.persistDefault(allocator, key, selection.group.name, selection.proxy) catch |err|
+                    exitProxySelectError(json_output, err, text);
+                persisted_identity = receipt.identity;
+            }
+            _ = proxy_cli.applySelection(allocator, &cfg, selection.group, selection.proxy, persisted_identity, &out) catch |err| exitProxySelectError(json_output, err, text);
         }
         // picker 取消（q/Esc）：无输出，exit 0。
         return;
@@ -1677,8 +1736,20 @@ fn runProxy(
     var manager = try outbound.OutboundManager.initWithKey(allocator, &cfg, config_key);
     defer manager.deinit();
 
-    // 从 meta.json 恢复持久化的节点选择
-    manager.loadPersistedSelections();
+    // Authority desired state is restored before any listener opens. Legacy
+    // meta.json remains a fallback until every existing profile is migrated.
+    var desired_snapshot: ?selection_state.DesiredSnapshot = if (config_key) |key|
+        try selection_state.loadDesiredDefault(allocator, key)
+    else
+        null;
+    defer if (desired_snapshot) |*snapshot| snapshot.deinit();
+    if (desired_snapshot) |snapshot| {
+        for (snapshot.selections) |selection| {
+            manager.applyPersistedSelection(selection.group, selection.proxy);
+        }
+    } else {
+        manager.loadPersistedSelections();
+    }
 
     // Initialize rule engine
     var engine = try rule_engine.Engine.init(allocator, &cfg.rules);
@@ -1694,6 +1765,7 @@ fn runProxy(
         const api_thread = try std.Thread.spawn(.{}, apiThreadFn, .{ allocator, &cfg, &engine, &manager, port });
         api_thread.detach();
     }
+    try publishRuntimeDescriptor(allocator, config_key, cfg.external_controller);
 
     std.debug.print("Configuration loaded:\n", .{});
     std.debug.print("  Port: {}\n", .{cfg.port});
@@ -1706,6 +1778,40 @@ fn runProxy(
 
     while (true) {
         compat.sleepNs(1 * std.time.ns_per_s);
+    }
+}
+
+fn publishRuntimeDescriptor(
+    allocator: std.mem.Allocator,
+    config_key: ?[]const u8,
+    endpoint: ?[]const u8,
+) !void {
+    var default_store = (try runtime_descriptor.openDefault(allocator, true)) orelse
+        return error.RuntimeDirectoryUnavailable;
+    defer default_store.deinit();
+    const store = default_store.store();
+    var existing = try store.observe();
+    defer if (existing) |*value| value.deinit();
+    const expected: runtime_descriptor.Expected = if (existing) |value|
+        .{ .nonce = value.nonce }
+    else
+        .missing;
+    const nonce = runtime_descriptor.Nonce.generate();
+    const observed_identity = if (config_key) |key|
+        try selection_state.observeDefault(allocator, key)
+    else
+        selection_state.Receipt{};
+    const actual_endpoint = endpoint orelse "unavailable";
+    const outcome = try store.publish(expected, .{
+        .pid = @intCast(std.c.getpid()),
+        .nonce = nonce,
+        .endpoint = actual_endpoint,
+        .identity = observed_identity.identity,
+        .generation = observed_identity.generation orelse 0,
+    });
+    switch (outcome) {
+        .committed, .durability_uncertain => {},
+        .conflict => return error.RuntimeDescriptorConflict,
     }
 }
 
@@ -1962,12 +2068,13 @@ fn loadRuntimeConfig(
     command_name: []const u8,
     prepare_runtime_artifacts: bool,
 ) !config.Config {
-    var cfg = if (config_path) |path|
-        try config.load(allocator, path)
-    else if (commandUsesQuietDefaultConfig(command_name))
-        try config.loadDefaultQuiet(allocator)
-    else
-        try config.loadDefault(allocator);
+    var cfg = if (config_path) |path| blk: {
+        if (try config.inferConfigKeyFromPath(allocator, path)) |managed_key| {
+            allocator.free(managed_key);
+            break :blk try config.loadDocument(allocator, path);
+        }
+        break :blk try config.load(allocator, path);
+    } else try config.loadDefaultManaged(allocator, !commandUsesQuietDefaultConfig(command_name));
     errdefer cfg.deinit();
 
     // 默认统一走 mixed-port，必要时允许 `zc start --port <n>` 覆盖本次 daemon 端口。
@@ -2248,6 +2355,10 @@ fn printConfigHelp() !void {
 
 fn printDiagHelp() !void {
     _ = try printTopicHelpStdout(&.{"diag"});
+}
+
+fn printConfigLoadHelp() !void {
+    _ = try printTopicHelpStdout(&.{ "config", "load" });
 }
 
 fn printConfigListHelp() !void {

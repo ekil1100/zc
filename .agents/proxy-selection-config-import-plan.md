@@ -1,6 +1,7 @@
 # proxy selection 可靠性与本地 config import 实施计划
 
-> 状态：In Progress（Batch 0-3 shadow 基础已完成；尚未接入生产路径）
+> 状态：In Progress（durable `proxy select` 与 `config load <path>` 已接生产路径；其余 writer cutover 未完成）
+> 2026-07-15 用户最终命名覆盖原计划：公开命令为 `zc config load <path>`，导入成功后设为 active；下文尚存的 `config import` 是早期设计记录。
 > 制定日期：2026-07-14
 > 基线提交：`70f8c30`
 > 工具链：Zig `0.16.0`
@@ -11,7 +12,7 @@
 本计划同时解决两个用户问题：
 
 1. `proxy select` 选择后没有真正生效，且修复后反复回归；
-2. 新增 `zc config import <path>`，把本地 Clash/mihomo 配置安全导入 zc 托管配置库。
+2. 新增 `zc config load <path>`，把本地 Clash/mihomo 配置及 root-contained assets 安全导入 zc 托管配置库并设为 active。
 
 两项工作共用一个前提：配置必须有稳定、可验证的 identity，持久状态和 runtime 状态不能再由 CLI、daemon、`meta.json` 分别解释。
 
@@ -30,9 +31,9 @@
 | Batch 2 — ConfigBundle shadow capture / resolver | Done | `65337fc` |
 | Batch 3 — exact catalog / immutable revisions / legacy migration | Done (shadow) | `052610f`–`01646d1` |
 | Batch 4 — managed loader / tracked runtime identity | In Progress | shadow seams `041578b`–`ee690e7`；待生产接线 |
-| Batch 5 — managed writers through Authority | In Progress | typed mutation core `0684a88`, `90e21b7`；待 writer adapters |
+| Batch 5 — managed writers through Authority | In Progress | durable selection/load production path complete；其余 writer adapters 待切换 |
 
-Batch 1-5 内部模块尚未接入 `main/config/meta/daemon/manager/API` 生产路径。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
+Durable selection、daemon startup restore、exact runtime descriptor 与 local config load 已接入生产路径；其余 legacy writer 尚未统一切换。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
 
 - `70f8c30` + harness：`legacy_bounded_read` median `28,852 ns/op`，p95 `32,493 ns/op`；
 - `b940f5d`：legacy median `30,795 ns/op`，strict median `30,577 ns/op`；
@@ -48,7 +49,7 @@ zig version
 # 0.16.0
 
 zig build test --summary all
-# 662/663 tests passed (1 skipped)
+# 664/665 tests passed (1 skipped)
 
 zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded

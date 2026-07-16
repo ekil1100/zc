@@ -15,7 +15,7 @@
 2. ~~**CLI `test --json` 不生效**~~（已解决：全 CLI 输出契约对齐落地，`test --json` 走统一 envelope + `CHECKS_FAILED` 语义，见 `docs/cli/spec.md`）。
 3. **API v1 仍是最小 REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
-5. **代理选择仍存在多状态源与回归风险**：CLI、daemon 内存和 `meta.json` 可能分裂；持久化错误可被吞掉，外部 `-c`/controller identity 也可能错位。当前还没有本地配置进入托管库的 `config import`。
+5. **代理选择与本地 load 主路径已接 Authority**：CLI durable-first、daemon 启动恢复 desired state，并通过 exact revision runtime descriptor 发现实际 controller endpoint；其余 legacy config writer 仍需统一 cutover，避免后续命令重建 mirror 时形成状态漂移。
 
 因此，v1.0 roadmap 现在应聚焦：**关闭 HTTP/SOCKS5 outbound 策略 P0，并完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import，再做最终 smoke gate 和 GA tag 判断。**
 
@@ -40,7 +40,7 @@ cat build.zig.zon
 
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 662/663 tests passed (1 skipped)
+# 664/665 tests passed (1 skipped)
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded
@@ -455,14 +455,14 @@ docs/
 
 ### P0-6：revisioned config identity、可靠代理选择与本地 config import
 
-状态：**In Progress；Batch 0-3 shadow 基础已完成，用户可见能力尚未实现**。
+状态：**In Progress；用户要求的 durable `proxy select` 与 `config load <path>` 已实现，其余 writer/API cutover 尚未完成**。
 
 目标：
 
 - durable desired selection 成为唯一权威状态，daemon runtime 通过 generation 对账；
 - 配置 identity 从不稳定的 key/path 推导升级为 `managed key + revision`；
 - `proxy select` 明确区分 persisted、runtime applied 和连接关闭结果；
-- 新增 CLI-only `zc config import <path>`，把本地完整配置及 source root 内依赖复制为托管 immutable bundle；
+- 新增 CLI-only `zc config load <path>`，把本地完整配置及 source root 内依赖复制为托管 immutable bundle 并设为 active；
 - 所有 transport 接入 owner-safe flow tracking 后，才开放显式 `--close-connections`；
 - 不新增 TUI、配置上传 API、`profile import` 或隐式 reload/restart。
 
@@ -478,8 +478,8 @@ docs/
 - Batch 3 exact catalog / immutable RevisionStore / legacy bootstrap / frozen override / derived mirror：`052610f`–`01646d1`；
 - Batch 4 shadow exact loader / tracked runtime descriptor seams：`041578b`–`ee690e7`；
 - Batch 5 typed mutation、catalog coordinator/commands、downloaded writer 与 revisioned override writer：`0684a88`、`90e21b7`、`b81227c`、`ad4ce7f`、`1c2eb78`、`aabd81e`、`cdf7497`、`62d8a1e`、`f2eb2b4`；
-- 662/663 tests passed（1 skipped），ReleaseFast 4/4；
-- authority、immutable reader/writer 与 runtime descriptor 仍尚未接入 `main/meta/daemon/manager/API` 生产 caller；下一步先让全部 managed writer 通过 Authority，再完成 Batch 4 daemon identity/discovery 生产接线，避免 partial cutover split-brain。
+- 664/665 tests passed（1 skipped），ReleaseFast 4/4；
+- `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与 `config load`；下一步让其余 managed writer 全部通过 Authority，消除 legacy mirror 写入。
 
 关键验收：
 
@@ -666,7 +666,7 @@ git push origin v1.0.0
 按风险排序：
 
 1. **决定 HTTP/SOCKS5 outbound 策略**：实现还是标 unsupported；建议先标 unsupported，并同步 validator / doctor / migrator / README。
-2. **继续 P0-6 Batch 5 / Batch 4 cutover**：schema-2 typed mutation core 已完成；下一步以 TDD 将 `list/use/download/update/delete/override` 全部 writer 同批路由 Authority，确认无 split-brain 后，再把 daemon 固定 exact identity、actual endpoint descriptor、CLI handshake 与 startup generation reconcile 接入生产路径。
+2. **继续 P0-6 writer cutover**：durable selection、startup restore、actual endpoint descriptor 与 local `config load` 已完成；下一步将 `list/use/download/update/delete/override` 全部 legacy writer 路由 Authority。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
 5. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。
@@ -678,14 +678,14 @@ git push origin v1.0.0
 当前 main 分支：
 
 - ✅ Zig 0.16 本地构建通过
-- ✅ 2026-07-15 单测 662/663 通过（1 项显式 skip，含 typed mutations、CatalogService/commands、downloaded/override writers、ConfigBundle、RevisionStore、legacy migration/mirror、exact loader 与 runtime descriptor 安全边界测试）
+- ✅ 2026-07-15 单测 664/665 通过（1 项显式 skip，新增 local config load 与 durable selection/startup restore 覆盖）
 - ⚠️ migrator/install/full validation 最近完整记录来自 2026-05，2026-07-14 未重跑，待 P0-7 验证
 - ⚠️ 2026-07-14 仅完成 version/status 无副作用 smoke；29001 daemon start/status/stop 待 P0-7 验证
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
 - ❌ 部分配置可接受但运行时未实现
-- ⚠️ Batch 1-3 shadow 基础及 Batch 4 loader/descriptor seam 已完成但尚未接生产路径；`proxy select` durable/runtime identity、daemon/CLI tracked discovery 与 `config import` CLI 仍未实现
+- ✅ `proxy select` durable/runtime identity、daemon startup restore、tracked controller discovery 与 `config load` CLI 已进入生产路径；其余 config writer 尚待统一 cutover
 - ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档
 

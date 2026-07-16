@@ -93,6 +93,45 @@ const DiskDescriptor = struct {
     generation: u64,
 };
 
+pub const DefaultStore = struct {
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    dir: std.Io.Dir,
+
+    pub fn store(self: DefaultStore) Store {
+        return Store.init(self.allocator, self.dir);
+    }
+
+    pub fn deinit(self: *DefaultStore) void {
+        self.dir.close(compat.io());
+        self.allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+pub fn openDefault(allocator: std.mem.Allocator, create: bool) !?DefaultStore {
+    const base = compat.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR") catch
+        try allocator.dupe(u8, "/tmp");
+    defer allocator.free(base);
+    if (!compat.fs.path.isAbsolute(base)) return error.InvalidRuntimeDirectory;
+    const path = try compat.fs.path.join(allocator, &.{ base, "zc-runtime" });
+    errdefer allocator.free(path);
+    if (create) {
+        compat.fs.cwd().makePath(path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    const dir = compat.fs.openDirAbsolute(path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            allocator.free(path);
+            return null;
+        },
+        else => return err,
+    };
+    return .{ .allocator = allocator, .path = path, .dir = dir };
+}
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,

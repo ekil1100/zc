@@ -3,6 +3,8 @@ const compat = @import("compat.zig");
 const config = @import("config.zig");
 const cli_output = @import("cli/output.zig");
 const runtime_selection = @import("runtime_selection.zig");
+const runtime_descriptor = @import("runtime_descriptor.zig");
+const config_identity = @import("config_identity.zig");
 const posix = std.posix;
 
 fn proxyTypeString(pt: config.ProxyType) []const u8 {
@@ -189,6 +191,7 @@ pub fn applySelection(
     cfg: *config.Config,
     group: *const config.ProxyGroup,
     proxy_name: []const u8,
+    identity: ?config_identity.ManagedIdentity,
     out: *cli_output.Output,
 ) !bool {
     var found = false;
@@ -210,7 +213,7 @@ pub fn applySelection(
         try out.flush();
     }
 
-    return notifyDaemon(allocator, cfg, group.name, proxy_name, out);
+    return notifyDaemon(allocator, cfg, group.name, proxy_name, identity, out);
 }
 
 pub const InteractiveSelection = struct {
@@ -443,9 +446,25 @@ fn notifyDaemon(
     cfg: *config.Config,
     group_name: []const u8,
     proxy_name: []const u8,
+    identity: ?config_identity.ManagedIdentity,
     out: *cli_output.Output,
 ) bool {
-    const ec = cfg.external_controller orelse {
+    var default_store = runtime_descriptor.openDefault(allocator, false) catch null;
+    defer if (default_store) |*value| value.deinit();
+    var descriptor: ?runtime_descriptor.Descriptor = if (default_store) |value|
+        value.store().observe() catch null
+    else
+        null;
+    defer if (descriptor) |*value| value.deinit();
+    const ec = if (descriptor) |runtime| blk: {
+        const expected = identity orelse break :blk cfg.external_controller orelse return false;
+        const actual = runtime.identity orelse return false;
+        if (!std.mem.eql(u8, expected.key, actual.key) or !expected.revision.eql(actual.revision)) {
+            noteDim(out, "(running daemon uses a different config revision; selection saved for restart)", .{});
+            return false;
+        }
+        break :blk runtime.endpoint;
+    } else cfg.external_controller orelse {
         noteDim(out, "(no external-controller, restart daemon to apply)", .{});
         return false;
     };
@@ -761,9 +780,9 @@ test "applySelection validates membership and reports applied=false without cont
     var out = streams.output(.text);
 
     const group = try resolveSelectGroup(&cfg, "Proxy");
-    try testing.expectError(error.ProxyNotFound, applySelection(allocator, &cfg, group, "missing", &out));
+    try testing.expectError(error.ProxyNotFound, applySelection(allocator, &cfg, group, "missing", null, &out));
 
-    const applied = try applySelection(allocator, &cfg, group, "Auto", &out);
+    const applied = try applySelection(allocator, &cfg, group, "Auto", null, &out);
     try testing.expect(!applied);
     // 确认行在 stdout，daemon 提示在 stderr。
     try testing.expect(std.mem.indexOf(u8, streams.out_alloc.written(), "Selected Auto in group Proxy") != null);
@@ -780,7 +799,7 @@ test "applySelection in json mode keeps stdout free for the envelope" {
     var out = streams.output(.json);
 
     const group = try resolveSelectGroup(&cfg, "Proxy");
-    const applied = try applySelection(allocator, &cfg, group, "Auto", &out);
+    const applied = try applySelection(allocator, &cfg, group, "Auto", null, &out);
     try testing.expect(!applied);
     try testing.expectEqualStrings("", streams.out_alloc.written());
     try testing.expectEqualStrings("", streams.err_alloc.written());
