@@ -49,7 +49,7 @@ zig version
 # 0.16.0
 
 zig build test --summary all
-# 664/665 tests passed (1 skipped)
+# 665/665 tests passed (0 skipped)
 
 zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded

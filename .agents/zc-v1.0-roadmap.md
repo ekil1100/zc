@@ -40,7 +40,7 @@ cat build.zig.zon
 
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 664/665 tests passed (1 skipped)
+# 665/665 tests passed (0 skipped)
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded
@@ -478,7 +478,7 @@ docs/
 - Batch 3 exact catalog / immutable RevisionStore / legacy bootstrap / frozen override / derived mirror：`052610f`–`01646d1`；
 - Batch 4 shadow exact loader / tracked runtime descriptor seams：`041578b`–`ee690e7`；
 - Batch 5 typed mutation、catalog coordinator/commands、downloaded writer 与 revisioned override writer：`0684a88`、`90e21b7`、`b81227c`、`ad4ce7f`、`1c2eb78`、`aabd81e`、`cdf7497`、`62d8a1e`、`f2eb2b4`；
-- 664/665 tests passed（1 skipped），ReleaseFast 4/4；
+- 665/665 tests passed（0 skipped），ReleaseFast 4/4；
 - `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与 `config load`；下一步让其余 managed writer 全部通过 Authority，消除 legacy mirror 写入。
 
 关键验收：
@@ -678,7 +678,7 @@ git push origin v1.0.0
 当前 main 分支：
 
 - ✅ Zig 0.16 本地构建通过
-- ✅ 2026-07-15 单测 664/665 通过（1 项显式 skip，新增 local config load 与 durable selection/startup restore 覆盖）
+- ✅ 2026-07-15 单测 665/665 通过（0 skipped；32/64 位 WebSocket 长度边界均走平台适配断言）
 - ⚠️ migrator/install/full validation 最近完整记录来自 2026-05，2026-07-14 未重跑，待 P0-7 验证
 - ⚠️ 2026-07-14 仅完成 version/status 无副作用 smoke；29001 daemon start/status/stop 待 P0-7 验证
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0
