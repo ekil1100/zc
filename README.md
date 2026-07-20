@@ -59,9 +59,24 @@ The remaining v1.0 work is tracked in [`docs/roadmap/v1.0.md`](docs/roadmap/v1.0
 
 CI and local development target Zig `0.16.0`.
 
-## Install from source
+## Install with Homebrew (release candidate)
 
-Public release artifacts are intentionally not documented until the release workflow is aligned and `v1.0.0` is tagged. For now, install from source:
+当前 release candidate 通过项目 Tap 发布：
+
+```bash
+brew install ekil1100/tap/zc
+zc --version
+```
+
+升级到 Tap 中的最新版本：
+
+```bash
+brew upgrade ekil1100/tap/zc
+```
+
+该渠道目前发布的是 `v1.0.0-rc6`，不代表 `v1.0.0` GA gate 已关闭。
+
+## Install from source
 
 ```bash
 git clone https://github.com/ekil1100/zc.git

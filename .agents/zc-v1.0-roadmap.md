@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-07-15
+> 最近更新：2026-07-20
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -30,27 +30,27 @@ zig version
 # 0.16.0
 
 cat build.zig.zon
-# .version = "1.0.0-rc5"
+# .version = "1.0.0-rc6"
 # .minimum_zig_version = "0.16.0"
 ```
 
-结果：2026-07-14 本机是 Zig 0.16.0；包版本为 `1.0.0-rc5`；`build.zig.zon` 的 minimum zig 已对齐为 `0.16.0`。
+结果：2026-07-20 本机是 Zig 0.16.0；包版本为 `1.0.0-rc6`；`build.zig.zon` 的 minimum zig 已对齐为 `0.16.0`。
 
 ### Zig 测试与 ReleaseFast 构建
 
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 665/665 tests passed (0 skipped)
+# 666/666 tests passed (0 skipped)
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded
 ```
 
-结果：2026-07-15 当前代码在本机 Zig 0.16.0 下可构建、单测通过（1 项显式 skip）；默认 `zig build test` 已包含 StateAuthority schema-2 typed mutations、ConfigBundle、RevisionStore、legacy bootstrap/mirror、exact loader 与 runtime descriptor 安全边界测试。
+结果：2026-07-20 当前代码在本机 Zig 0.16.0 下可构建，666/666 测试通过（0 skipped）；默认 `zig build test` 已包含 StateAuthority schema-2 typed mutations、ConfigBundle、RevisionStore、legacy bootstrap/mirror、exact loader 与 runtime descriptor 安全边界测试。
 
-### 迁移与安装回归（最近一次完整记录：2026-05）
+### 迁移、安装与完整回归（2026-07-20）
 
-以下历史结果尚未在 2026-07-14 计划更新中重跑；P0-7 必须重新验证。
+本轮 release-candidate 准备已重新执行以下 gate：
 
 ```bash
 bash tools/config-migrator/run-all.sh
@@ -65,19 +65,22 @@ bash scripts/run-full-validation.sh
 # VALIDATION_PASS=3/3
 ```
 
-结果：脚本层 full validation 通过。
+结果：2026-07-20 migrator 29/29 samples、install regression 与 full validation 3/3 均通过。
 
 ### CLI smoke
 
 ```bash
 ./zig-out/bin/zc --version
-# zc 1.0.0-rc5
+# zc 1.0.0-rc6
 
+# 在隔离 HOME / XDG_RUNTIME_DIR 下执行
+./zig-out/bin/zc start --port 29001 -c testdata/config/minimal.yaml --json
 ./zig-out/bin/zc status --json
-# valid JSON envelope
+./zig-out/bin/zc stop --json
+# SMOKE_RESULT=PASS
 ```
 
-结果：2026-07-14 只执行了无副作用的 version/status smoke；当前机器已有 tracked daemon，未干扰其端口或生命周期。完整 29001 start/status/stop smoke 保留到 P0-7 最终 gate。
+结果：2026-07-20 在隔离状态目录中完成 29001 start/status/stop smoke，未干扰当前机器的 tracked daemon 或生产保留端口。该结果只支持发布 `v1.0.0-rc6`，不关闭 P0-2、P0-6 或 `v1.0.0` GA gate。
 
 ### 已关闭的 CLI 契约问题
 
@@ -478,7 +481,7 @@ docs/
 - Batch 3 exact catalog / immutable RevisionStore / legacy bootstrap / frozen override / derived mirror：`052610f`–`01646d1`；
 - Batch 4 shadow exact loader / tracked runtime descriptor seams：`041578b`–`ee690e7`；
 - Batch 5 typed mutation、catalog coordinator/commands、downloaded writer 与 revisioned override writer：`0684a88`、`90e21b7`、`b81227c`、`ad4ce7f`、`1c2eb78`、`aabd81e`、`cdf7497`、`62d8a1e`、`f2eb2b4`；
-- 665/665 tests passed（0 skipped），ReleaseFast 4/4；
+- 666/666 tests passed（0 skipped），ReleaseFast 4/4；
 - `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与 `config load`；下一步让其余 managed writer 全部通过 Authority，消除 legacy mirror 写入。
 
 关键验收：
@@ -678,9 +681,9 @@ git push origin v1.0.0
 当前 main 分支：
 
 - ✅ Zig 0.16 本地构建通过
-- ✅ 2026-07-15 单测 665/665 通过（0 skipped；32/64 位 WebSocket 长度边界均走平台适配断言）
-- ⚠️ migrator/install/full validation 最近完整记录来自 2026-05，2026-07-14 未重跑，待 P0-7 验证
-- ⚠️ 2026-07-14 仅完成 version/status 无副作用 smoke；29001 daemon start/status/stop 待 P0-7 验证
+- ✅ 2026-07-20 单测 666/666 通过（0 skipped；包含 Linux path-only directory 权限回归与跨宽度 WebSocket 长度边界）
+- ✅ 2026-07-20 migrator 29/29、install regression 与 full validation 3/3 通过
+- ✅ 2026-07-20 在隔离 HOME / XDG_RUNTIME_DIR 下完成 29001 daemon start/status/stop smoke
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档

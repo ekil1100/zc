@@ -17,6 +17,15 @@ pub fn io() std.Io {
     return runtime_io orelse @panic("compat.io used before main initialized std.Io");
 }
 
+pub fn setDirPermissions(dir: std.Io.Dir, permissions: std.Io.File.Permissions) !void {
+    const writable = try dir.openDir(io(), ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer writable.close(io());
+    try writable.setPermissions(io(), permissions);
+}
+
 pub fn environMap() ?*const std.process.Environ.Map {
     return runtime_environ_map;
 }
@@ -357,6 +366,18 @@ pub fn fileReadBoundedAlloc(file: std.Io.File, allocator: std.mem.Allocator, max
     var extra: [1]u8 = undefined;
     if (try fileRead(file, &extra) != 0) return error.FileTooLarge;
     return out.toOwnedSlice(allocator);
+}
+
+test "setDirPermissions supports path-only directory handles" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try setDirPermissions(tmp.dir, std.Io.File.Permissions.fromMode(0o700));
+    const writable = try tmp.dir.openDir(io(), ".", .{ .iterate = true });
+    defer writable.close(io());
+    const stat = try writable.stat(io());
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
 }
 
 test "strict bounded file read accepts the limit and rejects one byte more" {

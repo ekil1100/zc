@@ -2,7 +2,24 @@
 
 This page documents the current v1.0 install scripts that exist in this repository.
 
-> v1.0 is still in release-candidate cleanup. Public release artifact URLs are intentionally not documented here until the release workflow is aligned and `v1.0.0` is tagged.
+> v1.0 仍处于 release-candidate cleanup。Homebrew Tap 可用于安装 rc 版本，但不代表 `v1.0.0` GA gate 已关闭。
+
+## Homebrew Tap
+
+macOS 或 Linux amd64 用户可以从项目 Tap 安装当前 release candidate：
+
+```bash
+brew install ekil1100/tap/zc
+zc --version
+```
+
+升级时使用同一个 fully qualified formula，避免与其他 Tap 的同名 formula 混淆：
+
+```bash
+brew upgrade ekil1100/tap/zc
+```
+
+发布工作流会为 macOS arm64、macOS amd64 和 Linux amd64 生成二进制归档，并在 GitHub Release 成功后更新 `ekil1100/homebrew-tap` 中的 formula。
 
 ## Local install flow
 
@@ -24,7 +41,7 @@ bash scripts/install/oc-run.sh install --target-dir /tmp/zc-install
 bash scripts/install/oc-run.sh verify --target-dir /tmp/zc-install
 
 # Upgrade requires an explicit version
-bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.0-rc5
+bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.0-rc6
 
 # Optional rollback cleanup
 bash scripts/install/oc-run.sh rollback --target-dir /tmp/zc-install
@@ -68,16 +85,15 @@ Expected output:
 VALIDATION_RESULT=PASS
 ```
 
-## After v1.0.0 is tagged
+## Other packaging channels
 
-Only after release workflow validation should this page grow public install methods such as:
+Homebrew Tap 是当前唯一文档化的 release-candidate 二进制安装入口。只有相关发布链路验证完成后，才增加以下公开安装方式：
 
-- GitHub Release tarball install;
-- Homebrew formula;
+- GitHub Release tarball installer;
 - Debian package;
 - curl installer.
 
-Until then, stale historical packaging notes live in `docs/archive/install/` and are not current user guidance.
+过时的历史打包说明位于 `docs/archive/install/`，不属于当前用户指南。
 
 ## No TUI in v1.0
 

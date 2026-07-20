@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc6] - 2026-07-20
+
+### Added
+- Add the MIT license file to the repository and packaged release archives.
+- Add immutable config bundles, revision catalog storage, and strict offline parsing for managed local configuration.
+- Add `zc config load <path>` with root-contained asset capture and durable proxy selection restoration at daemon startup.
+- Establish a reproducible control-plane performance baseline for state-authority operations.
+
+### Changed
+- Route config and selection mutations through transactional state authority with exact revision/runtime identity tracking.
+- Harden release automation with generated GitHub release notes, release-candidate metadata, audited Homebrew formula output, and automatic tap updates.
+
+### Fixed
+- Reopen path-only directories with mutation-capable handles before tightening permissions, preventing Zig 0.16 Linux `BADF` crashes in catalog, mirror, and runtime descriptor paths.
+- Reject special files in state and benchmark trees, isolate performance builds, and verify benchmark provenance.
+- Preserve legacy runtime config identity and cover WebSocket payload length bounds across target widths.
+
 ## [1.0.0-rc5] - 2026-07-10
 
 ### Changed

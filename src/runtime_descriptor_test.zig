@@ -64,8 +64,8 @@ test "RuntimeDescriptor observation is side-effect-free and works without write 
 
     const instance_nonce = try nonce("11111111111111111111111111111111");
     _ = try store.publish(.missing, .{ .pid = 1, .nonce = instance_nonce, .endpoint = "127.0.0.1:1" });
-    try tmp.dir.setPermissions(compat.io(), std.Io.File.Permissions.fromMode(0o500));
-    defer tmp.dir.setPermissions(compat.io(), std.Io.File.Permissions.fromMode(0o700)) catch {};
+    try compat.setDirPermissions(tmp.dir, std.Io.File.Permissions.fromMode(0o500));
+    defer compat.setDirPermissions(tmp.dir, std.Io.File.Permissions.fromMode(0o700)) catch {};
     var observed = (try store.observe()) orelse return error.TestExpectedEqual;
     defer observed.deinit();
     try testing.expect(observed.nonce.eql(instance_nonce));

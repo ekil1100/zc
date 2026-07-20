@@ -74,7 +74,7 @@ Ordered by user impact:
 | `scripts/test-release-install.sh:141-208` | various commands `… 2>&1 \|\| true` — must not hang or prompt | `zc test` must keep self-timeout; interactive select must never trigger non-interactively (replace auto-pick-index-0 with an error) |
 | `scripts/install-curl.sh:83-85` | `zc --help \| head -3` exit 0 under pipefail | Same as above: exit 0 + EPIPE-safe |
 | `Containerfile:23,29` | `RUN zc --version` exit 0; `CMD ["zc","--help"]` exit 0 | Implement `--version`; keep `--help` exit 0 |
-| `homebrew-zc/zc.rb:29-31` | `zc --help` exit 0 | Keep |
+| `.github/workflows/release.yml` generated Homebrew formula | `zc --help` exit 0 | Keep |
 | `scripts/zclash.service:6-12`, `scripts/build-deb.sh:44-59` | systemd `Type=simple`, `ExecStart=… start` long-running foreground; stop/restart exit 0 | Either change units to `Type=forking` + PIDFile, or add a foreground mode — per Open question 1 |
 | `src/integration_error_test.zig:13-68` | merged stdout+stderr contains compact `"ok":false`, `"error":{`, codes PROFILE_NOT_FOUND / PROXY_SUBCOMMAND_UNKNOWN / DIAG_SUBCOMMAND_UNKNOWN, `"message":`, `"hint":` | Update assertions for new envelope (add `"command":` key; std.json output formatting); keep code strings; tolerant of stdout move (already merged) |
 | `src/daemon.zig:1316-1334` | exact compact substrings of status JSON incl. `paths` object order | Rewrite test against std.json-emitted envelope; preserve field names `action/state/pid/uptime_seconds/active_config/selected_proxies/paths` |

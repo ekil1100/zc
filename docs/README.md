@@ -2,7 +2,7 @@
 
 This directory is the public documentation entry for the current zc v1.0 release work.
 
-For a first read, start with the root [`README.md`](../README.md). It contains the project overview, status, install-from-source flow, quick start, and the current zc project mark.
+首次阅读请从根目录 [`README.md`](../README.md) 开始，其中包含项目概览、状态、Homebrew Tap 与源码安装入口、quick start 和当前项目标识。
 
 ## Current status
 
@@ -26,7 +26,7 @@ zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当
 | Config | [`config/override.md`](config/override.md) | Runtime override behavior. |
 | Compatibility | [`compat/mihomo-clash.md`](compat/mihomo-clash.md) | mihomo/clash compatibility boundaries and unsupported features. |
 | Migrator | [`compat/migrator-rules-quickref.md`](compat/migrator-rules-quickref.md) | Config migrator rule reference. |
-| Install | [`install/README.md`](install/README.md) | Local install/verify/upgrade/rollback scripts. |
+| Install | [`install/README.md`](install/README.md) | Homebrew Tap 以及本地 install/verify/upgrade/rollback 流程。 |
 | API | [`api/README.md`](api/README.md) | Minimal API endpoints currently implemented. |
 | Reliability | [`reliability/soak-guide.md`](reliability/soak-guide.md) | Soak runner usage and release-gate evidence. |
 | Perf reports | [`perf/reports/README.md`](perf/reports/README.md) | Perf report storage used by scripts. |
