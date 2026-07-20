@@ -40,13 +40,13 @@ cat build.zig.zon
 
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-# 665/665 tests passed (0 skipped)
+# 666/666 tests passed (0 skipped)
 
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
 # 4/4 steps succeeded
 ```
 
-结果：2026-07-20 当前代码在本机 Zig 0.16.0 下可构建，665/665 测试通过（0 skipped）；默认 `zig build test` 已包含 StateAuthority schema-2 typed mutations、ConfigBundle、RevisionStore、legacy bootstrap/mirror、exact loader 与 runtime descriptor 安全边界测试。
+结果：2026-07-20 当前代码在本机 Zig 0.16.0 下可构建，666/666 测试通过（0 skipped）；默认 `zig build test` 已包含 StateAuthority schema-2 typed mutations、ConfigBundle、RevisionStore、legacy bootstrap/mirror、exact loader 与 runtime descriptor 安全边界测试。
 
 ### 迁移、安装与完整回归（2026-07-20）
 
@@ -481,7 +481,7 @@ docs/
 - Batch 3 exact catalog / immutable RevisionStore / legacy bootstrap / frozen override / derived mirror：`052610f`–`01646d1`；
 - Batch 4 shadow exact loader / tracked runtime descriptor seams：`041578b`–`ee690e7`；
 - Batch 5 typed mutation、catalog coordinator/commands、downloaded writer 与 revisioned override writer：`0684a88`、`90e21b7`、`b81227c`、`ad4ce7f`、`1c2eb78`、`aabd81e`、`cdf7497`、`62d8a1e`、`f2eb2b4`；
-- 665/665 tests passed（0 skipped），ReleaseFast 4/4；
+- 666/666 tests passed（0 skipped），ReleaseFast 4/4；
 - `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与 `config load`；下一步让其余 managed writer 全部通过 Authority，消除 legacy mirror 写入。
 
 关键验收：
@@ -681,9 +681,9 @@ git push origin v1.0.0
 当前 main 分支：
 
 - ✅ Zig 0.16 本地构建通过
-- ✅ 2026-07-15 单测 665/665 通过（0 skipped；32/64 位 WebSocket 长度边界均走平台适配断言）
-- ⚠️ migrator/install/full validation 最近完整记录来自 2026-05，2026-07-14 未重跑，待 P0-7 验证
-- ⚠️ 2026-07-14 仅完成 version/status 无副作用 smoke；29001 daemon start/status/stop 待 P0-7 验证
+- ✅ 2026-07-20 单测 666/666 通过（0 skipped；包含 Linux path-only directory 权限回归与跨宽度 WebSocket 长度边界）
+- ✅ 2026-07-20 migrator 29/29、install regression 与 full validation 3/3 通过
+- ✅ 2026-07-20 在隔离 HOME / XDG_RUNTIME_DIR 下完成 29001 daemon start/status/stop smoke
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档

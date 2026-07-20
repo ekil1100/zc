@@ -15,6 +15,7 @@
 - Harden release automation with generated GitHub release notes, release-candidate metadata, audited Homebrew formula output, and automatic tap updates.
 
 ### Fixed
+- Reopen path-only directories with mutation-capable handles before tightening permissions, preventing Zig 0.16 Linux `BADF` crashes in catalog, mirror, and runtime descriptor paths.
 - Reject special files in state and benchmark trees, isolate performance builds, and verify benchmark provenance.
 - Preserve legacy runtime config identity and cover WebSocket payload length bounds across target widths.
 

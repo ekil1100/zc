@@ -19,7 +19,7 @@ pub const LegacyMirror = struct {
     }
 
     pub fn rebuild(self: LegacyMirror) !RebuildReceipt {
-        try self.root.setPermissions(compat.io(), ownerDirPermissions());
+        try compat.setDirPermissions(self.root, ownerDirPermissions());
         const mirror_lock = try acquireMirrorLock(self.root);
         defer mirror_lock.close(compat.io());
         const authority = state_authority.Authority.init(self.allocator, self.root);

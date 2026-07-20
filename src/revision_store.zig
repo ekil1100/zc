@@ -217,7 +217,7 @@ pub const RevisionStore = struct {
         metadata: MetadataInput,
     ) !PublishedRevision {
         if (key.len == 0) return error.InvalidKey;
-        try self.root.setPermissions(compat.io(), ownerDirPermissions());
+        try compat.setDirPermissions(self.root, ownerDirPermissions());
         const sorted_params = try sortedParamIndexes(self.allocator, metadata.params);
         defer self.allocator.free(sorted_params);
         try validateDistinctParams(metadata.params, sorted_params);
@@ -319,7 +319,7 @@ pub const RevisionStore = struct {
         revision: config_identity.Revision,
     ) !RevisionView {
         if (key.len == 0) return error.InvalidKey;
-        try self.root.setPermissions(compat.io(), ownerDirPermissions());
+        try compat.setDirPermissions(self.root, ownerDirPermissions());
         const storage_id = config_identity.StorageId.derive(key).bytes;
         var storage_hex: [64]u8 = std.fmt.bytesToHex(storage_id, .lower);
         var revision_hex: [32]u8 = undefined;
@@ -936,7 +936,10 @@ fn isSingleComponent(name: []const u8) bool {
 
 fn openExistingDir(parent: std.Io.Dir, name: []const u8) !std.Io.Dir {
     if (!isSingleComponent(name)) return error.InvalidStoragePath;
-    const dir = try parent.openDir(compat.io(), name, .{ .follow_symlinks = false });
+    const dir = try parent.openDir(compat.io(), name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
     errdefer dir.close(compat.io());
     const stat = try dir.stat(compat.io());
     if (stat.kind != .directory) return error.InvalidStoragePath;

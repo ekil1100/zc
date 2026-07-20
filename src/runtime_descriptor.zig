@@ -147,7 +147,7 @@ pub const Store = struct {
 
     pub fn publish(self: Store, expected: Expected, next: DescriptorInput) !PublishOutcome {
         try validateInput(next);
-        try self.dir.setPermissions(compat.io(), ownerOnlyDir());
+        try compat.setDirPermissions(self.dir, ownerOnlyDir());
         const lock = try self.acquireLock();
         defer lock.close(compat.io());
         var current = try self.loadUnlocked();
@@ -174,7 +174,7 @@ pub const Store = struct {
     }
 
     pub fn remove(self: Store, expected: Nonce) !RemoveOutcome {
-        try self.dir.setPermissions(compat.io(), ownerOnlyDir());
+        try compat.setDirPermissions(self.dir, ownerOnlyDir());
         const lock = try self.acquireLock();
         defer lock.close(compat.io());
         var current = try self.loadUnlocked() orelse return .absent;
