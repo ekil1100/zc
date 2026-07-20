@@ -292,7 +292,7 @@ bash scripts/run-full-validation.sh
 - `release.yml`：实际 setup zig `0.16.0`。
 - `build.zig.zon`：`minimum_zig_version = "0.16.0"`。
 
-判断：P0-1 已完成代码与工作流层面的对齐；最终仍需由 GitHub Actions 实际 release job 验证。
+判断：P0-1 已完成代码与工作流层面的对齐；2026-07-20 GitHub Actions 已通过 `v1.0.0-rc6` 三平台 release 实际验证。
 
 ---
 
@@ -662,6 +662,16 @@ git push origin v1.0.0
 - Homebrew tap 更新成功或失败时有可操作 next-step。
 - 安装脚本能从 release artifact 完成 install / verify。
 
+### `v1.0.0-rc6` 发布证据（2026-07-20）
+
+- [`main` CI run 29732970476](https://github.com/ekil1100/zc/actions/runs/29732970476) 通过 build、666 tests、migrator、install regression 与 full validation；
+- [CD run 29733083750](https://github.com/ekil1100/zc/actions/runs/29733083750) 通过 tag/package/binary version 校验、Linux amd64、macOS arm64/amd64 构建测试、GitHub Release 发布和自动 Tap 更新；
+- [`v1.0.0-rc6` Release](https://github.com/ekil1100/zc/releases/tag/v1.0.0-rc6) 正确标记为 prerelease，包含 3 个归档及 3 个可移植 SHA-256 文件；
+- `ekil1100/homebrew-tap` commit `fbc5463a` 写入归档实际 SHA-256；
+- 本机从 rc5 升级到 rc6 后，`brew style`、`brew audit --strict --online`、`brew livecheck`、`brew test`、release 下载 checksum 与 `zc --version` 均通过。
+
+该证据验证的是 RC 发布链路，不关闭 P0-2、P0-6 或 `v1.0.0` GA gate。
+
 ---
 
 ## 8. 建议立即执行的下一步
@@ -672,7 +682,7 @@ git push origin v1.0.0
 2. **继续 P0-6 writer cutover**：durable selection、startup restore、actual endpoint descriptor 与 local `config load` 已完成；下一步将 `list/use/download/update/delete/override` 全部 legacy writer 路由 Authority。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
-5. **等待 GitHub Actions 验证 release job**：P0-1 本地配置已对齐，但 tag 前仍需确认远端 release 构建实际通过。
+5. ~~**等待 GitHub Actions 验证 release job**~~：`v1.0.0-rc6` 已通过三平台 release 与 Homebrew Tap 实际验证；GA 前仍需在 P0-2、P0-6 关闭后重跑最终 gate。
 
 ---
 
@@ -684,7 +694,7 @@ git push origin v1.0.0
 - ✅ 2026-07-20 单测 666/666 通过（0 skipped；包含 Linux path-only directory 权限回归与跨宽度 WebSocket 长度边界）
 - ✅ 2026-07-20 migrator 29/29、install regression 与 full validation 3/3 通过
 - ✅ 2026-07-20 在隔离 HOME / XDG_RUNTIME_DIR 下完成 29001 daemon start/status/stop smoke
-- ✅ CI / release workflow Zig 版本已对齐到 0.16.0
+- ✅ CI / release workflow Zig 版本已对齐到 0.16.0，`v1.0.0-rc6` 三平台 CD 与 Homebrew Tap 发布已通过
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
 - ❌ 部分配置可接受但运行时未实现
