@@ -3,13 +3,37 @@ name: CD Release
 on:
   push:
     tags:
-      - '*'
+      - 'v*'
 
 permissions:
   contents: write
 
 jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate tag and package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${{ github.ref_name }}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          EXPECTED_VERSION="${RELEASE_TAG#v}"
+          PACKAGE_VERSION=$(awk -F'"' '/^[[:space:]]*\.version = / { print $2; exit }' build.zig.zon)
+          if [[ "$PACKAGE_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "Tag/package version mismatch: tag=$EXPECTED_VERSION package=$PACKAGE_VERSION" >&2
+            exit 1
+          fi
+
   release:
+    needs: validate-release
     strategy:
       matrix:
         include:
@@ -35,6 +59,18 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 
+      - name: Verify binary version
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${{ github.ref_name }}"
+          EXPECTED="zc ${RELEASE_TAG#v}"
+          ACTUAL=$(./zig-out/bin/zc --version)
+          if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+            echo "Tag/binary version mismatch: expected='$EXPECTED' actual='$ACTUAL'" >&2
+            exit 1
+          fi
+
       - name: Test
         run: zig build test -Dcpu=baseline
 
@@ -51,12 +87,12 @@ jobs:
           PKG_DIR="dist/${PKG_NAME}"
           mkdir -p "$PKG_DIR"
           cp ./zig-out/bin/zc "$PKG_DIR/"
-          cp ./README.md "$PKG_DIR/"
+          cp ./README.md ./LICENSE "$PKG_DIR/"
           tar -czf "dist/${PKG_NAME}.tar.gz" -C dist "$PKG_NAME"
           if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "dist/${PKG_NAME}.tar.gz" > "dist/${PKG_NAME}.tar.gz.sha256"
+            (cd dist && shasum -a 256 "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256")
           else
-            sha256sum "dist/${PKG_NAME}.tar.gz" > "dist/${PKG_NAME}.tar.gz.sha256"
+            (cd dist && sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256")
           fi
 
       - name: Upload artifacts
@@ -69,31 +105,19 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - name: Generate release notes
-        run: |
-          RANGE="HEAD~20..HEAD"
-          LOGS="$(git log --pretty=format:'- %h %s' "$RANGE" 2>/dev/null || echo '- (no commits in range)')"
-          cat > dist/release-notes.md <<EOF
-          # zc ${{ github.ref_name }}
-
-          ## Changes
-          ${LOGS}
-          EOF
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          body_path: dist/release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
             dist/*.sha256
@@ -109,15 +133,20 @@ jobs:
           token: ${{ secrets.TAP_TOKEN }}
           path: homebrew-tap
 
-      - name: Download release assets
+      - name: Download release assets and render formula
+        shell: bash
         run: |
+          set -euo pipefail
           cd homebrew-tap
           VERSION="${{ github.ref_name }}"
-          VERSION_NO_V="${VERSION#v}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $VERSION" >&2
+            exit 1
+          fi
 
-          curl -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-arm64.tar.gz" -o macos-arm64.tar.gz
-          curl -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-amd64.tar.gz" -o macos-amd64.tar.gz
-          curl -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-amd64.tar.gz" -o linux-amd64.tar.gz
+          curl --retry 3 --retry-all-errors -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-arm64.tar.gz" -o macos-arm64.tar.gz
+          curl --retry 3 --retry-all-errors -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-amd64.tar.gz" -o macos-amd64.tar.gz
+          curl --retry 3 --retry-all-errors -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-amd64.tar.gz" -o linux-amd64.tar.gz
 
           MACOS_ARM64_SHA=$(sha256sum macos-arm64.tar.gz | cut -d' ' -f1)
           MACOS_AMD64_SHA=$(sha256sum macos-amd64.tar.gz | cut -d' ' -f1)
@@ -125,25 +154,30 @@ jobs:
 
           cat > zc.rb <<EOF
           class Zc < Formula
-            desc "Lightweight network tool built with Zig"
+            desc "CLI-first proxy runtime compatible with Clash configurations"
             homepage "https://github.com/ekil1100/zc"
-            version "${VERSION_NO_V}"
             license "MIT"
+
+            livecheck do
+              url :stable
+              regex(/^v?(\d+(?:\.\d+)*-rc\d+)$/i)
+              strategy :git
+            end
 
             on_macos do
               on_arm do
-                url "https://github.com/ekil1100/zc/releases/download/v#{version}/zc-v#{version}-macos-arm64.tar.gz"
+                url "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-arm64.tar.gz"
                 sha256 "${MACOS_ARM64_SHA}"
               end
               on_intel do
-                url "https://github.com/ekil1100/zc/releases/download/v#{version}/zc-v#{version}-macos-amd64.tar.gz"
+                url "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-amd64.tar.gz"
                 sha256 "${MACOS_AMD64_SHA}"
               end
             end
 
             on_linux do
               on_intel do
-                url "https://github.com/ekil1100/zc/releases/download/v#{version}/zc-v#{version}-linux-amd64.tar.gz"
+                url "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-amd64.tar.gz"
                 sha256 "${LINUX_AMD64_SHA}"
               end
             end
@@ -153,11 +187,12 @@ jobs:
             end
 
             test do
-              system "#{bin}/zc", "--help"
+              system bin/"zc", "--help"
             end
           end
           EOF
 
+          ruby -c zc.rb
           rm -f macos-arm64.tar.gz macos-amd64.tar.gz linux-amd64.tar.gz
 
       - name: Commit and push
@@ -169,6 +204,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Homebrew formula already up to date"
           else
-            git commit -m "Update zc to ${{ github.ref_name }}"
+            git commit -m "chore(zc): update to ${{ github.ref_name }}"
             git push
           fi
