@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-07-15
+> 最近更新：2026-07-20
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -30,11 +30,11 @@ zig version
 # 0.16.0
 
 cat build.zig.zon
-# .version = "1.0.0-rc5"
+# .version = "1.0.0-rc6"
 # .minimum_zig_version = "0.16.0"
 ```
 
-结果：2026-07-14 本机是 Zig 0.16.0；包版本为 `1.0.0-rc5`；`build.zig.zon` 的 minimum zig 已对齐为 `0.16.0`。
+结果：2026-07-20 本机是 Zig 0.16.0；包版本为 `1.0.0-rc6`；`build.zig.zon` 的 minimum zig 已对齐为 `0.16.0`。
 
 ### Zig 测试与 ReleaseFast 构建
 
@@ -46,11 +46,11 @@ env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summa
 # 4/4 steps succeeded
 ```
 
-结果：2026-07-15 当前代码在本机 Zig 0.16.0 下可构建、单测通过（1 项显式 skip）；默认 `zig build test` 已包含 StateAuthority schema-2 typed mutations、ConfigBundle、RevisionStore、legacy bootstrap/mirror、exact loader 与 runtime descriptor 安全边界测试。
+结果：2026-07-20 当前代码在本机 Zig 0.16.0 下可构建，665/665 测试通过（0 skipped）；默认 `zig build test` 已包含 StateAuthority schema-2 typed mutations、ConfigBundle、RevisionStore、legacy bootstrap/mirror、exact loader 与 runtime descriptor 安全边界测试。
 
-### 迁移与安装回归（最近一次完整记录：2026-05）
+### 迁移、安装与完整回归（2026-07-20）
 
-以下历史结果尚未在 2026-07-14 计划更新中重跑；P0-7 必须重新验证。
+本轮 release-candidate 准备已重新执行以下 gate：
 
 ```bash
 bash tools/config-migrator/run-all.sh
@@ -65,19 +65,22 @@ bash scripts/run-full-validation.sh
 # VALIDATION_PASS=3/3
 ```
 
-结果：脚本层 full validation 通过。
+结果：2026-07-20 migrator 29/29 samples、install regression 与 full validation 3/3 均通过。
 
 ### CLI smoke
 
 ```bash
 ./zig-out/bin/zc --version
-# zc 1.0.0-rc5
+# zc 1.0.0-rc6
 
+# 在隔离 HOME / XDG_RUNTIME_DIR 下执行
+./zig-out/bin/zc start --port 29001 -c testdata/config/minimal.yaml --json
 ./zig-out/bin/zc status --json
-# valid JSON envelope
+./zig-out/bin/zc stop --json
+# SMOKE_RESULT=PASS
 ```
 
-结果：2026-07-14 只执行了无副作用的 version/status smoke；当前机器已有 tracked daemon，未干扰其端口或生命周期。完整 29001 start/status/stop smoke 保留到 P0-7 最终 gate。
+结果：2026-07-20 在隔离状态目录中完成 29001 start/status/stop smoke，未干扰当前机器的 tracked daemon 或生产保留端口。该结果只支持发布 `v1.0.0-rc6`，不关闭 P0-2、P0-6 或 `v1.0.0` GA gate。
 
 ### 已关闭的 CLI 契约问题
 
