@@ -1144,6 +1144,8 @@ fn shouldRetryAcceptError(err: anyerror) bool {
     return switch (err) {
         error.ProcessFdQuotaExceeded,
         error.SystemFdQuotaExceeded,
+        error.ConnectionAborted,
+        error.WouldBlock,
         => true,
         else => false,
     };
@@ -1153,8 +1155,11 @@ test "mixed connection worker uses bounded stack" {
     try std.testing.expect(connection_task_stack_size <= 1024 * 1024);
 }
 
-test "mixed accept retries transient fd exhaustion" {
+test "mixed accept retries transient resource and connection failures" {
     try std.testing.expect(shouldRetryAcceptError(error.ProcessFdQuotaExceeded));
+    try std.testing.expect(shouldRetryAcceptError(error.SystemFdQuotaExceeded));
+    try std.testing.expect(shouldRetryAcceptError(error.ConnectionAborted));
+    try std.testing.expect(shouldRetryAcceptError(error.WouldBlock));
     try std.testing.expect(!shouldRetryAcceptError(error.ConnectionRefused));
 }
 

@@ -3,18 +3,31 @@ const compat = @import("compat.zig");
 const builtin = @import("builtin");
 const net = compat.net;
 
+fn setIntOption(
+    fd: std.posix.fd_t,
+    level: i32,
+    option: u32,
+    value: c_int,
+) !void {
+    if (std.c.setsockopt(
+        fd,
+        level,
+        option,
+        &value,
+        @sizeOf(c_int),
+    ) != 0) return error.SocketOptionFailed;
+}
+
 pub fn configureConnectedSocket(fd: std.posix.fd_t) !void {
     if (comptime builtin.os.tag == .macos) {
-        var enabled: c_int = 1;
-        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, std.mem.asBytes(&enabled));
+        try setIntOption(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, 1);
     }
     // Disable Nagle on every relayed socket. The relay forwards each decrypted
     // AEAD chunk as its own write(2); with Nagle on, those small writes deadlock
     // against the peer's delayed-ACK and stall streaming (SSE) downloads
     // ("Codex SSE response headers timed out"). Applies to both the client-facing
     // accept socket and the upstream proxy socket, which share this helper.
-    var nodelay: c_int = 1;
-    try std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&nodelay));
+    try setIntOption(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, 1);
 }
 
 pub fn configureConnectedStream(stream: net.Stream) !void {
@@ -37,33 +50,63 @@ const keepalive_probe_count: c_int = 3;
 pub fn configureUpstreamProxySocket(fd: std.posix.fd_t) !void {
     try configureConnectedSocket(fd);
 
-    var enabled: c_int = 1;
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&enabled));
+    try setIntOption(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, 1);
 
     // Tolerate setsockopt errors on per-OS options the platform may lack.
     if (comptime builtin.os.tag == .macos) {
-        var idle: c_int = keepalive_idle_secs;
-        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPALIVE, std.mem.asBytes(&idle)) catch {};
+        setIntOption(
+            fd,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.KEEPALIVE,
+            keepalive_idle_secs,
+        ) catch {};
         if (@hasDecl(std.posix.TCP, "KEEPINTVL")) {
-            var intvl: c_int = keepalive_intvl_secs;
-            std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
+            setIntOption(
+                fd,
+                std.posix.IPPROTO.TCP,
+                std.posix.TCP.KEEPINTVL,
+                keepalive_intvl_secs,
+            ) catch {};
         }
         if (@hasDecl(std.posix.TCP, "KEEPCNT")) {
-            var cnt: c_int = keepalive_probe_count;
-            std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, std.mem.asBytes(&cnt)) catch {};
+            setIntOption(
+                fd,
+                std.posix.IPPROTO.TCP,
+                std.posix.TCP.KEEPCNT,
+                keepalive_probe_count,
+            ) catch {};
         }
     } else if (comptime builtin.os.tag == .linux) {
-        var idle: c_int = keepalive_idle_secs;
-        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
-        var intvl: c_int = keepalive_intvl_secs;
-        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
-        var cnt: c_int = keepalive_probe_count;
-        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, std.mem.asBytes(&cnt)) catch {};
+        setIntOption(
+            fd,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.KEEPIDLE,
+            keepalive_idle_secs,
+        ) catch {};
+        setIntOption(
+            fd,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.KEEPINTVL,
+            keepalive_intvl_secs,
+        ) catch {};
+        setIntOption(
+            fd,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.KEEPCNT,
+            keepalive_probe_count,
+        ) catch {};
     }
 }
 
 pub fn configureUpstreamProxyStream(stream: net.Stream) !void {
     try configureUpstreamProxySocket(stream.handle);
+}
+
+test "configureConnectedSocket returns errors for closed sockets" {
+    try std.testing.expectError(
+        error.SocketOptionFailed,
+        configureConnectedSocket(-1),
+    );
 }
 
 test "configureConnectedSocket enables SO_NOSIGPIPE on macOS" {

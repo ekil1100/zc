@@ -54,7 +54,17 @@ pub fn nanoTimestamp() i128 {
 }
 
 pub fn milliTimestamp() i64 {
-    return @intCast(@divTrunc(std.Io.Timestamp.now(io(), .real).nanoseconds, std.time.ns_per_ms));
+    return @intCast(@divTrunc(
+        std.Io.Timestamp.now(io(), .real).nanoseconds,
+        std.time.ns_per_ms,
+    ));
+}
+
+pub fn monotonicMilliTimestamp() i64 {
+    return @intCast(@divTrunc(
+        std.Io.Timestamp.now(io(), .awake).nanoseconds,
+        std.time.ns_per_ms,
+    ));
 }
 
 pub fn randomBytes(buffer: []u8) void {
@@ -678,15 +688,24 @@ pub const net = struct {
         listen_address: Address,
 
         pub fn accept(self: *ReuseAddrListener) !Server.Connection {
-            var sa: std.c.sockaddr.in = undefined;
-            var sa_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
-            const cfd = std.c.accept(self.fd, @ptrCast(&sa), &sa_len);
-            if (cfd < 0) return error.AcceptFailed;
-            setCloexec(cfd);
-            return .{
-                .stream = Stream{ .handle = cfd },
-                .address = .{ .in = .{ .sa = sa } },
-            };
+            while (true) {
+                var sa: std.c.sockaddr.in = undefined;
+                var sa_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+                const cfd = std.c.accept(self.fd, @ptrCast(&sa), &sa_len);
+                if (cfd < 0) switch (std.c.errno(cfd)) {
+                    .INTR => continue,
+                    .AGAIN => return error.WouldBlock,
+                    .CONNABORTED => return error.ConnectionAborted,
+                    .MFILE => return error.ProcessFdQuotaExceeded,
+                    .NFILE => return error.SystemFdQuotaExceeded,
+                    else => return error.AcceptFailed,
+                };
+                setCloexec(cfd);
+                return .{
+                    .stream = Stream{ .handle = cfd },
+                    .address = .{ .in = .{ .sa = sa } },
+                };
+            }
         }
 
         pub fn deinit(self: *ReuseAddrListener) void {

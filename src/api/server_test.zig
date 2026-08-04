@@ -4,6 +4,111 @@ const build_options = @import("build_options");
 const server = @import("server.zig");
 const config = @import("../config.zig");
 
+test "minimal API framing is bounded and waits for a complete body" {
+    const incomplete_header = "PUT /proxies/Proxy HTTP/1.1\r\nHost: local\r\n";
+    try testing.expectEqual(
+        server.InspectResult.incomplete,
+        try server.inspectRequest(incomplete_header),
+    );
+
+    const incomplete_body =
+        "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+        "Content-Length: 15\r\n\r\n" ++
+        "{\"name\":\"A\"}";
+    try testing.expectEqual(
+        server.InspectResult.incomplete,
+        try server.inspectRequest(incomplete_body),
+    );
+
+    const headerless = try server.inspectRequest("GET /version HTTP/1.0\r\n\r\n");
+    try testing.expectEqualStrings("GET", headerless.complete.method);
+    try testing.expectEqualStrings("/version", headerless.complete.path);
+
+    const complete =
+        "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+        "Content-Length: 12\r\n\r\n" ++
+        "{\"name\":\"A\"}";
+    const result = try server.inspectRequest(complete);
+    try testing.expectEqualStrings("PUT", result.complete.method);
+    try testing.expectEqualStrings("/proxies/Proxy", result.complete.path);
+    try testing.expectEqualStrings("{\"name\":\"A\"}", result.complete.body);
+
+    try testing.expectError(
+        error.PayloadTooLarge,
+        server.inspectRequest(
+            "PUT / HTTP/1.1\r\nContent-Length: 65537\r\n\r\n",
+        ),
+    );
+    try testing.expectError(
+        error.InvalidRequest,
+        server.inspectRequest(
+            "PUT / HTTP/1.1\r\n" ++
+                "Content-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+        ),
+    );
+    try testing.expectError(
+        error.LengthRequired,
+        server.inspectRequest("PUT / HTTP/1.1\r\nHost: local\r\n\r\n"),
+    );
+    try testing.expectError(
+        error.UnsupportedTransferEncoding,
+        server.inspectRequest(
+            "PUT / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+    );
+    const invalid_lengths = [_][]const u8{
+        "Content-Length: +12",
+        "Content-Length: 1_2",
+        "Content-Length : 12",
+        " Content-Length: 12",
+        "\tContent-Length: 12",
+    };
+    for (invalid_lengths) |header| {
+        var request_buffer: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buffer,
+            "PUT / HTTP/1.1\r\n{s}\r\n\r\n{{\"name\":\"A\"}}",
+            .{header},
+        );
+        try testing.expectError(error.InvalidRequest, server.inspectRequest(request));
+    }
+    try testing.expectError(
+        error.InvalidRequest,
+        server.inspectRequest(
+            "PUT / HTTP/1.1\r\nContent-Length: 12\r\n" ++
+                "X-Ignored: value\nContent-Length: 0\r\n\r\n" ++
+                "{\"name\":\"A\"}",
+        ),
+    );
+    try testing.expectError(
+        error.InvalidRequest,
+        server.inspectRequest(
+            "GET / HTTP/1.1\r\nX-Ignored: value\rhidden\r\n\r\n",
+        ),
+    );
+    try testing.expectError(
+        error.InvalidRequest,
+        server.inspectRequest(
+            "PUT / HTTP/1.1\r\nContent-Length: 65537\r\n" ++
+                "X: value\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+    );
+    try testing.expectError(
+        error.InvalidRequest,
+        server.inspectRequest(
+            "PUT / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n" ++
+                "X: value\rContent-Length: 0\r\n\r\n",
+        ),
+    );
+
+    var oversized_header: [server.max_header_bytes + 1]u8 = undefined;
+    @memset(&oversized_header, 'a');
+    try testing.expectError(
+        error.HeaderTooLarge,
+        server.inspectRequest(&oversized_header),
+    );
+}
+
 // Simple HTTP response parsing test
 test "HTTP response parsing" {
     const ver = build_options.version;
@@ -206,6 +311,38 @@ test "minimal API serializers escape configured strings" {
         allocator,
         exerciseApiSerializers,
         .{&cfg},
+    );
+}
+
+test "minimal API rejects oversized JSON before allocating its body" {
+    const allocator = testing.allocator;
+    var cfg = config.Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+    defer cfg.deinit();
+
+    for (0..5) |_| {
+        const target = try allocator.alloc(u8, 1024 * 1024);
+        @memset(target, 'x');
+        errdefer allocator.free(target);
+        const payload = try allocator.dupe(u8, "example.com");
+        errdefer allocator.free(payload);
+        try cfg.rules.append(allocator, .{
+            .rule_type = .domain,
+            .payload = payload,
+            .target = target,
+        });
+    }
+
+    try testing.expectError(
+        error.ResponseTooLarge,
+        server.ApiServer.buildRulesJson(allocator, &cfg),
     );
 }
 

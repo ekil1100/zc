@@ -27,6 +27,15 @@ external-controller: 127.0.0.1:9090
 
 所有 JSON 响应均由标准序列化器生成；配置中的引号、反斜杠、控制字符与 Unicode 会按 JSON 规则转义并可无损还原。
 
+## 资源与 framing 上界
+
+- 同时最多处理 16 个连接；超出 admission 上界的连接立即关闭。
+- request header 最大 16 KiB，body 最大 64 KiB；超限返回 `413`。
+- 每个 request 的完整读取期限为 2 秒；超时返回 `408`。
+- response body 最大 4 MiB，写出期限为 2 秒；超限 endpoint 返回完整的 `500 Response Too Large`。
+- `PUT` 必须提供唯一、合法的 `Content-Length`；不支持 chunked transfer encoding。
+- 每个连接只处理一个 HTTP/1.0 或 HTTP/1.1 request，响应后关闭。
+
 ## Known limitations
 
 - No WebSocket event stream.

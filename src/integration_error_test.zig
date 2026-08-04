@@ -60,11 +60,18 @@ fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !CliRun {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
     }
-    return .{ .stdout = result.stdout, .stderr = result.stderr, .code = try exitCode(result.term) };
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .code = try exitCode(result.term),
+    };
 }
 
 /// stdout 必须是恰好一行可解析的 JSON envelope。
-fn parseEnvelope(allocator: std.mem.Allocator, stdout: []const u8) !std.json.Parsed(std.json.Value) {
+fn parseEnvelope(
+    allocator: std.mem.Allocator,
+    stdout: []const u8,
+) !std.json.Parsed(std.json.Value) {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, stdout, "\n"));
     return std.json.parseFromSlice(std.json.Value, allocator, stdout, .{});
 }
@@ -308,7 +315,10 @@ test "integration: zc test --help prints command help via table interception" {
 
 test "integration: zc test config-load failure emits envelope in json mode" {
     const allocator = std.testing.allocator;
-    var run = try runCli(allocator, &.{ "test", "-c", ".zig-cache/itest-definitely-missing.yaml", "--json" });
+    var run = try runCli(
+        allocator,
+        &.{ "test", "-c", ".zig-cache/itest-definitely-missing.yaml", "--json" },
+    );
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(u8, 1), run.code);
@@ -454,7 +464,10 @@ test "integration: zc doctor --json invalid config -> CHECKS_FAILED with config_
 test "integration: doctor config-load failure -> DIAG_DOCTOR_FAILED in both modes" {
     const allocator = std.testing.allocator;
 
-    var json_run = try runCli(allocator, &.{ "doctor", "-c", ".zig-cache/itest-definitely-missing.yaml", "--json" });
+    var json_run = try runCli(
+        allocator,
+        &.{ "doctor", "-c", ".zig-cache/itest-definitely-missing.yaml", "--json" },
+    );
     defer json_run.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 1), json_run.code);
     var parsed = try parseEnvelope(allocator, json_run.stdout);
@@ -462,7 +475,10 @@ test "integration: doctor config-load failure -> DIAG_DOCTOR_FAILED in both mode
     try expectErrorEnvelope(parsed.value, "doctor", "DIAG_DOCTOR_FAILED");
 
     // text 模式曾被 json-only guard 吞错（裸 Zig trace）；现在必须有错误块。
-    var text_run = try runCli(allocator, &.{ "doctor", "-c", ".zig-cache/itest-definitely-missing.yaml" });
+    var text_run = try runCli(
+        allocator,
+        &.{ "doctor", "-c", ".zig-cache/itest-definitely-missing.yaml" },
+    );
     defer text_run.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 1), text_run.code);
     try std.testing.expect(std.mem.indexOf(u8, text_run.stderr, "DIAG_DOCTOR_FAILED") != null);
@@ -535,8 +551,233 @@ const HttpResponder = struct {
             const conn = self.listener.accept() catch continue;
             var buf: [4096]u8 = undefined;
             _ = conn.stream.read(&buf) catch {};
-            conn.stream.writeAll("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+            conn.stream.writeAll(
+                "HTTP/1.1 204 No Content\r\n" ++
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n",
+            ) catch {};
             conn.stream.close();
         }
     }
 };
+
+fn connectController(port: u16) !compat.net.Stream {
+    const address = try compat.net.Address.parseIp4("127.0.0.1", port);
+    return compat.net.tcpConnectToAddress(address);
+}
+
+fn waitForController(port: u16) !void {
+    for (0..250) |_| {
+        if (connectController(port)) |stream| {
+            stream.close();
+            return;
+        } else |_| {}
+        compat.sleepNs(20 * std.time.ns_per_ms);
+    }
+    return error.ControllerStartTimeout;
+}
+
+fn responseContentLength(header: []const u8) !usize {
+    var lines = std.mem.splitSequence(u8, header, "\r\n");
+    _ = lines.next() orelse return error.InvalidHttpResponse;
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = line[0..colon];
+        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(usize, value, 10) catch
+            error.InvalidHttpResponse;
+    }
+    return error.InvalidHttpResponse;
+}
+
+fn readResponseWithin(
+    stream: compat.net.Stream,
+    buffer: []u8,
+    timeout_ms: i32,
+) ![]const u8 {
+    const deadline = compat.monotonicMilliTimestamp() + timeout_ms;
+    var used: usize = 0;
+    while (true) {
+        if (std.mem.indexOf(u8, buffer[0..used], "\r\n\r\n")) |header_end| {
+            const body_length = try responseContentLength(buffer[0..header_end]);
+            const total = header_end + 4 + body_length;
+            if (total > buffer.len) return error.ResponseTooLarge;
+            if (used >= total) return buffer[0..total];
+        }
+        if (used == buffer.len) return error.ResponseTooLarge;
+        const remaining = deadline - compat.monotonicMilliTimestamp();
+        if (remaining <= 0) return error.ResponseTimeout;
+        var descriptors = [_]std.posix.pollfd{.{
+            .fd = stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(
+            &descriptors,
+            @intCast(@min(remaining, std.math.maxInt(i32))),
+        );
+        if (ready == 0) return error.ResponseTimeout;
+        const count = try stream.read(buffer[used..]);
+        if (count == 0) return error.UnexpectedEndOfStream;
+        used += count;
+    }
+}
+
+test "integration: minimal API isolates idle clients and frames PUT bodies" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home/.config");
+    try tmp.dir.createDirPath(compat.io(), "run");
+
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_dir = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_dir);
+    const config_path = try compat.fs.path.join(allocator, &.{ root, "config.yaml" });
+    defer allocator.free(config_path);
+
+    const mixed_port = try reserveClosedPort();
+    var controller_port = try reserveClosedPort();
+    while (controller_port == mixed_port) controller_port = try reserveClosedPort();
+    const source = try std.fmt.allocPrint(allocator,
+        \\mixed-port: {d}
+        \\external-controller: 127.0.0.1:{d}
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\proxy-groups:
+        \\  - name: Proxy
+        \\    type: select
+        \\    proxies:
+        \\      - DIRECT
+        \\rules:
+        \\  - MATCH,Proxy
+        \\
+    , .{ mixed_port, controller_port });
+    defer allocator.free(source);
+    const file = try tmp.dir.createFile(compat.io(), "config.yaml", .{});
+    defer file.close(compat.io());
+    try compat.fileWriteAll(file, source);
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_dir);
+    var child = try std.process.spawn(compat.io(), .{
+        .argv = &.{ zc_binary, "start", "--foreground", "-c", config_path },
+        .environ_map = &environment,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(compat.io());
+    try waitForController(controller_port);
+
+    const idle = try connectController(controller_port);
+    defer idle.close();
+    {
+        const active = try connectController(controller_port);
+        defer active.close();
+        try active.writeAll("GET /version HTTP/1.1\r\nHost: local\r\n\r\n");
+        var response_buffer: [4096]u8 = undefined;
+        const response = try readResponseWithin(active, &response_buffer, 1_000);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200 OK") != null);
+        try std.testing.expect(
+            std.mem.indexOf(u8, response, "Connection: close\r\n") != null,
+        );
+    }
+
+    {
+        const headerless = try connectController(controller_port);
+        defer headerless.close();
+        try headerless.writeAll("GET /version HTTP/1.0\r\n\r\n");
+        var response_buffer: [4096]u8 = undefined;
+        const response = try readResponseWithin(headerless, &response_buffer, 1_000);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200 OK") != null);
+    }
+
+    {
+        const body = "{\"name\":\"DIRECT\"}";
+        const invalid_lengths = [_][]const u8{
+            "Content-Length: +17",
+            "Content-Length: 1_7",
+            "Content-Length : 17",
+            " Content-Length: 17",
+            "\tContent-Length: 17",
+            "Content-Length: 17\r\n" ++
+                "X-Ignored: value\nContent-Length: 0",
+            "Content-Length: 17\r\n" ++
+                "X-Ignored: value\nTransfer-Encoding: chunked",
+            "Content-Length: 65537\r\n" ++
+                "X-Ignored: value\nTransfer-Encoding: chunked",
+            "Transfer-Encoding: chunked\r\n" ++
+                "X-Ignored: value\rContent-Length: 0",
+        };
+        for (invalid_lengths) |length_header| {
+            const invalid = try connectController(controller_port);
+            defer invalid.close();
+            const request = try std.fmt.allocPrint(
+                allocator,
+                "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+                    "Host: local\r\n{s}\r\n\r\n{s}",
+                .{ length_header, body },
+            );
+            defer allocator.free(request);
+            try invalid.writeAll(request);
+            var response_buffer: [4096]u8 = undefined;
+            const response = try readResponseWithin(
+                invalid,
+                &response_buffer,
+                1_000,
+            );
+            try std.testing.expect(
+                std.mem.indexOf(u8, response, "400 Bad Request") != null,
+            );
+        }
+    }
+
+    {
+        const body = "{\"name\":\"DIRECT\"}";
+        const header = try std.fmt.allocPrint(
+            allocator,
+            "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+                "Host: local\r\nContent-Length: {d}\r\n\r\n",
+            .{body.len},
+        );
+        defer allocator.free(header);
+        const fragmented = try connectController(controller_port);
+        defer fragmented.close();
+        try fragmented.writeAll(header);
+        compat.sleepNs(20 * std.time.ns_per_ms);
+        try fragmented.writeAll(body);
+        var response_buffer: [4096]u8 = undefined;
+        const response = try readResponseWithin(fragmented, &response_buffer, 1_000);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200 OK") != null);
+    }
+
+    {
+        const oversized = try connectController(controller_port);
+        defer oversized.close();
+        try oversized.writeAll(
+            "PUT / HTTP/1.1\r\nContent-Length: 65537\r\n\r\n",
+        );
+        var response_buffer: [4096]u8 = undefined;
+        const response = try readResponseWithin(oversized, &response_buffer, 1_000);
+        try std.testing.expect(
+            std.mem.indexOf(u8, response, "413 Payload Too Large") != null,
+        );
+    }
+
+    var timeout_buffer: [4096]u8 = undefined;
+    const timeout_response = try readResponseWithin(idle, &timeout_buffer, 4_000);
+    try std.testing.expect(
+        std.mem.indexOf(u8, timeout_response, "408 Request Timeout") != null,
+    );
+}
