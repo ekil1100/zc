@@ -500,12 +500,8 @@ pub const OutboundManager = struct {
     pub fn connect(self: *OutboundManager, proxy_name: []const u8, target: []const u8, port: u16) !ProxyStream {
         std.debug.print("[Manager] connect: proxy={s}, target={s}:{d}\n", .{ proxy_name, target, port });
 
-        if (shouldBypassProxyForTarget(target)) {
-            std.debug.print("[Manager] Bypassing proxy for local/private target: {s}:{d}\n", .{ target, port });
-            return try self.connectDirectTarget(target, port);
-        }
-
-        // 处理 DIRECT 和 REJECT 特殊代理
+        // Resolve policy before applying the private-target loop guard. A deny
+        // decision is terminal and must never be rewritten to DIRECT.
         if (std.mem.eql(u8, proxy_name, "DIRECT")) {
             std.debug.print("[Manager] Using DIRECT\n", .{});
             return try self.connectDirectTarget(target, port);
@@ -514,25 +510,35 @@ pub const OutboundManager = struct {
             return error.ConnectionRejected;
         }
 
-        // 如果是代理组名称，解析为实际代理（递归解析嵌套的代理组）
         var current_name = proxy_name;
-        var resolved_name: ?[]const u8 = undefined;
-        var iter: usize = 0;
-        while (iter < 10) : (iter += 1) {
-            resolved_name = self.resolveProxyGroup(current_name);
-            if (resolved_name) |next| {
-                std.debug.print("[Manager] Resolved {s} to {s}\n", .{ current_name, next });
-                current_name = next;
-            } else {
-                break;
-            }
+        var iteration: usize = 0;
+        while (iteration < 10) : (iteration += 1) {
+            const next = self.resolveProxyGroup(current_name) orelse break;
+            std.debug.print("[Manager] Resolved {s} to {s}\n", .{ current_name, next });
+            current_name = next;
         }
 
-        // 现在 current_name 应该是一个实际的代理名称
+        if (std.mem.eql(u8, current_name, "DIRECT")) {
+            return try self.connectDirectTarget(target, port);
+        }
+        if (std.mem.eql(u8, current_name, "REJECT")) {
+            return error.ConnectionRejected;
+        }
+
         const proxy = self.findProxy(current_name) orelse {
             std.debug.print("[Manager] Proxy not found: {s}\n", .{current_name});
             return error.ProxyNotFound;
         };
+        switch (proxy.proxy_type) {
+            .direct => return try self.connectDirectTarget(target, port),
+            .reject => return error.ConnectionRejected,
+            else => {},
+        }
+
+        if (shouldBypassProxyForTarget(target)) {
+            std.debug.print("[Manager] Bypassing proxy for local/private target: {s}:{d}\n", .{ target, port });
+            return try self.connectDirectTarget(target, port);
+        }
         return try self.connectToProxy(proxy, target, port);
     }
 
@@ -1178,6 +1184,44 @@ test "shouldBypassProxyForTarget detects loopback and private targets" {
     try std.testing.expect(!shouldBypassProxyForTarget("8.8.8.8"));
     try std.testing.expect(!shouldBypassProxyForTarget("1.1.1.1"));
     try std.testing.expect(!shouldBypassProxyForTarget("open.feishu.cn"));
+}
+
+test "connect keeps reject policies terminal for private targets" {
+    // Explicit denial must be evaluated before any loopback bypass policy.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "deny"),
+        .proxy_type = .reject,
+        .server = try allocator.dupe(u8, ""),
+        .port = 0,
+    });
+    var group = @import("../../config.zig").ProxyGroup{
+        .name = try allocator.dupe(u8, "blocked"),
+        .group_type = .select,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+    try group.proxies.append(allocator, try allocator.dupe(u8, "deny"));
+    try cfg.proxy_groups.append(allocator, group);
+
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+    const policies = [_][]const u8{ "REJECT", "deny", "blocked" };
+    for (policies) |policy| {
+        try std.testing.expectError(
+            error.ConnectionRejected,
+            manager.connect(policy, "127.0.0.1", 1),
+        );
+    }
 }
 
 test "connect bypasses proxy groups for loopback targets" {

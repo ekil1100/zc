@@ -101,6 +101,8 @@ Parsed rule types:
 - `PROCESS-NAME`
 - `MATCH`
 
+`REJECT` 是终态策略：即使目标是 loopback、链路本地或私网地址，也不会被内部直连保护逻辑改写为 `DIRECT`。此语义同样适用于直接命名的 reject 节点和解析到 reject 节点的代理组。
+
 Known limitations:
 
 - HTTP CONNECT/forward paths must still be checked for full `DST-PORT` context propagation before GA.
