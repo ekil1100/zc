@@ -573,7 +573,7 @@ fn wantsCommandHelp(args: []const []const u8) bool {
 fn printOverrideOptionError(json_output: bool, err: anyerror) void {
     switch (err) {
         error.MissingOverrideScriptPath => printCliError(json_output, "OVERRIDE_SCRIPT_NOT_FOUND", "missing --override-script path", "use `--override-script <path>`"),
-        error.InvalidOverrideTimeout => printCliError(json_output, "OVERRIDE_SCRIPT_TIMEOUT", "invalid --override-timeout-ms value", "use a positive integer, e.g. `--override-timeout-ms 500`"),
+        error.InvalidOverrideTimeout => printCliError(json_output, "OVERRIDE_SCRIPT_TIMEOUT", "invalid --override-timeout-ms value", "use 1..60000 milliseconds, e.g. `--override-timeout-ms 5000`"),
         error.MissingOverrideArg => printCliError(json_output, "OVERRIDE_OUTPUT_INVALID", "missing --override-arg value", "use `--override-arg key=value`"),
         error.InvalidOverrideArg => printCliError(json_output, "OVERRIDE_OUTPUT_INVALID", "invalid --override-arg value", "use `--override-arg key=value`"),
         error.DeprecatedOverrideDumpOption => printCliError(json_output, "OVERRIDE_OPTION_DEPRECATED", "--override-dump-yaml/json has been removed", "use `zc config dump [-c <config>]`"),

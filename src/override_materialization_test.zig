@@ -17,7 +17,7 @@ const FakeRunner = struct {
         try testing.expectEqualStrings("override.sh", script.name);
         try testing.expectEqualStrings("#!/bin/sh\n", script.bytes);
         try testing.expectEqualStrings("legacy-migration", invocation.command);
-        try testing.expectEqual(@as(u32, 500), invocation.timeout_ms);
+        try testing.expectEqual(materialization.timeout_ms_default, invocation.timeout_ms);
         try testing.expectEqual(@as(usize, 1), invocation.args.len);
         try testing.expectEqualStrings("region", invocation.args[0].key);
         return allocator.dupe(u8, self.patch);
@@ -34,7 +34,7 @@ test "OverrideMaterialization executes once and freezes every effective input" {
         .invocation = .{
             .command = "legacy-migration",
             .config_path = "configs/home.yaml",
-            .timeout_ms = 500,
+            .timeout_ms = materialization.timeout_ms_default,
             .args = &args,
         },
         .runner = .{ .context = &fake, .run = FakeRunner.run },

@@ -4,6 +4,9 @@ const compat = @import("compat.zig");
 const config = @import("config.zig");
 const yaml = @import("util/yaml.zig");
 
+pub const timeout_ms_default: u32 = 5_000;
+pub const timeout_ms_max: u32 = 60_000;
+
 pub const OverrideArg = struct {
     key: []u8,
     value: []u8,
@@ -21,7 +24,7 @@ fn appendOwnedSlice(
 
 pub const CliOptions = struct {
     script_path: ?[]u8 = null,
-    timeout_ms: u32 = 500,
+    timeout_ms: u32 = timeout_ms_default,
     args: std.ArrayList(OverrideArg) = .empty,
 
     pub fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
@@ -52,7 +55,7 @@ pub const CliOptions = struct {
             errdefer allocator.free(pair);
             try out.append(allocator, pair);
         }
-        if (self.timeout_ms != 500) {
+        if (self.timeout_ms != timeout_ms_default) {
             try appendOwnedSlice(allocator, out, "--override-timeout-ms");
             const timeout = try std.fmt.allocPrint(
                 allocator,
@@ -82,6 +85,15 @@ pub const Errors = error{
     OverrideMergeFailed,
     DeprecatedOverrideDumpOption,
 };
+
+fn parseTimeoutMs(text: []const u8) !u32 {
+    const value = std.fmt.parseInt(u32, text, 10) catch
+        return Errors.InvalidOverrideTimeout;
+    if (value == 0 or value > timeout_ms_max) {
+        return Errors.InvalidOverrideTimeout;
+    }
+    return value;
+}
 
 fn replaceScriptPath(
     allocator: std.mem.Allocator,
@@ -132,13 +144,13 @@ pub fn parseCliOptions(allocator: std.mem.Allocator, args: []const []const u8) !
         if (std.mem.eql(u8, arg, "--override-timeout-ms")) {
             if (i + 1 >= args.len) return Errors.InvalidOverrideTimeout;
             i += 1;
-            opts.timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch return Errors.InvalidOverrideTimeout;
+            opts.timeout_ms = try parseTimeoutMs(args[i]);
             continue;
         }
 
         if (std.mem.startsWith(u8, arg, "--override-timeout-ms=")) {
             const value = arg["--override-timeout-ms=".len..];
-            opts.timeout_ms = std.fmt.parseInt(u32, value, 10) catch return Errors.InvalidOverrideTimeout;
+            opts.timeout_ms = try parseTimeoutMs(value);
             continue;
         }
 
@@ -188,6 +200,9 @@ pub fn executeScriptPatch(
     command_name: []const u8,
     config_path: ?[]const u8,
 ) ![]u8 {
+    if (timeout_ms == 0 or timeout_ms > timeout_ms_max) {
+        return Errors.InvalidOverrideTimeout;
+    }
     var options = CliOptions{
         .script_path = try allocator.dupe(u8, script_path),
         .timeout_ms = timeout_ms,
@@ -378,13 +393,12 @@ fn runCommandWithTimeout(
     env_map: *const std.process.Environ.Map,
     timeout_ms: u32,
 ) ![]u8 {
-    const timeout: std.Io.Timeout = if (timeout_ms == 0)
-        .none
-    else
-        .{ .duration = .{
-            .clock = .awake,
-            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
-        } };
+    std.debug.assert(timeout_ms > 0);
+    std.debug.assert(timeout_ms <= timeout_ms_max);
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .clock = .awake,
+        .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+    } };
     const result = try std.process.run(allocator, compat.io(), .{
         .argv = argv,
         .environ_map = env_map,
@@ -1337,6 +1351,28 @@ test "override CLI options release every allocation failure path" {
         std.testing.allocator,
         parseCliOptionsAllocationFixture,
         .{},
+    );
+}
+
+test "override parse options enforces a bounded timeout" {
+    // Zero disables deadlines today; values above one minute are not actionable.
+    const allocator = std.testing.allocator;
+    const zero = [_][]const u8{ "zc", "--override-timeout-ms=0" };
+    try std.testing.expectError(
+        Errors.InvalidOverrideTimeout,
+        parseCliOptions(allocator, &zero),
+    );
+    const excessive = [_][]const u8{
+        "zc",
+        "--override-timeout-ms=60001",
+    };
+    try std.testing.expectError(
+        Errors.InvalidOverrideTimeout,
+        parseCliOptions(allocator, &excessive),
+    );
+    try std.testing.expectError(
+        Errors.InvalidOverrideTimeout,
+        executeScriptPatch(allocator, "unused", &.{}, 0, "test", null),
     );
 }
 

@@ -9,7 +9,7 @@ You can bind a persistent override script to the current config profile via `zc 
 
 - `--override-script <path>`: run override script.
 - `--override-arg <k=v>`: repeatable key/value arguments passed to script.
-- `--override-timeout-ms <n>`: script timeout, default `500`.
+- `--override-timeout-ms <n>`：脚本超时范围为 `1..60000` ms，默认 `5000`；`0` 不再表示无期限执行。
 
 For merged config output, use:
 

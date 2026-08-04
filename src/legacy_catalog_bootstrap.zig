@@ -313,7 +313,7 @@ fn prepareProfile(
             .invocation = .{
                 .command = "legacy-migration",
                 .config_path = config_path,
-                .timeout_ms = 500,
+                .timeout_ms = override_materialization.timeout_ms_default,
                 .args = &.{},
             },
             .runner = process_runner.runner(),

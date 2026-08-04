@@ -6,6 +6,7 @@ const override = @import("override.zig");
 pub const max_script_bytes = 1024 * 1024;
 pub const max_patch_bytes = 1024 * 1024;
 pub const max_effective_source_bytes = 16 * 1024 * 1024;
+pub const timeout_ms_default = override.timeout_ms_default;
 
 pub const Argument = struct {
     key: []const u8,
@@ -20,7 +21,7 @@ pub const Script = struct {
 pub const Invocation = struct {
     command: []const u8,
     config_path: ?[]const u8 = null,
-    timeout_ms: u32 = 500,
+    timeout_ms: u32 = timeout_ms_default,
     args: []const Argument = &.{},
 };
 
