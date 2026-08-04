@@ -1,7 +1,8 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
 const net = compat.net;
-const Config = @import("../config.zig").Config;
+const config_mod = @import("../config.zig");
+const Config = config_mod.Config;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = @import("../proxy/outbound/manager.zig").OutboundManager;
 const build_options = @import("build_options");
@@ -16,7 +17,13 @@ pub const ApiServer = struct {
     manager: *OutboundManager,
     port: u16,
 
-    pub fn init(allocator: std.mem.Allocator, config: *const Config, engine: *Engine, manager: *OutboundManager, port: u16) ApiServer {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: *const Config,
+        engine: *Engine,
+        manager: *OutboundManager,
+        port: u16,
+    ) ApiServer {
         return .{
             .allocator = allocator,
             .config = config,
@@ -82,7 +89,13 @@ pub const ApiServer = struct {
         // 路由
         if (std.mem.eql(u8, method, "GET")) {
             if (std.mem.eql(u8, path, "/")) {
-                try self.sendJson(conn, comptime std.fmt.comptimePrint("{{\"version\":\"{s}\",\"hello\":\"zc\"}}", .{build_options.version}));
+                try self.sendJson(
+                    conn,
+                    comptime std.fmt.comptimePrint(
+                        "{{\"version\":\"{s}\",\"hello\":\"zc\"}}",
+                        .{build_options.version},
+                    ),
+                );
             } else if (std.mem.eql(u8, path, "/proxies")) {
                 try self.handleGetProxies(conn);
             } else if (std.mem.eql(u8, path, "/rules")) {
@@ -90,7 +103,13 @@ pub const ApiServer = struct {
             } else if (std.mem.eql(u8, path, "/status")) {
                 try self.handleGetStatus(conn);
             } else if (std.mem.eql(u8, path, "/version")) {
-                try self.sendJson(conn, comptime std.fmt.comptimePrint("{{\"version\":\"{s}\"}}", .{build_options.version}));
+                try self.sendJson(
+                    conn,
+                    comptime std.fmt.comptimePrint(
+                        "{{\"version\":\"{s}\"}}",
+                        .{build_options.version},
+                    ),
+                );
             } else {
                 try self.sendError(conn, 404, "Not Found");
             }
@@ -110,35 +129,42 @@ pub const ApiServer = struct {
     }
 
     fn handleGetProxies(self: *ApiServer, conn: net.Server.Connection) !void {
-        var json = std.ArrayList(u8).empty;
-        defer json.deinit(self.allocator);
+        const json = try buildProxiesJson(self.allocator, self.config);
+        defer self.allocator.free(json);
+        try self.sendJsonRaw(conn, json);
+    }
 
-        try json.appendSlice(self.allocator, "{\"proxies\":[");
+    pub fn buildProxiesJson(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+    ) ![]u8 {
+        const ProxyView = struct {
+            name: []const u8,
+            type: []const u8,
+            server: []const u8,
+            port: u16,
+        };
+        const Response = struct { proxies: []const ProxyView };
 
-        for (self.config.proxies.items, 0..) |proxy, i| {
-            if (i > 0) try json.appendSlice(self.allocator, ",");
-
-            const type_str = switch (proxy.proxy_type) {
-                .direct => "Direct",
-                .reject => "Reject",
-                .http => "Http",
-                .socks5 => "Socks5",
-                .ss => "Shadowsocks",
-                .vmess => "Vmess",
-                .trojan => "Trojan",
-                .vless => "Vless",
-                .anytls => "AnyTLS",
+        const views = try allocator.alloc(ProxyView, cfg.proxies.items.len);
+        defer allocator.free(views);
+        for (cfg.proxies.items, views) |proxy, *view| {
+            view.* = .{
+                .name = proxy.name,
+                .type = proxyTypeName(proxy.proxy_type),
+                .server = proxy.server,
+                .port = proxy.port,
             };
-
-            try json.print(self.allocator, "{{\"name\":\"{s}\",\"type\":\"{s}\",\"server\":\"{s}\",\"port\":{d}}}", .{ proxy.name, type_str, proxy.server, proxy.port });
         }
-
-        try json.appendSlice(self.allocator, "]}");
-        try self.sendJsonRaw(conn, json.items);
+        return stringifyOwned(allocator, Response{ .proxies = views });
     }
 
     fn handleGetStatus(self: *ApiServer, conn: net.Server.Connection) !void {
-        const json_str = try ApiServer.buildStatusJson(self.allocator, self.manager, self.config);
+        const json_str = try ApiServer.buildStatusJson(
+            self.allocator,
+            self.manager,
+            self.config,
+        );
         defer self.allocator.free(json_str);
         try self.sendJsonRaw(conn, json_str);
     }
@@ -154,52 +180,50 @@ pub const ApiServer = struct {
         const cfg_key = manager.configKey();
         const entries = try manager.snapshotSelections(allocator);
         defer runtime_selection.freeSelectionEntries(allocator, entries);
-        const selections = try runtime_selection.collectSelectedProxiesFromSnapshot(allocator, cfg, entries);
+        const selections = try runtime_selection.collectSelectedProxiesFromSnapshot(
+            allocator,
+            cfg,
+            entries,
+        );
         defer runtime_selection.deinitSelectedProxies(allocator, selections);
 
         const Resp = struct {
             config_key: ?[]const u8,
             selected_proxies: []const runtime_selection.SelectedProxy,
         };
-        var w: std.Io.Writer.Allocating = .init(allocator);
-        defer w.deinit();
-        try std.json.Stringify.value(
+        return stringifyOwned(
+            allocator,
             Resp{ .config_key = cfg_key, .selected_proxies = selections },
-            .{ .whitespace = .minified },
-            &w.writer,
         );
-        return try allocator.dupe(u8, w.written());
     }
 
     fn handleGetRules(self: *ApiServer, conn: net.Server.Connection) !void {
-        var json = std.ArrayList(u8).empty;
-        defer json.deinit(self.allocator);
+        const json = try buildRulesJson(self.allocator, self.config);
+        defer self.allocator.free(json);
+        try self.sendJsonRaw(conn, json);
+    }
 
-        try json.appendSlice(self.allocator, "{\"rules\":[");
+    pub fn buildRulesJson(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+    ) ![]u8 {
+        const RuleView = struct {
+            type: []const u8,
+            payload: []const u8,
+            target: []const u8,
+        };
+        const Response = struct { rules: []const RuleView };
 
-        for (self.config.rules.items, 0..) |rule, i| {
-            if (i > 0) try json.appendSlice(self.allocator, ",");
-
-            const type_str = switch (rule.rule_type) {
-                .domain => "DOMAIN",
-                .domain_suffix => "DOMAIN-SUFFIX",
-                .domain_keyword => "DOMAIN-KEYWORD",
-                .ip_cidr => "IP-CIDR",
-                .ip_cidr6 => "IP-CIDR6",
-                .geoip => "GEOIP",
-                .rule_set => "RULE-SET",
-                .src_ip_cidr => "SRC-IP-CIDR",
-                .dst_port => "DST-PORT",
-                .src_port => "SRC-PORT",
-                .process_name => "PROCESS-NAME",
-                .final => "MATCH",
+        const views = try allocator.alloc(RuleView, cfg.rules.items.len);
+        defer allocator.free(views);
+        for (cfg.rules.items, views) |rule, *view| {
+            view.* = .{
+                .type = ruleTypeName(rule.rule_type),
+                .payload = rule.payload,
+                .target = rule.target,
             };
-
-            try json.print(self.allocator, "{{\"type\":\"{s}\",\"payload\":\"{s}\",\"target\":\"{s}\"}}", .{ type_str, rule.payload, rule.target });
         }
-
-        try json.appendSlice(self.allocator, "]}");
-        try self.sendJsonRaw(conn, json.items);
+        return stringifyOwned(allocator, Response{ .rules = views });
     }
 
     /// PUT /proxies/<group_name> body: {"name":"proxy_name"}
@@ -208,7 +232,12 @@ pub const ApiServer = struct {
     /// 修复旧 extractJsonString 扫到第一个 `"` 字节截断转义名的 bug）；
     /// 组/节点先对照配置校验，未命中返回 404 而不是无条件 200（修复 CLI
     /// `data.applied` 假阳性）。
-    fn handleSwitchProxy(self: *ApiServer, conn: net.Server.Connection, group_name: []const u8, body: []const u8) !void {
+    fn handleSwitchProxy(
+        self: *ApiServer,
+        conn: net.Server.Connection,
+        group_name: []const u8,
+        body: []const u8,
+    ) !void {
         const proxy_name = parseSelectionName(self.allocator, body) orelse {
             try self.sendError(conn, 400, "Missing name in body");
             return;
@@ -256,8 +285,17 @@ pub const ApiServer = struct {
         try conn.stream.writeAll(response);
     }
 
-    fn sendError(self: *ApiServer, conn: net.Server.Connection, code: u16, message: []const u8) !void {
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{message});
+    fn sendError(
+        self: *ApiServer,
+        conn: net.Server.Connection,
+        code: u16,
+        message: []const u8,
+    ) !void {
+        const ErrorResponse = struct { @"error": []const u8 };
+        const body = try stringifyOwned(
+            self.allocator,
+            ErrorResponse{ .@"error" = message },
+        );
         defer self.allocator.free(body);
 
         const response = try std.fmt.allocPrint(self.allocator, "HTTP/1.1 {d} {s}\r\n" ++
@@ -270,6 +308,45 @@ pub const ApiServer = struct {
         try conn.stream.writeAll(response);
     }
 };
+
+fn stringifyOwned(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    return std.json.Stringify.valueAlloc(
+        allocator,
+        value,
+        .{ .whitespace = .minified },
+    );
+}
+
+fn proxyTypeName(proxy_type: config_mod.ProxyType) []const u8 {
+    return switch (proxy_type) {
+        .direct => "Direct",
+        .reject => "Reject",
+        .http => "Http",
+        .socks5 => "Socks5",
+        .ss => "Shadowsocks",
+        .vmess => "Vmess",
+        .trojan => "Trojan",
+        .vless => "Vless",
+        .anytls => "AnyTLS",
+    };
+}
+
+fn ruleTypeName(rule_type: config_mod.RuleType) []const u8 {
+    return switch (rule_type) {
+        .domain => "DOMAIN",
+        .domain_suffix => "DOMAIN-SUFFIX",
+        .domain_keyword => "DOMAIN-KEYWORD",
+        .ip_cidr => "IP-CIDR",
+        .ip_cidr6 => "IP-CIDR6",
+        .geoip => "GEOIP",
+        .rule_set => "RULE-SET",
+        .src_ip_cidr => "SRC-IP-CIDR",
+        .dst_port => "DST-PORT",
+        .src_port => "SRC-PORT",
+        .process_name => "PROCESS-NAME",
+        .final => "MATCH",
+    };
+}
 
 /// 从 PUT body 解析 `name` 字段（std.json，真实反转义）。返回 owned slice，
 /// 调用方负责 free；body 非法/缺字段/非字符串返回 null。
@@ -286,7 +363,11 @@ pub const SelectionCheck = enum { ok, group_not_found, proxy_not_found };
 
 /// 对照配置校验选择目标（与 OutboundManager.selectProxyInternal 的成员
 /// 匹配语义一致），让 handleSwitchProxy 能对未命中返回 404。
-pub fn validateSelection(cfg: *const Config, group_name: []const u8, proxy_name: []const u8) SelectionCheck {
+pub fn validateSelection(
+    cfg: *const Config,
+    group_name: []const u8,
+    proxy_name: []const u8,
+) SelectionCheck {
     for (cfg.proxy_groups.items) |grp| {
         if (std.mem.eql(u8, grp.name, group_name)) {
             for (grp.proxies.items) |member| {

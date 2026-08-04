@@ -7,7 +7,9 @@ const config = @import("../config.zig");
 // Simple HTTP response parsing test
 test "HTTP response parsing" {
     const ver = build_options.version;
-    const response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" ++ comptime std.fmt.comptimePrint("{{\"version\":\"{s}\"}}", .{ver});
+    const response = "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        comptime std.fmt.comptimePrint("{{\"version\":\"{s}\"}}", .{ver});
 
     // Check status line
     try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK"));
@@ -108,10 +110,22 @@ test "validateSelection distinguishes ok / missing group / missing proxy" {
     try group.proxies.append(allocator, try allocator.dupe(u8, "node \"HK\""));
     try cfg.proxy_groups.append(allocator, group);
 
-    try testing.expectEqual(server.SelectionCheck.ok, server.validateSelection(&cfg, "PROXY", "dummy-b"));
-    try testing.expectEqual(server.SelectionCheck.ok, server.validateSelection(&cfg, "PROXY", "node \"HK\""));
-    try testing.expectEqual(server.SelectionCheck.proxy_not_found, server.validateSelection(&cfg, "PROXY", "no-such-node"));
-    try testing.expectEqual(server.SelectionCheck.group_not_found, server.validateSelection(&cfg, "NOPE", "dummy-b"));
+    try testing.expectEqual(
+        server.SelectionCheck.ok,
+        server.validateSelection(&cfg, "PROXY", "dummy-b"),
+    );
+    try testing.expectEqual(
+        server.SelectionCheck.ok,
+        server.validateSelection(&cfg, "PROXY", "node \"HK\""),
+    );
+    try testing.expectEqual(
+        server.SelectionCheck.proxy_not_found,
+        server.validateSelection(&cfg, "PROXY", "no-such-node"),
+    );
+    try testing.expectEqual(
+        server.SelectionCheck.group_not_found,
+        server.validateSelection(&cfg, "NOPE", "dummy-b"),
+    );
 }
 
 test "JSON response format" {
@@ -130,6 +144,69 @@ test "JSON response format" {
 
     try testing.expect(std.mem.indexOf(u8, result, "\"proxies\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "\"name\":\"Proxy1\"") != null);
+}
+
+fn exerciseApiSerializers(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+) !void {
+    const proxies = try server.ApiServer.buildProxiesJson(allocator, cfg);
+    defer allocator.free(proxies);
+    const rules = try server.ApiServer.buildRulesJson(allocator, cfg);
+    defer allocator.free(rules);
+}
+
+test "minimal API serializers escape configured strings" {
+    // Quotes, backslashes, control characters, and Unicode must round-trip.
+    const allocator = testing.allocator;
+    var cfg = config.Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+    defer cfg.deinit();
+
+    const proxy_name = "node \"HK\"\\line\n雪";
+    const server_name = "server\\name\t雪";
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, proxy_name),
+        .proxy_type = .ss,
+        .server = try allocator.dupe(u8, server_name),
+        .port = 8388,
+    });
+    const payload = "foo\"bar\\baz\n雪";
+    const target = "node \"HK\"\\line\n雪";
+    try cfg.rules.append(allocator, .{
+        .rule_type = .domain,
+        .payload = try allocator.dupe(u8, payload),
+        .target = try allocator.dupe(u8, target),
+    });
+
+    const proxies_json = try server.ApiServer.buildProxiesJson(allocator, &cfg);
+    defer allocator.free(proxies_json);
+    var proxies = try std.json.parseFromSlice(std.json.Value, allocator, proxies_json, .{});
+    defer proxies.deinit();
+    const proxy = proxies.value.object.get("proxies").?.array.items[0].object;
+    try testing.expectEqualStrings(proxy_name, proxy.get("name").?.string);
+    try testing.expectEqualStrings(server_name, proxy.get("server").?.string);
+
+    const rules_json = try server.ApiServer.buildRulesJson(allocator, &cfg);
+    defer allocator.free(rules_json);
+    var rules = try std.json.parseFromSlice(std.json.Value, allocator, rules_json, .{});
+    defer rules.deinit();
+    const rule = rules.value.object.get("rules").?.array.items[0].object;
+    try testing.expectEqualStrings(payload, rule.get("payload").?.string);
+    try testing.expectEqualStrings(target, rule.get("target").?.string);
+
+    try testing.checkAllAllocationFailures(
+        allocator,
+        exerciseApiSerializers,
+        .{&cfg},
+    );
 }
 
 test "buildStatusJson returns daemon config_key and runtime selections" {

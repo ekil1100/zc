@@ -25,6 +25,8 @@ external-controller: 127.0.0.1:9090
 | `GET` | `/rules` | List configured rules. |
 | `PUT` | `/proxies/<group_name>` | Select a proxy for a group; body contains `{"name":"proxy_name"}`. |
 
+所有 JSON 响应均由标准序列化器生成；配置中的引号、反斜杠、控制字符与 Unicode 会按 JSON 规则转义并可无损还原。
+
 ## Known limitations
 
 - No WebSocket event stream.
