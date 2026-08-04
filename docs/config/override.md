@@ -61,6 +61,8 @@ input.script_path  -- resolved override script path
 input.args         -- key/value map from --override-arg
 ```
 
+Lua 参数通过逐项环境变量传输，值中的 `;`、`=` 和空字符串会原样保留；重复 key 按命令行顺序由后一个值覆盖前一个值。
+
 Example:
 
 ```lua
@@ -84,10 +86,13 @@ log-level: debug
 
 ## Merge Rules
 
+- override stdout 必须是一个完整 YAML map；重复 key、尾随非注释内容和畸形文档会被拒绝
+- 整个 patch 采用事务式提交：语法、类型、分配或语义失败时，原配置保持不变
 - scalar keys: replace
 - map key `rule-providers`: whole-map replace
 - list keys (`proxies`, `proxy-groups`, `rules`): whole-list replace
 - unknown/unsupported key: error (`OVERRIDE_OUTPUT_INVALID`)
+- YAML `null` 清除 `external-controller`；带引号的 `"null"` 保持为字符串
 
 `RULE-SET` in `rules` is supported via `rule-providers`.
 Runtime preparation behavior:

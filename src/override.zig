@@ -9,6 +9,16 @@ pub const OverrideArg = struct {
     value: []u8,
 };
 
+fn appendOwnedSlice(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList([]const u8),
+    value: []const u8,
+) !void {
+    const copy = try allocator.dupe(u8, value);
+    errdefer allocator.free(copy);
+    try out.append(allocator, copy);
+}
+
 pub const CliOptions = struct {
     script_path: ?[]u8 = null,
     timeout_ms: u32 = 500,
@@ -23,19 +33,34 @@ pub const CliOptions = struct {
         self.args.deinit(allocator);
     }
 
-    pub fn appendForwardArgs(self: *const CliOptions, allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
+    pub fn appendForwardArgs(
+        self: *const CliOptions,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList([]const u8),
+    ) !void {
         if (self.script_path) |script| {
-            try out.append(allocator, try allocator.dupe(u8, "--override-script"));
-            try out.append(allocator, try allocator.dupe(u8, script));
+            try appendOwnedSlice(allocator, out, "--override-script");
+            try appendOwnedSlice(allocator, out, script);
         }
         for (self.args.items) |arg| {
-            const kv = try std.fmt.allocPrint(allocator, "{s}={s}", .{ arg.key, arg.value });
-            try out.append(allocator, try allocator.dupe(u8, "--override-arg"));
-            try out.append(allocator, kv);
+            try appendOwnedSlice(allocator, out, "--override-arg");
+            const pair = try std.fmt.allocPrint(
+                allocator,
+                "{s}={s}",
+                .{ arg.key, arg.value },
+            );
+            errdefer allocator.free(pair);
+            try out.append(allocator, pair);
         }
         if (self.timeout_ms != 500) {
-            try out.append(allocator, try allocator.dupe(u8, "--override-timeout-ms"));
-            try out.append(allocator, try std.fmt.allocPrint(allocator, "{d}", .{self.timeout_ms}));
+            try appendOwnedSlice(allocator, out, "--override-timeout-ms");
+            const timeout = try std.fmt.allocPrint(
+                allocator,
+                "{d}",
+                .{self.timeout_ms},
+            );
+            errdefer allocator.free(timeout);
+            try out.append(allocator, timeout);
         }
     }
 };
@@ -58,6 +83,30 @@ pub const Errors = error{
     DeprecatedOverrideDumpOption,
 };
 
+fn replaceScriptPath(
+    allocator: std.mem.Allocator,
+    options: *CliOptions,
+    value: []const u8,
+) !void {
+    const replacement = try allocator.dupe(u8, value);
+    const old = options.script_path;
+    options.script_path = replacement;
+    if (old) |item| allocator.free(item);
+}
+
+fn appendOverrideArg(
+    allocator: std.mem.Allocator,
+    options: *CliOptions,
+    text: []const u8,
+) !void {
+    const pair = try parseOverrideArg(allocator, text);
+    errdefer {
+        allocator.free(pair.key);
+        allocator.free(pair.value);
+    }
+    try options.args.append(allocator, pair);
+}
+
 pub fn parseCliOptions(allocator: std.mem.Allocator, args: []const []const u8) !CliOptions {
     var opts = CliOptions{};
     errdefer opts.deinit(allocator);
@@ -69,16 +118,14 @@ pub fn parseCliOptions(allocator: std.mem.Allocator, args: []const []const u8) !
         if (std.mem.eql(u8, arg, "--override-script")) {
             if (i + 1 >= args.len) return Errors.MissingOverrideScriptPath;
             i += 1;
-            if (opts.script_path) |old| allocator.free(old);
-            opts.script_path = try allocator.dupe(u8, args[i]);
+            try replaceScriptPath(allocator, &opts, args[i]);
             continue;
         }
 
         if (std.mem.startsWith(u8, arg, "--override-script=")) {
             const value = arg["--override-script=".len..];
             if (value.len == 0) return Errors.MissingOverrideScriptPath;
-            if (opts.script_path) |old| allocator.free(old);
-            opts.script_path = try allocator.dupe(u8, value);
+            try replaceScriptPath(allocator, &opts, value);
             continue;
         }
 
@@ -98,14 +145,16 @@ pub fn parseCliOptions(allocator: std.mem.Allocator, args: []const []const u8) !
         if (std.mem.eql(u8, arg, "--override-arg")) {
             if (i + 1 >= args.len) return Errors.MissingOverrideArg;
             i += 1;
-            const pair = try parseOverrideArg(allocator, args[i]);
-            try opts.args.append(allocator, pair);
+            try appendOverrideArg(allocator, &opts, args[i]);
             continue;
         }
 
         if (std.mem.startsWith(u8, arg, "--override-arg=")) {
-            const pair = try parseOverrideArg(allocator, arg["--override-arg=".len..]);
-            try opts.args.append(allocator, pair);
+            try appendOverrideArg(
+                allocator,
+                &opts,
+                arg["--override-arg=".len..],
+            );
             continue;
         }
 
@@ -122,9 +171,12 @@ fn parseOverrideArg(allocator: std.mem.Allocator, pair: []const u8) !OverrideArg
     const key = std.mem.trim(u8, pair[0..eq], " \t");
     const value = pair[eq + 1 ..];
     if (key.len == 0) return Errors.InvalidOverrideArg;
+    const key_copy = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_copy);
+    const value_copy = try allocator.dupe(u8, value);
     return .{
-        .key = try allocator.dupe(u8, key),
-        .value = try allocator.dupe(u8, value),
+        .key = key_copy,
+        .value = value_copy,
     };
 }
 
@@ -179,16 +231,25 @@ pub fn applyPatch(
 ) !void {
     const trimmed = std.mem.trim(u8, patch_text, " \t\r\n");
     if (trimmed.len == 0) return;
-    var root = yaml.parse(allocator, trimmed) catch |err| switch (err) {
+    var root = yaml.parseDocument(allocator, trimmed) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return Errors.OverrideOutputInvalid,
     };
     defer root.deinit(allocator);
     if (root != .map) return Errors.OverrideOutputInvalid;
-    applyMapOverride(allocator, cfg, &root.map) catch |err| switch (err) {
+
+    const source = try dumpEffectiveConfigYaml(allocator, cfg);
+    defer allocator.free(source);
+    var replacement = try config.parseDocument(allocator, source);
+    errdefer replacement.deinit();
+    applyMapOverride(allocator, &replacement, &root.map) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return Errors.OverrideMergeFailed,
     };
+
+    var previous = cfg.*;
+    cfg.* = replacement;
+    previous.deinit();
 }
 
 pub fn materializeSource(
@@ -226,17 +287,44 @@ fn executeOverrideScript(
     defer allocator.free(timeout_text);
     try env_map.put("ZC_OVERRIDE_TIMEOUT_MS", timeout_text);
 
+    const argument_count = try std.fmt.allocPrint(
+        allocator,
+        "{d}",
+        .{opts.args.items.len},
+    );
+    defer allocator.free(argument_count);
+    try env_map.put("ZC_OVERRIDE_ARG_COUNT", argument_count);
+
     var args_buf = std.ArrayList(u8).empty;
     defer args_buf.deinit(allocator);
-    for (opts.args.items, 0..) |arg, idx| {
-        if (idx > 0) try args_buf.append(allocator, ';');
+    for (opts.args.items, 0..) |arg, index| {
+        if (index > 0) try args_buf.append(allocator, ';');
         try args_buf.appendSlice(allocator, arg.key);
         try args_buf.append(allocator, '=');
         try args_buf.appendSlice(allocator, arg.value);
 
+        const key_name = try std.fmt.allocPrint(
+            allocator,
+            "ZC_OVERRIDE_ARG_{d}_KEY",
+            .{index},
+        );
+        defer allocator.free(key_name);
+        const value_name = try std.fmt.allocPrint(
+            allocator,
+            "ZC_OVERRIDE_ARG_{d}_VALUE",
+            .{index},
+        );
+        defer allocator.free(value_name);
+        try env_map.put(key_name, arg.key);
+        try env_map.put(value_name, arg.value);
+
         const env_key = try sanitizeEnvKey(allocator, arg.key);
         defer allocator.free(env_key);
-        const full_key = try std.fmt.allocPrint(allocator, "ZC_OVERRIDE_ARG_{s}", .{env_key});
+        const full_key = try std.fmt.allocPrint(
+            allocator,
+            "ZC_OVERRIDE_ARG_{s}",
+            .{env_key},
+        );
         defer allocator.free(full_key);
         try env_map.put(full_key, arg.value);
     }
@@ -337,7 +425,7 @@ fn sanitizeEnvKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
 
 fn luaWrapper() []const u8 {
     return
-    \\local function parse_args(raw)
+    \\local function parse_legacy_args(raw)
     \\  local out = {}
     \\  if not raw or raw == "" then return out end
     \\  for part in string.gmatch(raw, "([^;]+)") do
@@ -351,11 +439,26 @@ fn luaWrapper() []const u8 {
     \\  return out
     \\end
     \\
+    \\local function parse_args()
+    \\  local count = tonumber(os.getenv("ZC_OVERRIDE_ARG_COUNT"))
+    \\  if count == nil then
+    \\    return parse_legacy_args(os.getenv("ZC_OVERRIDE_ARGS"))
+    \\  end
+    \\  local out = {}
+    \\  for index = 0, count - 1 do
+    \\    local prefix = "ZC_OVERRIDE_ARG_" .. tostring(index)
+    \\    local key = os.getenv(prefix .. "_KEY")
+    \\    local value = os.getenv(prefix .. "_VALUE")
+    \\    if key ~= nil then out[key] = value or "" end
+    \\  end
+    \\  return out
+    \\end
+    \\
     \\input = {
     \\  command = os.getenv("ZC_OVERRIDE_COMMAND"),
     \\  config_path = os.getenv("ZC_OVERRIDE_CONFIG_PATH"),
     \\  script_path = os.getenv("ZC_OVERRIDE_SCRIPT_PATH"),
-    \\  args = parse_args(os.getenv("ZC_OVERRIDE_ARGS")),
+    \\  args = parse_args(),
     \\}
     \\
     \\local function esc(s)
@@ -463,6 +566,17 @@ fn luaWrapper() []const u8 {
     ;
 }
 
+fn replaceOwnedString(
+    allocator: std.mem.Allocator,
+    field: *[]const u8,
+    value: []const u8,
+) !void {
+    const replacement = try allocator.dupe(u8, value);
+    const old = field.*;
+    field.* = replacement;
+    allocator.free(old);
+}
+
 fn applyMapOverride(
     allocator: std.mem.Allocator,
     cfg: *config.Config,
@@ -493,45 +607,38 @@ fn applyMapOverride(
             continue;
         }
         if (std.mem.eql(u8, key, "bind-address")) {
-            const s = switch (value) {
-                .string => |v| v,
+            const string = switch (value) {
+                .string => |item| item,
                 else => return Errors.OverrideOutputInvalid,
             };
-            cfg.allocator.free(cfg.bind_address);
-            cfg.bind_address = try cfg.allocator.dupe(u8, s);
+            try replaceOwnedString(cfg.allocator, &cfg.bind_address, string);
             continue;
         }
         if (std.mem.eql(u8, key, "mode")) {
-            const s = switch (value) {
-                .string => |v| v,
+            const string = switch (value) {
+                .string => |item| item,
                 else => return Errors.OverrideOutputInvalid,
             };
-            cfg.allocator.free(cfg.mode);
-            cfg.mode = try cfg.allocator.dupe(u8, s);
+            try replaceOwnedString(cfg.allocator, &cfg.mode, string);
             continue;
         }
         if (std.mem.eql(u8, key, "log-level")) {
-            const s = switch (value) {
-                .string => |v| v,
+            const string = switch (value) {
+                .string => |item| item,
                 else => return Errors.OverrideOutputInvalid,
             };
-            cfg.allocator.free(cfg.log_level);
-            cfg.log_level = try cfg.allocator.dupe(u8, s);
+            try replaceOwnedString(cfg.allocator, &cfg.log_level, string);
             continue;
         }
         if (std.mem.eql(u8, key, "external-controller")) {
-            if (cfg.external_controller) |old| cfg.allocator.free(old);
-            switch (value) {
-                .null => cfg.external_controller = null,
-                .string => |v| {
-                    if (std.mem.eql(u8, v, "null")) {
-                        cfg.external_controller = null;
-                    } else {
-                        cfg.external_controller = try cfg.allocator.dupe(u8, v);
-                    }
-                },
+            const replacement: ?[]const u8 = switch (value) {
+                .null => null,
+                .string => |item| try cfg.allocator.dupe(u8, item),
                 else => return Errors.OverrideOutputInvalid,
-            }
+            };
+            const old = cfg.external_controller;
+            cfg.external_controller = replacement;
+            if (old) |item| cfg.allocator.free(item);
             continue;
         }
         if (std.mem.eql(u8, key, "proxies")) {
@@ -1203,6 +1310,36 @@ test "override parse options supports script args and timeout" {
     try std.testing.expectEqualStrings("sg", opts.args.items[0].value);
 }
 
+fn parseCliOptionsAllocationFixture(allocator: std.mem.Allocator) !void {
+    const args = [_][]const u8{
+        "zc",
+        "--override-script=first.lua",
+        "--override-script",
+        "second.lua",
+        "--override-arg",
+        "region=sg",
+        "--override-arg=empty=",
+    };
+    var options = try parseCliOptions(allocator, &args);
+    defer options.deinit(allocator);
+
+    var forwarded = std.ArrayList([]const u8).empty;
+    defer {
+        for (forwarded.items) |item| allocator.free(item);
+        forwarded.deinit(allocator);
+    }
+    try options.appendForwardArgs(allocator, &forwarded);
+}
+
+test "override CLI options release every allocation failure path" {
+    // Repeated options and list growth must transfer each allocation once.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseCliOptionsAllocationFixture,
+        .{},
+    );
+}
+
 test "override parse options rejects deprecated dump flags" {
     const allocator = std.testing.allocator;
     const args = [_][]const u8{
@@ -1358,6 +1495,45 @@ test "override execution enforces the configured timeout" {
     try std.testing.expectEqual(@as(u16, 7890), cfg.mixed_port);
 }
 
+test "Lua override arguments preserve delimiters" {
+    // The execution seam must transport values without delimiter re-parsing.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script = try tmp.dir.createFile(compat.io(), "args.lua", .{});
+    try script.writeStreamingAll(
+        compat.io(),
+        "return { [\"bind-address\"] = input.args.value }\n",
+    );
+    script.close(compat.io());
+    const script_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "args.lua",
+        allocator,
+    );
+    defer allocator.free(script_path);
+
+    const value = "alpha;injected=beta=gamma";
+    const patch = executeScriptPatch(
+        allocator,
+        script_path,
+        &.{.{ .key = "value", .value = value }},
+        2_000,
+        "test",
+        null,
+    ) catch |err| switch (err) {
+        Errors.OverrideScriptNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.free(patch);
+
+    var cfg = try config.parseDocument(allocator, "bind-address: old\n");
+    defer cfg.deinit();
+    try applyPatch(allocator, &cfg, patch);
+    try std.testing.expectEqualStrings(value, cfg.bind_address);
+}
+
 test "override apply map supports scalar fields" {
     const allocator = std.testing.allocator;
     const content =
@@ -1368,18 +1544,109 @@ test "override apply map supports scalar fields" {
         \\external-controller: null
     ;
 
-    var root = try yaml.parse(allocator, content);
-    defer root.deinit(allocator);
-
     var cfg = try config.loadDefault(allocator);
     defer cfg.deinit();
     if (cfg.external_controller) |old| allocator.free(old);
     cfg.external_controller = try allocator.dupe(u8, "127.0.0.1:9090");
 
-    try applyMapOverride(allocator, &cfg, &root.map);
+    try applyPatch(allocator, &cfg, content);
     try std.testing.expectEqualStrings("global", cfg.mode);
     try std.testing.expectEqualStrings("debug", cfg.log_level);
     try std.testing.expect(cfg.allow_lan);
     try std.testing.expectEqualStrings("0.0.0.0", cfg.bind_address);
     try std.testing.expect(cfg.external_controller == null);
+}
+
+test "invalid external-controller override preserves config ownership" {
+    // A rejected patch must leave the old allocation readable and singly owned.
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(
+        allocator,
+        "external-controller: 127.0.0.1:9090\n",
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(
+        Errors.OverrideMergeFailed,
+        applyPatch(allocator, &cfg, "external-controller: false\n"),
+    );
+    try std.testing.expectEqualStrings(
+        "127.0.0.1:9090",
+        cfg.external_controller.?,
+    );
+}
+
+fn applyOwnedStringPatchAllocationFixture(allocator: std.mem.Allocator) !void {
+    var cfg = try config.parseDocument(
+        allocator,
+        "bind-address: 127.0.0.1\n" ++
+            "mode: rule\n" ++
+            "log-level: info\n" ++
+            "external-controller: 127.0.0.1:9090\n",
+    );
+    defer cfg.deinit();
+    try applyPatch(
+        allocator,
+        &cfg,
+        "bind-address: 0.0.0.0\n" ++
+            "mode: global\n" ++
+            "log-level: debug\n" ++
+            "external-controller: 127.0.0.1:9091\n",
+    );
+}
+
+test "owned string overrides release every allocation failure path" {
+    // Failing every allocation proves replacement never loses the old owner.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        applyOwnedStringPatchAllocationFixture,
+        .{},
+    );
+}
+
+test "override patch rejects malformed trailing content before mutation" {
+    // Strict document parsing must reject ignored tails before applying fields.
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(allocator, "mixed-port: 7890\n");
+    defer cfg.deinit();
+
+    try std.testing.expectError(
+        Errors.OverrideOutputInvalid,
+        applyPatch(allocator, &cfg, "mixed-port: 9000\nnot-a-mapping\n"),
+    );
+    try std.testing.expectEqual(@as(u16, 7890), cfg.mixed_port);
+}
+
+test "failed override patch is atomic" {
+    // A later semantic error must not expose any earlier field mutation.
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(
+        allocator,
+        "mixed-port: 7890\nmode: rule\n",
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(
+        Errors.OverrideMergeFailed,
+        applyPatch(
+            allocator,
+            &cfg,
+            "mixed-port: 9000\nmode: global\nunsupported-field: true\n",
+        ),
+    );
+    try std.testing.expectEqual(@as(u16, 7890), cfg.mixed_port);
+    try std.testing.expectEqualStrings("rule", cfg.mode);
+}
+
+test "quoted null remains an external-controller string" {
+    // YAML quoting must distinguish a string from the null scalar.
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(
+        allocator,
+        "external-controller: 127.0.0.1:9090\n",
+    );
+    defer cfg.deinit();
+
+    try applyPatch(allocator, &cfg, "external-controller: \"null\"\n");
+    try std.testing.expectEqualStrings("null", cfg.external_controller.?);
 }
