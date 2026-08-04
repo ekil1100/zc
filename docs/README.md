@@ -12,9 +12,10 @@ zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当
 2. 让文档声明与已实现能力一致；
 3. 从 v1.0 范围移除 TUI；
 4. 清理过期文档；
-5. 让代理选择具备持久、revision-aware 的一致语义；
-6. 增加经过验证、仅 CLI 可用的本地 config import；
-7. 通过最终 smoke gate 后再标记 `v1.0.0`。
+5. 用统一 capability gate 在 bind/dial 前拒绝未经验证的协议；
+6. 让代理选择具备持久、revision-aware 的一致语义；
+7. 增加经过验证、仅 CLI 可用的本地 config import；
+8. 修复安全审计阻断项并通过最终 smoke gate 后再标记 `v1.0.0`。
 
 公开 v1.0 roadmap 见 [`roadmap/v1.0.md`](roadmap/v1.0.md)。可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)。
 
@@ -51,7 +52,7 @@ Included:
 
 - daemon lifecycle through CLI: `start` (`up`), `stop` (`down`), `restart`, `reload`, `status`, `log`, `doctor`, with a uniform `--json` envelope on stdout and uniform exit codes (see [`cli/spec.md`](cli/spec.md));
 - default mixed inbound runtime;
-- AnyTLS 出站(动态 padding、session 多路复用 + 空闲池、UoT v2 UDP 中继;[设计](anytls/session-multiplexing-design.md) / [兼容与已知限制](compat/mihomo-clash.md));
+- DIRECT、REJECT、四种 Shadowsocks AEAD cipher 与 Trojan TCP/TLS 出站；
 - non-production explicit port override via `zc start --port <port>`;
 - core rule matching and rule-provider expansion;
 - minimal REST API for version/proxies/rules/proxy selection;
@@ -63,5 +64,4 @@ Not included in v1.0:
 - TUN/redir/tproxy transparent proxying;
 - complete mihomo DNS behavior;
 - complete REST API v1/WebSocket event stream;
-- full VMess/VLESS transport matrix;
-- HTTP/SOCKS5 outbound unless explicitly implemented before GA.
+- HTTP/SOCKS5/VMess/VLESS/AnyTLS outbound；这些协议只有在独立 wire、互操作、资源和生命周期门禁通过后才会逐个启用。

@@ -171,11 +171,11 @@ Current v1.0 documentation tracks implemented behavior for:
 
 - mixed inbound runtime;
 - core rule matching and rule-provider expansion;
-- select, url-test, fallback, load-balance, and relay proxy groups;
-- direct、reject、Shadowsocks、VMess、Trojan、VLESS 和 AnyTLS 出站运行路径(AnyTLS 含动态 padding、session 多路复用/空闲池、UoT v2 UDP 中继);
+- select proxy groups;
+- DIRECT、REJECT、`aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305` Shadowsocks，以及 Trojan TCP/TLS 出站；
 - minimal REST control endpoints.
 
-Known gaps include full mihomo DNS behavior, transparent proxying through TUN/redir/tproxy, full REST API v1, WebSocket event streams, complete VMess/VLESS transport matrices, and third-party dashboard compatibility.
+v1.0 会在 bind/dial 前拒绝 HTTP、SOCKS5、VMess、VLESS、AnyTLS、未验证的 Shadowsocks cipher 与未接线 transport。某项能力只有在独立 wire、互操作、资源上界和生命周期测试通过后才会逐个启用。其他已知缺口包括完整 mihomo DNS、TUN/redir/tproxy、完整 REST API v1、WebSocket 事件流和第三方 dashboard 兼容。
 
 ## Development
 

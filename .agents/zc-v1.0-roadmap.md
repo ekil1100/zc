@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-07-20
+> 最近更新：2026-08-02
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -11,13 +11,13 @@
 
 当前代码**仍不应直接 GA tag**。本轮 cleanup 已完成 Zig 0.16.0 工具链对齐、TUI de-scope、旧根目录 roadmap/tasks 移除和主要文档重整；剩余阻塞项集中在：
 
-1. **配置层声明支持的部分代理类型未实现出站连接**：`http` / `socks5` 可被 parser 和 validator 接受，但 `OutboundManager.connectToProxy()` 对它们走 `NotImplemented`。`anytls` 已接入最小 TCP 出站路径。
+1. **配置准入与已验证运行能力不一致**：`http` / `socks5` 未实现；VMess/VLESS wire/transport 未通过标准互操作；AnyTLS 生命周期与资源上界仍有安全阻断项。v1.0 已冻结为 fail-closed：仅允许 `direct` / `reject` / 经验证的 Shadowsocks AEAD / Trojan TCP，其他类型在 bind/dial 前拒绝。
 2. ~~**CLI `test --json` 不生效**~~（已解决：全 CLI 输出契约对齐落地，`test --json` 走统一 envelope + `CHECKS_FAILED` 语义，见 `docs/cli/spec.md`）。
 3. **API v1 仍是最小 REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
 5. **代理选择与本地 load 主路径已接 Authority**：CLI durable-first、daemon 启动恢复 desired state，并通过 exact revision runtime descriptor 发现实际 controller endpoint；其余 legacy config writer 仍需统一 cutover，避免后续命令重建 mirror 时形成状态漂移。
 
-因此，v1.0 roadmap 现在应聚焦：**关闭 HTTP/SOCKS5 outbound 策略 P0，并完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import，再做最终 smoke gate 和 GA tag 判断。**
+因此，v1.0 roadmap 现在应聚焦：**落地统一 capability gate，关闭所有未经互操作与生命周期验证的协议；完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import；修复安全审计阻断项后，再做最终 smoke gate 和 GA tag 判断。**
 
 ---
 
@@ -195,7 +195,7 @@ bash scripts/run-full-validation.sh
 
 出站：`src/proxy/outbound/manager.zig`
 
-实际 `connectToProxy()` 已实现：
+`connectToProxy()` 中存在代码路径：
 
 - `direct`
 - `reject`
@@ -205,10 +205,20 @@ bash scripts/run-full-validation.sh
 - `vless`
 - `anytls`
 
-实际未实现但可被配置接受：
+但“存在代码路径”不等于 v1.0 支持。v1.0 capability gate 只允许：
+
+- `direct`
+- `reject`
+- Shadowsocks AEAD：`aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`
+- Trojan TCP/TLS
+
+以下类型在 v1.0 必须由 validator/doctor/runtime 一致地提前拒绝：
 
 - `http`
 - `socks5`
+- `vmess`
+- `vless`
+- `anytls`
 
 协议细节限制：
 
@@ -307,7 +317,7 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 - 默认 mixed inbound 可启动、停止、重启、查看状态。
 - 不发布 TUI；v1.0 只承诺 CLI + minimal API + daemon runtime。
 - `zc start --port <port>` 非生产端口开发入口稳定。
-- DIRECT / REJECT / Shadowsocks AEAD / VMess TCP / Trojan TLS / VLESS TCP 的边界清晰。
+- DIRECT / REJECT / Shadowsocks AEAD / Trojan TCP/TLS 的边界清晰；其他协议在 bind/dial 前 fail closed。
 - 规则：DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / IP-CIDR / IP-CIDR6 / RULE-SET / MATCH 稳定可用。
 - 配置解析失败、端口冲突、provider 下载失败有可操作错误。
 - `doctor --json` 可作为最小诊断包。
@@ -320,8 +330,7 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 - 完整 API v1 资源模型与 WebSocket 事件流。
 - TUN / redir / tproxy。
 - 完整 mihomo DNS 行为，包括 fake-ip、enhanced-mode、nameserver-policy 等。
-- HTTP / SOCKS5 出站，除非 v1.0 前补实现。
-- VMess/VLESS 的 TLS/WS/Reality/gRPC 等完整传输生态，除非 v1.0 前补实现。
+- HTTP / SOCKS5 / VMess / VLESS / AnyTLS 出站；只有固定版本的独立互操作、资源上界和生命周期测试全部通过后，才能逐个重新启用。
 - 完整日志系统、日志轮转、结构化日志。
 
 ---
@@ -354,21 +363,19 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 
 - workflow 中不再出现 `0.15.2`。
 
-### P0-2：修正“配置可接受但出站未实现”的协议声明
+### P0-2：统一 v1 capability gate — Decision locked, implementation in progress
 
-必须二选一：
+冻结决策：v1.0 只允许 `direct`、`reject`、四种已验证 Shadowsocks AEAD cipher 与 Trojan TCP/TLS。HTTP、SOCKS5、VMess、VLESS、AnyTLS 以及未接线 transport 必须在 bind/dial 前 hard reject；协议代码保留不构成支持声明。
 
-A. v1.0 前实现 HTTP / SOCKS5 outbound；或  
-B. parser / validator / docs / migrator 明确把 HTTP / SOCKS5 outbound 标为 unsupported，避免用户配置通过但运行时报 `NotImplemented`。
-
-建议：v1.0 走 B，1.1 再做 A。因为 HTTP/SOCKS5 outbound 看似简单，但需要认证、CONNECT、UDP、错误映射和回归。
+重新启用某一协议的必要条件：固定协议版本的独立外部 oracle、正负 wire vectors、真实互操作、连接生命周期、资源上界和 ReleaseFast 回归全部通过，并在单独 capability-enable commit 中更新 validator、doctor、migrator 与文档。
 
 验收标准：
 
-- `zc test` / `doctor` / config validation 能提前暴露 unsupported outbound，而不是运行时连接时才失败。
-- README 的代理协议兼容表与代码一致。
-- migrator 对 http/socks5 outbound 给出明确 warning/error 和 next-step。
-- 新增回归测试覆盖 `http` / `socks5` outbound 配置的行为。
+- `zc test` / `doctor` / config validation 使用同一 capability 结论，提前拒绝 unsupported outbound。
+- runtime manager 保留第二道 fail-closed 防线，不得因绕过 validator 而建立连接。
+- Shadowsocks validator 只接受 runtime 实际实现的四种 AEAD cipher。
+- README、compat matrix、migrator 和错误码与代码一致。
+- 新增回归测试逐类覆盖 HTTP、SOCKS5、VMess、VLESS、AnyTLS 与 unsupported cipher。
 
 ### P0-3：修正 CLI JSON 契约：`zc test --json`
 
@@ -582,8 +589,7 @@ v1.0 建议：
 以下建议从 v1.0 剥离，进入 v1.1 或后续：
 
 - 完整 API v1 + WebSocket event stream。
-- HTTP / SOCKS5 outbound 完整实现，如果 v1.0 选择先标 unsupported。
-- VMess / VLESS 的 TLS / WS / Reality / gRPC 支持。
+- HTTP / SOCKS5 / VMess / VLESS / AnyTLS 出站逐协议重新实现与启用；每项都必须独立通过 wire、互操作、资源和生命周期门禁。
 - mihomo DNS 完整兼容：`dns:` section、fake-ip、enhanced-mode、nameserver-policy。
 - TUN / redir / tproxy。
 - 统一 logger、日志轮转、JSON logs、trace id。
@@ -600,7 +606,7 @@ v1.0 建议：
 任务：
 
 1. P0-1 修正 CI / release / package Zig 版本。
-2. P0-2 对齐 outbound 协议声明：HTTP/SOCKS5 outbound 实现或明确 unsupported。
+2. P0-2 落地统一 capability gate：v1.0 只允许 direct/reject/SS AEAD/Trojan，其余协议 fail closed。
 3. P0-3 补 `zc test --json`。
 4. P0-4 砍掉 TUI 并清理对应代码 / help / docs。
 5. P0-5 清理或归档历史无用文档，包括删除/归档旧 `ROADMAP.md` / `TASKS.md`、重整 `docs/` 信息架构、清理过期 TUI 草稿、旧 GA-ready 结论和无关 skill/agent 辅助说明。
@@ -678,7 +684,7 @@ git push origin v1.0.0
 
 按风险排序：
 
-1. **决定 HTTP/SOCKS5 outbound 策略**：实现还是标 unsupported；建议先标 unsupported，并同步 validator / doctor / migrator / README。
+1. **实现已冻结的 capability gate**：validator / doctor / runtime / migrator / README 一致拒绝 HTTP、SOCKS5、VMess、VLESS、AnyTLS 与 unsupported Shadowsocks cipher。
 2. **继续 P0-6 writer cutover**：durable selection、startup restore、actual endpoint descriptor 与 local `config load` 已完成；下一步将 `list/use/download/update/delete/override` 全部 legacy writer 路由 Authority。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
@@ -697,11 +703,11 @@ git push origin v1.0.0
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0，`v1.0.0-rc6` 三平台 CD 与 Homebrew Tap 发布已通过
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
-- ❌ 部分配置可接受但运行时未实现
+- ❌ v1 capability gate 决策已冻结，但 validator/doctor/runtime/migrator 尚未全部落地
 - ✅ `proxy select` durable/runtime identity、daemon startup restore、tracked controller discovery 与 `config load` CLI 已进入生产路径；其余 config writer 尚待统一 cutover
 - ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档
 
 结论：
 
-> **暂不建议立即打 `v1.0.0` tag。先关闭 HTTP/SOCKS5 outbound 策略 P0，并按 P0-6 完成可靠代理选择和本地 config import，再进入最终 GA gate。**
+> **暂不建议立即打 `v1.0.0` tag。先落地统一 fail-closed capability gate、修复安全审计阻断项，并按 P0-6 完成剩余 writer cutover，再进入最终 GA gate。**
