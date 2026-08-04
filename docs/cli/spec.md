@@ -54,6 +54,8 @@ group help on stdout, exit 0. Every subcommand accepts `help`, `--help`, or
 | `zc config dump [-c <config>] [--no-override] [--json]` | Prints the merged config as a **bare document** — YAML in text mode, bare JSON object with `--json`（唯一 envelope 例外，决策 D2）。可直接 `\| yq` / `\| jq`。Failures still use the envelope/error block。 |
 | `zc config override [<script>\|--clear] [--json]` | Bind/show/clear the persisted override for the current config; applies to a running daemon. |
 
+托管配置名在剥除一个 `.yaml` 后必须为 1–255 字节的有效 UTF-8，且不能是 `.`、`..`，也不能包含控制字符、`/` 或 `\`。`download/update/use/delete` 共用此约束；无效名称返回 `CONFIG_NAME_INVALID`，并且不会发起网络或文件访问。
+
 ### proxy / profile
 
 `profile` is an alias group for `proxy`（决策 D10）：same handler, messages and

@@ -88,6 +88,7 @@
 | `CONFIG_LOAD_INVALID` | local config is invalid | fix the config and retry |
 | `CONFIG_LOAD_FAILED` | failed to load local config | check the path, local dependencies, and file permissions |
 | `CONFIG_ALREADY_EXISTS` | a config with this name already exists | rename the file or delete the existing config first |
+| `CONFIG_NAME_INVALID` | invalid config name | use 1-255 characters without control characters, `/` or `\` |
 | `CONFIG_LIST_FAILED` | failed to list configs | ensure the config directory exists and is readable |
 | `CONFIG_LIST_ARGUMENT_INVALID` | unknown or unexpected argument for `config list` | use `zc config list [--json]` |
 | `CONFIG_DOWNLOAD_URL_REQUIRED` | missing <url> for config download | use `zc config download <url> [-n <name>] [-d]` |

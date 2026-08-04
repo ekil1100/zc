@@ -3,6 +3,7 @@ const compat = @import("compat.zig");
 const yaml = @import("util/yaml.zig");
 const meta = @import("meta.zig");
 const cli_output = @import("cli/output.zig");
+const config_catalog = @import("config_catalog.zig");
 
 pub const ProxyType = enum {
     direct,
@@ -1754,6 +1755,12 @@ pub fn normalizeConfigKey(name: []const u8) []const u8 {
     return name;
 }
 
+fn normalizeManagedConfigKey(name: []const u8) ![]const u8 {
+    const key = normalizeConfigKey(name);
+    if (!config_catalog.isManagedKey(key)) return error.InvalidConfigKey;
+    return key;
+}
+
 /// 下载结果（key/path 均为 caller 所有）。
 pub const DownloadOutcome = struct {
     key: []const u8,
@@ -1778,6 +1785,11 @@ pub fn downloadConfig(
     set_default: bool,
     out: *cli_output.Output,
 ) !DownloadOutcome {
+    const normalized_name = if (name) |value|
+        try normalizeManagedConfigKey(value)
+    else
+        null;
+
     const fetch_result = try fetchConfig(allocator, url);
     defer allocator.free(fetch_result.body);
 
@@ -1796,11 +1808,12 @@ pub fn downloadConfig(
     defer allocator.free(configs_dir);
 
     // 确定 key（与 switchConfig/updateConfig 同一套归一化：`-n smoke.yaml` -> key "smoke"）
-    const key = if (name) |n|
-        try allocator.dupe(u8, normalizeConfigKey(n))
+    const key = if (normalized_name) |value|
+        try allocator.dupe(u8, value)
     else
         try meta.generateKey(allocator);
     errdefer allocator.free(key);
+    std.debug.assert(config_catalog.isManagedKey(key));
 
     // 保存文件到 configs/{key}.yaml
     const yaml_filename = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
@@ -2121,11 +2134,11 @@ fn toResolvedPathForKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// 获取订阅 URL（从 meta.json）
 pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8) !?[]const u8 {
+    // config_name 可能带 .yaml 后缀
+    const key = try normalizeManagedConfigKey(config_name);
+
     var meta_data = meta.load(allocator) catch return null;
     defer meta_data.deinit();
-
-    // config_name 可能带 .yaml 后缀
-    const key = normalizeConfigKey(config_name);
 
     if (meta_data.configs.get(key)) |cm| {
         if (cm.url) |url| {
@@ -2140,7 +2153,7 @@ pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8)
 /// 没有订阅 URL 返回 error.NoSubscriptionUrl；成功返回 key（caller 释放）。
 pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8, out: *cli_output.Output) ![]const u8 {
     // config_name 可能带 .yaml 后缀
-    const key = normalizeConfigKey(config_name);
+    const key = try normalizeManagedConfigKey(config_name);
 
     const url = (try getSubscriptionUrl(allocator, key)) orelse return error.NoSubscriptionUrl;
     defer allocator.free(url);
@@ -2262,11 +2275,11 @@ pub fn listConfigs(allocator: std.mem.Allocator, out: *cli_output.Output) !void 
 /// 决策 D8：绝不自动 apply 到运行中的 daemon，文本模式提示下一步。
 /// 找不到目标返回 error.ConfigNotFound（envelope 由调用方渲染）。
 pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_output.Output) !void {
+    // target 可能带 .yaml 后缀
+    const key = try normalizeManagedConfigKey(target);
+
     var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
     defer meta_data.deinit();
-
-    // target 可能带 .yaml 后缀
-    const key = normalizeConfigKey(target);
 
     // 验证 key 存在于 meta 中
     if (!meta_data.configs.contains(key)) {
@@ -2325,7 +2338,7 @@ pub const DeleteOutcome = struct {
 /// 内存，不受影响，直到下次 reload/restart（届时回退到内置默认）。
 pub fn deleteConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_output.Output) !DeleteOutcome {
     // target 可能带 .yaml 后缀（与 use/update/download 共用同一套归一化）。
-    const key = normalizeConfigKey(target);
+    const key = try normalizeManagedConfigKey(target);
 
     const configs_dir = try meta.getConfigsDir(allocator) orelse return error.ConfigNotFound;
     defer allocator.free(configs_dir);
@@ -2813,6 +2826,86 @@ test "normalizeConfigKey strips exactly one .yaml suffix (download/use/update sh
     try std.testing.expectEqualStrings("foo.yaml", normalizeConfigKey("foo.yaml.yaml"));
     // 退化输入不产生空 key
     try std.testing.expectEqualStrings(".yaml", normalizeConfigKey(".yaml"));
+}
+
+test "switchConfig rejects a profile key that escapes the managed root" {
+    // The public command seam must reject traversal before it probes any path.
+    const allocator = std.testing.allocator;
+    var stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var output = cli_output.Output.init(
+        .text,
+        "config use",
+        false,
+        false,
+        &stdout.writer,
+        &stderr.writer,
+    );
+
+    try std.testing.expectError(
+        error.InvalidConfigKey,
+        switchConfig(allocator, "../escaped", &output),
+    );
+}
+
+test "deleteConfig rejects a profile key that escapes the managed root" {
+    // Deletion must validate the logical key before deriving a filesystem path.
+    const allocator = std.testing.allocator;
+    var stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var output = cli_output.Output.init(
+        .text,
+        "config delete",
+        false,
+        false,
+        &stdout.writer,
+        &stderr.writer,
+    );
+
+    try std.testing.expectError(
+        error.InvalidConfigKey,
+        deleteConfig(allocator, "../escaped", &output),
+    );
+}
+
+test "getSubscriptionUrl rejects an invalid managed profile key" {
+    // Subscription lookup must share the same key contract as all writers.
+    try std.testing.expectError(
+        error.InvalidConfigKey,
+        getSubscriptionUrl(std.testing.allocator, "bad/key"),
+    );
+}
+
+test "downloadConfig validates the managed key before network access" {
+    // An invalid logical key must win over any remote transport failure.
+    const allocator = std.testing.allocator;
+    var stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var output = cli_output.Output.init(
+        .text,
+        "config download",
+        false,
+        false,
+        &stdout.writer,
+        &stderr.writer,
+    );
+
+    try std.testing.expectError(
+        error.InvalidConfigKey,
+        downloadConfig(
+            allocator,
+            "http://127.0.0.1:1/config.yaml",
+            "../escaped",
+            false,
+            &output,
+        ),
+    );
 }
 
 test "resolveRuntimeConfigKey infers key from explicit configs path" {

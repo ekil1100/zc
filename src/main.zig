@@ -811,6 +811,15 @@ fn applyResultToken(result: ?daemon.ApplyResult) ?[]const u8 {
     };
 }
 
+fn printInvalidConfigName(json_output: bool) void {
+    printCliError(
+        json_output,
+        "CONFIG_NAME_INVALID",
+        "invalid config name",
+        "use 1-255 characters without control characters, '/' or '\\'",
+    );
+}
+
 /// config 命令树 dispatch。错误统一走 printCliError（envelope/error block）
 /// 并以非零码退出；用法错误用 exit_usage，运行失败用 exit_failure。
 fn runConfigCommand(
@@ -909,6 +918,7 @@ fn runConfigCommand(
             // “errors actionable” 契约）。
             out.note("config download failed: {s}\n", .{@errorName(err)}) catch {};
             switch (err) {
+                error.InvalidConfigKey => printInvalidConfigName(json_output),
                 error.NoConfigDir,
                 error.AccessDenied,
                 error.PermissionDenied,
@@ -954,6 +964,7 @@ fn runConfigCommand(
         var out = streams.output(json_output);
         const updated_key = config.updateConfig(allocator, target_name, &out) catch |err| {
             switch (err) {
+                error.InvalidConfigKey => printInvalidConfigName(json_output),
                 error.NoSubscriptionUrl => printCliError(json_output, "CONFIG_UPDATE_NO_SUBSCRIPTION", "no subscription url recorded for this config", "use `zc config download <url>` to (re)create it"),
                 else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to update config", "check subscription url/network and retry"),
             }
@@ -1009,6 +1020,7 @@ fn runConfigCommand(
         var out = streams.output(json_output);
         config.switchConfig(allocator, args[3], &out) catch |err| {
             switch (err) {
+                error.InvalidConfigKey => printInvalidConfigName(json_output),
                 error.ConfigNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
                 else => printCliError(json_output, "CONFIG_SWITCH_FAILED", "failed to switch active config", "verify file permission and retry"),
             }
@@ -1041,6 +1053,7 @@ fn runConfigCommand(
         var out = streams.output(json_output);
         var outcome = config.deleteConfig(allocator, args[3], &out) catch |err| {
             switch (err) {
+                error.InvalidConfigKey => printInvalidConfigName(json_output),
                 error.ConfigNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
                 else => printCliError(json_output, "CONFIG_DELETE_FAILED", "failed to delete config", "verify file permission and retry"),
             }
