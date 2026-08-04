@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const compat = @import("compat.zig");
+const aead = @import("crypto/aead.zig");
 const Config = @import("config.zig").Config;
 const ProxyType = @import("config.zig").ProxyType;
 const RuleType = @import("config.zig").RuleType;
@@ -61,6 +62,8 @@ pub fn validate(allocator: std.mem.Allocator, config: *Config) !ValidationResult
     var result = ValidationResult.init(allocator);
     errdefer result.deinit();
 
+    try validateV1Capabilities(config, &result);
+
     // 校验基础配置
     try validateBasicConfig(config, &result);
 
@@ -80,6 +83,100 @@ pub fn validate(allocator: std.mem.Allocator, config: *Config) !ValidationResult
     try validateReferences(allocator, config, &result);
 
     return result;
+}
+
+pub fn validateRuntimeCapabilities(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) !ValidationResult {
+    var result = ValidationResult.init(allocator);
+    errdefer result.deinit();
+    try validateV1Capabilities(config, &result);
+    return result;
+}
+
+fn validateV1Capabilities(
+    config: *const Config,
+    result: *ValidationResult,
+) !void {
+    if (config.port != 0) {
+        try result.addError(
+            "port is not supported in zc v1.0; use mixed-port",
+            .{},
+        );
+    }
+    if (config.socks_port != 0) {
+        try result.addError(
+            "socks-port is not supported in zc v1.0; use mixed-port",
+            .{},
+        );
+    }
+
+    for (config.proxies.items) |proxy| {
+        switch (proxy.proxy_type) {
+            .direct, .reject => {},
+            .trojan => {
+                if (proxy.udp) {
+                    try result.addError(
+                        "Proxy '{s}': udp:true is not supported for type " ++
+                            "'trojan' in zc v1.0",
+                        .{proxy.name},
+                    );
+                }
+            },
+            .ss => {
+                if (proxy.udp) {
+                    try result.addError(
+                        "Proxy '{s}': udp:true is not supported for type 'ss' " ++
+                            "in zc v1.0",
+                        .{proxy.name},
+                    );
+                }
+                if (proxy.cipher) |cipher| {
+                    if (aead.parseCipherType(cipher) == null) {
+                        try result.addError(
+                            "Proxy '{s}': Shadowsocks cipher '{s}' is not " ++
+                                "supported in zc v1.0",
+                            .{ proxy.name, cipher },
+                        );
+                    }
+                }
+            },
+            .http, .socks5, .vmess, .vless, .anytls => {
+                try result.addError(
+                    "Proxy '{s}': type '{s}' is not supported in zc v1.0; " ++
+                        "supported types: direct, reject, ss, trojan",
+                    .{ proxy.name, @tagName(proxy.proxy_type) },
+                );
+            },
+        }
+
+        const type_is_enabled = proxy.proxy_type == .ss or
+            proxy.proxy_type == .trojan;
+        if (type_is_enabled and proxy.ws) {
+            try result.addError(
+                "Proxy '{s}': ws-opts is not supported for type '{s}' in " ++
+                    "zc v1.0",
+                .{ proxy.name, @tagName(proxy.proxy_type) },
+            );
+        }
+        if (proxy.proxy_type == .ss and proxy.tls) {
+            try result.addError(
+                "Proxy '{s}': tls:true is not supported for type 'ss' in " ++
+                    "zc v1.0",
+                .{proxy.name},
+            );
+        }
+    }
+
+    for (config.proxy_groups.items) |group| {
+        if (group.group_type == .select) continue;
+        try result.addError(
+            "Proxy group '{s}': type '{s}' is not supported in zc v1.0; " ++
+                "supported type: select",
+            .{ group.name, @tagName(group.group_type) },
+        );
+    }
 }
 
 /// 校验基础配置
@@ -182,12 +279,6 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
     var name_set = std.StringHashMap(void).init(allocator);
     defer name_set.deinit();
 
-    // udp:true is anytls-only; subscriptions often set it on every node. Count
-    // the offenders and emit a single rolled-up warning after the loop instead
-    // of one line per proxy (which floods ~90 lines on a typical airport sub).
-    var udp_ignored_count: usize = 0;
-    var udp_ignored_first: []const u8 = "";
-
     for (config.proxies.items, 0..) |proxy, i| {
         // 检查名称是否为空
         if (proxy.name.len == 0) {
@@ -235,19 +326,6 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 }
                 if (proxy.cipher == null or proxy.cipher.?.len == 0) {
                     try result.addError("Shadowsocks proxy '{s}': cipher is required", .{proxy.name});
-                } else {
-                    // 检查加密方式
-                    const valid_ciphers = [_][]const u8{ "aes-128-gcm", "aes-192-gcm", "aes-256-gcm", "aes-128-cfb", "aes-192-cfb", "aes-256-cfb", "chacha20-ietf-poly1305", "chacha20-poly1305", "rc4-md5", "none" };
-                    var valid = false;
-                    for (valid_ciphers) |cipher| {
-                        if (std.mem.eql(u8, proxy.cipher.?, cipher)) {
-                            valid = true;
-                            break;
-                        }
-                    }
-                    if (!valid) {
-                        try result.addWarning("Shadowsocks proxy '{s}': unknown cipher '{s}'", .{ proxy.name, proxy.cipher.? });
-                    }
                 }
             },
             .vmess => {
@@ -273,16 +351,9 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 if (proxy.password == null or proxy.password.?.len == 0) {
                     try result.addError("Trojan proxy '{s}': password is required", .{proxy.name});
                 }
-                // Trojan client is CONNECT-only (handshake() always sends
-                // Command.connect); UDP ASSOCIATE is unimplemented, so udp:true
-                // is accepted (config stays valid) but UDP relay fails at
-                // runtime — see the rolled-up non-anytls udp warning below.
-                // mihomo treats udp:true as a capability declaration, not a
-                // config error; rejecting it would break real-world trojan
-                // subscriptions where nearly every node sets udp:true.
-                // Disabling cert verification is a real security downgrade; make
-                // it visible in validation output (warning, not error — isValid()
-                // stays true).
+                // Disabling cert verification is a real security downgrade;
+                // keep it visible even when another capability check rejects the
+                // same proxy.
                 if (proxy.skip_cert_verify) {
                     try result.addWarning("Trojan proxy '{s}': skip-cert-verify=true disables TLS certificate verification", .{proxy.name});
                 }
@@ -312,20 +383,6 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 }
             },
         }
-
-        // udp:true is only honored for anytls proxies (UDP relay is anytls-only
-        // for now). Tally — and ignore — when set on any other proxy type; the
-        // rolled-up warning is emitted once after the loop.
-        if (proxy.udp and proxy.proxy_type != .anytls) {
-            if (udp_ignored_count == 0) udp_ignored_first = proxy.name;
-            udp_ignored_count += 1;
-        }
-    }
-
-    if (udp_ignored_count == 1) {
-        try result.addWarning("Proxy '{s}': udp:true is only supported for anytls proxies; ignored", .{udp_ignored_first});
-    } else if (udp_ignored_count > 1) {
-        try result.addWarning("udp:true is set on {d} non-anytls proxies (e.g. '{s}'); anytls-only, ignored", .{ udp_ignored_count, udp_ignored_first });
     }
 }
 
@@ -593,6 +650,134 @@ const base_yaml =
     \\    port: 0
 ;
 
+test "v1 capability gate rejects VMess before runtime" {
+    // Validation must fail before an unsupported protocol can bind or dial.
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: vmess-node
+        \\    type: vmess
+        \\    server: example.com
+        \\    port: 443
+        \\    uuid: 12345678-1234-1234-1234-123456789abc
+        \\rules:
+        \\  - MATCH,vmess-node
+    );
+    defer cfg.deinit();
+
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "Proxy 'vmess-node': type 'vmess' is not supported in zc v1.0; " ++
+            "supported types: direct, reject, ss, trojan",
+        result.errors.items[0].message,
+    );
+}
+
+test "v1 capability gate rejects an unimplemented Shadowsocks cipher" {
+    // Capability checks must use the same cipher set as the runtime dialer.
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: legacy-ss
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-cfb
+        \\    password: secret
+        \\rules:
+        \\  - MATCH,legacy-ss
+    );
+    defer cfg.deinit();
+
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "Proxy 'legacy-ss': Shadowsocks cipher 'aes-128-cfb' is not " ++
+            "supported in zc v1.0",
+        result.errors.items[0].message,
+    );
+}
+
+test "v1 capability gate rejects non-select proxy groups" {
+    // Parsed group strategies must not imply runtime scheduling support.
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: ss-node
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\proxy-groups:
+        \\  - name: auto
+        \\    type: url-test
+        \\    proxies: [ss-node]
+        \\    url: https://example.com/ping
+        \\rules:
+        \\  - MATCH,auto
+    );
+    defer cfg.deinit();
+
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqualStrings(
+        "Proxy group 'auto': type 'url_test' is not supported in zc v1.0; " ++
+            "supported type: select",
+        result.errors.items[0].message,
+    );
+}
+
+test "v1 capability gate rejects ignored transports on supported proxies" {
+    // Accepted fields must not silently degrade to a different wire transport.
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: ss-transport
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    tls: true
+        \\    ws-opts:
+        \\      path: /ws
+    );
+    defer cfg.deinit();
+
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.errors.items.len);
+    try std.testing.expect(hasErrorContaining(&result, "tls:true"));
+    try std.testing.expect(hasErrorContaining(&result, "ws-opts"));
+}
+
+test "v1 capability gate rejects standalone inbound ports" {
+    // v1 exposes one mixed listener and must not silently clear other listeners.
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(
+        allocator,
+        "port: 7890\nsocks-port: 7891\n",
+    );
+    defer cfg.deinit();
+
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.errors.items.len);
+    try std.testing.expect(hasErrorContaining(&result, "port"));
+    try std.testing.expect(hasErrorContaining(&result, "socks-port"));
+}
+
 test "C6: validator clamps both sub-5s idle interval/timeout to 30 and warns" {
     const allocator = std.testing.allocator;
     const yaml_config =
@@ -658,15 +843,8 @@ test "C6: validator clamps defaults are valid (no clamp on the 30s default)" {
     try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_timeout);
 }
 
-fn countUdpWarnings(result: *const ValidationResult) usize {
-    var c: usize = 0;
-    for (result.warnings.items) |w| {
-        if (std.mem.indexOf(u8, w.message, "udp:true") != null) c += 1;
-    }
-    return c;
-}
-
-test "D4: validator warns on non-anytls proxy with udp:true" {
+test "v1 capability gate rejects Shadowsocks udp" {
+    // A supported cipher does not imply support for its unimplemented UDP path.
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
@@ -681,31 +859,41 @@ test "D4: validator warns on non-anytls proxy with udp:true" {
     ;
     var cfg = try config_mod.parse(allocator, yaml_config);
     defer cfg.deinit();
-    var result = try validate(allocator, &cfg);
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), countUdpWarnings(&result));
-    try std.testing.expect(result.isValid()); // warning only, not an error
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
 }
 
-test "D4: validator does not warn on anytls proxy with udp:true" {
+test "v1 capability gate rejects every unverified proxy type" {
+    // One document exercises the complete negative protocol space.
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
         \\proxies:
-        \\  - name: anytls-udp
-        \\    type: anytls
-        \\    server: edge.example.com
-        \\    port: 443
-        \\    password: secret
-        \\    udp: true
+        \\  - { name: http-node, type: http, server: example.com, port: 8080 }
+        \\  - { name: socks-node, type: socks5, server: example.com, port: 1080 }
+        \\  - { name: vmess-node, type: vmess, server: example.com, port: 443, uuid: 12345678-1234-1234-1234-123456789abc }
+        \\  - { name: vless-node, type: vless, server: example.com, port: 443, uuid: 12345678-1234-1234-1234-123456789abc }
+        \\  - { name: anytls-node, type: anytls, server: example.com, port: 443, password: secret }
     ;
     var cfg = try config_mod.parse(allocator, yaml_config);
     defer cfg.deinit();
-    var result = try validate(allocator, &cfg);
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), countUdpWarnings(&result));
+    try std.testing.expectEqual(@as(usize, 5), result.errors.items.len);
+    const names = [_][]const u8{
+        "http-node",
+        "socks-node",
+        "vmess-node",
+        "vless-node",
+        "anytls-node",
+    };
+    for (names) |name| {
+        try std.testing.expect(hasErrorContaining(&result, name));
+    }
 }
 
 fn hasErrorContaining(result: *const ValidationResult, needle: []const u8) bool {
@@ -715,7 +903,8 @@ fn hasErrorContaining(result: *const ValidationResult, needle: []const u8) bool 
     return false;
 }
 
-test "trojan proxy with udp:true stays valid (mihomo-compat: udp is a runtime concern, not a config error)" {
+test "v1 capability gate rejects Trojan udp" {
+    // An unsupported transport declaration must fail before runtime traffic.
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
@@ -729,18 +918,16 @@ test "trojan proxy with udp:true stays valid (mihomo-compat: udp is a runtime co
     ;
     var cfg = try config_mod.parse(allocator, yaml_config);
     defer cfg.deinit();
-    var result = try validate(allocator, &cfg);
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
     defer result.deinit();
 
-    // mihomo treats udp:true as a capability declaration, not a config error.
-    // Real-world trojan subscriptions almost always carry udp:true (90/90 nodes
-    // on a real Flower subscription); rejecting it makes zc unable to load
-    // mainstream airport configs. zc does not implement Trojan UDP relay, so
-    // we warn (rolled up with other non-anytls proxies) but keep config valid —
-    // UDP traffic fails at runtime instead of blocking config load.
-    try std.testing.expect(result.isValid());
-    try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
-    try std.testing.expectEqual(@as(usize, 1), countUdpWarnings(&result));
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "Proxy 'trojan-udp': udp:true is not supported for type 'trojan' " ++
+            "in zc v1.0",
+        result.errors.items[0].message,
+    );
 }
 
 test "trojan proxy without udp stays valid" {
@@ -764,11 +951,8 @@ test "trojan proxy without udp stays valid" {
     try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
 }
 
-test "regression: real-world trojan subscription (udp:true + skip-cert-verify on every node) loads valid" {
-    // 机场订阅里 trojan 节点几乎都带 udp:true 和 skip-cert-verify:true
-    // (真实 Flower 订阅 90/90 节点如此). Such a config MUST load — udp:true is
-    // a capability declaration, not a config error — otherwise zc cannot be used
-    // with mainstream airport subscriptions at all.
+test "Trojan UDP subscriptions fail closed and retain TLS warnings" {
+    // Every unsupported node is rejected while independent TLS risks stay visible.
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
@@ -795,12 +979,10 @@ test "regression: real-world trojan subscription (udp:true + skip-cert-verify on
     var result = try validate(allocator, &cfg);
     defer result.deinit();
 
-    // Must NOT be rejected: udp:true on trojan is valid config.
-    try std.testing.expect(result.isValid());
-    try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
-    // 2 trojan udp:true nodes -> 1 rolled-up udp warning (not 2, not an error).
-    try std.testing.expectEqual(@as(usize, 1), countUdpWarnings(&result));
-    // 2 skip-cert-verify nodes -> 2 cert warnings (warnings, not errors).
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 2), result.errors.items.len);
+    try std.testing.expect(hasErrorContaining(&result, "HK-1"));
+    try std.testing.expect(hasErrorContaining(&result, "JP-1"));
     try std.testing.expectEqual(@as(usize, 2), countTrojanCertWarnings(&result));
 }
 

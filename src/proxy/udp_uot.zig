@@ -286,8 +286,8 @@ pub fn UotStream(comptime Stream: type) type {
 /// loopback client reaches it). BND.PORT is big-endian.
 pub fn buildAssociateReply(bnd_port: u16) [10]u8 {
     return .{
-        0x05, 0x00, 0x00, 0x01,
-        127,  0,    0,    1,
+        0x05,                    0x00,                      0x00, 0x01,
+        127,                     0,                         0,    1,
         @intCast(bnd_port >> 8), @intCast(bnd_port & 0xff),
     };
 }
@@ -303,6 +303,7 @@ fn repForConnectError(err: anyerror) u8 {
     return switch (err) {
         error.UdpNotSupportedByProxy,
         error.UdpNotSupportedForDirect,
+        error.UnsupportedProxyType,
         error.ProxyNotFound,
         error.ConnectionRejected,
         => 0x07, // command not supported / not allowed
@@ -784,8 +785,8 @@ test "D3: drains two frames in one read then need_more" {
     var uot = TestUot.init(testing.allocator, &fs);
     defer uot.deinit();
 
-    const a = mkSocksAddrV4(.{ 2, 2, 2, 2 }, 1 );
-    const b = mkSocksAddrV4(.{ 3, 3, 3, 3 }, 2 );
+    const a = mkSocksAddrV4(.{ 2, 2, 2, 2 }, 1);
+    const b = mkSocksAddrV4(.{ 3, 3, 3, 3 }, 2);
     const fa = try frameBytes(testing.allocator, a, "one");
     defer testing.allocator.free(fa);
     const fb = try frameBytes(testing.allocator, b, "two");
@@ -865,7 +866,7 @@ test "D3: partial-frame held in rx survives across reads (notifier-drain safety)
     var uot = TestUot.init(testing.allocator, &fs);
     defer uot.deinit();
 
-    const src = mkSocksAddrV4(.{ 4, 4, 4, 4 }, 7 );
+    const src = mkSocksAddrV4(.{ 4, 4, 4, 4 }, 7);
     const frame = try frameBytes(testing.allocator, src, "ok");
     defer testing.allocator.free(frame);
     try fs.feed(frame);
@@ -908,6 +909,7 @@ test "D6: buildSocks5Failure REP=0x07" {
 test "D6: repForConnectError maps no-udp/reject -> 0x07, dial -> 0x05" {
     try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.UdpNotSupportedByProxy));
     try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.UdpNotSupportedForDirect));
+    try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.UnsupportedProxyType));
     try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.ConnectionRejected));
     try testing.expectEqual(@as(u8, 0x07), repForConnectError(error.ProxyNotFound));
     try testing.expectEqual(@as(u8, 0x05), repForConnectError(error.TargetTcpConnectFailed));

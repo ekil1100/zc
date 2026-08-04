@@ -603,6 +603,15 @@ fn printOverrideRuntimeError(json_output: bool, err: anyerror) bool {
             printCliError(json_output, "OVERRIDE_MERGE_FAILED", "failed to merge override output", "check script output structure, or run `zc config override --clear` / `zc config dump --no-override`");
             return true;
         },
+        error.UnsupportedCapability => {
+            printCliError(
+                json_output,
+                "CONFIG_CAPABILITY_UNSUPPORTED",
+                "config uses a capability not supported in zc v1.0",
+                "run `zc doctor -c <config>` and use direct/reject/ss/trojan",
+            );
+            return true;
+        },
         else => return false,
     }
 }
@@ -2058,6 +2067,17 @@ fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) voi
     cfg.socks_port = 0;
 }
 
+fn requireRuntimeCapabilities(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+) !void {
+    var result = try validator.validateRuntimeCapabilities(allocator, cfg);
+    defer result.deinit();
+    if (result.isValid()) return;
+    validator.printResult(&result);
+    return error.UnsupportedCapability;
+}
+
 fn ruleProviderSyncPolicyForCommand(command_name: []const u8) config.RuleProviderSyncPolicy {
     if (std.mem.eql(u8, command_name, "test") or
         std.mem.eql(u8, command_name, "doctor") or
@@ -2090,11 +2110,6 @@ fn loadRuntimeConfig(
     } else try config.loadDefaultManaged(allocator, !commandUsesQuietDefaultConfig(command_name));
     errdefer cfg.deinit();
 
-    // 默认统一走 mixed-port，必要时允许 `zc start --port <n>` 覆盖本次 daemon 端口。
-    cfg.mixed_port = constants.MIXED_PORT;
-    cfg.port = 0;
-    cfg.socks_port = 0;
-
     var persisted_script: ?[]u8 = null;
     defer if (persisted_script) |p| allocator.free(p);
     var effective_override = try resolveEffectiveOverrideOptions(
@@ -2105,6 +2120,7 @@ fn loadRuntimeConfig(
     );
 
     try override.apply(allocator, &cfg, &effective_override, command_name, config_path);
+    try requireRuntimeCapabilities(allocator, &cfg);
     applyRuntimePortSelection(&cfg, mixed_port_override);
     if (prepare_runtime_artifacts) {
         try config.prepareRuleProvidersForRuntimeWithPolicy(
@@ -2862,6 +2878,27 @@ test "commandUsesQuietDefaultConfig keeps doctor output clean" {
     try testing.expect(commandUsesQuietDefaultConfig("doctor"));
     try testing.expect(commandUsesQuietDefaultConfig("diag.doctor"));
     try testing.expect(!commandUsesQuietDefaultConfig("start"));
+}
+
+test "runtime capability preflight rejects unsupported proxies" {
+    // The runtime loader must invoke the validator before port or network work.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var cfg = try config.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: vmess-node
+        \\    type: vmess
+        \\    server: example.com
+        \\    port: 443
+        \\    uuid: 12345678-1234-1234-1234-123456789abc
+    );
+    defer cfg.deinit();
+
+    try testing.expectError(
+        error.UnsupportedCapability,
+        requireRuntimeCapabilities(allocator, &cfg),
+    );
 }
 
 test "applyRuntimePortSelection prefers explicit port and keeps mixed mode" {

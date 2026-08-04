@@ -16,9 +16,7 @@ const runtime_selection = @import("../../runtime_selection.zig");
 /// writeDatagram/readDatagram on it via ProxyStream.udpStream().
 pub const AnyTlsUdpStream = udp_uot.UotStream(anytls.Stream);
 const crypto = std.crypto;
-const vmess = @import("../../protocol/vmess.zig");
 const trojan = @import("../../protocol/trojan.zig");
-const vless = @import("../../protocol/vless.zig");
 const socket_options = @import("../../socket_options.zig");
 
 /// 代理流包装器
@@ -32,11 +30,9 @@ pub const ProxyStream = struct {
     /// the Session here (that is the pool's drain in §13).
     owned_anytls_stream: ?*anytls.Stream = null,
     owned_trojan_client: ?*trojan.Client = null,
-    /// AnyTLS UoT v2 UDP arm (D5). A heap `AnyTlsUdpStream` wrapping a borrowed
-    /// anytls.Stream opened to the magic UoT dest. Produced ONLY by connectUdp;
-    /// it NEVER flows through relay(). Only close/getHandle/udpStream/move are
-    /// valid — the byte-stream methods @panic (MUST-FIX #5). close() frees the
-    /// UotStream and routes the inner Stream.close (returns the Session to pool).
+    /// Retained AnyTLS UoT v2 arm for protocol tests and future capability work.
+    /// The v1 `connectUdp` path never constructs it. It never flows through
+    /// relay(); only close/getHandle/udpStream/move are valid.
     owned_anytls_udp: ?*AnyTlsUdpStream = null,
     is_closed: bool = false,
 
@@ -542,16 +538,8 @@ pub const OutboundManager = struct {
         return try self.connectToProxy(proxy, target, port);
     }
 
-    /// Open a UoT v2 UDP path through `proxy_name` (D5). Mirrors connect()'s
-    /// group-resolution prologue but with NO concrete target (the magic UoT dest
-    /// is the stream-open address; per-datagram targets travel inside the frames).
-    ///
-    /// MUST-FIX #7 — DIRECT/REJECT semantics match the TCP path AFTER group
-    /// resolution: DIRECT (or a group resolving to a .direct proxy) ->
-    /// error.UdpNotSupportedForDirect (a direct UDP path is out of scope);
-    /// REJECT (literal or a group resolving to REJECT/.reject) ->
-    /// error.ConnectionRejected; a non-anytls proxy or an anytls proxy without
-    /// udp:true -> error.UdpNotSupportedByProxy.
+    /// Reject all v1 UDP proxy paths before dialing. DIRECT and REJECT preserve
+    /// their narrower policy errors so SOCKS5 can report an accurate denial.
     pub fn connectUdp(self: *OutboundManager, proxy_name: []const u8) !ProxyStream {
         if (std.mem.eql(u8, proxy_name, "DIRECT")) return error.UdpNotSupportedForDirect;
         if (std.mem.eql(u8, proxy_name, "REJECT")) return error.ConnectionRejected;
@@ -574,7 +562,11 @@ pub const OutboundManager = struct {
         if (std.mem.eql(u8, current_name, "REJECT")) return error.ConnectionRejected;
 
         const proxy = self.findProxy(current_name) orelse return error.ProxyNotFound;
-        return try self.connectAnyTlsUdp(proxy);
+        return switch (proxy.proxy_type) {
+            .direct => error.UdpNotSupportedForDirect,
+            .reject => error.ConnectionRejected,
+            else => error.UnsupportedProxyType,
+        };
     }
 
     /// Open the single UoT v2 stream for an association: gate on the proxy being
@@ -624,26 +616,7 @@ pub const OutboundManager = struct {
                 const stream = try client.connect(addr);
                 return ProxyStream.initShadowsocks(self.allocator, stream, client);
             },
-            .anytls => {
-                // Route through the per-identity SessionPool (§12): reuse a warm
-                // idle Session or dial a fresh one, then check out a multiplexed
-                // Stream. The pool owns the Session; ProxyStream borrows the Stream.
-                const key = try self.poolKey(proxy);
-                defer self.allocator.free(key);
-                const pool = try self.getOrCreatePool(key, proxy);
-                const stream = try pool.createStream(target, port);
-                return ProxyStream.initAnyTlsStream(stream);
-            },
-            .vmess => {
-                var client = try vmess.Client.init(self.allocator, .{
-                    .id = proxy.uuid orelse return error.MissingUuid,
-                    .address = proxy.server,
-                    .port = proxy.port,
-                    .alter_id = proxy.alter_id,
-                });
-                const stream = try client.connect(target, port);
-                return ProxyStream.initDirect(stream);
-            },
+            .anytls, .vmess => return error.UnsupportedProxyType,
             .trojan => {
                 const client = try self.allocator.create(trojan.Client);
                 errdefer self.allocator.destroy(client);
@@ -658,19 +631,7 @@ pub const OutboundManager = struct {
                 const stream = try client.connect(target, port);
                 return ProxyStream.initTrojan(self.allocator, stream, client);
             },
-            .vless => {
-                var client = try vless.Client.init(self.allocator, .{
-                    .id = proxy.uuid orelse return error.MissingUuid,
-                    .address = proxy.server,
-                    .port = proxy.port,
-                });
-                const stream = try client.connect(target, port);
-                return ProxyStream.initDirect(stream);
-            },
-            else => {
-                std.debug.print("Proxy type not implemented yet\n", .{});
-                return error.NotImplemented;
-            },
+            .vless, .http, .socks5 => return error.UnsupportedProxyType,
         }
     }
 
@@ -1224,6 +1185,38 @@ test "connect keeps reject policies terminal for private targets" {
     }
 }
 
+test "connect rejects disabled proxy types before dialing" {
+    // The manager is the second fail-closed boundary after config validation.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(@import("../../config.zig").ProxyGroup).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "vmess-disabled"),
+        .proxy_type = .vmess,
+        .server = try allocator.dupe(u8, "127.0.0.1"),
+        .port = 1,
+        .uuid = try allocator.dupe(
+            u8,
+            "12345678-1234-1234-1234-123456789abc",
+        ),
+    });
+
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+    try std.testing.expectError(
+        error.UnsupportedProxyType,
+        manager.connect("vmess-disabled", "8.8.8.8", 53),
+    );
+}
+
 test "connect bypasses proxy groups for loopback targets" {
     const allocator = std.testing.allocator;
 
@@ -1322,7 +1315,29 @@ test "D5: connectUdp(REJECT) -> error.ConnectionRejected" {
     try std.testing.expectError(error.ConnectionRejected, manager.connectUdp("REJECT"));
 }
 
-test "D5: connectUdp on anytls WITHOUT udp:true -> error.UdpNotSupportedByProxy" {
+test "v1 capability gate rejects AnyTLS UDP before dialing" {
+    // No UDP transport is enabled in v1, even when the node requests udp:true.
+    const allocator = std.testing.allocator;
+    var cfg = try makeUdpTestConfig(allocator);
+    defer cfg.deinit();
+    try cfg.proxies.append(allocator, .{
+        .name = try allocator.dupe(u8, "atls"),
+        .proxy_type = .anytls,
+        .server = try allocator.dupe(u8, "127.0.0.1"),
+        .port = 1,
+        .password = try allocator.dupe(u8, "password"),
+        .udp = true,
+    });
+    var manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedProxyType,
+        manager.connectUdp("atls"),
+    );
+}
+
+test "v1 connectUdp rejects AnyTLS without dialing" {
     const allocator = std.testing.allocator;
     var cfg = try makeUdpTestConfig(allocator);
     defer cfg.deinit();
@@ -1337,10 +1352,10 @@ test "D5: connectUdp on anytls WITHOUT udp:true -> error.UdpNotSupportedByProxy"
     var manager = try OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
-    try std.testing.expectError(error.UdpNotSupportedByProxy, manager.connectUdp("atls"));
+    try std.testing.expectError(error.UnsupportedProxyType, manager.connectUdp("atls"));
 }
 
-test "D5: connectUdp on a non-anytls proxy (ss) -> error.UdpNotSupportedByProxy" {
+test "v1 connectUdp rejects Shadowsocks UDP" {
     const allocator = std.testing.allocator;
     var cfg = try makeUdpTestConfig(allocator);
     defer cfg.deinit();
@@ -1356,10 +1371,10 @@ test "D5: connectUdp on a non-anytls proxy (ss) -> error.UdpNotSupportedByProxy"
     var manager = try OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
-    try std.testing.expectError(error.UdpNotSupportedByProxy, manager.connectUdp("ss-udp"));
+    try std.testing.expectError(error.UnsupportedProxyType, manager.connectUdp("ss-udp"));
 }
 
-test "D5: connectUdp resolves a group to a no-udp anytls -> error.UdpNotSupportedByProxy" {
+test "v1 connectUdp rejects a group resolving to AnyTLS" {
     const allocator = std.testing.allocator;
     var cfg = try makeUdpTestConfig(allocator);
     defer cfg.deinit();
@@ -1381,8 +1396,8 @@ test "D5: connectUdp resolves a group to a no-udp anytls -> error.UdpNotSupporte
     var manager = try OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
-    // The group resolves to "atls" (no udp:true) -> UdpNotSupportedByProxy.
-    try std.testing.expectError(error.UdpNotSupportedByProxy, manager.connectUdp("G"));
+    // Group resolution cannot bypass the v1 capability gate.
+    try std.testing.expectError(error.UnsupportedProxyType, manager.connectUdp("G"));
 }
 
 // MUST-FIX #5: the byte-stream methods (write/read/readBlocking/hasPendingRead/

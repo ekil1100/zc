@@ -86,6 +86,7 @@
 | `CONFIG_LOAD_PATH_REQUIRED` | missing `<path>` for config load | use `zc config load <path>` |
 | `CONFIG_LOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `config load` | use `zc config load <path>` |
 | `CONFIG_LOAD_INVALID` | local config is invalid | fix the config and retry |
+| `CONFIG_CAPABILITY_UNSUPPORTED` | config uses a capability not supported in zc v1.0 | run `zc doctor -c <config>` and use direct/reject/ss/trojan |
 | `CONFIG_LOAD_FAILED` | failed to load local config | check the path, local dependencies, and file permissions |
 | `CONFIG_ALREADY_EXISTS` | a config with this name already exists | rename the file or delete the existing config first |
 | `CONFIG_NAME_INVALID` | invalid config name | use 1-255 characters without control characters, `/` or `\` |
