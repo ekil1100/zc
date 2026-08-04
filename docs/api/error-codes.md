@@ -54,16 +54,18 @@
 | `START_PORT_INVALID` | invalid `--port` value | use an integer between 1 and 65535 |
 | `START_CONFIG_PATH_REQUIRED` | missing value for `-c` | use `zc start -c <config>` |
 | `START_PORT_IN_USE` | requested start port is already in use | retry with `zc start --port <free-port>` |
+| `START_CONTROLLER_PORT_IN_USE` | configured controller port is already in use | free the exact `external-controller` port or update the config |
 | `START_PORT_CONFLICT` | requested start port conflicts with another runtime listener | change the port or fix the conflicting runtime config |
 | `START_BIND_ADDRESS_INVALID` | invalid bind address for start preflight | fix `bind-address` in config and retry |
-| `START_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | fix `external-controller` to `host:port` format |
+| `START_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | use an explicit loopback endpoint such as `127.0.0.1:9090` |
 | `START_PREFLIGHT_FAILED` | failed to validate daemon start ports | check config and retry |
 | `STOP_FAILED` | failed to stop daemon | verify process permissions and retry `zc stop` |
 | `RESTART_FAILED` | failed to restart daemon | check logs and retry `zc restart -c <config>` |
 | `RESTART_PORT_IN_USE` | restart target port is already in use | free the occupied port, then retry `zc restart` |
+| `RESTART_CONTROLLER_PORT_IN_USE` | restart controller port is already in use | free the exact `external-controller` port before retrying `zc restart` |
 | `RESTART_PORT_CONFLICT` | restart target port conflicts with another runtime listener | fix the conflicting runtime config before retrying `zc restart` |
 | `RESTART_BIND_ADDRESS_INVALID` | invalid bind address for restart preflight | fix `bind-address` in config and retry `zc restart` |
-| `RESTART_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | fix `external-controller` to `host:port` format before retrying `zc restart` |
+| `RESTART_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | use an explicit loopback endpoint such as `127.0.0.1:9090` |
 | `RESTART_PREFLIGHT_FAILED` | failed to validate daemon restart ports | check config and retry `zc restart` |
 | `RELOAD_FAILED` | daemon is not running | start it first with `zc start` |
 | `RELOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `reload` | use `zc reload [--json]` |

@@ -13,6 +13,7 @@ test "include zc test modules" {
     _ = @import("config_bundle_test.zig");
     _ = @import("config_catalog_test.zig");
     _ = @import("config_import_test.zig");
+    _ = @import("controller_endpoint.zig");
     _ = @import("config.zig");
     _ = @import("config_validator.zig");
     _ = @import("daemon.zig");

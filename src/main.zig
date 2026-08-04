@@ -3,6 +3,7 @@ const compat = @import("compat.zig");
 const config = @import("config.zig");
 const config_import = @import("config_import.zig");
 const config_identity = @import("config_identity.zig");
+const controller_endpoint = @import("controller_endpoint.zig");
 const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
 const http_proxy = @import("proxy/http.zig");
@@ -162,6 +163,13 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(cli_output.exit_usage);
         };
 
+        preflightRuntimeCommand(allocator, .start, start_opts, &override_opts) catch |err| {
+            if (!printOverrideRuntimeError(json_output, err)) {
+                printRuntimeCommandPreflightError(.start, json_output, err);
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+
         // 决策 D1：--foreground 不 fork，自己持锁 + 写 pid（容器/systemd）。
         if (start_opts.foreground) {
             const lock_file = daemon.acquireForegroundLock(allocator) catch |err| {
@@ -182,13 +190,6 @@ pub fn main(init: std.process.Init) !void {
             };
             return;
         }
-
-        preflightRuntimeCommand(allocator, .start, start_opts, &override_opts) catch |err| {
-            if (!printOverrideRuntimeError(json_output, err)) {
-                printRuntimeCommandPreflightError(.start, json_output, err);
-            }
-            std.process.exit(cli_output.exit_failure);
-        };
 
         // 后台启动
         var forward_args = std.ArrayList([]const u8).empty;
@@ -274,9 +275,12 @@ pub fn main(init: std.process.Init) !void {
         runRestartCommand(allocator, start_opts, &out, &override_opts) catch |err| {
             if (!printOverrideRuntimeError(json_output, err)) {
                 switch (err) {
-                    error.PortAlreadyInUse, error.PortConflict, error.InvalidBindAddress, error.InvalidExternalController => {
-                        printRuntimeCommandPreflightError(.restart, json_output, err);
-                    },
+                    error.PortAlreadyInUse,
+                    error.ControllerPortAlreadyInUse,
+                    error.PortConflict,
+                    error.InvalidBindAddress,
+                    error.InvalidExternalController,
+                    => printRuntimeCommandPreflightError(.restart, json_output, err),
                     error.ForegroundDaemonSupervised => printCliError(json_output, "RESTART_FAILED", "daemon is running in the foreground (likely under a supervisor)", "restart it via the supervisor (e.g. `systemctl restart`), or `zc stop` then `zc start --foreground`"),
                     error.StartFailed => printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details"),
                     error.DaemonPidUntracked => printCliError(json_output, "RESTART_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc restart`"),
@@ -1940,18 +1944,69 @@ const CliErrorInfo = struct {
 fn runtimeCommandPreflightErrorInfo(command: RuntimeCommand, err: anyerror) CliErrorInfo {
     return switch (command) {
         .start => switch (err) {
-            error.PortAlreadyInUse => .{ .code = "START_PORT_IN_USE", .message = "requested start port is already in use", .hint = "retry with `zc start --port <free-port>`" },
-            error.PortConflict => .{ .code = "START_PORT_CONFLICT", .message = "requested start port conflicts with another runtime listener", .hint = "change the port or fix the conflicting runtime config" },
-            error.InvalidBindAddress => .{ .code = "START_BIND_ADDRESS_INVALID", .message = "invalid bind address for start preflight", .hint = "fix `bind-address` in config and retry" },
-            error.InvalidExternalController => .{ .code = "START_EXTERNAL_CONTROLLER_INVALID", .message = "invalid `external-controller` address in config", .hint = "fix `external-controller` to `host:port` format" },
-            else => .{ .code = "START_PREFLIGHT_FAILED", .message = "failed to validate daemon start ports", .hint = "check config and retry" },
+            error.PortAlreadyInUse => .{
+                .code = "START_PORT_IN_USE",
+                .message = "requested start port is already in use",
+                .hint = "retry with `zc start --port <free-port>`",
+            },
+            error.ControllerPortAlreadyInUse => .{
+                .code = "START_CONTROLLER_PORT_IN_USE",
+                .message = "configured controller port is already in use",
+                .hint = "free the exact `external-controller` port or update the config",
+            },
+            error.PortConflict => .{
+                .code = "START_PORT_CONFLICT",
+                .message = "requested start port conflicts with another runtime listener",
+                .hint = "change the port or fix the conflicting runtime config",
+            },
+            error.InvalidBindAddress => .{
+                .code = "START_BIND_ADDRESS_INVALID",
+                .message = "invalid bind address for start preflight",
+                .hint = "fix `bind-address` in config and retry",
+            },
+            error.InvalidExternalController => .{
+                .code = "START_EXTERNAL_CONTROLLER_INVALID",
+                .message = "invalid `external-controller` address in config",
+                .hint = "use an explicit loopback endpoint such as `127.0.0.1:9090`",
+            },
+            else => .{
+                .code = "START_PREFLIGHT_FAILED",
+                .message = "failed to validate daemon start ports",
+                .hint = "check config and retry",
+            },
         },
         .restart => switch (err) {
-            error.PortAlreadyInUse => .{ .code = "RESTART_PORT_IN_USE", .message = "restart target port is already in use", .hint = "free the occupied port, then retry `zc restart` or use `zc start --port <free-port>`" },
-            error.PortConflict => .{ .code = "RESTART_PORT_CONFLICT", .message = "restart target port conflicts with another runtime listener", .hint = "fix the conflicting runtime config before retrying `zc restart`" },
-            error.InvalidBindAddress => .{ .code = "RESTART_BIND_ADDRESS_INVALID", .message = "invalid bind address for restart preflight", .hint = "fix `bind-address` in config and retry `zc restart`" },
-            error.InvalidExternalController => .{ .code = "RESTART_EXTERNAL_CONTROLLER_INVALID", .message = "invalid `external-controller` address in config", .hint = "fix `external-controller` to `host:port` format before retrying `zc restart`" },
-            else => .{ .code = "RESTART_PREFLIGHT_FAILED", .message = "failed to validate daemon restart ports", .hint = "check config and retry `zc restart`" },
+            error.PortAlreadyInUse => .{
+                .code = "RESTART_PORT_IN_USE",
+                .message = "restart target port is already in use",
+                .hint = "free the occupied port, then retry `zc restart`",
+            },
+            error.ControllerPortAlreadyInUse => .{
+                .code = "RESTART_CONTROLLER_PORT_IN_USE",
+                .message = "restart controller port is already in use",
+                .hint = "free the exact `external-controller` port before " ++
+                    "retrying `zc restart`",
+            },
+            error.PortConflict => .{
+                .code = "RESTART_PORT_CONFLICT",
+                .message = "restart target port conflicts with another runtime listener",
+                .hint = "fix the conflicting runtime config before retrying `zc restart`",
+            },
+            error.InvalidBindAddress => .{
+                .code = "RESTART_BIND_ADDRESS_INVALID",
+                .message = "invalid bind address for restart preflight",
+                .hint = "fix `bind-address` in config and retry `zc restart`",
+            },
+            error.InvalidExternalController => .{
+                .code = "RESTART_EXTERNAL_CONTROLLER_INVALID",
+                .message = "invalid `external-controller` address in config",
+                .hint = "use an explicit loopback endpoint such as `127.0.0.1:9090`",
+            },
+            else => .{
+                .code = "RESTART_PREFLIGHT_FAILED",
+                .message = "failed to validate daemon restart ports",
+                .hint = "check config and retry",
+            },
         },
     };
 }
@@ -2015,8 +2070,12 @@ fn runRestartCommand(
     const port: ?u16 = start_opts.port orelse
         (if (preserved) |inv| inv.port else null);
 
-    // 预检在 stop 之前：注定失败的 restart 不能先杀掉健康的 daemon。
-    // 旧 daemon 自己监听的端口会随 stop 释放，预检时视为可用。
+    // Preflight before stop so a known failure does not kill a healthy daemon.
+    // Only listener ports published by the tracked daemon may be skipped.
+    const old_controller_port: ?u16 = if (was_running)
+        observedRuntimeControllerPort(allocator)
+    else
+        null;
     {
         var cfg = try loadRuntimeConfig(allocator, config_path, port, override_opts, "restart", false);
         defer cfg.deinit();
@@ -2026,7 +2085,12 @@ fn runRestartCommand(
             (inv.port orelse constants.MIXED_PORT)
         else
             constants.MIXED_PORT;
-        try preflightPortCheckAllowing(&cfg, false, old_daemon_port);
+        try preflightPortCheckAllowing(
+            &cfg,
+            false,
+            old_daemon_port,
+            old_controller_port,
+        );
     }
 
     // 决策 D6：restart 整体只输出一个最终 envelope；中间进度文本走 stderr。
@@ -2055,6 +2119,15 @@ fn runRestartCommand(
         try out.print("zc daemon restarted (pid: {d})\n", .{pid});
         try out.flush();
     }
+}
+
+fn observedRuntimeControllerPort(allocator: std.mem.Allocator) ?u16 {
+    var default_store = (runtime_descriptor.openDefault(allocator, false) catch return null) orelse
+        return null;
+    defer default_store.deinit();
+    var descriptor = (default_store.store().observe() catch return null) orelse return null;
+    defer descriptor.deinit();
+    return parseExternalControllerPort(descriptor.endpoint) catch null;
 }
 
 fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) void {
@@ -2261,12 +2334,16 @@ fn hasInProcessPortConflict(cfg: *const config.Config) !bool {
 }
 
 fn preflightPortCheck(cfg: *config.Config, emit_errors: bool) !void {
-    return preflightPortCheckAllowing(cfg, emit_errors, null);
+    return preflightPortCheckAllowing(cfg, emit_errors, null, null);
 }
 
-/// 同 preflightPortCheck，但允许跳过 `allowed_port` 的占用检查：restart 在
-/// stop 之前预检，旧 daemon 自己监听的端口会随 stop 释放，不算冲突。
-fn preflightPortCheckAllowing(cfg: *config.Config, emit_errors: bool, allowed_port: ?u16) !void {
+/// Skip ports proven to belong to the daemon that restart is about to stop.
+fn preflightPortCheckAllowing(
+    cfg: *config.Config,
+    emit_errors: bool,
+    allowed_proxy_port: ?u16,
+    allowed_controller_port: ?u16,
+) !void {
     const bind_ip = effectiveBindAddress(cfg);
 
     // 进程内端口冲突检查
@@ -2277,7 +2354,7 @@ fn preflightPortCheckAllowing(cfg: *config.Config, emit_errors: bool, allowed_po
 
     // 系统端口占用检查
     if (cfg.mixed_port > 0) {
-        if (allowed_port == null or allowed_port.? != cfg.mixed_port) {
+        if (allowed_proxy_port == null or allowed_proxy_port.? != cfg.mixed_port) {
             try checkPortAvailable(bind_ip, cfg.mixed_port, emit_errors);
         }
     } else {
@@ -2285,34 +2362,13 @@ fn preflightPortCheckAllowing(cfg: *config.Config, emit_errors: bool, allowed_po
         if (cfg.socks_port > 0) try checkPortAvailable(bind_ip, cfg.socks_port, emit_errors);
     }
 
-    // external-controller 端口：被占用时自动尝试 port+1..+10
-    if (cfg.external_controller) |ec| {
-        const original_port = try parseExternalControllerPort(ec);
-        if (isPortAvailable("127.0.0.1", original_port)) return;
-
-        // 原始端口被占用，尝试 fallback
-        var fallback_port: u16 = original_port;
-        var found = false;
-        for (1..11) |offset| {
-            const try_port = original_port +| @as(u16, @intCast(offset));
-            if (try_port <= original_port) break; // overflow
-            if (isPortAvailable("127.0.0.1", try_port)) {
-                fallback_port = try_port;
-                found = true;
-                break;
-            }
-        }
-
-        if (found) {
-            std.debug.print("external-controller: {d} in use, using {d}\n", .{ original_port, fallback_port });
-            // 更新 cfg.external_controller 为新端口
-            const new_ec = std.fmt.allocPrint(cfg.allocator, "127.0.0.1:{d}", .{fallback_port}) catch return;
-            cfg.allocator.free(cfg.external_controller.?);
-            cfg.external_controller = new_ec;
-        } else {
-            std.debug.print("warning: external-controller port {d}-{d} all in use, skipping API server\n", .{ original_port, original_port +| 10 });
-            cfg.allocator.free(cfg.external_controller.?);
-            cfg.external_controller = null;
+    if (cfg.external_controller) |value| {
+        const port = try parseExternalControllerPort(value);
+        if (allowed_controller_port == null or allowed_controller_port.? != port) {
+            checkPortAvailable("127.0.0.1", port, emit_errors) catch |err| switch (err) {
+                error.PortAlreadyInUse => return error.ControllerPortAlreadyInUse,
+                else => return err,
+            };
         }
     }
 }
@@ -2343,17 +2399,10 @@ fn checkPortAvailable(ip: []const u8, port: u16, emit_errors: bool) !void {
     server.deinit();
 }
 
-fn parseExternalControllerPort(ec: []const u8) !u16 {
-    const colon_pos = std.mem.lastIndexOf(u8, ec, ":") orelse {
+fn parseExternalControllerPort(value: []const u8) !u16 {
+    const endpoint = controller_endpoint.parse(value) catch
         return error.InvalidExternalController;
-    };
-
-    const port = std.fmt.parseInt(u16, ec[colon_pos + 1 ..], 10) catch {
-        return error.InvalidExternalController;
-    };
-
-    if (port == 0) return error.InvalidExternalController;
-    return port;
+    return endpoint.port;
 }
 
 fn isHelpArg(arg: []const u8) bool {
@@ -2426,6 +2475,14 @@ test "parseExternalControllerPort valid and invalid" {
     const testing = std.testing;
 
     try testing.expectEqual(@as(u16, 9090), try parseExternalControllerPort("127.0.0.1:9090"));
+    try testing.expectError(
+        error.InvalidExternalController,
+        parseExternalControllerPort("0.0.0.0:9090"),
+    );
+    try testing.expectError(
+        error.InvalidExternalController,
+        parseExternalControllerPort("localhost:9090"),
+    );
     try testing.expectError(error.InvalidExternalController, parseExternalControllerPort("127.0.0.1"));
     try testing.expectError(error.InvalidExternalController, parseExternalControllerPort("127.0.0.1:abc"));
     try testing.expectError(error.InvalidExternalController, parseExternalControllerPort("127.0.0.1:0"));
@@ -2947,6 +3004,34 @@ test "preflightPortCheck rejects mixed-port conflicts without fallback" {
     try testing.expectEqualStrings("127.0.0.1:7901", cfg.external_controller.?);
 }
 
+test "preflight controller port conflict fails without endpoint drift" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const address = try compat.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try compat.net.listenReuseAddr(address);
+    defer listener.deinit();
+    const port = listener.listen_address.getPort();
+    const endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
+
+    var cfg = config.Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "127.0.0.1"),
+        .external_controller = endpoint,
+        .proxies = std.ArrayList(config.Proxy).empty,
+        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
+        .rules = std.ArrayList(config.Rule).empty,
+    };
+    defer cfg.deinit();
+
+    try testing.expectError(
+        error.ControllerPortAlreadyInUse,
+        preflightPortCheck(&cfg, false),
+    );
+    try testing.expectEqualStrings(endpoint, cfg.external_controller.?);
+}
+
 test "SO_REUSEADDR-only listener rejects a second active listener" {
     const testing = std.testing;
     // Bind a real active listener via the SO_REUSEADDR-only helper used by the
@@ -2971,6 +3056,13 @@ test "runtimeCommandPreflightErrorInfo maps restart port conflicts" {
     try testing.expectEqualStrings("RESTART_PORT_IN_USE", info.code);
     try testing.expectEqualStrings("restart target port is already in use", info.message);
     try testing.expect(std.mem.indexOf(u8, info.hint, "zc restart") != null);
+
+    const controller = runtimeCommandPreflightErrorInfo(
+        .restart,
+        error.ControllerPortAlreadyInUse,
+    );
+    try testing.expectEqualStrings("RESTART_CONTROLLER_PORT_IN_USE", controller.code);
+    try testing.expect(std.mem.indexOf(u8, controller.hint, "external-controller") != null);
 }
 
 test "start skips port preflight when daemon is already running" {

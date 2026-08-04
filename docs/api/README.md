@@ -6,7 +6,7 @@ The API is **minimal** and should not be advertised as a complete REST API v1 or
 
 ## Enabling the API
 
-The API server starts when `external-controller` is present in the active config.
+The API server starts when `external-controller` is present in the active config. zc v1.0 accepts only an explicit `127.0.0.1:<port>` endpoint. If that exact port is unavailable, startup fails; zc never drifts to another port or silently disables the controller.
 
 Example:
 

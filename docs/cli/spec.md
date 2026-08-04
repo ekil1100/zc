@@ -32,6 +32,8 @@ frozen `START_*` argument-error codes (messages/hints rendered for restart);
 `stop`/`status`/`reload`/`log` use `<CMD>_ARGUMENT_INVALID`, and
 `doctor`/`diag doctor` share `DIAG_DOCTOR_ARGUMENT_INVALID`.
 
+v1 的 `external-controller` 只接受显式 `127.0.0.1:<port>`。启动必须绑定配置中的精确端口；端口已占用时返回 `START_CONTROLLER_PORT_IN_USE` / `RESTART_CONTROLLER_PORT_IN_USE`，不得自动改用相邻端口，也不得静默禁用控制面。
+
 The TUI command is excluded from v1.0 and is not present in help/dispatch.
 `zc --daemon-run` is an internal mode used by `zc start` and is intentionally
 undocumented in help.

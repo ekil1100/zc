@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const compat = @import("compat.zig");
+const controller_endpoint = @import("controller_endpoint.zig");
 const aead = @import("crypto/aead.zig");
 const Config = @import("config.zig").Config;
 const ProxyType = @import("config.zig").ProxyType;
@@ -229,20 +230,14 @@ fn validateBasicConfig(config: *const Config, result: *ValidationResult) !void {
         try result.addWarning("allow-lan=false: bind-address '{s}' will be ignored, using 127.0.0.1", .{config.bind_address});
     }
 
-    // external-controller 格式校验（host:port）
-    if (config.external_controller) |ec| {
-        const colon_pos = std.mem.lastIndexOf(u8, ec, ":") orelse {
-            try result.addError("Invalid external-controller '{s}' (expected host:port)", .{ec});
-            return;
+    // v1 exposes the controller only on an explicit IPv4 loopback endpoint.
+    if (config.external_controller) |value| {
+        _ = controller_endpoint.parse(value) catch {
+            try result.addError(
+                "Invalid external-controller '{s}' (expected 127.0.0.1:PORT)",
+                .{value},
+            );
         };
-        const port_str = ec[colon_pos + 1 ..];
-        const p = std.fmt.parseInt(u16, port_str, 10) catch {
-            try result.addError("Invalid external-controller port in '{s}'", .{ec});
-            return;
-        };
-        if (!isValidPort(p)) {
-            try result.addError("Invalid external-controller port: {d} (must be 1-65535)", .{p});
-        }
     }
 
     // 检查是否至少有一个监听端口
@@ -649,6 +644,25 @@ const base_yaml =
     \\    server: ""
     \\    port: 0
 ;
+
+test "v1 controller requires an explicit IPv4 loopback endpoint" {
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\external-controller: 0.0.0.0:9090
+    );
+    defer cfg.deinit();
+
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "Invalid external-controller '0.0.0.0:9090' " ++
+            "(expected 127.0.0.1:PORT)",
+        result.errors.items[0].message,
+    );
+}
 
 test "v1 capability gate rejects VMess before runtime" {
     // Validation must fail before an unsupported protocol can bind or dial.

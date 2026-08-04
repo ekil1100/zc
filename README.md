@@ -147,7 +147,7 @@ See [`testdata/config/`](testdata/config/) for runnable examples and [`docs/comp
 
 ## Minimal API
 
-The API starts when `external-controller` is set in the active config:
+The API starts when `external-controller` is set to an explicit IPv4 loopback endpoint. zc uses the exact configured port and fails startup on conflicts:
 
 ```yaml
 external-controller: 127.0.0.1:9090
