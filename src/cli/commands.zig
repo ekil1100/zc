@@ -33,7 +33,7 @@ const probe_port_flag: Flag = .{ .spec = "--port <port>", .help = "Probe this po
 const override_flags = [_]Flag{
     .{ .spec = "--override-script <path>", .help = "Run override script (lua table or executable printing YAML)" },
     .{ .spec = "--override-arg <k=v>", .help = "Pass key/value to override script (repeatable)" },
-    .{ .spec = "--override-timeout-ms <n>", .help = "Override script timeout in milliseconds (default: 500)" },
+    .{ .spec = "--override-timeout-ms <n>", .help = "Override script timeout in milliseconds (default: 5000)" },
 };
 
 pub const groups = [_]Group{
