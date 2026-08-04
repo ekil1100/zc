@@ -419,14 +419,18 @@ pub fn parseIpv4(str: []const u8, out: *[4]u8) bool {
     var parts: [4]u8 = undefined;
     var part_idx: usize = 0;
     var current: u16 = 0;
+    var digit_count: usize = 0;
 
     for (str) |c| {
         if (c == '.') {
-            if (part_idx >= 4) return false;
+            if (part_idx >= 3 or digit_count == 0) return false;
             parts[part_idx] = @intCast(current);
             part_idx += 1;
             current = 0;
+            digit_count = 0;
         } else if (c >= '0' and c <= '9') {
+            digit_count += 1;
+            if (digit_count > 3) return false;
             current = current * 10 + (c - '0');
             if (current > 255) return false;
         } else {
@@ -434,7 +438,7 @@ pub fn parseIpv4(str: []const u8, out: *[4]u8) bool {
         }
     }
 
-    if (part_idx != 3) return false;
+    if (part_idx != 3 or digit_count == 0) return false;
     parts[3] = @intCast(current);
 
     @memcpy(out, &parts);
@@ -469,9 +473,9 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
             var it = std.mem.splitScalar(u8, str[0..dc_pos], ':');
             while (it.next()) |part| {
                 if (part.len == 0 or part.len > 4) return false;
+                if (part_count >= parts.len) return false;
                 parts[part_count] = std.fmt.parseInt(u16, part, 16) catch return false;
                 part_count += 1;
-                if (part_count > 8) return false;
             }
         }
 
@@ -483,9 +487,9 @@ fn parseIpv6(str: []const u8, out: *[16]u8) bool {
             var it = std.mem.splitScalar(u8, after, ':');
             while (it.next()) |part| {
                 if (part.len == 0 or part.len > 4) return false;
+                if (after_count >= after_parts.len) return false;
                 after_parts[after_count] = std.fmt.parseInt(u16, part, 16) catch return false;
                 after_count += 1;
-                if (after_count > 8) return false;
             }
         }
 
@@ -563,6 +567,13 @@ test "VMess parseIpv6 compressed" {
     try testing.expect(parseIpv6("2001:db8::1", &out));
     try testing.expectEqual(@as(u8, 0x20), out[0]);
     try testing.expectEqual(@as(u8, 1), out[15]);
+}
+
+test "VMess parseIpv6 rejects a ninth compressed hextet" {
+    // Both halves must reject an index before writing outside the fixed array.
+    var out: [16]u8 = undefined;
+    try testing.expect(!parseIpv6("1:2:3:4:5:6:7:8:9::", &out));
+    try testing.expect(!parseIpv6("::1:2:3:4:5:6:7:8:9", &out));
 }
 
 test "VMess parseIpv6 ipv4-mapped" {

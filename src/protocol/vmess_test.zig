@@ -53,6 +53,14 @@ test "VMess parseIpv4 invalid" {
     try testing.expect(!result);
 }
 
+test "VMess parseIpv4 rejects empty octets" {
+    // Invalid separators must not silently become zero-valued octets.
+    var ip: [4]u8 = undefined;
+    try testing.expect(!vmess.parseIpv4("1..2.3", &ip));
+    try testing.expect(!vmess.parseIpv4(".1.2.3", &ip));
+    try testing.expect(!vmess.parseIpv4("1.2.3.", &ip));
+}
+
 test "VMess parseIpv4 octet overflow rejected" {
     var ip: [4]u8 = undefined;
     // Octet > 255 whose running accumulation overflows a u8 must be rejected,
