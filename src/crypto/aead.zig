@@ -5,6 +5,12 @@ const compat = @import("../compat.zig");
 const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
 const HkdfSha1 = std.crypto.kdf.hkdf.Hkdf(HmacSha1);
 
+pub const chunk_payload_size_max: usize = 0x3fff;
+
+comptime {
+    std.debug.assert(chunk_payload_size_max == std.math.maxInt(u14));
+}
+
 /// Shadowsocks AEAD 加密支持
 /// 支持：AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
 pub const CipherType = enum {
@@ -155,7 +161,7 @@ pub const AeadStream = struct {
         const payload_len = (@as(u16, len_bytes[0]) << 8) | len_bytes[1];
         // Shadowsocks AEAD spec caps a single chunk payload at 0x3FFF (16383) bytes.
         // Reject larger declared lengths to prevent an upstream from amplifying memory.
-        if (payload_len > 0x3FFF) return error.ChunkTooLarge;
+        if (payload_len > chunk_payload_size_max) return error.ChunkTooLarge;
         return payload_len;
     }
 

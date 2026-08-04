@@ -220,8 +220,7 @@ pub const ShadowsocksClient = struct {
     /// Send initial SS data wrapped in HTTP obfs request
     fn sendWithHttpObfs(self: *ShadowsocksClient, stream: *net.Stream, host: []const u8, salt: []const u8, enc_data: []const u8) !void {
         // Build HTTP GET request headers
-        const header = try std.fmt.allocPrint(self.allocator,
-            "GET / HTTP/1.1\r\n" ++
+        const header = try std.fmt.allocPrint(self.allocator, "GET / HTTP/1.1\r\n" ++
             "Host: {s}\r\n" ++
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n" ++
             "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n" ++
@@ -250,7 +249,7 @@ pub const ShadowsocksClient = struct {
         const stream = self.stream orelse return error.NotConnected;
         var ctx = &self.enc_ctx.?;
 
-        const max_chunk = 16384;
+        const max_chunk = aead.chunk_payload_size_max;
         var offset: usize = 0;
 
         while (offset < data.len) {
@@ -470,7 +469,6 @@ pub const ShadowsocksClient = struct {
             self.dec_ctx = try aead.AeadStream.init(self.cipher_type, self.password, salt_buf[0..salt_len]);
         }
     }
-
 };
 
 fn sleepBeforeRetry(attempt_index: usize, max_attempts: usize) void {
@@ -546,9 +544,93 @@ test "read skips a zero-length AEAD chunk instead of reporting false EOF" {
     try std.testing.expectEqualStrings("hello", out[0..n]);
 }
 
+const WriteTestContext = struct {
+    client: *ShadowsocksClient,
+    payload: []const u8,
+    failure: ?anyerror = null,
+
+    fn run(context: *WriteTestContext) void {
+        context.client.write(context.payload) catch |err| {
+            context.failure = err;
+            _ = compat.shutdownWrite(context.client.stream.?.handle) catch {};
+            return;
+        };
+        compat.shutdownWrite(context.client.stream.?.handle) catch |err| {
+            context.failure = err;
+        };
+    }
+};
+
+test "write splits 0x4000 bytes at the Shadowsocks AEAD limit" {
+    // The sender and receiver must enforce the same 0x3fff wire payload cap.
+    const allocator = std.testing.allocator;
+    const fds = try makeSocketPair();
+    defer _ = std.c.close(fds[1]);
+
+    var client = try ShadowsocksClient.init(
+        allocator,
+        "127.0.0.1",
+        8388,
+        "password",
+        "aes-128-gcm",
+    );
+    defer client.deinit();
+    client.stream = net.Stream{ .handle = fds[0] };
+
+    const salt = [_]u8{0} ** 16;
+    client.enc_ctx = try aead.AeadStream.init(
+        .aes_128_gcm,
+        "password",
+        &salt,
+    );
+    var decoder = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+
+    const payload = [_]u8{0x5a} ** 0x4000;
+    var context = WriteTestContext{ .client = &client, .payload = &payload };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 128 * 1024 },
+        WriteTestContext.run,
+        .{&context},
+    );
+
+    const tag_size = 16;
+    const frame_overhead = 2 + tag_size + tag_size;
+    var wire: [payload.len + 2 * frame_overhead]u8 = undefined;
+    const wire_size = try readToEndFd(fds[1], &wire);
+    thread.join();
+    if (context.failure) |err| return err;
+    try std.testing.expectEqual(wire.len, wire_size);
+
+    const header_size = 2 + tag_size;
+    const first_size = try decoder.decryptLen(wire[0..header_size]);
+    try std.testing.expectEqual(@as(u16, 0x3fff), first_size);
+    const first_end = header_size + first_size + tag_size;
+    var first_plaintext: [0x3fff]u8 = undefined;
+    try decoder.decryptPayload(
+        wire[header_size..first_end],
+        &first_plaintext,
+    );
+
+    const second_header_end = first_end + header_size;
+    const second_size = try decoder.decryptLen(
+        wire[first_end..second_header_end],
+    );
+    try std.testing.expectEqual(@as(u16, 1), second_size);
+}
+
 fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     var off: usize = 0;
     while (off < data.len) off += try compat.posixWrite(fd, data[off..]);
+}
+
+fn readToEndFd(fd: std.posix.fd_t, data: []u8) !usize {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const read_count = try compat.posixRead(fd, data[offset..]);
+        if (read_count == 0) break;
+        offset += read_count;
+    }
+    return offset;
 }
 
 fn makeSocketPair() ![2]std.posix.fd_t {
