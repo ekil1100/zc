@@ -16,6 +16,50 @@ const udp_uot = @import("udp_uot.zig");
 // stack size makes a small number of stale/idle tunnels look like hundreds of
 // megabytes in Activity Monitor. Keep the worker stack explicit and bounded.
 const connection_task_stack_size: usize = 512 * 1024;
+const max_connections: u32 = 128;
+const handshake_timeout_ms: i64 = 5_000;
+
+comptime {
+    std.debug.assert(max_connections > 0);
+    std.debug.assert(
+        max_connections * connection_task_stack_size <= 64 * 1024 * 1024,
+    );
+}
+
+const ConnectionLimiter = struct {
+    allocator: std.mem.Allocator,
+    active: std.atomic.Value(u32) = .init(0),
+    references: std.atomic.Value(u32) = .init(1),
+
+    fn create(allocator: std.mem.Allocator) !*ConnectionLimiter {
+        const limiter = try allocator.create(ConnectionLimiter);
+        limiter.* = .{ .allocator = allocator };
+        return limiter;
+    }
+
+    fn acquire(self: *ConnectionLimiter) bool {
+        const previous = self.active.fetchAdd(1, .monotonic);
+        if (previous < max_connections) {
+            _ = self.references.fetchAdd(1, .monotonic);
+            return true;
+        }
+        const after = self.active.fetchSub(1, .monotonic);
+        std.debug.assert(after > 0);
+        return false;
+    }
+
+    fn release(self: *ConnectionLimiter) void {
+        const previous = self.active.fetchSub(1, .monotonic);
+        std.debug.assert(previous > 0);
+        self.releaseReference();
+    }
+
+    fn releaseReference(self: *ConnectionLimiter) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) self.allocator.destroy(self);
+    }
+};
 
 // Use a heartbeat instead of an infinite poll so relays that miss EOF/HUP on
 // macOS can still be reaped. The idle budget is intentionally much larger than
@@ -52,6 +96,8 @@ pub fn startWithReady(
     ready_count: ?*std.atomic.Value(u8),
     accept_gate: ?*std.atomic.Value(bool),
 ) !void {
+    const connection_limiter = try ConnectionLimiter.create(allocator);
+    defer connection_limiter.releaseReference();
     const listen_ip = if (std.mem.eql(u8, bind_address, "*")) "0.0.0.0" else bind_address;
     const address = try net.Address.parseIp4(listen_ip, port);
     // SO_REUSEADDR-only: lets restart rebind past TIME_WAIT while still rejecting
@@ -81,7 +127,22 @@ pub fn startWithReady(
             conn.stream.close();
             continue;
         };
-        try spawnConnectionTask(allocator, conn, engine, manager);
+        if (!connection_limiter.acquire()) {
+            conn.stream.close();
+            continue;
+        }
+        spawnConnectionTask(
+            allocator,
+            conn,
+            engine,
+            manager,
+            connection_limiter,
+        ) catch |err| {
+            connection_limiter.release();
+            conn.stream.close();
+            std.debug.print("Mixed connection spawn error: {}\n", .{err});
+            continue;
+        };
     }
 }
 
@@ -90,9 +151,16 @@ const ConnTask = struct {
     conn: net.Server.Connection,
     engine: *Engine,
     manager: *OutboundManager,
+    limiter: *ConnectionLimiter,
 };
 
-fn spawnConnectionTask(allocator: std.mem.Allocator, conn: net.Server.Connection, engine: *Engine, manager: *OutboundManager) !void {
+fn spawnConnectionTask(
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    engine: *Engine,
+    manager: *OutboundManager,
+    limiter: *ConnectionLimiter,
+) !void {
     const task = try allocator.create(ConnTask);
     errdefer allocator.destroy(task);
     task.* = .{
@@ -100,6 +168,7 @@ fn spawnConnectionTask(allocator: std.mem.Allocator, conn: net.Server.Connection
         .conn = conn,
         .engine = engine,
         .manager = manager,
+        .limiter = limiter,
     };
 
     const thread = try std.Thread.spawn(.{ .stack_size = connection_task_stack_size }, connectionTaskMain, .{task});
@@ -108,24 +177,70 @@ fn spawnConnectionTask(allocator: std.mem.Allocator, conn: net.Server.Connection
 
 fn connectionTaskMain(task: *ConnTask) void {
     defer task.allocator.destroy(task);
+    defer task.limiter.release();
     handleConnection(task.allocator, task.conn, task.engine, task.manager) catch |err| {
         std.debug.print("Mixed connection error: {}\n", .{err});
     };
 }
 
+fn readBeforeDeadline(
+    stream: net.Stream,
+    buffer: []u8,
+    deadline_ms: i64,
+) !usize {
+    while (true) {
+        const remaining = deadline_ms - compat.monotonicMilliTimestamp();
+        if (remaining <= 0) return error.HandshakeTimeout;
+        var descriptors = [_]std.posix.pollfd{.{
+            .fd = stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(
+            &descriptors,
+            @intCast(@min(remaining, std.math.maxInt(i32))),
+        );
+        if (ready == 0) return error.HandshakeTimeout;
+        const events = descriptors[0].revents;
+        if (events & std.posix.POLL.NVAL != 0 or
+            events & std.posix.POLL.ERR != 0)
+        {
+            return error.HandshakeSocketFailure;
+        }
+        if (events & std.posix.POLL.IN != 0 or
+            events & std.posix.POLL.HUP != 0)
+        {
+            return stream.read(buffer);
+        }
+    }
+}
+
 fn handleConnection(allocator: std.mem.Allocator, conn: net.Server.Connection, engine: *Engine, manager: *OutboundManager) !void {
     defer conn.stream.close();
+    const handshake_deadline = compat.monotonicMilliTimestamp() +
+        handshake_timeout_ms;
 
     // 读取第一个字节来判断协议类型
     var first_byte: [1]u8 = undefined;
-    const n = try conn.stream.read(&first_byte);
+    const n = try readBeforeDeadline(
+        conn.stream,
+        &first_byte,
+        handshake_deadline,
+    );
     if (n == 0) return;
 
     // 判断协议类型
     if (first_byte[0] == 0x05) {
         // SOCKS5 协议
         std.debug.print("[Mixed] Detected SOCKS5 connection\n", .{});
-        try handleSocks5(allocator, conn, first_byte[0], engine, manager);
+        try handleSocks5(
+            allocator,
+            conn,
+            first_byte[0],
+            engine,
+            manager,
+            handshake_deadline,
+        );
     } else if (first_byte[0] == 0x04) {
         // SOCKS4 协议（暂不支持，按 SOCKS5 处理）
         std.debug.print("[Mixed] Detected SOCKS4 connection (not supported)\n", .{});
@@ -133,15 +248,33 @@ fn handleConnection(allocator: std.mem.Allocator, conn: net.Server.Connection, e
     } else {
         // HTTP/HTTPS 代理（第一个字节是可打印字符如 'C', 'G', 'P', 'H' 等）
         std.debug.print("[Mixed] Detected HTTP connection\n", .{});
-        try handleHttp(allocator, conn, first_byte[0], engine, manager);
+        try handleHttp(
+            allocator,
+            conn,
+            first_byte[0],
+            engine,
+            manager,
+            handshake_deadline,
+        );
     }
 }
 
-fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first_byte: u8, engine: *Engine, manager: *OutboundManager) !void {
+fn handleSocks5(
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    first_byte: u8,
+    engine: *Engine,
+    manager: *OutboundManager,
+    handshake_deadline: i64,
+) !void {
     _ = allocator;
 
     var buf: [256]u8 = undefined;
-    const n = try conn.stream.read(&buf);
+    const n = try readBeforeDeadline(
+        conn.stream,
+        &buf,
+        handshake_deadline,
+    );
     if (n < 2) return error.InvalidGreeting;
 
     const num_methods = buf[0];
@@ -161,7 +294,11 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
 
     try conn.stream.writeAll(&.{ first_byte, 0x00 });
 
-    const req_n = try conn.stream.read(&buf);
+    const req_n = try readBeforeDeadline(
+        conn.stream,
+        &buf,
+        handshake_deadline,
+    );
     if (req_n < 7) return error.InvalidRequest;
     if (buf[0] != 0x05) return error.InvalidVersion;
     switch (buf[1]) {
@@ -219,7 +356,14 @@ fn handleSocks5(allocator: std.mem.Allocator, conn: net.Server.Connection, first
     try relay(conn.stream, &target_stream);
 }
 
-fn handleHttp(allocator: std.mem.Allocator, conn: net.Server.Connection, first_byte: u8, engine: *Engine, manager: *OutboundManager) !void {
+fn handleHttp(
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    first_byte: u8,
+    engine: *Engine,
+    manager: *OutboundManager,
+    handshake_deadline: i64,
+) !void {
     // Read a full HTTP header block. CONNECT headers may arrive fragmented across
     // multiple TCP reads; tunneling before seeing \r\n\r\n can leak the remaining
     // proxy headers into the upstream TLS stream.
@@ -229,7 +373,11 @@ fn handleHttp(allocator: std.mem.Allocator, conn: net.Server.Connection, first_b
 
     while (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") == null) {
         if (total == buf.len) return error.HttpHeaderTooLarge;
-        const n = try conn.stream.read(buf[total..]);
+        const n = try readBeforeDeadline(
+            conn.stream,
+            buf[total..],
+            handshake_deadline,
+        );
         if (n == 0) return error.UnexpectedEof;
         total += n;
     }
@@ -1183,8 +1331,29 @@ fn shouldRetryAcceptError(err: anyerror) bool {
     };
 }
 
-test "mixed connection worker uses bounded stack" {
+test "mixed connection workers have bounded count and stack" {
     try std.testing.expect(connection_task_stack_size <= 1024 * 1024);
+    const limiter = try ConnectionLimiter.create(std.testing.allocator);
+    defer limiter.releaseReference();
+    for (0..max_connections) |_| try std.testing.expect(limiter.acquire());
+    try std.testing.expect(!limiter.acquire());
+    for (0..max_connections) |_| limiter.release();
+    try std.testing.expectEqual(@as(u32, 0), limiter.active.load(.monotonic));
+}
+
+test "mixed handshake reads honor one monotonic deadline" {
+    const pair = try makeTcpStreamPair();
+    defer pair.left.close();
+    defer pair.right.close();
+    var buffer: [1]u8 = undefined;
+    try std.testing.expectError(
+        error.HandshakeTimeout,
+        readBeforeDeadline(
+            pair.left,
+            &buffer,
+            compat.monotonicMilliTimestamp() + 20,
+        ),
+    );
 }
 
 test "mixed accept retries transient resource and connection failures" {
