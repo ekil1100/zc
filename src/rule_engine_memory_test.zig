@@ -21,7 +21,7 @@ fn deinitTestRules(allocator: std.mem.Allocator, rules: *std.ArrayList(config.Ru
     rules.deinit(allocator);
 }
 
-test "domain suffix index stores one hash entry per suffix rule" {
+test "domain suffix rules preserve first-match order" {
     const allocator = std.testing.allocator;
 
     var rules = std.ArrayList(config.Rule).empty;
@@ -33,8 +33,7 @@ test "domain suffix index stores one hash entry per suffix rule" {
     var engine = try rule_engine.Engine.init(allocator, &rules);
     defer engine.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), engine.domain_suffix_set.count());
-    try std.testing.expectEqualStrings("PROXY", engine.match("a.b.example.com", true).?);
+    try std.testing.expectEqualStrings("DIRECT", engine.match("a.b.example.com", true).?);
 }
 
 test "domain suffix matching honors label boundaries" {

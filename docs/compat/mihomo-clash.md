@@ -41,7 +41,8 @@ Known gaps:
 - `external-controller` is restricted to an explicit `127.0.0.1:<port>` endpoint；端口冲突时启动失败，不自动漂移或静默关闭控制面；
 - TUN/fake-ip/enhanced-mode are not supported;
 - both legacy and managed YAML parsing reject nesting deeper than 128 levels;
-- managed/offline configs without `MATCH` receive an implicit terminal `MATCH,REJECT`; duplicate or non-terminal `MATCH` entries are rejected. A legacy config with no `rules` field retains its historical `MATCH,DIRECT`; any present, well-formed ruleset without `MATCH` receives `MATCH,REJECT`, while malformed rule values are rejected.
+- managed/offline configs without `MATCH` receive an implicit terminal `MATCH,REJECT`; duplicate or non-terminal `MATCH` entries are rejected. A legacy config with no `rules` field retains its historical `MATCH,DIRECT`; any present, well-formed ruleset without `MATCH` receives `MATCH,REJECT`, while malformed rule values are rejected;
+- rules use declaration-order first-match semantics across rule types. Domain matching is ASCII case-insensitive and ignores a final root dot. Domain targets reaching `IP-CIDR`, `IP-CIDR6`, or `GEOIP` use the system resolver and a bounded 256-entry process cache.
 
 ## Proxy support
 

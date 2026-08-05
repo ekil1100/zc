@@ -555,6 +555,16 @@ pub const net = struct {
             return .{ .in = .{ .sa = sa } };
         }
 
+        pub fn initIp6(bytes: [16]u8, port: u16) Address {
+            const sa: std.c.sockaddr.in6 = .{
+                .port = std.mem.nativeToBig(u16, port),
+                .flowinfo = 0,
+                .addr = bytes,
+                .scope_id = 0,
+            };
+            return .{ .in6 = .{ .sa = sa } };
+        }
+
         pub fn listen(address: Address, options: ListenOptions) !Server {
             var inner_address = address.toIo();
             const inner = try inner_address.listen(io(), .{ .reuse_address = options.reuse_address });
@@ -594,15 +604,7 @@ pub const net = struct {
         fn fromIo(address: ionet.IpAddress) Address {
             return switch (address) {
                 .ip4 => |ip4| initIp4(ip4.bytes, ip4.port),
-                .ip6 => |ip6| blk: {
-                    const sa: std.c.sockaddr.in6 = .{
-                        .port = std.mem.nativeToBig(u16, ip6.port),
-                        .flowinfo = 0,
-                        .addr = ip6.bytes,
-                        .scope_id = 0,
-                    };
-                    break :blk .{ .in6 = .{ .sa = sa } };
-                },
+                .ip6 => |ip6| initIp6(ip6.bytes, ip6.port),
             };
         }
     };
@@ -762,6 +764,21 @@ pub const net = struct {
     pub fn tcpConnectToAddress(address: Address) !Stream {
         var inner_address = address.toIo();
         const stream = try inner_address.connect(io(), .{ .mode = .stream });
+        return Stream.fromIo(stream);
+    }
+
+    pub fn tcpConnectToAddressWithTimeout(
+        address: Address,
+        timeout_ms: u32,
+    ) !Stream {
+        var inner_address = address.toIo();
+        const stream = try inner_address.connect(io(), .{
+            .mode = .stream,
+            .timeout = .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(timeout_ms),
+            } },
+        });
         return Stream.fromIo(stream);
     }
 

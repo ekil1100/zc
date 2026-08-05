@@ -117,8 +117,8 @@ pub const Message = struct {
         while (i < qdcount) : (i += 1) {
             const name = try decodeName(self.allocator, data, &pos);
             if (pos + 4 > data.len) return error.InvalidMessage;
-            const qtype = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos..pos+2].ptr)), .big);
-            const qclass = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos+2..pos+4].ptr)), .big);
+            const qtype = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos .. pos + 2].ptr)), .big);
+            const qclass = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos + 2 .. pos + 4].ptr)), .big);
             pos += 4;
 
             try self.questions.append(self.allocator, .{
@@ -151,15 +151,15 @@ pub const Message = struct {
         const name = try decodeName(self.allocator, data, pos);
         if (pos.* + 10 > data.len) return error.InvalidMessage;
 
-        const rtype = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos.*..pos.*+2].ptr)), .big);
-        const rclass = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos.*+2..pos.*+4].ptr)), .big);
-        const ttl = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(data[pos.*+4..pos.*+8].ptr)), .big);
-        const rdlength = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos.*+8..pos.*+10].ptr)), .big);
+        const rtype = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos.* .. pos.* + 2].ptr)), .big);
+        const rclass = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos.* + 2 .. pos.* + 4].ptr)), .big);
+        const ttl = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(data[pos.* + 4 .. pos.* + 8].ptr)), .big);
+        const rdlength = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[pos.* + 8 .. pos.* + 10].ptr)), .big);
         pos.* += 10;
 
         if (pos.* + rdlength > data.len) return error.InvalidMessage;
 
-        const rdata = try self.allocator.dupe(u8, data[pos.*..pos.*+rdlength]);
+        const rdata = try self.allocator.dupe(u8, data[pos.* .. pos.* + rdlength]);
         pos.* += rdlength;
 
         try list.append(self.allocator, .{
@@ -257,7 +257,7 @@ pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) !
 
         if (pos.* + len > data.len) return error.InvalidMessage;
 
-        const label = try allocator.dupe(u8, data[pos.*..pos.*+len]);
+        const label = try allocator.dupe(u8, data[pos.* .. pos.* + len]);
         try name_parts.append(allocator, label);
         pos.* += len;
     }
@@ -281,7 +281,7 @@ pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, pos: *usize) !
     const result = try allocator.alloc(u8, total_len);
     var offset: usize = 0;
     for (name_parts.items, 0..) |label, i| {
-        @memcpy(result[offset..offset+label.len], label);
+        @memcpy(result[offset .. offset + label.len], label);
         offset += label.len;
         if (i < name_parts.items.len - 1) {
             result[offset] = '.';
@@ -310,8 +310,11 @@ pub fn encodeName(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: [
     try buf.append(allocator, 0);
 }
 
-/// 创建 A 记录查询
-pub fn createAQuery(allocator: std.mem.Allocator, domain: []const u8) !Message {
+pub fn createQuery(
+    allocator: std.mem.Allocator,
+    domain: []const u8,
+    query_type: QueryType,
+) !Message {
     var msg = Message.init(allocator);
     errdefer msg.deinit();
 
@@ -326,10 +329,15 @@ pub fn createAQuery(allocator: std.mem.Allocator, domain: []const u8) !Message {
     const name = try allocator.dupe(u8, domain);
     try msg.questions.append(allocator, .{
         .name = name,
-        .qtype = .a,
+        .qtype = query_type,
     });
 
     return msg;
+}
+
+/// 创建 A 记录查询
+pub fn createAQuery(allocator: std.mem.Allocator, domain: []const u8) !Message {
+    return createQuery(allocator, domain, .a);
 }
 
 /// 解析 A 记录响应
