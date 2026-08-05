@@ -13,11 +13,16 @@ brew install ekil1100/tap/zc
 zc --version
 ```
 
-升级时使用同一个 fully qualified formula，避免与其他 Tap 的同名 formula 混淆：
+升级时使用同一个 fully qualified formula，避免与其他 Tap 的同名 formula 混淆。release candidate 之间可能迁移 runtime 路径，因此必须先用当前（旧）二进制停止 daemon，确认停止后再替换：
 
 ```bash
+zc stop
+zc status --json  # must report data.state == "stopped"
 brew upgrade ekil1100/tap/zc
+zc start          # only if it was running before the upgrade
 ```
+
+如果 daemon 由 systemd 或其他 supervisor 管理，应通过 supervisor 先停止、升级，再启动；不要在替换后才调用新二进制的 `restart`。
 
 发布工作流会为 macOS arm64、macOS amd64 和 Linux amd64 生成二进制归档，并在 GitHub Release 成功后更新 `ekil1100/homebrew-tap` 中的 formula。
 
@@ -29,7 +34,7 @@ The shortest local install flow is:
 just install
 ```
 
-This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`. It replaces the local binary only; it does not stop or restart an already running daemon.
+This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`. `just install` binds lifecycle checks to the exact target `$HOME/.local/bin/zc`: it detects a running daemon with that old binary, verifies the tracked process was launched from that exact target path, stops it before replacement, verifies it stopped, then starts it with the new target binary. If replacement or the new startup/health check fails after stopping a previously running default instance, an EXIT rollback restores the retained old binary and attempts to restart it. To avoid silently losing invocation state, it refuses automatic replacement when the old daemon uses `--foreground`, `-c`, `--port`, or override flags; stop/start it through its supervisor or manually preserve those arguments. The lower-level `local-dev-install.sh` only replaces the binary and must not be used directly while a daemon is running.
 
 The underlying maintained install workflow is script-based:
 
@@ -52,6 +57,12 @@ Expected behavior:
 - every command prints machine-readable `INSTALL_*` fields;
 - failures include `INSTALL_FAILED_STEP` and `INSTALL_NEXT_STEP`;
 - rollback removes the install marker/version/shim produced by the local scripts.
+
+## Runtime directory
+
+直接运行时，已设置的 `XDG_RUNTIME_DIR` 必须是绝对、规范化路径，由当前 euid 所有且权限为 `0700`。未设置时 zc 使用规范化 `$HOME/.local/state/zc/runtime`；`HOME` 必须由当前 euid 所有且不得由 group/other 写入，zc 创建的后续目录收敛为 owner-only。zc 不再使用共享 `/tmp/zc.pid`、`/tmp/zc.lock` 或 `/tmp/zc.log`。
+
+仓库中的 systemd unit 使用 `RuntimeDirectory=zc`、`RuntimeDirectoryMode=0700` 与 `XDG_RUNTIME_DIR=/run/zc`。自定义 unit 必须保持等价约束；不要把多个 OS 用户指向同一个 runtime directory。
 
 ## Regression gates
 
