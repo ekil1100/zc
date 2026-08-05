@@ -11,6 +11,32 @@ install:
     was_running=0
     rollback_needed=0
     backup_path=""
+    old_pid=""
+    file_identity() {
+        local path="$1"
+        if stat -f '%d:%i' "$path" >/dev/null 2>&1; then
+            stat -f '%d:%i' "$path"
+        else
+            stat -Lc '%d:%i' "$path"
+        fi
+    }
+    process_executable_identity() {
+        local pid="$1"
+        local record device inode
+        if [ -e "/proc/$pid/exe" ]; then
+            stat -Lc '%d:%i' "/proc/$pid/exe"
+            return
+        fi
+        record="$(lsof -a -p "$pid" -d txt -FDi 2>/dev/null | awk '
+            /^D/ { device=substr($0, 2) }
+            /^i/ { inode=substr($0, 2) }
+            device != "" && inode != "" { print device ":" inode; exit }
+        ')"
+        [ -n "$record" ] || return 1
+        device="${record%%:*}"
+        inode="${record#*:}"
+        printf '%d:%s\n' "$((device))" "$inode"
+    }
     rollback_install() {
         rc=$?
         trap - EXIT
@@ -41,7 +67,21 @@ install:
                 echo "运行实例并非由安装目标启动，拒绝自动接管：$old_executable" >&2
                 exit 1
             fi
-            if [[ "$old_command" == *" --foreground"* \
+            pid_file="$(jq -er '.data.paths.pid_file' <<<"$old_status")"
+            descriptor_file="$(dirname "$pid_file")/zc.daemon.json"
+            prepared_default=0
+            if [ -f "$descriptor_file" ] && jq -e \
+              --argjson pid "$old_pid" \
+              '.pid == $pid and .ready == true and
+               .invocation.prepared == true and
+               .invocation.foreground == false and
+               .invocation.source_path == null and
+               .invocation.port_override == null and
+               .identity != null' \
+              "$descriptor_file" >/dev/null 2>&1; then
+                prepared_default=1
+            fi
+            if [ "$prepared_default" -ne 1 ] && [[ "$old_command" == *" --foreground"* \
               || "$old_command" == *" -c "* \
               || "$old_command" == *" --port "* \
               || "$old_command" == *" --port="* \
@@ -68,9 +108,24 @@ install:
     fi
     bash scripts/install/local-dev-install.sh
     if [ "$was_running" -eq 1 ]; then
+        expected_identity="$(file_identity "$installed_zc")"
         echo "使用安装目标中的新二进制启动 zc..."
-        "$installed_zc" start
+        new_start="$("$installed_zc" start --json)"
+        [ "$(jq -er '.data.state' <<<"$new_start")" = "running" ]
         new_status="$("$installed_zc" status --json)"
         [ "$(jq -er '.data.state' <<<"$new_status")" = "running" ]
+        new_pid="$(jq -er '.data.pid' <<<"$new_status")"
+        if [ "$new_pid" = "$old_pid" ]; then
+            echo "新 daemon 未发生 PID 转换，拒绝确认安装成功" >&2
+            exit 1
+        fi
+        actual_identity="$(process_executable_identity "$new_pid")" || {
+            echo "无法确认新 daemon 的可执行文件身份" >&2
+            exit 1
+        }
+        if [ "$actual_identity" != "$expected_identity" ]; then
+            echo "新 daemon 仍在运行被替换的旧 inode，拒绝确认安装成功" >&2
+            exit 1
+        fi
         rollback_needed=0
     fi
