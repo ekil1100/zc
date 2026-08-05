@@ -23,6 +23,15 @@ test "minimal API framing is bounded and waits for a complete body" {
     const headerless = try server.inspectRequest("GET /version HTTP/1.0\r\n\r\n");
     try testing.expectEqualStrings("GET", headerless.complete.method);
     try testing.expectEqualStrings("/version", headerless.complete.path);
+    try testing.expect(headerless.complete.authorization == null);
+
+    const authorized = try server.inspectRequest(
+        "GET /version HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+    );
+    try testing.expectEqualStrings(
+        "Bearer test-secret",
+        authorized.complete.authorization.?,
+    );
 
     const complete =
         "PUT /proxies/Proxy HTTP/1.1\r\n" ++
@@ -44,6 +53,14 @@ test "minimal API framing is bounded and waits for a complete body" {
         server.inspectRequest(
             "PUT / HTTP/1.1\r\n" ++
                 "Content-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+        ),
+    );
+    try testing.expectError(
+        error.InvalidRequest,
+        server.inspectRequest(
+            "GET / HTTP/1.1\r\n" ++
+                "Authorization: Bearer one\r\n" ++
+                "Authorization: Bearer two\r\n\r\n",
         ),
     );
     try testing.expectError(
@@ -107,6 +124,16 @@ test "minimal API framing is bounded and waits for a complete body" {
         error.HeaderTooLarge,
         server.inspectRequest(&oversized_header),
     );
+}
+
+test "minimal API requires the configured bearer secret" {
+    try testing.expect(server.isAuthorized(null, null));
+    try testing.expect(server.isAuthorized("", null));
+    try testing.expect(server.isAuthorized("secret", "Bearer secret"));
+    try testing.expect(server.isAuthorized("secret", "bearer secret"));
+    try testing.expect(!server.isAuthorized("secret", null));
+    try testing.expect(!server.isAuthorized("secret", "Bearer wrong"));
+    try testing.expect(!server.isAuthorized("secret", "Basic secret"));
 }
 
 // Simple HTTP response parsing test

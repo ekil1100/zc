@@ -1837,6 +1837,7 @@ fn runProxyFamilyCommand(
                 proxy_name,
                 receipt.identity,
                 receipt.generation,
+                cfg.secret,
                 &out,
             ) catch |err| exitProxySelectError(json_output, err, text);
             if (json_output) {
@@ -1902,6 +1903,7 @@ fn runProxyFamilyCommand(
                 selection.proxy,
                 receipt.identity,
                 receipt.generation,
+                cfg.secret,
                 &out,
             ) catch |err| exitProxySelectError(json_output, err, text);
         }
@@ -2382,7 +2384,15 @@ fn runProxy(
         const api_thread = std.Thread.spawn(
             .{},
             apiThreadFn,
-            .{ allocator, cfg, &engine, &manager, port, &listener_startup },
+            .{
+                allocator,
+                cfg,
+                &engine,
+                &manager,
+                port,
+                loaded.identity != null,
+                &listener_startup,
+            },
         ) catch |err| abortStartedRuntime(
             allocator,
             json_output,
@@ -3295,9 +3305,17 @@ fn apiThreadFn(
     engine: *rule_engine.Engine,
     manager: *outbound.OutboundManager,
     port: u16,
+    managed_runtime: bool,
     startup: *ListenerStartup,
 ) void {
-    var api_server = api.ApiServer.init(allocator, cfg, engine, manager, port);
+    var api_server = api.ApiServer.init(
+        allocator,
+        cfg,
+        engine,
+        manager,
+        port,
+        managed_runtime,
+    );
     api_server.startWithAcceptGate(
         &startup.ready,
         &startup.control_available,

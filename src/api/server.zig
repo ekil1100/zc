@@ -6,6 +6,7 @@ const Config = config_mod.Config;
 const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = @import("../proxy/outbound/manager.zig").OutboundManager;
 const build_options = @import("build_options");
+const controller_auth = @import("../controller_auth.zig");
 const socket_options = @import("../socket_options.zig");
 const runtime_selection = @import("../runtime_selection.zig");
 const runtime_descriptor = @import("../runtime_descriptor.zig");
@@ -31,6 +32,7 @@ pub const Request = struct {
     method: []const u8,
     path: []const u8,
     body: []const u8,
+    authorization: ?[]const u8,
 };
 
 pub const InspectResult = union(enum) {
@@ -152,6 +154,7 @@ pub fn inspectRequest(bytes: []const u8) !InspectResult {
     }
 
     var content_length: ?usize = null;
+    var authorization: ?[]const u8 = null;
     lines = std.mem.splitSequence(u8, headers, "\r\n");
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -166,6 +169,9 @@ pub fn inspectRequest(bytes: []const u8) !InspectResult {
             if (content_length.? > max_body_bytes) return error.PayloadTooLarge;
         } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
             return error.UnsupportedTransferEncoding;
+        } else if (std.ascii.eqlIgnoreCase(name, "authorization")) {
+            if (authorization != null) return error.InvalidRequest;
+            authorization = value;
         }
     }
     if (std.mem.eql(u8, method, "PUT") and content_length == null) {
@@ -183,6 +189,7 @@ pub fn inspectRequest(bytes: []const u8) !InspectResult {
         .method = method,
         .path = path,
         .body = bytes[body_offset..total_length],
+        .authorization = authorization,
     } };
 }
 
@@ -258,6 +265,13 @@ fn writeAllWithDeadline(fd: std.posix.fd_t, bytes: []const u8) !void {
     }
 }
 
+pub fn isAuthorized(
+    configured_secret: ?[]const u8,
+    authorization: ?[]const u8,
+) bool {
+    return controller_auth.isAuthorized(configured_secret, authorization);
+}
+
 /// REST API 服务器
 pub const ApiServer = struct {
     allocator: std.mem.Allocator,
@@ -268,6 +282,7 @@ pub const ApiServer = struct {
     active_connections: std.atomic.Value(u32) = .init(0),
     selection_apply_lock: std.atomic.Mutex = .unlocked,
     runtime_ready: ?*std.atomic.Value(bool) = null,
+    managed_runtime: bool,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -275,6 +290,7 @@ pub const ApiServer = struct {
         engine: *Engine,
         manager: *OutboundManager,
         port: u16,
+        managed_runtime: bool,
     ) ApiServer {
         return .{
             .allocator = allocator,
@@ -282,6 +298,7 @@ pub const ApiServer = struct {
             .engine = engine,
             .manager = manager,
             .port = port,
+            .managed_runtime = managed_runtime,
         };
     }
 
@@ -389,6 +406,12 @@ pub const ApiServer = struct {
         const path = request.path;
         const body = request.body;
 
+        if (std.mem.eql(u8, method, "PUT") and
+            !isAuthorized(self.config.secret, request.authorization))
+        {
+            try self.sendError(conn, 401, "Unauthorized");
+            return;
+        }
         std.debug.print("[API] {s} {s}\n", .{ method, path });
 
         // 路由
@@ -681,7 +704,7 @@ pub const ApiServer = struct {
             compat.sleepNs(1 * std.time.ns_per_ms);
         }
         defer self.selection_apply_lock.unlock();
-        return self.manager.applyPersistedSelection(group_name, proxy_name);
+        return self.manager.applyTransientSelection(group_name, proxy_name);
     }
 
     /// PUT /proxies/<group_name> body: {"name":"proxy_name"}
@@ -723,6 +746,10 @@ pub const ApiServer = struct {
             return;
         };
         defer if (managed_request) |*request| request.deinit(self.allocator);
+        if (self.managed_runtime and managed_request == null) {
+            try self.sendError(conn, 409, "Managed selection metadata required");
+            return;
+        }
         const applied = if (managed_request) |request|
             try self.applyManagedSelection(group_name, proxy_name, request)
         else blk: {

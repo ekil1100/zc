@@ -257,6 +257,7 @@ pub const OutboundManager = struct {
 
     /// 每个代理组的当前选择（group_name → proxy_name）
     group_selections: std.StringHashMap([]const u8),
+    group_selection_sources: std.StringHashMap(runtime_selection.SelectionSource),
     group_selections_mutex: std.Io.Mutex = .init,
     selection_generation: u64 = 0,
     traffic_ready: std.atomic.Value(bool) = .init(true),
@@ -289,6 +290,9 @@ pub const OutboundManager = struct {
             .allocator = allocator,
             .config = config_arg,
             .group_selections = std.StringHashMap([]const u8).init(allocator),
+            .group_selection_sources = std.StringHashMap(
+                runtime_selection.SelectionSource,
+            ).init(allocator),
             .config_key = owned_config_key,
         };
     }
@@ -311,6 +315,7 @@ pub const OutboundManager = struct {
         self.lockSelections();
         defer self.unlockSelections();
         self.group_selections.deinit();
+        self.group_selection_sources.deinit();
         if (self.config_key) |k| self.allocator.free(k);
     }
 
@@ -381,7 +386,12 @@ pub const OutboundManager = struct {
         group_name: []const u8,
         proxy_name: []const u8,
     ) !bool {
-        return self.selectProxyInternal(group_name, proxy_name, true);
+        return self.selectProxyInternal(
+            group_name,
+            proxy_name,
+            true,
+            .persisted,
+        );
     }
 
     /// Applies a selection already committed by the CLI authority path.
@@ -390,7 +400,25 @@ pub const OutboundManager = struct {
         group_name: []const u8,
         proxy_name: []const u8,
     ) !bool {
-        return self.selectProxyInternal(group_name, proxy_name, false);
+        return self.selectProxyInternal(
+            group_name,
+            proxy_name,
+            false,
+            .persisted,
+        );
+    }
+
+    pub fn applyTransientSelection(
+        self: *OutboundManager,
+        group_name: []const u8,
+        proxy_name: []const u8,
+    ) !bool {
+        return self.selectProxyInternal(
+            group_name,
+            proxy_name,
+            false,
+            .transient,
+        );
     }
 
     pub const PersistedSelectionTransaction = struct {
@@ -443,6 +471,9 @@ pub const OutboundManager = struct {
             if (!valid) return false;
         }
         try self.group_selections.ensureUnusedCapacity(@intCast(selections.len));
+        try self.group_selection_sources.ensureUnusedCapacity(
+            @intCast(selections.len),
+        );
         return true;
     }
 
@@ -486,12 +517,17 @@ pub const OutboundManager = struct {
         generation: u64,
     ) void {
         self.group_selections.clearRetainingCapacity();
+        self.group_selection_sources.clearRetainingCapacity();
         for (selections) |selection| {
             for (self.config.proxy_groups.items) |group| {
                 if (!std.mem.eql(u8, group.name, selection.group)) continue;
                 for (group.proxies.items) |proxy| {
                     if (!std.mem.eql(u8, proxy, selection.proxy)) continue;
                     self.group_selections.putAssumeCapacity(group.name, proxy);
+                    self.group_selection_sources.putAssumeCapacity(
+                        group.name,
+                        .persisted,
+                    );
                     break;
                 }
                 break;
@@ -580,7 +616,14 @@ pub const OutboundManager = struct {
                 allocator.free(group);
                 continue;
             };
-            entries.append(allocator, .{ .group = group, .proxy = proxy }) catch {
+            const source = self.group_selection_sources.get(
+                entry.key_ptr.*,
+            ) orelse .persisted;
+            entries.append(allocator, .{
+                .group = group,
+                .proxy = proxy,
+                .source = source,
+            }) catch {
                 allocator.free(group);
                 allocator.free(proxy);
                 continue;
@@ -594,6 +637,7 @@ pub const OutboundManager = struct {
         group_name: []const u8,
         proxy_name: []const u8,
         persist: bool,
+        source: runtime_selection.SelectionSource,
     ) !bool {
         self.lockSelections();
         defer self.unlockSelections();
@@ -603,15 +647,32 @@ pub const OutboundManager = struct {
                 for (grp.proxies.items) |pname| {
                     if (std.mem.eql(u8, pname, proxy_name)) {
                         const previous = self.group_selections.get(grp.name);
-                        try self.group_selections.put(grp.name, pname);
+                        const previous_source = self.group_selection_sources.get(
+                            grp.name,
+                        );
+                        try self.group_selections.ensureUnusedCapacity(1);
+                        try self.group_selection_sources.ensureUnusedCapacity(1);
+                        self.group_selections.putAssumeCapacity(grp.name, pname);
+                        self.group_selection_sources.putAssumeCapacity(
+                            grp.name,
+                            source,
+                        );
                         if (persist) {
                             self.persistSelections() catch |err| {
                                 if (previous) |old_proxy| {
                                     self.group_selections.getPtr(grp.name).?.* =
                                         old_proxy;
+                                    self.group_selection_sources.getPtr(
+                                        grp.name,
+                                    ).?.* = previous_source orelse .persisted;
                                 } else {
                                     std.debug.assert(
                                         self.group_selections.remove(grp.name),
+                                    );
+                                    std.debug.assert(
+                                        self.group_selection_sources.remove(
+                                            grp.name,
+                                        ),
                                     );
                                 }
                                 return err;
@@ -644,6 +705,23 @@ pub const OutboundManager = struct {
         try selections.put(group, proxy);
     }
 
+    fn copyPersistableSelectionsLocked(
+        self: *OutboundManager,
+        selections: *std.StringHashMap([]const u8),
+    ) !void {
+        var selection_iterator = self.group_selections.iterator();
+        while (selection_iterator.next()) |selection| {
+            const source = self.group_selection_sources.get(
+                selection.key_ptr.*,
+            ) orelse .persisted;
+            if (source == .transient) continue;
+            try self.persistSelectionsPut(selections, .{
+                .group = selection.key_ptr.*,
+                .proxy = selection.value_ptr.*,
+            });
+        }
+    }
+
     fn persistSelections(self: *OutboundManager) !void {
         const key = self.config_key orelse return;
         self.persist_invocations +|= 1;
@@ -660,13 +738,7 @@ pub const OutboundManager = struct {
         }
         entry.selections.clearRetainingCapacity();
 
-        var selection_iterator = self.group_selections.iterator();
-        while (selection_iterator.next()) |selection| {
-            try self.persistSelectionsPut(&entry.selections, .{
-                .group = selection.key_ptr.*,
-                .proxy = selection.value_ptr.*,
-            });
-        }
+        try self.copyPersistableSelectionsLocked(&entry.selections);
         try meta.saveVisible(self.allocator, &meta_data);
     }
 
@@ -685,6 +757,7 @@ pub const OutboundManager = struct {
                 entry.key_ptr.*,
                 entry.value_ptr.*,
                 false,
+                .persisted,
             )) {
                 return error.InvalidDesiredSelection;
             }
@@ -1301,8 +1374,23 @@ test "selectProxyInternal with persist=false skips persist" {
     var mgr = try OutboundManager.init(allocator, &cfg);
     defer mgr.deinit();
 
-    try std.testing.expect(try mgr.selectProxyInternal("G1", "P1", false));
+    try std.testing.expect(try mgr.selectProxyInternal("G1", "P1", false, .transient));
     try std.testing.expectEqual(@as(usize, 0), mgr.persist_invocations);
+
+    var durable = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var iterator = durable.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        durable.deinit();
+    }
+    try mgr.copyPersistableSelectionsLocked(&durable);
+    try std.testing.expectEqual(@as(usize, 0), durable.count());
+    try std.testing.expect(try mgr.applyPersistedSelection("G1", "P1"));
+    try mgr.copyPersistableSelectionsLocked(&durable);
+    try std.testing.expectEqual(@as(usize, 1), durable.count());
 }
 
 test "legacy persistence failure rolls back the runtime selection" {
@@ -1381,12 +1469,21 @@ test "configKey and snapshotSelections expose daemon runtime state" {
     try std.testing.expectEqual(@as(usize, 0), snap0.len);
 
     // Select P2 in G1 (persist=false: no meta.json writes) -> snapshot reflects it.
-    try std.testing.expect(try mgr.selectProxyInternal("G1", "P2", false));
+    try std.testing.expect(try mgr.selectProxyInternal(
+        "G1",
+        "P2",
+        false,
+        .transient,
+    ));
     const snap1 = try mgr.snapshotSelections(allocator);
     defer runtime_selection.freeSelectionEntries(allocator, snap1);
     try std.testing.expectEqual(@as(usize, 1), snap1.len);
     try std.testing.expectEqualStrings("G1", snap1[0].group);
     try std.testing.expectEqualStrings("P2", snap1[0].proxy);
+    try std.testing.expectEqual(
+        runtime_selection.SelectionSource.transient,
+        snap1[0].source,
+    );
 
     const generation_two = [_]config_catalog.Selection{.{
         .group = "G1",
@@ -1402,8 +1499,17 @@ test "configKey and snapshotSelections expose daemon runtime state" {
     const snap2 = try mgr.snapshotSelections(allocator);
     defer runtime_selection.freeSelectionEntries(allocator, snap2);
     try std.testing.expectEqualStrings("P1", snap2[0].proxy);
+    try std.testing.expectEqual(
+        runtime_selection.SelectionSource.persisted,
+        snap2[0].source,
+    );
 
-    try std.testing.expect(try mgr.selectProxyInternal("G1", "P2", false));
+    try std.testing.expect(try mgr.selectProxyInternal(
+        "G1",
+        "P2",
+        false,
+        .transient,
+    ));
     try std.testing.expect(try mgr.applyPersistedSelections(&.{}, 3));
     const snap3 = try mgr.snapshotSelections(allocator);
     defer runtime_selection.freeSelectionEntries(allocator, snap3);

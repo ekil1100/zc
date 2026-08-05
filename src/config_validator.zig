@@ -2,6 +2,7 @@ const std = @import("std");
 const config_mod = @import("config.zig");
 const compat = @import("compat.zig");
 const controller_endpoint = @import("controller_endpoint.zig");
+const controller_auth = @import("controller_auth.zig");
 const aead = @import("crypto/aead.zig");
 const Config = @import("config.zig").Config;
 const ProxyType = @import("config.zig").ProxyType;
@@ -238,6 +239,15 @@ fn validateBasicConfig(config: *const Config, result: *ValidationResult) !void {
                 .{value},
             );
         };
+    }
+    if (config.secret) |secret| {
+        if (secret.len != 0 and !controller_auth.isValidSecret(secret)) {
+            try result.addError(
+                "Invalid controller secret (use at most {d} characters from " ++
+                    "A-Z, a-z, 0-9, '-', '.', '_' or '~')",
+                .{controller_auth.max_secret_bytes},
+            );
+        }
     }
 
     // 检查是否至少有一个监听端口
@@ -662,6 +672,21 @@ test "v1 controller requires an explicit IPv4 loopback endpoint" {
             "(expected 127.0.0.1:PORT)",
         result.errors.items[0].message,
     );
+}
+
+test "controller secret must be a valid bearer token" {
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\external-controller: 127.0.0.1:9090
+        \\secret: "line break"
+    );
+    defer cfg.deinit();
+
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(&result, "controller secret"));
 }
 
 test "v1 capability gate rejects VMess before runtime" {

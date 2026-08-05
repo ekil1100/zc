@@ -1367,6 +1367,56 @@ test "integration: background start returns only after listeners are ready" {
         applied_descriptor.value.object.get("ready").?.bool,
     );
     const descriptor_object = applied_descriptor.value.object;
+    const metadata_free_body = "{\"name\":\"DIRECT\"}";
+    const metadata_free_request = try std.fmt.allocPrint(
+        allocator,
+        "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n\r\n{s}",
+        .{ metadata_free_body.len, metadata_free_body },
+    );
+    defer allocator.free(metadata_free_request);
+    const metadata_free_connection = try connectController(controller_port);
+    defer metadata_free_connection.close();
+    try metadata_free_connection.writeAll(metadata_free_request);
+    var metadata_free_response_buffer: [4096]u8 = undefined;
+    const metadata_free_response = try readResponseWithin(
+        metadata_free_connection,
+        &metadata_free_response_buffer,
+        1_000,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, metadata_free_response, "HTTP/1.1 409 ") != null,
+    );
+    const partial_metadata_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"name\":\"DIRECT\",\"instance_nonce\":\"{s}\"}}",
+        .{descriptor_object.get("nonce").?.string},
+    );
+    defer allocator.free(partial_metadata_body);
+    const partial_metadata_request = try std.fmt.allocPrint(
+        allocator,
+        "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n\r\n{s}",
+        .{ partial_metadata_body.len, partial_metadata_body },
+    );
+    defer allocator.free(partial_metadata_request);
+    const partial_metadata_connection = try connectController(controller_port);
+    defer partial_metadata_connection.close();
+    try partial_metadata_connection.writeAll(partial_metadata_request);
+    var partial_metadata_response_buffer: [4096]u8 = undefined;
+    const partial_metadata_response = try readResponseWithin(
+        partial_metadata_connection,
+        &partial_metadata_response_buffer,
+        1_000,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, partial_metadata_response, "HTTP/1.1 400 ") != null,
+    );
+
     const stale_body = try std.fmt.allocPrint(
         allocator,
         "{{\"name\":\"DIRECT\",\"instance_nonce\":\"{s}\",\"identity_key\":\"{s}\",\"identity_revision\":\"{s}\",\"generation\":1}}",
@@ -1980,6 +2030,7 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
     const source = try std.fmt.allocPrint(allocator,
         \\mixed-port: {d}
         \\external-controller: 127.0.0.1:{d}
+        \\secret: test-secret
         \\proxies:
         \\  - name: DIRECT
         \\    type: direct
@@ -2117,10 +2168,33 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
 
     {
         const body = "{\"name\":\"DIRECT\"}";
+        const unauthorized = try connectController(controller_port);
+        defer unauthorized.close();
+        const unauthorized_request = try std.fmt.allocPrint(
+            allocator,
+            "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+                "Host: local\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ body.len, body },
+        );
+        defer allocator.free(unauthorized_request);
+        try unauthorized.writeAll(unauthorized_request);
+        var unauthorized_buffer: [4096]u8 = undefined;
+        const unauthorized_response = try readResponseWithin(
+            unauthorized,
+            &unauthorized_buffer,
+            1_000,
+        );
+        if (std.mem.indexOf(u8, unauthorized_response, "401 Unauthorized") == null) {
+            std.debug.print("unauthorized response: {s}\n", .{unauthorized_response});
+            return error.TestUnexpectedResult;
+        }
+
         const header = try std.fmt.allocPrint(
             allocator,
             "PUT /proxies/Proxy HTTP/1.1\r\n" ++
-                "Host: local\r\nContent-Length: {d}\r\n\r\n",
+                "Host: local\r\n" ++
+                "Authorization: Bearer test-secret\r\n" ++
+                "Content-Length: {d}\r\n\r\n",
             .{body.len},
         );
         defer allocator.free(header);

@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
 const controller_endpoint = @import("controller_endpoint.zig");
+const controller_auth = @import("controller_auth.zig");
 const daemon = @import("daemon.zig");
 const cli_output = @import("cli/output.zig");
 const runtime_selection = @import("runtime_selection.zig");
@@ -204,6 +205,7 @@ pub fn applySelection(
     proxy_name: []const u8,
     identity: ?config_identity.ManagedIdentity,
     generation: ?u64,
+    controller_secret: ?[]const u8,
     out: *cli_output.Output,
 ) !bool {
     try validateSelection(group, proxy_name);
@@ -224,6 +226,7 @@ pub fn applySelection(
         proxy_name,
         identity,
         generation,
+        controller_secret,
         out,
     );
 }
@@ -459,6 +462,7 @@ fn notifyDaemon(
     proxy_name: []const u8,
     identity: ?config_identity.ManagedIdentity,
     generation: ?u64,
+    controller_secret: ?[]const u8,
     out: *cli_output.Output,
 ) bool {
     const expected_identity = identity orelse {
@@ -542,7 +546,18 @@ fn notifyDaemon(
     std.Uri.Component.percentEncode(&path_writer.writer, group_name, isUriPathSegmentChar) catch return false;
     const encoded_group = path_writer.written();
 
-    const req = std.fmt.allocPrint(allocator, "PUT /proxies/{s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ encoded_group, ec, body.len, body }) catch return false;
+    const req = buildControllerRequest(
+        allocator,
+        encoded_group,
+        ec,
+        body,
+        controller_secret,
+    ) catch |err| {
+        if (err == error.InvalidControllerSecret) {
+            noteDim(out, "(controller secret is not a valid bearer token)", .{});
+        }
+        return false;
+    };
     defer allocator.free(req);
 
     const stream = compat.net.tcpConnectToHost(
@@ -567,6 +582,41 @@ fn notifyDaemon(
     }
     noteDim(out, "(daemon at {s} rejected the selection; is it running this config?)", .{ec});
     return false;
+}
+
+fn buildControllerRequest(
+    allocator: std.mem.Allocator,
+    encoded_group: []const u8,
+    endpoint: []const u8,
+    body: []const u8,
+    controller_secret: ?[]const u8,
+) ![]u8 {
+    const authorization_header = if (controller_secret) |secret| blk: {
+        if (secret.len == 0) break :blk null;
+        if (!controller_auth.isValidSecret(secret)) {
+            return error.InvalidControllerSecret;
+        }
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "Authorization: Bearer {s}\r\n",
+            .{secret},
+        );
+    } else null;
+    defer if (authorization_header) |header| allocator.free(header);
+    return std.fmt.allocPrint(
+        allocator,
+        "PUT /proxies/{s} HTTP/1.1\r\n" ++
+            "Host: {s}\r\n{s}" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n\r\n{s}",
+        .{
+            encoded_group,
+            endpoint,
+            authorization_header orelse "",
+            body.len,
+            body,
+        },
+    );
 }
 
 /// URL path 段安全字符（RFC 3986 unreserved）；其余一律 %XX 编码。
@@ -830,6 +880,45 @@ test "resolveSelectGroup reports missing select group" {
     try testing.expectError(error.NoSelectGroup, resolveSelectGroup(&cfg, null));
 }
 
+test "controller selection requests include the configured bearer secret" {
+    const allocator = testing.allocator;
+    const authenticated = try buildControllerRequest(
+        allocator,
+        "Proxy",
+        "127.0.0.1:9090",
+        "{}",
+        "test-secret",
+    );
+    defer allocator.free(authenticated);
+    try testing.expect(
+        std.mem.indexOf(
+            u8,
+            authenticated,
+            "Authorization: Bearer test-secret\r\n",
+        ) != null,
+    );
+
+    const unauthenticated = try buildControllerRequest(
+        allocator,
+        "Proxy",
+        "127.0.0.1:9090",
+        "{}",
+        null,
+    );
+    defer allocator.free(unauthenticated);
+    try testing.expect(std.mem.indexOf(u8, unauthenticated, "Authorization:") == null);
+    try testing.expectError(
+        error.InvalidControllerSecret,
+        buildControllerRequest(
+            allocator,
+            "Proxy",
+            "127.0.0.1:9090",
+            "{}",
+            "not valid",
+        ),
+    );
+}
+
 test "applySelection validates membership and reports applied=false without controller" {
     const allocator = testing.allocator;
     var cfg = try makeTestConfig(allocator);
@@ -842,13 +931,14 @@ test "applySelection validates membership and reports applied=false without cont
     const group = try resolveSelectGroup(&cfg, "Proxy");
     try testing.expectError(
         error.ProxyNotFound,
-        applySelection(allocator, group, "missing", null, null, &out),
+        applySelection(allocator, group, "missing", null, null, null, &out),
     );
 
     const applied = try applySelection(
         allocator,
         group,
         "Auto",
+        null,
         null,
         null,
         &out,
@@ -885,6 +975,7 @@ test "applySelection in json mode keeps stdout free for the envelope" {
         allocator,
         group,
         "Auto",
+        null,
         null,
         null,
         &out,

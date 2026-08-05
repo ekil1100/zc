@@ -352,12 +352,12 @@ fn parseRoot(
             .null => {},
             else => return error.InvalidConfig,
         };
-        if (root.map.get("secret")) |v| switch (v) {
-            .string => config.secret = try allocator.dupe(u8, v.string),
-            .null => {},
-            else => return error.InvalidConfig,
-        };
     }
+    if (root.map.get("secret")) |v| switch (v) {
+        .string => config.secret = try allocator.dupe(u8, v.string),
+        .null => {},
+        else => return error.InvalidConfig,
+    };
 
     // AnyTLS idle session pool tunables (§15). Optional; defaults stay when
     // absent. Stored raw (seconds); config_validator clamps the two intervals.

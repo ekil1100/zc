@@ -1188,7 +1188,16 @@ fn parseDaemonStatusJson(allocator: std.mem.Allocator, body: []const u8) !?Daemo
     for (resp.selected_proxies) |item| {
         const group = allocator.dupe(u8, item.group) catch continue;
         const proxy: ?[]const u8 = if (item.proxy) |pr| (allocator.dupe(u8, pr) catch null) else null;
-        const source: runtime_selection.SelectionSource = if (std.mem.eql(u8, item.source, "persisted")) .persisted else .default;
+        const source: runtime_selection.SelectionSource = if (std.mem.eql(
+            u8,
+            item.source,
+            "persisted",
+        ))
+            .persisted
+        else if (std.mem.eql(u8, item.source, "transient"))
+            .transient
+        else
+            .default;
         selections.append(allocator, .{ .group_name = group, .proxy_name = proxy, .source = source }) catch {
             allocator.free(group);
             if (proxy) |pr| allocator.free(pr);
@@ -2725,18 +2734,19 @@ test "status text output goes to stdout with state tokens" {
     try std.testing.expectEqualStrings("", err_aw.written());
 }
 
-test "parseDaemonStatusJson: config_key + persisted/default selections" {
+test "parseDaemonStatusJson preserves selection sources" {
     const allocator = std.testing.allocator;
-    const body = "{\"config_key\":\"Flower_Trojan\",\"selected_proxies\":[{\"group\":\"Proxies\",\"proxy\":\"SG-1\",\"source\":\"persisted\"},{\"group\":\"HK\",\"proxy\":\"HK-1\",\"source\":\"default\"}]}";
+    const body = "{\"config_key\":\"Flower_Trojan\",\"selected_proxies\":[{\"group\":\"Proxies\",\"proxy\":\"SG-1\",\"source\":\"persisted\"},{\"group\":\"Temp\",\"proxy\":\"US-1\",\"source\":\"transient\"},{\"group\":\"HK\",\"proxy\":\"HK-1\",\"source\":\"default\"}]}";
     var ds = (try parseDaemonStatusJson(allocator, body)).?;
     defer ds.deinit(allocator);
 
     try std.testing.expectEqualStrings("Flower_Trojan", ds.config_key.?);
-    try std.testing.expectEqual(@as(usize, 2), ds.selected_proxies.len);
+    try std.testing.expectEqual(@as(usize, 3), ds.selected_proxies.len);
     try std.testing.expectEqualStrings("Proxies", ds.selected_proxies[0].group_name);
     try std.testing.expectEqualStrings("SG-1", ds.selected_proxies[0].proxy_name.?);
     try std.testing.expectEqual(runtime_selection.SelectionSource.persisted, ds.selected_proxies[0].source);
-    try std.testing.expectEqual(runtime_selection.SelectionSource.default, ds.selected_proxies[1].source);
+    try std.testing.expectEqual(runtime_selection.SelectionSource.transient, ds.selected_proxies[1].source);
+    try std.testing.expectEqual(runtime_selection.SelectionSource.default, ds.selected_proxies[2].source);
 }
 
 test "parseDaemonStatusJson: null config_key and empty selections" {

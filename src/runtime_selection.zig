@@ -4,6 +4,7 @@ const meta = @import("meta.zig");
 
 pub const SelectionSource = enum {
     persisted,
+    transient,
     default,
 };
 
@@ -34,6 +35,7 @@ pub const SelectedProxy = struct {
 pub fn sourceString(source: SelectionSource) []const u8 {
     return switch (source) {
         .persisted => "persisted",
+        .transient => "transient",
         .default => "default",
     };
 }
@@ -99,6 +101,7 @@ fn collectSelectedProxiesFromMetaData(
 pub const SelectionEntry = struct {
     group: []const u8,
     proxy: []const u8,
+    source: SelectionSource,
 };
 
 pub fn freeSelectionEntries(allocator: std.mem.Allocator, entries: []SelectionEntry) void {
@@ -123,22 +126,28 @@ pub fn collectSelectedProxiesFromSnapshot(
     }
     for (cfg.proxy_groups.items) |group| {
         if (group.group_type != .select) continue;
-        const persisted_proxy = findSnapshotEntry(entries, group.name);
-        const selected_proxy = persisted_proxy orelse firstGroupProxy(&group);
+        const snapshot_entry = findSnapshotEntry(entries, group.name);
+        const selected_proxy = if (snapshot_entry) |entry|
+            entry.proxy
+        else
+            firstGroupProxy(&group);
         try appendSelectedProxy(
             allocator,
             &selections,
             group.name,
             selected_proxy,
-            if (persisted_proxy != null) .persisted else .default,
+            if (snapshot_entry) |entry| entry.source else .default,
         );
     }
     return selections.toOwnedSlice(allocator);
 }
 
-fn findSnapshotEntry(entries: []const SelectionEntry, group_name: []const u8) ?[]const u8 {
-    for (entries) |e| {
-        if (std.mem.eql(u8, e.group, group_name)) return e.proxy;
+fn findSnapshotEntry(
+    entries: []const SelectionEntry,
+    group_name: []const u8,
+) ?SelectionEntry {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.group, group_name)) return entry;
     }
     return null;
 }
@@ -293,7 +302,11 @@ test "collectSelectedProxiesFromSnapshot prefers runtime override over default" 
     defer cfg.deinit();
 
     const entries = [_]SelectionEntry{
-        .{ .group = try allocator.dupe(u8, "Proxy"), .proxy = try allocator.dupe(u8, "B") },
+        .{
+            .group = try allocator.dupe(u8, "Proxy"),
+            .proxy = try allocator.dupe(u8, "B"),
+            .source = .transient,
+        },
     };
     defer for (entries) |e| {
         allocator.free(e.group);
@@ -306,7 +319,7 @@ test "collectSelectedProxiesFromSnapshot prefers runtime override over default" 
     try std.testing.expectEqual(@as(usize, 1), selections.len);
     try std.testing.expectEqualStrings("Proxy", selections[0].group_name);
     try std.testing.expectEqualStrings("B", selections[0].proxy_name.?);
-    try std.testing.expectEqual(SelectionSource.persisted, selections[0].source);
+    try std.testing.expectEqual(SelectionSource.transient, selections[0].source);
 }
 
 test "collectSelectedProxiesFromSnapshot falls back to default with empty snapshot" {

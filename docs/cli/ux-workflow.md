@@ -57,7 +57,7 @@
 
 - 错误码字符串（`docs/api/error-codes.md` + integration tests 中已断言的全部 `*_FAILED` / `*_UNKNOWN` 等）。
 - `state` 取值：`running` / `stopped` / `selected` 等；`detail` 取值：`already_running`、`already_stopped`、`stale_pid_file`、`lock_held_pid_untracked`。
-- JSON 字段名：`action`、`state`、`pid`、`uptime_seconds`、`active_config`、`selected_proxies`、`paths`、`daemon_state`、`proxy_reachable`、`group`、`proxy`、`source`。
+- JSON 字段名：`action`、`state`、`pid`、`uptime_seconds`、`active_config`、`selected_proxies`、`paths`、`daemon_state`、`proxy_reachable`、`group`、`proxy`、`source`。`selected_proxies[].source` 为 `persisted`、`transient` 或 `default`，不会把仅存在于当前进程内存的选择标成已持久化。
 - `active_config` / `selected_proxies` 反映 **daemon 实际运行时状态**：daemon 在跑时仅通过 PID 匹配的 live runtime descriptor 定位 controller，再经 IPC `GET /status` 读 daemon 内存 `group_selections` + 实际 `config_key`，不从当前配置猜测 endpoint；controller 不可用时仅保留 descriptor identity、把 runtime selections 报为空，并返回 `runtime_state_available:false`；不会拿当前 active 的 durable 状态冒充 daemon 内存，也不向猜测端点发送请求。IPC 成功时该字段为 `true`，此时 null/空值同样是权威结果。
 - doctor 文本标签：`Config:`、`Daemon:`、`PID:`、`Port:`、`Connection:`；健康输出含 `OK`/`valid`。
 - 字段**顺序**不再保证：测试改为解析 JSON 后断言（淘汰子串顺序断言）。

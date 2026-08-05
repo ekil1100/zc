@@ -13,6 +13,7 @@ Example:
 ```yaml
 mixed-port: 7899
 external-controller: 127.0.0.1:9090
+secret: replace-with-a-random-secret
 ```
 
 ## Implemented endpoints
@@ -23,11 +24,14 @@ external-controller: 127.0.0.1:9090
 | `GET` | `/version` | Version response. |
 | `GET` | `/proxies` | List configured proxy nodes. |
 | `GET` | `/rules` | List configured rules. |
+| `GET` | `/status` | Report the running config identity and current group selections. |
 | `PUT` | `/proxies/<group_name>` | Select a proxy for a group; body contains `{"name":"proxy_name"}`. |
 
 所有 JSON 响应均由标准序列化器生成；配置中的引号、反斜杠、控制字符与 Unicode 会按 JSON 规则转义并可无损还原。
 
-直接发送仅含 `name` 的 PUT 是当前 daemon 的临时 runtime 选择，重启后不保证保留。`zc proxy select` 会先提交 durable desired generation，再附带 instance nonce、exact identity 与 generation 调用同一端点；daemon 拒绝过期或乱序 generation；当 durable desired 已领先多个 generation 时，可从旧 descriptor 原子前跳到最新完整 snapshot，并在数据面提交后推进 runtime descriptor。
+配置非空 `secret` 后，变更状态的 `PUT` endpoint 要求 `Authorization: Bearer <secret>`；缺失或错误凭据返回 `401`。只读 endpoint 保持可用于本机状态探测。controller 虽然仅监听 loopback，但 loopback 不是多用户系统上的授权边界，生产环境应始终配置随机 secret。
+
+仅显式 unmanaged 配置允许发送只含 `name` 的临时 runtime PUT，重启后不保证保留。Managed daemon 要求完整的 instance nonce、exact identity、revision 与 generation，缺少元数据返回 `409`。`zc proxy select` 会先提交 durable desired generation，再调用同一端点；daemon 拒绝过期或乱序 generation；当 durable desired 已领先多个 generation 时，可从旧 descriptor 原子前跳到最新完整 snapshot，并在数据面提交后推进 runtime descriptor。
 
 ## 资源与 framing 上界
 

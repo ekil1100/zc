@@ -324,7 +324,7 @@ test "managed config document rejects known fields with invalid shapes" {
     try testing.expectEqualStrings("token", config.secret.?);
 }
 
-test "managed-only fields do not change the legacy parser during shadow rollout" {
+test "legacy parsing keeps controller authentication while ignoring managed-only fields" {
     const allocator = testing.allocator;
     var config = try parseConfig(allocator,
         \\redir-port: 7892
@@ -339,7 +339,7 @@ test "managed-only fields do not change the legacy parser during shadow rollout"
     try testing.expectEqual(@as(u16, 0), config.tproxy_port);
     try testing.expect(config.ipv6);
     try testing.expect(config.external_ui == null);
-    try testing.expect(config.secret == null);
+    try testing.expectEqualStrings("token", config.secret.?);
 }
 
 fn parseManagedAllocationFixture(allocator: std.mem.Allocator) !void {
