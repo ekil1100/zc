@@ -276,15 +276,21 @@ pub const OutboundManager = struct {
         return try initWithKey(allocator, config_arg, null);
     }
 
-    pub fn initWithKey(allocator: std.mem.Allocator, config_arg: *const Config, config_key: ?[]const u8) !OutboundManager {
-        const manager = OutboundManager{
+    pub fn initWithKey(
+        allocator: std.mem.Allocator,
+        config_arg: *const Config,
+        config_key: ?[]const u8,
+    ) !OutboundManager {
+        const owned_config_key = if (config_key) |key|
+            try allocator.dupe(u8, key)
+        else
+            null;
+        return .{
             .allocator = allocator,
             .config = config_arg,
             .group_selections = std.StringHashMap([]const u8).init(allocator),
-            .config_key = if (config_key) |k| allocator.dupe(u8, k) catch null else null,
+            .config_key = owned_config_key,
         };
-
-        return manager;
     }
 
     pub fn deinit(self: *OutboundManager) void {
@@ -369,12 +375,13 @@ pub const OutboundManager = struct {
         return pool;
     }
 
-    /// 设置代理组的选择（由 TUI/API 调用）
-    /// 注意：存储 config 中的稳定字符串引用，而非调用者的临时切片
-    pub fn selectProxy(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8) void {
-        _ = self.selectProxyInternal(group_name, proxy_name, true) catch |err| {
-            std.debug.print("[Manager] Selection update failed: {}\n", .{err});
-        };
+    /// Applies and persists a legacy metadata selection.
+    pub fn selectProxy(
+        self: *OutboundManager,
+        group_name: []const u8,
+        proxy_name: []const u8,
+    ) !bool {
+        return self.selectProxyInternal(group_name, proxy_name, true);
     }
 
     /// Applies a selection already committed by the CLI authority path.
@@ -595,13 +602,25 @@ pub const OutboundManager = struct {
             if (std.mem.eql(u8, grp.name, group_name)) {
                 for (grp.proxies.items) |pname| {
                     if (std.mem.eql(u8, pname, proxy_name)) {
+                        const previous = self.group_selections.get(grp.name);
                         try self.group_selections.put(grp.name, pname);
-                        std.debug.print("[Manager] Group '{s}' selected: {s}\n", .{ grp.name, pname });
-
                         if (persist) {
-                            // 持久化到 meta.json
-                            self.persistSelections();
+                            self.persistSelections() catch |err| {
+                                if (previous) |old_proxy| {
+                                    self.group_selections.getPtr(grp.name).?.* =
+                                        old_proxy;
+                                } else {
+                                    std.debug.assert(
+                                        self.group_selections.remove(grp.name),
+                                    );
+                                }
+                                return err;
+                            };
                         }
+                        std.debug.print(
+                            "[Manager] Group '{s}' selected: {s}\n",
+                            .{ grp.name, pname },
+                        );
                         return true;
                     }
                 }
@@ -613,49 +632,49 @@ pub const OutboundManager = struct {
         return false;
     }
 
-    /// 持久化当前 selections 到 meta.json
-    fn persistSelections(self: *OutboundManager) void {
+    fn persistSelectionsPut(
+        self: *OutboundManager,
+        selections: *std.StringHashMap([]const u8),
+        selection: config_catalog.Selection,
+    ) !void {
+        const group = try self.allocator.dupe(u8, selection.group);
+        errdefer self.allocator.free(group);
+        const proxy = try self.allocator.dupe(u8, selection.proxy);
+        errdefer self.allocator.free(proxy);
+        try selections.put(group, proxy);
+    }
+
+    fn persistSelections(self: *OutboundManager) !void {
         const key = self.config_key orelse return;
-        self.persist_invocations += 1;
+        self.persist_invocations +|= 1;
 
-        var meta_data = meta.load(self.allocator) catch return;
+        var meta_data = try meta.load(self.allocator);
         defer meta_data.deinit();
+        const entry = meta_data.configs.getPtr(key) orelse
+            return error.LegacyMetadataEntryMissing;
 
-        const entry = meta_data.configs.getPtr(key) orelse return;
-
-        // 清除旧的 selections
-        {
-            var it = entry.selections.iterator();
-            while (it.next()) |e| {
-                self.allocator.free(e.key_ptr.*);
-                self.allocator.free(e.value_ptr.*);
-            }
-            entry.selections.clearRetainingCapacity();
+        var old_iterator = entry.selections.iterator();
+        while (old_iterator.next()) |old_selection| {
+            self.allocator.free(old_selection.key_ptr.*);
+            self.allocator.free(old_selection.value_ptr.*);
         }
+        entry.selections.clearRetainingCapacity();
 
-        // 写入当前 selections
-        var sel_it = self.group_selections.iterator();
-        while (sel_it.next()) |e| {
-            const gn = self.allocator.dupe(u8, e.key_ptr.*) catch continue;
-            const pn = self.allocator.dupe(u8, e.value_ptr.*) catch {
-                self.allocator.free(gn);
-                continue;
-            };
-            entry.selections.put(gn, pn) catch {
-                self.allocator.free(gn);
-                self.allocator.free(pn);
-                continue;
-            };
+        var selection_iterator = self.group_selections.iterator();
+        while (selection_iterator.next()) |selection| {
+            try self.persistSelectionsPut(&entry.selections, .{
+                .group = selection.key_ptr.*,
+                .proxy = selection.value_ptr.*,
+            });
         }
-
-        meta.saveVisible(self.allocator, &meta_data) catch {};
+        try meta.saveVisible(self.allocator, &meta_data);
     }
 
     /// 从 meta.json 加载持久化的 selections
     pub fn loadPersistedSelections(self: *OutboundManager) !void {
         const key = self.config_key orelse return;
 
-        var meta_data = meta.load(self.allocator) catch return;
+        var meta_data = try meta.load(self.allocator);
         defer meta_data.deinit();
 
         const cm = meta_data.configs.get(key) orelse return;
@@ -1284,6 +1303,49 @@ test "selectProxyInternal with persist=false skips persist" {
 
     try std.testing.expect(try mgr.selectProxyInternal("G1", "P1", false));
     try std.testing.expectEqual(@as(usize, 0), mgr.persist_invocations);
+}
+
+test "legacy persistence failure rolls back the runtime selection" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = std.ArrayList(Proxy).empty,
+        .proxy_groups = std.ArrayList(
+            @import("../../config.zig").ProxyGroup,
+        ).empty,
+        .rules = std.ArrayList(@import("../../config.zig").Rule).empty,
+    };
+    defer cfg.deinit();
+    var group = @import("../../config.zig").ProxyGroup{
+        .name = try allocator.dupe(u8, "rollback-group"),
+        .group_type = .select,
+        .proxies = std.ArrayList([]const u8).empty,
+    };
+    try group.proxies.append(allocator, try allocator.dupe(u8, "A"));
+    try group.proxies.append(allocator, try allocator.dupe(u8, "B"));
+    try cfg.proxy_groups.append(allocator, group);
+
+    var manager = try OutboundManager.initWithKey(
+        allocator,
+        &cfg,
+        "missing-legacy-entry",
+    );
+    defer manager.deinit();
+    try std.testing.expect(try manager.applyPersistedSelection(
+        "rollback-group",
+        "A",
+    ));
+    try std.testing.expectError(
+        error.LegacyMetadataEntryMissing,
+        manager.selectProxy("rollback-group", "B"),
+    );
+    const selections = try manager.snapshotSelections(allocator);
+    defer runtime_selection.freeSelectionEntries(allocator, selections);
+    try std.testing.expectEqual(@as(usize, 1), selections.len);
+    try std.testing.expectEqualStrings("A", selections[0].proxy);
 }
 
 test "configKey and snapshotSelections expose daemon runtime state" {

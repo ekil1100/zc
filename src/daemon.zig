@@ -1120,10 +1120,17 @@ fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
     };
 }
 
-fn collectStatusSelectedProxies(allocator: std.mem.Allocator, active_config: ?[]const u8) ![]runtime_selection.SelectedProxy {
-    var cfg = config.loadDefaultQuiet(allocator) catch return try allocator.alloc(runtime_selection.SelectedProxy, 0);
+fn collectStatusSelectedProxies(
+    allocator: std.mem.Allocator,
+    active_config: ?[]const u8,
+) ![]runtime_selection.SelectedProxy {
+    var cfg = try config.loadDefaultQuiet(allocator);
     defer cfg.deinit();
-    return try runtime_selection.collectSelectedProxies(allocator, &cfg, active_config);
+    return try runtime_selection.collectSelectedProxies(
+        allocator,
+        &cfg,
+        active_config,
+    );
 }
 
 /// daemon GET /status 返回的实际运行时状态。status 经 IPC 读取以反映 daemon

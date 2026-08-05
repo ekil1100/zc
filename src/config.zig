@@ -915,6 +915,45 @@ fn parseRuleProviderBehavior(s: []const u8) ?RuleProviderBehavior {
     return null;
 }
 
+fn absolutePathExists(path: []const u8) !bool {
+    compat.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn cwdPathExists(path: []const u8) !bool {
+    compat.fs.cwd().access(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn activeConfigPathInDirectory(
+    allocator: std.mem.Allocator,
+    configs_directory: []const u8,
+    active_key: []const u8,
+) ![]u8 {
+    if (!config_catalog.isManagedKey(active_key)) {
+        return error.InvalidConfigKey;
+    }
+    const yaml_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}.yaml",
+        .{active_key},
+    );
+    defer allocator.free(yaml_name);
+    const path = try compat.fs.path.join(
+        allocator,
+        &.{ configs_directory, yaml_name },
+    );
+    errdefer allocator.free(path);
+    if (!try absolutePathExists(path)) return error.ActiveConfigMissing;
+    return path;
+}
+
 /// 查找默认配置文件路径
 /// 通过 meta.json 的 active 字段确定当前配置，路径在 configs/ 子目录
 /// 回退：~/.config/zc/config.yaml > ~/.zc/config.yaml > ./config.yaml
@@ -923,27 +962,24 @@ fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
     if (try meta.getConfigsDir(allocator)) |configs_dir| {
         defer allocator.free(configs_dir);
 
-        var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+        var meta_data = try meta.load(allocator);
         defer meta_data.deinit();
 
         if (meta_data.active) |active_key| {
-            const yaml_name = try std.fmt.allocPrint(allocator, "{s}.yaml", .{active_key});
-            defer allocator.free(yaml_name);
-            const full_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_name });
-            if (compat.fs.accessAbsolute(full_path, .{})) |_| {
-                return full_path;
-            } else |_| {
-                allocator.free(full_path);
-            }
+            return try activeConfigPathInDirectory(
+                allocator,
+                configs_dir,
+                active_key,
+            );
         }
 
         // 1b. 尝试 configs/ 目录下的 config.yaml
-        const configs_default = try compat.fs.path.join(allocator, &.{ configs_dir, "config.yaml" });
-        if (compat.fs.accessAbsolute(configs_default, .{})) |_| {
-            return configs_default;
-        } else |_| {
-            allocator.free(configs_default);
-        }
+        const configs_default = try compat.fs.path.join(
+            allocator,
+            &.{ configs_dir, "config.yaml" },
+        );
+        if (try absolutePathExists(configs_default)) return configs_default;
+        allocator.free(configs_default);
     }
 
     // 2. 回退到旧路径
@@ -951,22 +987,22 @@ fn getDefaultConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
     defer allocator.free(home);
 
     // 旧的 config.yaml（符号链接或直接文件）
-    const old_config = try compat.fs.path.join(allocator, &.{ home, ".config/zc/config.yaml" });
-    if (compat.fs.accessAbsolute(old_config, .{})) |_| {
-        return old_config;
-    } else |_| {
-        allocator.free(old_config);
-    }
+    const old_config = try compat.fs.path.join(
+        allocator,
+        &.{ home, ".config/zc/config.yaml" },
+    );
+    if (try absolutePathExists(old_config)) return old_config;
+    allocator.free(old_config);
 
-    const old_config2 = try compat.fs.path.join(allocator, &.{ home, ".zc/config.yaml" });
-    if (compat.fs.accessAbsolute(old_config2, .{})) |_| {
-        return old_config2;
-    } else |_| {
-        allocator.free(old_config2);
-    }
+    const old_config2 = try compat.fs.path.join(
+        allocator,
+        &.{ home, ".zc/config.yaml" },
+    );
+    if (try absolutePathExists(old_config2)) return old_config2;
+    allocator.free(old_config2);
 
     // 检查当前目录的 config.yaml
-    compat.fs.cwd().access("config.yaml", .{}) catch return null;
+    if (!try cwdPathExists("config.yaml")) return null;
     return try allocator.dupe(u8, "config.yaml");
 }
 
@@ -1774,6 +1810,93 @@ pub const DownloadOutcome = struct {
     }
 };
 
+const legacy_config_bytes_max: usize = 16 * 1024 * 1024;
+
+const ConfigFilePublishOutcome = union(enum) {
+    committed,
+    durability_uncertain: anyerror,
+};
+
+fn readConfigFileIfPresent(
+    allocator: std.mem.Allocator,
+    directory: std.Io.Dir,
+    name: []const u8,
+) !?[]u8 {
+    const stat = directory.statFile(
+        compat.io(),
+        name,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (stat.kind != .file) return error.InvalidConfigFile;
+    const file = try directory.openFile(
+        compat.io(),
+        name,
+        .{ .follow_symlinks = false },
+    );
+    defer file.close(compat.io());
+    return try compat.fileReadToEndAlloc(
+        file,
+        allocator,
+        legacy_config_bytes_max,
+    );
+}
+
+fn publishConfigFile(
+    directory: std.Io.Dir,
+    name: []const u8,
+    bytes: []const u8,
+) !ConfigFilePublishOutcome {
+    if (bytes.len > legacy_config_bytes_max) return error.ConfigTooLarge;
+    const permissions = std.Io.File.Permissions.fromMode(0o600);
+    var atomic = try directory.createFileAtomic(
+        compat.io(),
+        name,
+        .{ .replace = true, .permissions = permissions },
+    );
+    defer atomic.deinit(compat.io());
+    try atomic.file.setPermissions(compat.io(), permissions);
+    try compat.fileWriteAll(atomic.file, bytes);
+    try atomic.file.sync(compat.io());
+    const parent = try directory.openFile(
+        compat.io(),
+        ".",
+        .{ .allow_directory = true },
+    );
+    defer parent.close(compat.io());
+    try atomic.replace(compat.io());
+    parent.sync(compat.io()) catch |err|
+        return .{ .durability_uncertain = err };
+    return .committed;
+}
+
+fn rollbackConfigFile(
+    directory: std.Io.Dir,
+    name: []const u8,
+    previous: ?[]const u8,
+) !void {
+    if (previous) |bytes| {
+        switch (try publishConfigFile(directory, name, bytes)) {
+            .committed => return,
+            .durability_uncertain => return error.ConfigRollbackDurabilityUncertain,
+        }
+    }
+    directory.deleteFile(compat.io(), name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const parent = try directory.openFile(
+        compat.io(),
+        ".",
+        .{ .allow_directory = true },
+    );
+    defer parent.close(compat.io());
+    parent.sync(compat.io()) catch
+        return error.ConfigRollbackDurabilityUncertain;
+}
+
 /// 下载配置文件从 URL 并保存到 configs/ 目录
 /// name: 可选的自定义 key，为 null 则生成 8 位随机 key
 /// set_default: `-d`，下载后设为默认（active）；当前没有 active 时首个下载也会设为 active
@@ -1797,6 +1920,9 @@ pub fn downloadConfig(
         try out.note("Failed to download config: HTTP {d}\n", .{@intFromEnum(fetch_result.status)});
         return error.DownloadFailed;
     }
+
+    var meta_data = try meta.load(allocator);
+    defer meta_data.deinit();
 
     // 确保 configs/ 目录存在
     try meta.ensureConfigsDir(allocator);
@@ -1822,14 +1948,6 @@ pub fn downloadConfig(
     const config_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_filename });
     defer allocator.free(config_path);
 
-    const file = try compat.fs.createFileAbsolute(config_path, .{});
-    defer file.close(compat.io());
-    try compat.fileWriteAll(file, fetch_result.body);
-
-    // 解析 URL 参数并写入 meta.json
-    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
-    defer meta_data.deinit();
-
     var cm = meta.ConfigMeta.init(allocator);
     cm.url = try allocator.dupe(u8, url);
 
@@ -1843,8 +1961,8 @@ pub fn downloadConfig(
     cm.params.deinit();
     cm.params = url_params;
 
-    // 文件先于 meta.load 落盘，syncFromDisk 可能已为 key 建了空 entry：
-    // 用 getOrPut 替换旧值并复用旧 key，避免泄漏（put 不会释放已存在的 key/value）。
+    // load() may have discovered an existing YAML before this replacement.
+    // Reuse its key while replacing the associated metadata value.
     const gop = try meta_data.configs.getOrPut(key);
     if (gop.found_existing) {
         gop.value_ptr.deinit(allocator);
@@ -1860,7 +1978,33 @@ pub fn downloadConfig(
         meta_data.active = try allocator.dupe(u8, key);
     }
 
-    try meta.saveVisible(allocator, &meta_data);
+    const configs_directory = try compat.fs.openDirAbsolute(configs_dir, .{});
+    defer configs_directory.close(compat.io());
+    const previous_config = try readConfigFileIfPresent(
+        allocator,
+        configs_directory,
+        yaml_filename,
+    );
+    defer if (previous_config) |bytes| allocator.free(bytes);
+    switch (try publishConfigFile(
+        configs_directory,
+        yaml_filename,
+        fetch_result.body,
+    )) {
+        .committed => {},
+        .durability_uncertain => |err| try out.note(
+            "Config is visible but directory sync failed: {s}\n",
+            .{@errorName(err)},
+        ),
+    }
+    meta.saveVisible(allocator, &meta_data) catch |save_error| {
+        rollbackConfigFile(
+            configs_directory,
+            yaml_filename,
+            previous_config,
+        ) catch |rollback_error| return rollback_error;
+        return save_error;
+    };
 
     const display = meta.getDisplayName(&cm, key);
     if (out.mode == .text) {
@@ -1881,13 +2025,19 @@ pub fn downloadConfig(
 
 /// 获取当前激活的配置 key（从 meta.json）
 pub fn getCurrentConfigName(allocator: std.mem.Allocator) !?[]const u8 {
-    var meta_data = meta.load(allocator) catch return null;
+    var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
-
-    if (meta_data.active) |active| {
-        return try allocator.dupe(u8, active);
-    }
-    return null;
+    const active = meta_data.active orelse return null;
+    const configs_directory = try meta.getConfigsDir(allocator) orelse
+        return error.NoConfigDir;
+    defer allocator.free(configs_directory);
+    const active_path = try activeConfigPathInDirectory(
+        allocator,
+        configs_directory,
+        active,
+    );
+    allocator.free(active_path);
+    return try allocator.dupe(u8, active);
 }
 
 /// 解析运行时配置 key：
@@ -1985,7 +2135,7 @@ pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, s
     const overrides_dir = (try getOverrideScriptsDir(allocator)) orelse return error.NoConfigDir;
     defer allocator.free(overrides_dir);
 
-    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
 
     const cm = try ensureConfigMetaEntry(allocator, &meta_data, key);
@@ -2021,7 +2171,7 @@ pub fn clearPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator
     const key = (try resolveRuntimeConfigKey(allocator, null)) orelse return error.NoActiveConfig;
     defer allocator.free(key);
 
-    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
 
     const cm = meta_data.configs.getPtr(key) orelse return false;
@@ -2137,7 +2287,7 @@ pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8)
     // config_name 可能带 .yaml 后缀
     const key = try normalizeManagedConfigKey(config_name);
 
-    var meta_data = meta.load(allocator) catch return null;
+    var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
 
     if (meta_data.configs.get(key)) |cm| {
@@ -2197,7 +2347,7 @@ pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8, out: 
 /// 列出所有可用的配置文件。
 /// 文本模式经 out.print 走 stdout；JSON 模式经 out.success 输出单个 envelope。
 pub fn listConfigs(allocator: std.mem.Allocator, out: *cli_output.Output) !void {
-    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
 
     const configs_dir = try meta.getConfigsDir(allocator) orelse return error.NoConfigDir;
@@ -2278,7 +2428,7 @@ pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_
     // target 可能带 .yaml 后缀
     const key = try normalizeManagedConfigKey(target);
 
-    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
 
     // 验证 key 存在于 meta 中
@@ -2349,7 +2499,7 @@ pub fn deleteConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_
     const file_path = try compat.fs.path.join(allocator, &.{ configs_dir, yaml_name });
     defer allocator.free(file_path);
 
-    var meta_data = meta.load(allocator) catch meta.MetaData.init(allocator);
+    var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
 
     const in_meta = meta_data.configs.contains(key);
@@ -2870,6 +3020,35 @@ test "deleteConfig rejects a profile key that escapes the managed root" {
         error.InvalidConfigKey,
         deleteConfig(allocator, "../escaped", &output),
     );
+}
+
+test "config file rollback restores the previous atomic value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "profile.yaml",
+        .data = "old\n",
+    });
+    const previous = (try readConfigFileIfPresent(
+        allocator,
+        tmp.dir,
+        "profile.yaml",
+    )).?;
+    defer allocator.free(previous);
+    try std.testing.expectEqual(
+        ConfigFilePublishOutcome.committed,
+        try publishConfigFile(tmp.dir, "profile.yaml", "new\n"),
+    );
+    try rollbackConfigFile(tmp.dir, "profile.yaml", previous);
+    const restored = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "profile.yaml",
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings("old\n", restored);
 }
 
 test "getSubscriptionUrl rejects an invalid managed profile key" {

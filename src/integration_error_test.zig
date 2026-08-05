@@ -688,6 +688,132 @@ test "integration: special pid files fail without blocking" {
     try expectErrorEnvelope(envelope.value, "status", "STATUS_FAILED");
 }
 
+test "integration: corrupt metadata fails closed without replacement" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(
+        compat.io(),
+        "home/.config/zc/configs",
+    );
+    const home = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home",
+        allocator,
+    );
+    defer allocator.free(home);
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+
+    for ([_][]const u8{ "{not-json\n", "" }) |corrupt_metadata| {
+        try tmp.dir.writeFile(compat.io(), .{
+            .sub_path = "home/.config/zc/meta.json",
+            .data = corrupt_metadata,
+        });
+        const result = try std.process.run(allocator, compat.io(), .{
+            .argv = &.{ zc_binary, "config", "list", "--json" },
+            .environ_map = &environment,
+            .stdout_limit = .limited(max_output),
+            .stderr_limit = .limited(max_output),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expectEqual(
+            @as(u8, 1),
+            try exitCode(result.term),
+        );
+        var parsed = try parseEnvelope(allocator, result.stdout);
+        defer parsed.deinit();
+        try expectErrorEnvelope(
+            parsed.value,
+            "config list",
+            "CONFIG_LIST_FAILED",
+        );
+        const preserved = try tmp.dir.readFileAlloc(
+            compat.io(),
+            "home/.config/zc/meta.json",
+            allocator,
+            .limited(64),
+        );
+        defer allocator.free(preserved);
+        try std.testing.expectEqualStrings(corrupt_metadata, preserved);
+    }
+}
+
+test "integration: missing active config does not fall back to direct" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(
+        compat.io(),
+        "home/.config/zc/configs",
+    );
+    const metadata =
+        "{\"active\":\"missing\",\"configs\":{\"missing\":{}}}\n";
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "home/.config/zc/meta.json",
+        .data = metadata,
+    });
+    const home = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home",
+        allocator,
+    );
+    defer allocator.free(home);
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "proxy", "list", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(result.term));
+    var parsed = try parseEnvelope(allocator, result.stdout);
+    defer parsed.deinit();
+    try expectErrorEnvelope(
+        parsed.value,
+        "proxy list",
+        "PROXY_CONFIG_LOAD_FAILED",
+    );
+
+    const override_result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "config", "override", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(override_result.stdout);
+    defer allocator.free(override_result.stderr);
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try exitCode(override_result.term),
+    );
+    var override_envelope = try parseEnvelope(
+        allocator,
+        override_result.stdout,
+    );
+    defer override_envelope.deinit();
+    try expectErrorEnvelope(
+        override_envelope.value,
+        "config override",
+        "CONFIG_OVERRIDE_FAILED",
+    );
+}
+
 test "integration: configured missing runtime directory fails closed" {
     const allocator = std.testing.allocator;
     try ensureZcBinary(allocator);

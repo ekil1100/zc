@@ -1214,7 +1214,15 @@ fn runConfigCommand(
             std.process.exit(cli_output.exit_usage);
         };
 
-        const current_config = config.getCurrentConfigName(allocator) catch null;
+        const current_config = config.getCurrentConfigName(allocator) catch {
+            printCliError(
+                json_output,
+                "CONFIG_UPDATE_FAILED",
+                "failed to read config metadata",
+                "repair `~/.config/zc/meta.json` and retry",
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
         defer if (current_config) |c| allocator.free(c);
         const target_name = upd.name orelse current_config orelse {
             printCliError(json_output, "CONFIG_UPDATE_NAME_REQUIRED", "no config name given and no active config", "use `zc config update <name>`, or `zc config use <name>` first");
@@ -1402,8 +1410,14 @@ fn runConfigCommand(
             std.process.exit(cli_output.exit_usage);
         };
 
-        const runtime_key = config.resolveRuntimeConfigKey(allocator, null) catch null;
-        defer if (runtime_key) |k| allocator.free(k);
+        const runtime_key = config.resolveRuntimeConfigKey(
+            allocator,
+            null,
+        ) catch |err| {
+            printConfigOverrideError(json_output, err);
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer if (runtime_key) |key| allocator.free(key);
         const profile_name = runtime_key orelse "(none)";
 
         var streams = StdStreams{};
@@ -1697,13 +1711,36 @@ fn runProxyFamilyCommand(
         var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, null, json_output, override_opts, text.list_cmd_name, text.load_list_msg);
         defer cfg.deinit();
 
-        // 当前选择用于文本标记 / JSON 的 `now` 字段；拿不到不阻塞 list。
-        const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
+        const config_key = config.resolveRuntimeConfigKey(
+            allocator,
+            parsed.config_path,
+        ) catch {
+            printCliError(
+                json_output,
+                "PROXY_CONFIG_LOAD_FAILED",
+                text.load_list_msg,
+                proxy_config_load_hint,
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
         defer if (config_key) |key| allocator.free(key);
-        const selections_opt: ?[]runtime_selection.SelectedProxy =
-            runtime_selection.collectSelectedProxies(allocator, &cfg, config_key) catch null;
-        defer if (selections_opt) |s| runtime_selection.deinitSelectedProxies(allocator, s);
-        const selections: []const runtime_selection.SelectedProxy = selections_opt orelse &.{};
+        const selections = runtime_selection.collectSelectedProxies(
+            allocator,
+            &cfg,
+            config_key,
+        ) catch {
+            printCliError(
+                json_output,
+                "PROXY_CONFIG_LOAD_FAILED",
+                "failed to read persisted proxy selections",
+                "repair `~/.config/zc/meta.json` and retry",
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer runtime_selection.deinitSelectedProxies(
+            allocator,
+            selections,
+        );
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
@@ -1803,14 +1840,23 @@ fn runProxyFamilyCommand(
             );
             std.process.exit(cli_output.exit_failure);
         };
-        const selections_opt: ?[]runtime_selection.SelectedProxy =
-            runtime_selection.collectSelectedProxies(
-                allocator,
-                cfg,
-                managed_identity.key,
-            ) catch null;
-        defer if (selections_opt) |s| runtime_selection.deinitSelectedProxies(allocator, s);
-        const selections: []const runtime_selection.SelectedProxy = selections_opt orelse &.{};
+        const selections = runtime_selection.collectSelectedProxies(
+            allocator,
+            cfg,
+            managed_identity.key,
+        ) catch {
+            printCliError(
+                json_output,
+                "PROXY_CONFIG_LOAD_FAILED",
+                "failed to read persisted proxy selections",
+                "repair `~/.config/zc/meta.json` and retry",
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer runtime_selection.deinitSelectedProxies(
+            allocator,
+            selections,
+        );
 
         const picked = proxy_cli.selectProxyInteractive(
             allocator,

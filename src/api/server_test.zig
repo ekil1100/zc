@@ -374,8 +374,8 @@ test "buildStatusJson returns daemon config_key and runtime selections" {
 
     var mgr = try manager_mod.OutboundManager.initWithKey(allocator, &cfg, "runtimkey");
     defer mgr.deinit();
-    // Select B (persist no-ops: meta.json has no "runtimkey" entry -> getPtr null).
-    mgr.selectProxy("Proxy", "B");
+    // Apply the already-authorized runtime value without touching legacy metadata.
+    try testing.expect(try mgr.applyPersistedSelection("Proxy", "B"));
 
     const json = try server.ApiServer.buildStatusJson(allocator, &mgr, &cfg);
     defer allocator.free(json);

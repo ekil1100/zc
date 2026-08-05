@@ -115,10 +115,7 @@ pub fn load(allocator: std.mem.Allocator) !MetaData {
     const content = try compat.fileReadToEndAlloc(file, allocator, 1024 * 1024);
     defer allocator.free(content);
 
-    if (content.len == 0) {
-        try syncFromDisk(allocator, &meta);
-        return meta;
-    }
+    if (content.len == 0) return error.InvalidMetaJson;
 
     // 解析 JSON
     try parseMetaJson(allocator, content, &meta);

@@ -54,7 +54,7 @@ pub fn collectSelectedProxies(
     defer if (meta_data) |*data| data.deinit();
 
     if (config_key != null) {
-        meta_data = meta.load(allocator) catch null;
+        meta_data = try meta.load(allocator);
     }
 
     return try collectSelectedProxiesFromMetaData(allocator, cfg, config_key, if (meta_data) |*data| data else null);
