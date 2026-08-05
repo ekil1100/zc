@@ -50,7 +50,7 @@ The remaining v1.0 work is tracked in [`docs/roadmap/v1.0.md`](docs/roadmap/v1.0
 - **Minimal API**: implemented endpoints for version, proxies, rules, and proxy-group selection when `external-controller` is configured.
 - **Operational gates**: install regression, config migrator regression, smoke validation, reliability scenarios, and performance report scripts.
 
-## Requirements
+## Development requirements
 
 - Zig `0.16.0+`
 - Linux or another POSIX-like development environment for the current scripts
@@ -58,6 +58,22 @@ The remaining v1.0 work is tracked in [`docs/roadmap/v1.0.md`](docs/roadmap/v1.0
 - `just` for the local install shortcut
 
 CI and local development target Zig `0.16.0`.
+
+## Install standalone (recommended)
+
+Linux/macOS amd64/arm64 可以直接安装，无需 Homebrew 或 `sudo`：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/ekil1100/zc/main/install.sh | sh
+export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
+zc --version
+```
+
+默认目标是 `${XDG_BIN_HOME:-$HOME/.local/bin}/zc`。Linux 发布物是静态 musl ELF；
+macOS 发布物只依赖系统库。installer 会验证版本化 Release SHA-256，并在下载、校验或
+自检失败时保留旧二进制。固定版本和自定义目录使用 `ZC_VERSION`、`ZC_INSTALL_DIR`，
+详见 [`docs/install/README.md`](docs/install/README.md)。
 
 ## Install with Homebrew (release candidate)
 
@@ -187,6 +203,7 @@ Run the focused local gates before sending changes:
 ```bash
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
+zig build e2e --summary all  # PR/tag gate; downloads checksum-pinned static fixtures
 bash tools/config-migrator/run-all.sh
 bash scripts/install/run-all-regression.sh
 bash scripts/run-full-validation.sh
@@ -208,6 +225,7 @@ Daemon smoke test:
 - [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md): compatibility boundaries
 - [`docs/install/README.md`](docs/install/README.md): install and validation scripts
 - [`docs/api/README.md`](docs/api/README.md): implemented minimal API
+- [`docs/reliability/e2e.md`](docs/reliability/e2e.md): PR/tag-only real network E2E gate
 - [`docs/reliability/soak-guide.md`](docs/reliability/soak-guide.md): soak validation
 
 Historical drafts live under [`docs/archive/`](docs/archive/) and are not current commitments.

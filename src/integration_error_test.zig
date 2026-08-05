@@ -528,8 +528,7 @@ test "integration: zc doctor text keeps frozen labels and exit 0 on healthy conf
     var run = try runCli(allocator, &.{ "doctor", "-c", "testdata/config/minimal.yaml" });
     defer run.deinit(allocator);
 
-    // e2e-test-podman.sh 依赖：有效配置（即使 daemon 停止）exit 0，
-    // 文本含 "OK"（grep "OK\|valid"）与冻结标签。
+    // Healthy offline diagnostics keep stable labels and return success.
     try std.testing.expectEqual(@as(u8, 0), run.code);
     try std.testing.expect(std.mem.indexOf(u8, run.stdout, "Config: OK") != null);
     try std.testing.expect(std.mem.indexOf(u8, run.stdout, "Daemon:") != null);

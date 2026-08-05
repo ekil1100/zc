@@ -513,6 +513,8 @@ docs/
 - 本机命令
 - CI workflow
 - release dry-run 或 tag 前脚本
+- standalone/static release artifact 与根目录 `install.sh`
+- 只在 pull request 与 version tag 执行的真实进程/网络 E2E
 
 验收标准：
 
@@ -522,11 +524,19 @@ env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
 env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
 bash tools/config-migrator/run-all.sh
 bash scripts/install/run-all-regression.sh
+bash scripts/install/test-oneline-installer.sh
 bash scripts/run-full-validation.sh
+zig build e2e
 ./zig-out/bin/zc start --port 29001 -c testdata/config/minimal.yaml --json
 ./zig-out/bin/zc status --json
 ./zig-out/bin/zc stop --json
 ```
+
+`install.sh` 必须从版本化 GitHub Release 下载 Linux/macOS amd64/arm64 standalone
+归档，严格校验 SHA-256，并在校验、自检或安装失败时保留旧二进制。Linux 发布物必须
+是静态 musl ELF。E2E 只通过 `zc` CLI、mixed HTTP/SOCKS5 与 minimal API 公共接口
+验证 catalog、DIRECT/REJECT、四个 Shadowsocks 配置名、Trojan TLS 和 daemon
+reload/stop；普通 `main` push 不重复运行该门禁。
 
 全部通过后，才允许进入 tag 确认。
 

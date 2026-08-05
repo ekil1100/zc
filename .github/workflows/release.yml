@@ -6,21 +6,25 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Validate tag and package version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          RELEASE_TAG="${{ github.ref_name }}"
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc(0|[1-9][0-9]*))?$ ]]; then
             echo "Invalid release tag: $RELEASE_TAG" >&2
             exit 1
           fi
@@ -40,30 +44,54 @@ jobs:
           - os: ubuntu-latest
             target_os: linux
             target_arch: amd64
+            zig_target: x86_64-linux-musl
+          - os: ubuntu-24.04-arm
+            target_os: linux
+            target_arch: arm64
+            zig_target: aarch64-linux-musl
           - os: macos-latest
             target_os: macos
             target_arch: arm64
+            zig_target: aarch64-macos
           - os: macos-15-intel
             target_os: macos
             target_arch: amd64
+            zig_target: x86_64-macos
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Zig
         uses: step-security/setup-zig@v2.2.2
         with:
           version: 0.16.0
 
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+      - name: Build standalone binary
+        run: >-
+          zig build
+          -Dtarget=${{ matrix.zig_target }}
+          -Doptimize=ReleaseSafe
+          -Dcpu=baseline
 
-      - name: Verify binary version
+      - name: Verify standalone linkage
         shell: bash
         run: |
           set -euo pipefail
-          RELEASE_TAG="${{ github.ref_name }}"
+          file zig-out/bin/zc
+          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
+            file zig-out/bin/zc | grep -q 'statically linked'
+          fi
+
+      - name: Verify binary version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
           EXPECTED="zc ${RELEASE_TAG#v}"
           ACTUAL=$(./zig-out/bin/zc --version)
           if [[ "$ACTUAL" != "$EXPECTED" ]]; then
@@ -72,7 +100,10 @@ jobs:
           fi
 
       - name: Test
-        run: zig build test -Dcpu=baseline
+        run: >-
+          zig build test
+          -Dtarget=${{ matrix.zig_target }}
+          -Dcpu=baseline
 
       - name: Smoke (migrator regression)
         run: bash tools/config-migrator/run-all.sh
@@ -80,10 +111,44 @@ jobs:
       - name: Smoke (install regression)
         run: bash scripts/install/run-all-regression.sh
 
+      - name: End-to-end release artifact
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'amd64'
+        run: >-
+          zig build e2e-release
+          -Dtarget=${{ matrix.zig_target }}
+          -Doptimize=ReleaseSafe
+          -Dcpu=baseline
+          --summary all
+
+      - name: Rebuild final standalone artifact
+        run: >-
+          zig build
+          -Dtarget=${{ matrix.zig_target }}
+          -Doptimize=ReleaseSafe
+          -Dcpu=baseline
+
+      - name: Verify final artifact
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          file zig-out/bin/zc
+          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
+            file zig-out/bin/zc | grep -q 'statically linked'
+          fi
+          EXPECTED="zc ${RELEASE_TAG#v}"
+          ACTUAL=$(./zig-out/bin/zc --version)
+          [[ "$ACTUAL" == "$EXPECTED" ]]
+
       - name: Package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET_OS: ${{ matrix.target_os }}
+          TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
           mkdir -p dist
-          PKG_NAME="zc-${{ github.ref_name }}-${{ matrix.target_os }}-${{ matrix.target_arch }}"
+          PKG_NAME="zc-${RELEASE_TAG}-${TARGET_OS}-${TARGET_ARCH}"
           PKG_DIR="dist/${PKG_NAME}"
           mkdir -p "$PKG_DIR"
           cp ./zig-out/bin/zc "$PKG_DIR/"
@@ -104,12 +169,23 @@ jobs:
   publish:
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+
+      - name: Add version-resolving installer
+        run: cp install.sh dist/install.sh
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
@@ -121,10 +197,14 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/install.sh
 
   update-tap:
     needs: publish
     runs-on: ubuntu-latest
+    concurrency:
+      group: zc-homebrew-tap
+      cancel-in-progress: false
     steps:
       - name: Checkout homebrew-tap
         uses: actions/checkout@v7
@@ -135,22 +215,80 @@ jobs:
 
       - name: Download release assets and render formula
         shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd homebrew-tap
-          VERSION="${{ github.ref_name }}"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc(0|[1-9][0-9]*))?$ ]]; then
             echo "Invalid release tag: $VERSION" >&2
             exit 1
+          fi
+
+          CURRENT_VERSION=$(grep -m1 -Eo \
+            'releases/download/v[0-9][0-9A-Za-z.-]*' zc.rb 2>/dev/null \
+            | sed 's#.*/##' || true)
+          version_is_newer() {
+            local left="$1"
+            local right="$2"
+            local pattern='^v([0-9]+)\.([0-9]+)\.([0-9]+)(-rc([0-9]+))?$'
+            [[ "$left" =~ $pattern ]]
+            local left_major="${BASH_REMATCH[1]}"
+            local left_minor="${BASH_REMATCH[2]}"
+            local left_patch="${BASH_REMATCH[3]}"
+            local left_rc="${BASH_REMATCH[5]}"
+            [[ "$right" =~ $pattern ]]
+            local right_major="${BASH_REMATCH[1]}"
+            local right_minor="${BASH_REMATCH[2]}"
+            local right_patch="${BASH_REMATCH[3]}"
+            local right_rc="${BASH_REMATCH[5]}"
+
+            local index
+            local left_core=("$left_major" "$left_minor" "$left_patch")
+            local right_core=("$right_major" "$right_minor" "$right_patch")
+            for index in 0 1 2; do
+              if ((10#${left_core[$index]} > 10#${right_core[$index]})); then
+                return 0
+              fi
+              if ((10#${left_core[$index]} < 10#${right_core[$index]})); then
+                return 1
+              fi
+            done
+            if [[ -z "$left_rc" && -n "$right_rc" ]]; then
+              return 0
+            fi
+            if [[ -n "$left_rc" && -z "$right_rc" ]]; then
+              return 1
+            fi
+            if [[ -n "$left_rc" && -n "$right_rc" ]]; then
+              ((10#$left_rc > 10#$right_rc))
+              return
+            fi
+            return 1
+          }
+
+          version_is_newer v1.0.0 v1.0.0-rc6
+          if version_is_newer v1.0.0-rc6 v1.0.0; then
+            echo "SemVer guard treats an RC as newer than GA" >&2
+            exit 1
+          fi
+          version_is_newer v1.1.0-rc1 v1.0.9
+
+          if [[ -n "$CURRENT_VERSION" ]] && \
+            version_is_newer "$CURRENT_VERSION" "$VERSION"; then
+            echo "Tap already contains newer $CURRENT_VERSION; refusing downgrade to $VERSION"
+            exit 0
           fi
 
           curl --retry 3 --retry-all-errors -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-arm64.tar.gz" -o macos-arm64.tar.gz
           curl --retry 3 --retry-all-errors -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-amd64.tar.gz" -o macos-amd64.tar.gz
           curl --retry 3 --retry-all-errors -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-amd64.tar.gz" -o linux-amd64.tar.gz
+          curl --retry 3 --retry-all-errors -fsSL "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-arm64.tar.gz" -o linux-arm64.tar.gz
 
           MACOS_ARM64_SHA=$(sha256sum macos-arm64.tar.gz | cut -d' ' -f1)
           MACOS_AMD64_SHA=$(sha256sum macos-amd64.tar.gz | cut -d' ' -f1)
           LINUX_AMD64_SHA=$(sha256sum linux-amd64.tar.gz | cut -d' ' -f1)
+          LINUX_ARM64_SHA=$(sha256sum linux-arm64.tar.gz | cut -d' ' -f1)
 
           cat > zc.rb <<EOF
           class Zc < Formula
@@ -160,7 +298,7 @@ jobs:
 
             livecheck do
               url :stable
-              regex(/^v?(\d+(?:\.\d+)*-rc\d+)$/i)
+              regex(/^v?(\d+\.\d+\.\d+(?:-rc\d+)?)$/i)
               strategy :git
             end
 
@@ -176,6 +314,10 @@ jobs:
             end
 
             on_linux do
+              on_arm do
+                url "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-arm64.tar.gz"
+                sha256 "${LINUX_ARM64_SHA}"
+              end
               on_intel do
                 url "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-linux-amd64.tar.gz"
                 sha256 "${LINUX_AMD64_SHA}"
@@ -193,9 +335,11 @@ jobs:
           EOF
 
           ruby -c zc.rb
-          rm -f macos-arm64.tar.gz macos-amd64.tar.gz linux-amd64.tar.gz
+          rm -f macos-arm64.tar.gz macos-amd64.tar.gz linux-amd64.tar.gz linux-arm64.tar.gz
 
       - name: Commit and push
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
@@ -204,6 +348,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Homebrew formula already up to date"
           else
-            git commit -m "chore(zc): update to ${{ github.ref_name }}"
+            git commit -m "chore(zc): update to $VERSION"
             git push
           fi

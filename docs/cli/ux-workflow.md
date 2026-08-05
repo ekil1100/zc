@@ -75,7 +75,7 @@
 验收：
 - `zig build test` 通过；
 - `zc --help >out 2>err`：帮助在 `out`，`err` 为空，exit 0；帮助含 `Usage`（兼容 e2e grep）；
-- `zc --version` stdout 输出版本，exit 0（解除 Containerfile:23 阻塞）；
+- `zc --version` stdout 输出版本，exit 0（供 standalone installer 自检）；
 - `zc nope`：用法 stderr，exit ≠ 0；`zc nope --json | jq -e '.ok==false'` 在 stdout 可解析；
 - `zc up --help` 显示 start 帮助，不启动 daemon。
 
