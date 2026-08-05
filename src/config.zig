@@ -448,40 +448,60 @@ fn parseRoot(
         }
     }
 
-    // 解析规则
+    var legacy_direct_fallback_allowed = false;
     if (root.map.get("rules")) |rules| {
-        if (rules != .array) {
-            if (managed) return error.InvalidConfig;
-        } else {
-            for (rules.array.items) |*item| {
-                if (item.* != .string) {
-                    if (managed) return error.InvalidConfig;
-                    continue;
-                }
-                var rule = try parseRule(allocator, item.string);
-                config.rules.append(allocator, rule) catch |err| {
-                    rule.deinit(allocator);
-                    return err;
-                };
-            }
+        if (rules != .array) return error.InvalidConfig;
+        for (rules.array.items) |*item| {
+            if (item.* != .string) return error.InvalidConfig;
+            var rule = try parseRule(allocator, item.string);
+            config.rules.append(allocator, rule) catch |err| {
+                rule.deinit(allocator);
+                return err;
+            };
         }
+    } else {
+        legacy_direct_fallback_allowed = true;
     }
 
-    // 如果没有规则，添加默认 MATCH 规则
-    if (config.rules.items.len == 0) {
-        const payload = try allocator.dupe(u8, "");
-        var payload_owned = true;
-        errdefer if (payload_owned) allocator.free(payload);
-        const target = try allocator.dupe(u8, "DIRECT");
-        var rule = Rule{ .rule_type = .final, .payload = payload, .target = target };
-        payload_owned = false;
-        config.rules.append(allocator, rule) catch |err| {
-            rule.deinit(allocator);
-            return err;
-        };
+    var final_count: u8 = 0;
+    for (config.rules.items, 0..) |rule, index| {
+        if (rule.rule_type != .final) continue;
+        if (final_count == 1) return error.InvalidConfig;
+        final_count += 1;
+        if (index + 1 != config.rules.items.len) {
+            return error.InvalidConfig;
+        }
+    }
+    if (final_count == 0) {
+        const implicit_target = if (!managed and
+            legacy_direct_fallback_allowed)
+            "DIRECT"
+        else
+            "REJECT";
+        try appendImplicitFinalRule(
+            allocator,
+            &config.rules,
+            implicit_target,
+        );
     }
 
     return config;
+}
+
+fn appendImplicitFinalRule(
+    allocator: std.mem.Allocator,
+    rules: *std.ArrayList(Rule),
+    target_name: []const u8,
+) !void {
+    const payload = try allocator.dupe(u8, "");
+    errdefer allocator.free(payload);
+    const target = try allocator.dupe(u8, target_name);
+    errdefer allocator.free(target);
+    try rules.append(allocator, .{
+        .rule_type = .final,
+        .payload = payload,
+        .target = target,
+    });
 }
 
 /// Clash airport subscriptions inject pseudo "nodes" that aren't dialable
@@ -1460,6 +1480,7 @@ fn expandRuleSetRules(allocator: std.mem.Allocator, cfg: *Config) !void {
         try appendRulesFromProvider(allocator, &expanded, provider, rule.target, rule.no_resolve);
     }
 
+    try validateExpandedFinalRule(expanded.items);
     for (cfg.rules.items) |*r| r.deinit(allocator);
     cfg.rules.deinit(allocator);
     cfg.rules = expanded;
@@ -1486,9 +1507,21 @@ fn expandLocalRuleSetRules(allocator: std.mem.Allocator, cfg: *Config) !void {
         try appendRulesFromProvider(allocator, &expanded, provider, rule.target, rule.no_resolve);
     }
 
+    try validateExpandedFinalRule(expanded.items);
     for (cfg.rules.items) |*rule| rule.deinit(allocator);
     cfg.rules.deinit(allocator);
     cfg.rules = expanded;
+}
+
+fn validateExpandedFinalRule(rules: []const Rule) !void {
+    var final_count: u8 = 0;
+    for (rules, 0..) |rule, index| {
+        if (rule.rule_type != .final) continue;
+        if (final_count == 1) return error.InvalidConfig;
+        final_count += 1;
+        if (index + 1 != rules.len) return error.InvalidConfig;
+    }
+    if (final_count != 1) return error.InvalidConfig;
 }
 
 fn appendRulesFromProvider(
@@ -2719,6 +2752,97 @@ pub fn deleteConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_
     }
 
     return .{ .key = try allocator.dupe(u8, key), .was_active = was_active };
+}
+
+test "managed config keeps final routing terminal and fail closed" {
+    const allocator = std.testing.allocator;
+    const base =
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+    ;
+    var fail_closed = try parseDocument(allocator, base);
+    defer fail_closed.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        fail_closed.rules.items.len,
+    );
+    try std.testing.expectEqual(
+        RuleType.final,
+        fail_closed.rules.items[0].rule_type,
+    );
+    try std.testing.expectEqualStrings(
+        "REJECT",
+        fail_closed.rules.items[0].target,
+    );
+    var legacy_fail_closed = try parse(allocator,
+        \\mixed-port: 7890
+        \\rules:
+        \\  - DOMAIN,example.com,DIRECT
+    );
+    defer legacy_fail_closed.deinit();
+    try std.testing.expectEqual(
+        RuleType.final,
+        legacy_fail_closed.rules.items[1].rule_type,
+    );
+    try std.testing.expectEqualStrings(
+        "REJECT",
+        legacy_fail_closed.rules.items[1].target,
+    );
+    var legacy_empty = try parse(allocator,
+        \\mixed-port: 7890
+        \\rules: []
+    );
+    defer legacy_empty.deinit();
+    try std.testing.expectEqual(
+        RuleType.final,
+        legacy_empty.rules.items[0].rule_type,
+    );
+    try std.testing.expectEqualStrings(
+        "REJECT",
+        legacy_empty.rules.items[0].target,
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        parse(allocator,
+            \\mixed-port: 7890
+            \\rules:
+            \\  - 123
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        parse(allocator,
+            \\mixed-port: 7890
+            \\rules: null
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        parseDocument(allocator,
+            \\mixed-port: 7890
+            \\rules:
+            \\  - MATCH,DIRECT
+            \\  - MATCH,REJECT
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        parseDocument(allocator,
+            \\mixed-port: 7890
+            \\rules:
+            \\  - MATCH,DIRECT
+            \\  - DOMAIN,example.com,REJECT
+        ),
+    );
+    var valid = try parseDocument(allocator,
+        \\mixed-port: 7890
+        \\rules:
+        \\  - DOMAIN,example.com,REJECT
+        \\  - MATCH,DIRECT
+    );
+    valid.deinit();
 }
 
 test "config parsing" {

@@ -481,8 +481,8 @@ const Parser = struct {
                         val = try self.parseValue(next_indent);
                     }
                 }
-            } else if (self.strict and
-                (self.source[self.pos] == '{' or self.source[self.pos] == '['))
+            } else if (self.source[self.pos] == '{' or
+                self.source[self.pos] == '[')
             {
                 if (self.depth >= max_nesting_depth) {
                     return error.YamlNestingTooDeep;
@@ -552,9 +552,37 @@ const Parser = struct {
             while (self.pos < self.source.len and
                 (self.source[self.pos] == ' ' or self.source[self.pos] == '\t')) self.pos += 1;
 
+            if (self.pos >= self.source.len or self.source[self.pos] == '\n' or
+                self.source[self.pos] == '#' or
+                (self.strict and self.source[self.pos] == '\r' and
+                    self.pos + 1 < self.source.len and
+                    self.source[self.pos + 1] == '\n'))
+            {
+                if (self.pos < self.source.len) self.skipLine();
+                if (self.strict) self.skipTriviaLines();
+
+                var item: YamlValue = .null;
+                if (self.pos < self.source.len) {
+                    const next_indent = self.getIndentAt(self.pos);
+                    if (next_indent > indent) {
+                        if (self.depth >= max_nesting_depth) {
+                            return error.YamlNestingTooDeep;
+                        }
+                        self.depth += 1;
+                        defer self.depth -= 1;
+                        item = try self.parseValue(next_indent);
+                    }
+                }
+                arr.append(self.allocator, item) catch |err| {
+                    item.deinit(self.allocator);
+                    return err;
+                };
+                continue;
+            }
+
             // Check for an inline collection.
             if (self.pos < self.source.len and
-                (self.source[self.pos] == '{' or (self.strict and self.source[self.pos] == '[')))
+                (self.source[self.pos] == '{' or self.source[self.pos] == '['))
             {
                 if (self.depth >= max_nesting_depth) {
                     return error.YamlNestingTooDeep;

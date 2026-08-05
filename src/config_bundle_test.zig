@@ -713,8 +713,9 @@ test "ConfigBundle parses nested CRLF blocks across blank and comment lines" {
     defer bundle.deinit();
     var loaded = try bundle.loadOffline(allocator);
     defer loaded.deinit();
-    try testing.expectEqual(@as(usize, 1), loaded.config.rules.items.len);
+    try testing.expectEqual(@as(usize, 2), loaded.config.rules.items.len);
     try testing.expectEqualStrings("example.com", loaded.config.rules.items[0].payload);
+    try testing.expectEqualStrings("REJECT", loaded.config.rules.items[1].target);
 }
 
 test "ConfigBundle offline load expands local rule sets and preserves remote declarations" {
@@ -858,9 +859,10 @@ test "ConfigBundle parses root-flow provider documents with metadata" {
     defer bundle.deinit();
     var loaded = try bundle.loadOffline(allocator);
     defer loaded.deinit();
-    try testing.expectEqual(@as(usize, 1), loaded.config.rules.items.len);
+    try testing.expectEqual(@as(usize, 2), loaded.config.rules.items.len);
     try testing.expectEqual(.domain_suffix, loaded.config.rules.items[0].rule_type);
     try testing.expectEqualStrings("example.com", loaded.config.rules.items[0].payload);
+    try testing.expectEqualStrings("REJECT", loaded.config.rules.items[1].target);
 }
 
 test "ConfigBundle accepts IPv4-embedded IPv6 provider CIDR" {
@@ -888,8 +890,9 @@ test "ConfigBundle accepts IPv4-embedded IPv6 provider CIDR" {
     var loaded = try bundle.loadOffline(allocator);
     defer loaded.deinit();
     try testing.expect(loaded.validation.isValid());
-    try testing.expectEqual(@as(usize, 1), loaded.config.rules.items.len);
+    try testing.expectEqual(@as(usize, 2), loaded.config.rules.items.len);
     try testing.expectEqual(.ip_cidr6, loaded.config.rules.items[0].rule_type);
+    try testing.expectEqualStrings("REJECT", loaded.config.rules.items[1].target);
 }
 
 test "ConfigBundle rejects malformed unused local IP provider offline" {
@@ -913,6 +916,29 @@ test "ConfigBundle rejects malformed unused local IP provider offline" {
     var bundle = try ConfigBundle.capture(allocator, path, .{});
     defer bundle.deinit();
     try testing.expectError(error.InvalidRuleProviderEntry, bundle.loadOffline(allocator));
+}
+
+test "ConfigBundle rejects MATCH injected by a classical provider" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\mixed-port: 7890
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: classical
+        \\    path: rules.txt
+        \\rules:
+        \\  - RULE-SET,local,DIRECT
+    ;
+    try writeFile(tmp.dir, "config.yaml", source);
+    try writeFile(tmp.dir, "rules.txt", "MATCH\n");
+    const path = try realPath(allocator, tmp.dir, "config.yaml");
+    defer allocator.free(path);
+    var bundle = try ConfigBundle.capture(allocator, path, .{});
+    defer bundle.deinit();
+    try testing.expectError(error.InvalidConfig, bundle.loadOffline(allocator));
 }
 
 test "ConfigBundle preserves raw classical entries containing mapping-like colons" {
@@ -939,10 +965,11 @@ test "ConfigBundle preserves raw classical entries containing mapping-like colon
     defer bundle.deinit();
     var loaded = try bundle.loadOffline(allocator);
     defer loaded.deinit();
-    try testing.expectEqual(@as(usize, 1), loaded.config.rules.items.len);
+    try testing.expectEqual(@as(usize, 2), loaded.config.rules.items.len);
     try testing.expectEqual(.process_name, loaded.config.rules.items[0].rule_type);
     try testing.expectEqualStrings("foo: bar", loaded.config.rules.items[0].payload);
     try testing.expectEqualStrings("REJECT", loaded.config.rules.items[0].target);
+    try testing.expectEqualStrings("REJECT", loaded.config.rules.items[1].target);
 }
 
 test "ConfigBundle classical providers cannot override the RULE-SET target" {

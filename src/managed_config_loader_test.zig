@@ -67,8 +67,9 @@ test "ManagedConfigLoader loads active immutable bytes and local assets with exa
     try testing.expect(loaded.identity.?.revision.eql(published.revision));
     try testing.expectEqual(@as(u16, 7890), loaded.config.mixed_port);
     try testing.expect(loaded.validation.isValid());
-    try testing.expectEqual(@as(usize, 1), loaded.config.rules.items.len);
+    try testing.expectEqual(@as(usize, 2), loaded.config.rules.items.len);
     try testing.expectEqualStrings("example.com", loaded.config.rules.items[0].payload);
+    try testing.expectEqualStrings("REJECT", loaded.config.rules.items[1].target);
 }
 
 test "ManagedConfigLoader distinguishes head from an older exact revision" {
@@ -162,6 +163,7 @@ test "ManagedConfigLoader explicit unmanaged path never falls back to active ide
     try testing.expectEqual(managed_loader.Origin.unmanaged_path, loaded.origin);
     try testing.expect(loaded.identity == null);
     try testing.expectEqual(@as(u16, 7000), loaded.config.mixed_port);
-    try testing.expectEqual(@as(usize, 1), loaded.config.rules.items.len);
+    try testing.expectEqual(@as(usize, 2), loaded.config.rules.items.len);
     try testing.expectEqualStrings("unmanaged.example", loaded.config.rules.items[0].payload);
+    try testing.expectEqualStrings("REJECT", loaded.config.rules.items[1].target);
 }

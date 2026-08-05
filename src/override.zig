@@ -705,13 +705,25 @@ fn parseSingleFieldOverride(allocator: std.mem.Allocator, field: []const u8, val
             try writeYamlScalar(&out, allocator, value);
             try out.append(allocator, '\n');
         },
-        else => {
-            try out.appendSlice(allocator, ":\n");
-            try writeYamlValue(&out, allocator, &value, 2);
+        .array => |items| {
+            if (items.items.len == 0) {
+                try out.appendSlice(allocator, ": []\n");
+            } else {
+                try out.appendSlice(allocator, ":\n");
+                try writeYamlValue(&out, allocator, &value, 2);
+            }
+        },
+        .map => |items| {
+            if (items.count() == 0) {
+                try out.appendSlice(allocator, ": {}\n");
+            } else {
+                try out.appendSlice(allocator, ":\n");
+                try writeYamlValue(&out, allocator, &value, 2);
+            }
         },
     }
 
-    return config.parse(allocator, out.items) catch Errors.OverrideOutputInvalid;
+    return config.parseDocument(allocator, out.items) catch Errors.OverrideOutputInvalid;
 }
 
 fn releaseTempConfig(tmp: *config.Config) void {
@@ -770,8 +782,14 @@ fn writeYamlValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
                 try out.appendSlice(allocator, entry.key_ptr.*);
                 switch (entry.value_ptr.*) {
                     .array, .map => {
-                        try out.appendSlice(allocator, ":\n");
-                        try writeYamlValue(out, allocator, entry.value_ptr, indent + 2);
+                        if (emptyCollectionMarker(entry.value_ptr)) |marker| {
+                            try out.appendSlice(allocator, ": ");
+                            try out.appendSlice(allocator, marker);
+                            try out.append(allocator, '\n');
+                        } else {
+                            try out.appendSlice(allocator, ":\n");
+                            try writeYamlValue(out, allocator, entry.value_ptr, indent + 2);
+                        }
                     },
                     else => {
                         try out.appendSlice(allocator, ": ");
@@ -786,8 +804,14 @@ fn writeYamlValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
                 try appendIndent(out, allocator, indent);
                 switch (item.*) {
                     .array, .map => {
-                        try out.appendSlice(allocator, "-\n");
-                        try writeYamlValue(out, allocator, item, indent + 2);
+                        if (emptyCollectionMarker(item)) |marker| {
+                            try out.appendSlice(allocator, "- ");
+                            try out.appendSlice(allocator, marker);
+                            try out.append(allocator, '\n');
+                        } else {
+                            try out.appendSlice(allocator, "-\n");
+                            try writeYamlValue(out, allocator, item, indent + 2);
+                        }
                     },
                     else => {
                         try out.appendSlice(allocator, "- ");
@@ -803,6 +827,14 @@ fn writeYamlValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
             try out.append(allocator, '\n');
         },
     }
+}
+
+fn emptyCollectionMarker(value: *const yaml.YamlValue) ?[]const u8 {
+    return switch (value.*) {
+        .array => |items| if (items.items.len == 0) "[]" else null,
+        .map => |items| if (items.count() == 0) "{}" else null,
+        else => null,
+    };
 }
 
 fn writeYamlQuotedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -1472,6 +1504,38 @@ test "override materialization preserves runtime secrets in owner-only effective
     try std.testing.expect(parsed.proxies.items[0].ws);
     try std.testing.expectEqualStrings("local rules", parsed.rule_providers.items[0].name);
     try std.testing.expectEqualStrings("assets/rules.yaml", parsed.rule_providers.items[0].path);
+}
+
+test "override field parsing preserves nested empty collections" {
+    const allocator = std.testing.allocator;
+    const source = "mixed-port: 7890\n";
+    const patch =
+        \\proxies:
+        \\  - name: node
+        \\    type: trojan
+        \\    server: example.com
+        \\    port: 443
+        \\    password: secret
+        \\    ws-opts:
+        \\      headers: {}
+        \\proxy-groups:
+        \\  - name: Empty
+        \\    type: select
+        \\    proxies: []
+        \\rules: []
+    ;
+    const effective = try materializeSource(allocator, source, patch);
+    defer allocator.free(effective);
+
+    var parsed = try config.parseDocument(allocator, effective);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.proxies.items[0].ws);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        parsed.proxy_groups.items[0].proxies.items.len,
+    );
+    try std.testing.expectEqual(config.RuleType.final, parsed.rules.items[0].rule_type);
+    try std.testing.expectEqualStrings("REJECT", parsed.rules.items[0].target);
 }
 
 test "override materialization keeps original bytes for an empty patch and is deterministic" {
