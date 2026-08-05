@@ -1254,6 +1254,16 @@ test "integration: background start returns only after listeners are ready" {
         .limited(32),
     );
     defer allocator.free(tracked_pid_bytes);
+    const tracked_pid = try std.fmt.parseInt(
+        i32,
+        std.mem.trim(u8, tracked_pid_bytes, " \t\r\n"),
+        10,
+    );
+    try std.posix.kill(tracked_pid, std.posix.SIG.STOP);
+    var daemon_paused = true;
+    defer if (daemon_paused) {
+        std.posix.kill(tracked_pid, std.posix.SIG.CONT) catch {};
+    };
     try tmp.dir.deleteFile(compat.io(), "run/zc.pid");
     try tmp.dir.rename(lock_path, tmp.dir, old_lock_path, compat.io());
     const replacement_lock = try tmp.dir.createFile(
@@ -1302,6 +1312,8 @@ test "integration: background start returns only after listeners are ready" {
     });
     try compat.fileWriteAll(restored_pid, tracked_pid_bytes);
     restored_pid.close(compat.io());
+    try std.posix.kill(tracked_pid, std.posix.SIG.CONT);
+    daemon_paused = false;
 
     const selected = try std.process.run(allocator, compat.io(), .{
         .argv = &.{
