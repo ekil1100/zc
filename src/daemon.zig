@@ -2,6 +2,8 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const config_catalog = @import("config_catalog.zig");
+const config_identity = @import("config_identity.zig");
 const constants = @import("constants.zig");
 const controller_endpoint = @import("controller_endpoint.zig");
 const runtime_selection = @import("runtime_selection.zig");
@@ -14,6 +16,19 @@ const startup_lock_wait_ms: i64 = 80_000;
 const override_timeout_ms_default: i64 = 5_000;
 const startup_overhead_timeout_ms: i64 = 20_000;
 const command_probe_max_output_bytes: usize = 16 * 1024;
+const prepared_config_prefix = "zc.prepared.";
+const prepared_config_suffix = ".yaml";
+const prepared_key_name = "zc.prepared.key";
+const prepared_key_lock_name = "zc.prepared.key.lock";
+const prepared_mac_hex_bytes: usize = 64;
+const prepared_nonce_hex_bytes: usize = 32;
+const prepared_name_bytes: usize = prepared_config_prefix.len +
+    prepared_mac_hex_bytes + 1 + prepared_nonce_hex_bytes +
+    prepared_config_suffix.len;
+const prepared_header_prefix = "# zc-prepared-v1 ";
+const prepared_source_prefix = "# zc-prepared-source-v1 ";
+const prepared_port_prefix = "# zc-prepared-port-v1 ";
+const prepared_config_max_bytes: usize = 16 * 1024 * 1024;
 const daemon_status_response_max_bytes: usize = 4 * 1024 * 1024 + 64 * 1024;
 const daemon_status_io_timeout_ms: i64 = 2_000;
 pub const daemon_log_max_bytes: u64 = 8 * 1024 * 1024;
@@ -36,6 +51,55 @@ pub const LifecycleOutcome = struct {
     /// 冻结 detail 词汇：already_running / already_stopped。
     detail: ?[]const u8 = null,
     pid: ?i32 = null,
+};
+
+pub const StartRequest = struct {
+    config_path: ?[]const u8,
+    extra_args: []const []const u8,
+};
+
+pub const PreviousRequest = struct {
+    start: StartRequest,
+    instance: RuntimeInstance,
+};
+
+pub const PreparedConfig = struct {
+    allocator: std.mem.Allocator,
+    runtime: runtime_dir.RuntimeDir,
+    name: []u8,
+    path: []u8,
+    retained: bool = false,
+
+    pub fn retain(self: *PreparedConfig) void {
+        self.retained = true;
+    }
+
+    pub fn deinit(self: *PreparedConfig) void {
+        if (!self.retained) {
+            self.runtime.deleteFile(self.name) catch {};
+        }
+        self.runtime.deinit();
+        self.allocator.free(self.name);
+        self.allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedContent = struct {
+    allocator: std.mem.Allocator,
+    storage: []u8,
+    yaml: []const u8,
+    identity: ?runtime_descriptor.Identity,
+    source_path: ?[]u8,
+    port_override: ?u16,
+
+    pub fn deinit(self: *PreparedContent) void {
+        if (self.identity) |value| self.allocator.free(value.key);
+        if (self.source_path) |path| self.allocator.free(path);
+        @memset(self.storage, 0);
+        self.allocator.free(self.storage);
+        self.* = undefined;
+    }
 };
 
 const StatusSnapshot = struct {
@@ -333,6 +397,28 @@ fn stopRequestName(
     return buffer;
 }
 
+fn stopRequestMatches(
+    runtime: runtime_dir.RuntimeDir,
+    nonce: runtime_descriptor.Nonce,
+) bool {
+    var name_buffer: [runtime_dir.stop_prefix.len + 32]u8 = undefined;
+    const name = stopRequestName(nonce, &name_buffer);
+    const file = runtime.openFile(name, .{}) catch return false;
+    defer file.close(compat.io());
+    const stat = file.stat(compat.io()) catch return false;
+    if (stat.size != 33) return false;
+    var observed_bytes: [33]u8 = undefined;
+    if ((compat.fileReadAll(file, &observed_bytes) catch return false) != 33) {
+        return false;
+    }
+    var expected_bytes: [33]u8 = undefined;
+    return std.mem.eql(
+        u8,
+        &observed_bytes,
+        stopRequestBytes(nonce, &expected_bytes),
+    );
+}
+
 fn publishStopRequest(
     allocator: std.mem.Allocator,
     nonce: runtime_descriptor.Nonce,
@@ -343,7 +429,29 @@ fn publishStopRequest(
     var name_buffer: [runtime_dir.stop_prefix.len + 32]u8 = undefined;
     const name = stopRequestName(nonce, &name_buffer);
     var content_buffer: [33]u8 = undefined;
-    try runtime.replaceFile(name, stopRequestBytes(nonce, &content_buffer));
+    runtime.replaceFile(
+        name,
+        stopRequestBytes(nonce, &content_buffer),
+    ) catch |err| {
+        if (stopRequestMatches(runtime, nonce)) return;
+        return err;
+    };
+}
+
+fn removeStopRequest(
+    allocator: std.mem.Allocator,
+    nonce: runtime_descriptor.Nonce,
+) !bool {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return false;
+    defer runtime.deinit();
+    var name_buffer: [runtime_dir.stop_prefix.len + 32]u8 = undefined;
+    const name = stopRequestName(nonce, &name_buffer);
+    runtime.deleteFile(name) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 pub fn consumeStopRequest(
@@ -476,77 +584,521 @@ fn pidMatchesRunningDaemon(allocator: std.mem.Allocator, pid: i32) !bool {
     };
 }
 
-/// 已被 stop/restart/reload 依赖的“当前 daemon 的启动参数”快照，
-/// 从 tracked pid 的命令行解析得到（-c / --port / --foreground）。
+/// Descriptor-bound invocation metadata used by stop/restart/reload.
 pub const TrackedInvocation = struct {
     pid: i32,
     /// `zc start --foreground`：受 systemd/容器监管的前台 daemon。
     foreground: bool = false,
+    prepared: bool = false,
     config_path: ?[]u8 = null,
+    source_path: ?[]u8 = null,
     port: ?u16 = null,
 
     pub fn deinit(self: *TrackedInvocation, allocator: std.mem.Allocator) void {
-        if (self.config_path) |p| allocator.free(p);
-        self.config_path = null;
+        if (self.config_path) |path| allocator.free(path);
+        if (self.source_path) |path| allocator.free(path);
+        self.* = undefined;
+    }
+
+    pub fn appendForwardArgs(
+        self: *const TrackedInvocation,
+        allocator: std.mem.Allocator,
+        args: *std.ArrayList([]const u8),
+    ) !void {
+        if (self.prepared) {
+            const marker = try allocator.dupe(u8, "--prepared-runtime-config");
+            errdefer allocator.free(marker);
+            try args.append(allocator, marker);
+        }
+        if (self.port) |port| {
+            const owned = try std.fmt.allocPrint(allocator, "--port={d}", .{port});
+            errdefer allocator.free(owned);
+            try args.append(allocator, owned);
+        }
     }
 };
 
-fn rawDaemonCommandLineAlloc(allocator: std.mem.Allocator, pid: i32) !?[]u8 {
-    switch (builtin.os.tag) {
-        .linux => {
-            var path_buf: [64]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return null;
-            const file = compat.fs.openFileAbsolute(path, .{}) catch return null;
-            defer file.close(compat.io());
-            return compat.fileReadToEndAlloc(file, allocator, command_probe_max_output_bytes) catch null;
-        },
-        else => {
-            var pid_buf: [32]u8 = undefined;
-            const pid_text = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return null;
-            const result = compat.childRun(allocator, &.{ "ps", "-ww", "-o", "command=", "-p", pid_text }, command_probe_max_output_bytes) catch return null;
-            allocator.free(result.stderr);
-            if (result.term.exited != 0) {
-                allocator.free(result.stdout);
-                return null;
-            }
-            return result.stdout;
-        },
+fn preparedMacFromName(name: []const u8) ![32]u8 {
+    if (name.len != prepared_name_bytes) return error.InvalidPreparedConfig;
+    if (!std.mem.startsWith(u8, name, prepared_config_prefix)) {
+        return error.InvalidPreparedConfig;
     }
+    if (!std.mem.endsWith(u8, name, prepared_config_suffix)) {
+        return error.InvalidPreparedConfig;
+    }
+    const mac_start = prepared_config_prefix.len;
+    const mac_end = mac_start + prepared_mac_hex_bytes;
+    if (name[mac_end] != '.') return error.InvalidPreparedConfig;
+    const nonce_start = mac_end + 1;
+    const nonce_end = nonce_start + prepared_nonce_hex_bytes;
+    for (name[mac_start..mac_end]) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return error.InvalidPreparedConfig,
+    };
+    for (name[nonce_start..nonce_end]) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return error.InvalidPreparedConfig,
+    };
+    var mac: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&mac, name[mac_start..mac_end]) catch
+        return error.InvalidPreparedConfig;
+    return mac;
 }
 
-fn parseTrackedInvocationFromCmdline(allocator: std.mem.Allocator, pid: i32, cmdline: []const u8) !TrackedInvocation {
-    var inv = TrackedInvocation{ .pid = pid };
-    errdefer inv.deinit(allocator);
+fn readPreparedKey(runtime: runtime_dir.RuntimeDir) ![32]u8 {
+    const file = try runtime.openFile(prepared_key_name, .{});
+    defer file.close(compat.io());
+    const stat = try file.stat(compat.io());
+    if (stat.size != 32) return error.InvalidPreparedKey;
+    if (builtin.os.tag != .windows and
+        stat.permissions.toMode() & 0o777 != 0o600)
+    {
+        return error.InvalidPreparedKey;
+    }
+    var key: [32]u8 = undefined;
+    if (try compat.fileReadAll(file, &key) != key.len) {
+        return error.InvalidPreparedKey;
+    }
+    return key;
+}
 
-    // /proc cmdline 是 NUL 分隔，ps 输出是空白分隔；统一按两者切词。
-    var parts = std.mem.tokenizeAny(u8, cmdline, " \t\r\n\x00");
-    _ = parts.next(); // argv0
-    while (parts.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--foreground")) {
-            inv.foreground = true;
-        } else if (std.mem.eql(u8, arg, "-c")) {
-            if (parts.next()) |value| {
-                if (inv.config_path) |old| allocator.free(old);
-                inv.config_path = try allocator.dupe(u8, value);
-            }
-        } else if (std.mem.eql(u8, arg, "--port")) {
-            if (parts.next()) |value| {
-                inv.port = std.fmt.parseInt(u16, value, 10) catch inv.port;
-            }
-        } else if (std.mem.startsWith(u8, arg, "--port=")) {
-            inv.port = std.fmt.parseInt(u16, arg["--port=".len..], 10) catch inv.port;
+fn acquirePreparedKeyLock(runtime: runtime_dir.RuntimeDir) !std.Io.File {
+    const created = runtime.createExclusive(prepared_key_lock_name) catch |err| switch (err) {
+        error.PathAlreadyExists => null,
+        else => return err,
+    };
+    if (created) |file| file.close(compat.io());
+    var attempt: u8 = 0;
+    while (attempt < 100) : (attempt += 1) {
+        const lock = runtime.openFile(prepared_key_lock_name, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => {
+                compat.sleepNs(50 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        return lock;
+    }
+    return error.PreparedKeyLockTimeout;
+}
+
+fn loadOrCreatePreparedKey(runtime: runtime_dir.RuntimeDir) ![32]u8 {
+    if (readPreparedKey(runtime)) |existing| {
+        return existing;
+    } else |read_error| switch (read_error) {
+        error.FileNotFound => {},
+        else => return read_error,
+    }
+    const lock = try acquirePreparedKeyLock(runtime);
+    defer lock.close(compat.io());
+    if (readPreparedKey(runtime)) |existing| {
+        return existing;
+    } else |read_error| switch (read_error) {
+        error.FileNotFound => {},
+        else => return read_error,
+    }
+    var key: [32]u8 = undefined;
+    compat.randomBytes(&key);
+    try runtime.replaceFile(prepared_key_name, &key);
+    return key;
+}
+
+pub fn publishPreparedConfig(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    identity: ?runtime_descriptor.Identity,
+    source_path: ?[]const u8,
+    port_override: ?u16,
+) !PreparedConfig {
+    const identity_bytes: usize = if (identity) |value|
+        std.math.mul(usize, value.key.len, 2) catch
+            return error.PreparedConfigTooLarge
+    else
+        1;
+    const identity_suffix_bytes: usize = if (identity != null) 1 + 32 else 0;
+    if (source_path) |path| {
+        if (path.len == 0 or path.len > 4096 or
+            std.mem.indexOfScalar(u8, path, 0) != null)
+        {
+            return error.InvalidPreparedSource;
         }
     }
-    return inv;
+    const source_bytes: usize = if (source_path) |path|
+        std.math.mul(usize, path.len, 2) catch
+            return error.PreparedConfigTooLarge
+    else
+        1;
+    const identity_line_bytes = std.math.add(
+        usize,
+        prepared_header_prefix.len + 1,
+        identity_bytes + identity_suffix_bytes,
+    ) catch return error.PreparedConfigTooLarge;
+    const source_line_bytes = std.math.add(
+        usize,
+        prepared_source_prefix.len + 1,
+        source_bytes,
+    ) catch return error.PreparedConfigTooLarge;
+    if (port_override) |port| {
+        if (port == 0) return error.InvalidPreparedPort;
+    }
+    const port_bytes: usize = if (port_override) |port|
+        std.fmt.count("{d}", .{port})
+    else
+        1;
+    const identity_source_bytes = std.math.add(
+        usize,
+        identity_line_bytes,
+        source_line_bytes,
+    ) catch return error.PreparedConfigTooLarge;
+    const port_line_bytes = std.math.add(
+        usize,
+        prepared_port_prefix.len + 1,
+        port_bytes,
+    ) catch return error.PreparedConfigTooLarge;
+    const header_bytes = std.math.add(
+        usize,
+        identity_source_bytes,
+        port_line_bytes,
+    ) catch return error.PreparedConfigTooLarge;
+    const envelope_bytes = std.math.add(usize, header_bytes, bytes.len) catch
+        return error.PreparedConfigTooLarge;
+    if (envelope_bytes > prepared_config_max_bytes) {
+        return error.PreparedConfigTooLarge;
+    }
+    const envelope = try allocator.alloc(u8, envelope_bytes);
+    defer {
+        @memset(envelope, 0);
+        allocator.free(envelope);
+    }
+    const digits = "0123456789abcdef";
+    var cursor: usize = 0;
+    @memcpy(envelope[cursor..][0..prepared_header_prefix.len], prepared_header_prefix);
+    cursor += prepared_header_prefix.len;
+    if (identity) |value| {
+        for (value.key) |byte| {
+            envelope[cursor] = digits[byte >> 4];
+            envelope[cursor + 1] = digits[byte & 0x0f];
+            cursor += 2;
+        }
+        envelope[cursor] = ':';
+        cursor += 1;
+        var revision_hex: [32]u8 = undefined;
+        const revision = value.revision.formatHex(&revision_hex);
+        @memcpy(envelope[cursor..][0..revision.len], revision);
+        cursor += revision.len;
+    } else {
+        envelope[cursor] = '-';
+        cursor += 1;
+    }
+    envelope[cursor] = '\n';
+    cursor += 1;
+    @memcpy(envelope[cursor..][0..prepared_source_prefix.len], prepared_source_prefix);
+    cursor += prepared_source_prefix.len;
+    if (source_path) |path| {
+        for (path) |byte| {
+            envelope[cursor] = digits[byte >> 4];
+            envelope[cursor + 1] = digits[byte & 0x0f];
+            cursor += 2;
+        }
+    } else {
+        envelope[cursor] = '-';
+        cursor += 1;
+    }
+    envelope[cursor] = '\n';
+    cursor += 1;
+    @memcpy(envelope[cursor..][0..prepared_port_prefix.len], prepared_port_prefix);
+    cursor += prepared_port_prefix.len;
+    if (port_override) |port| {
+        const written = std.fmt.bufPrint(envelope[cursor..], "{d}", .{port}) catch
+            return error.PreparedConfigTooLarge;
+        cursor += written.len;
+    } else {
+        envelope[cursor] = '-';
+        cursor += 1;
+    }
+    envelope[cursor] = '\n';
+    cursor += 1;
+    std.debug.assert(cursor == header_bytes);
+    @memcpy(envelope[cursor..], bytes);
+
+    var runtime = (try runtime_dir.openDefault(allocator, true)) orelse
+        return error.InvalidRuntimeDirectory;
+    errdefer runtime.deinit();
+    var key = try loadOrCreatePreparedKey(runtime);
+    defer @memset(&key, 0);
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, envelope, &key);
+    var mac_hex: [prepared_mac_hex_bytes]u8 =
+        std.fmt.bytesToHex(mac, .lower);
+    var nonce: [16]u8 = undefined;
+    compat.randomBytes(&nonce);
+    var nonce_hex: [prepared_nonce_hex_bytes]u8 =
+        std.fmt.bytesToHex(nonce, .lower);
+    const name = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}.{s}{s}",
+        .{
+            prepared_config_prefix,
+            &mac_hex,
+            &nonce_hex,
+            prepared_config_suffix,
+        },
+    );
+    std.debug.assert(name.len == prepared_name_bytes);
+    errdefer allocator.free(name);
+    try runtime.replaceFile(name, envelope);
+    errdefer runtime.deleteFile(name) catch {};
+    const path = try runtime.filePath(name);
+    return .{
+        .allocator = allocator,
+        .runtime = runtime,
+        .name = name,
+        .path = path,
+    };
 }
 
-/// 捕获 tracked daemon 的调用参数；daemon 不在运行（或命令行不可读）时返回 null。
-pub fn captureTrackedInvocation(allocator: std.mem.Allocator) !?TrackedInvocation {
-    const pid = (try readTrackedPid(allocator)) orelse return null;
-    const maybe_cmdline = rawDaemonCommandLineAlloc(allocator, pid) catch null;
-    const cmdline = maybe_cmdline orelse return null;
-    defer allocator.free(cmdline);
-    return try parseTrackedInvocationFromCmdline(allocator, pid, cmdline);
+pub fn removePreparedConfig(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse return;
+    defer runtime.deinit();
+    const parent = compat.fs.path.dirname(path) orelse return error.InvalidPreparedConfig;
+    const name = compat.fs.path.basename(path);
+    if (!std.mem.eql(u8, parent, runtime.path)) {
+        return error.InvalidPreparedConfig;
+    }
+    _ = try preparedMacFromName(name);
+    runtime.deleteFile(name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+pub fn isPreparedConfigNamespacePath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !bool {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return false;
+    defer runtime.deinit();
+    const parent = compat.fs.path.dirname(path) orelse return false;
+    const name = compat.fs.path.basename(path);
+    if (!std.mem.eql(u8, parent, runtime.path)) return false;
+    _ = preparedMacFromName(name) catch return false;
+    return true;
+}
+
+pub fn isPreparedConfigPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !bool {
+    if (!try isPreparedConfigNamespacePath(allocator, path)) return false;
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return false;
+    defer runtime.deinit();
+    const name = compat.fs.path.basename(path);
+    const file = runtime.openFile(name, .{}) catch return false;
+    defer file.close(compat.io());
+    const stat = try file.stat(compat.io());
+    return stat.kind == .file and
+        (builtin.os.tag == .windows or
+            stat.permissions.toMode() & 0o777 == 0o600);
+}
+
+pub fn readPreparedConfig(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !PreparedContent {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return error.InvalidPreparedConfig;
+    defer runtime.deinit();
+    const parent = compat.fs.path.dirname(path) orelse
+        return error.InvalidPreparedConfig;
+    const name = compat.fs.path.basename(path);
+    if (!std.mem.eql(u8, parent, runtime.path)) {
+        return error.InvalidPreparedConfig;
+    }
+    const expected_mac = try preparedMacFromName(name);
+    const file = try runtime.openFile(name, .{});
+    defer file.close(compat.io());
+    const stat = try file.stat(compat.io());
+    if (builtin.os.tag != .windows and
+        stat.permissions.toMode() & 0o777 != 0o600)
+    {
+        return error.InvalidPreparedConfig;
+    }
+    const storage = try compat.fileReadToEndAlloc(
+        file,
+        allocator,
+        prepared_config_max_bytes,
+    );
+    errdefer {
+        @memset(storage, 0);
+        allocator.free(storage);
+    }
+    var authentication_key = try readPreparedKey(runtime);
+    defer @memset(&authentication_key, 0);
+    var observed_mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(
+        &observed_mac,
+        storage,
+        &authentication_key,
+    );
+    if (!std.crypto.timing_safe.eql(
+        [32]u8,
+        expected_mac,
+        observed_mac,
+    )) {
+        return error.InvalidPreparedConfig;
+    }
+    const identity_newline = std.mem.indexOfScalar(u8, storage, '\n') orelse
+        return error.InvalidPreparedConfig;
+    const source_newline = std.mem.indexOfScalarPos(
+        u8,
+        storage,
+        identity_newline + 1,
+        '\n',
+    ) orelse return error.InvalidPreparedConfig;
+    const port_newline = std.mem.indexOfScalarPos(
+        u8,
+        storage,
+        source_newline + 1,
+        '\n',
+    ) orelse return error.InvalidPreparedConfig;
+    const header = storage[0..identity_newline];
+    if (!std.mem.startsWith(u8, header, prepared_header_prefix)) {
+        return error.InvalidPreparedConfig;
+    }
+    const encoded = header[prepared_header_prefix.len..];
+    var identity: ?runtime_descriptor.Identity = null;
+    errdefer if (identity) |value| allocator.free(value.key);
+    if (!std.mem.eql(u8, encoded, "-")) {
+        const separator = std.mem.indexOfScalar(u8, encoded, ':') orelse
+            return error.InvalidPreparedConfig;
+        if (std.mem.indexOfScalarPos(u8, encoded, separator + 1, ':') != null) {
+            return error.InvalidPreparedConfig;
+        }
+        const key_hex = encoded[0..separator];
+        const revision_hex = encoded[separator + 1 ..];
+        if (key_hex.len == 0 or key_hex.len % 2 != 0 or key_hex.len > 510) {
+            return error.InvalidPreparedConfig;
+        }
+        const key = try allocator.alloc(u8, key_hex.len / 2);
+        errdefer allocator.free(key);
+        _ = std.fmt.hexToBytes(key, key_hex) catch
+            return error.InvalidPreparedConfig;
+        if (!config_catalog.isManagedKey(key)) return error.InvalidPreparedConfig;
+        identity = .{
+            .key = key,
+            .revision = config_identity.Revision.parseHex(revision_hex) catch
+                return error.InvalidPreparedConfig,
+        };
+    }
+    const source_header = storage[identity_newline + 1 .. source_newline];
+    if (!std.mem.startsWith(u8, source_header, prepared_source_prefix)) {
+        return error.InvalidPreparedConfig;
+    }
+    const source_encoded = source_header[prepared_source_prefix.len..];
+    const source_path: ?[]u8 = if (std.mem.eql(u8, source_encoded, "-"))
+        null
+    else blk: {
+        if (source_encoded.len == 0 or source_encoded.len % 2 != 0 or
+            source_encoded.len > 8192)
+        {
+            return error.InvalidPreparedConfig;
+        }
+        const decoded_path = try allocator.alloc(u8, source_encoded.len / 2);
+        errdefer allocator.free(decoded_path);
+        _ = std.fmt.hexToBytes(decoded_path, source_encoded) catch
+            return error.InvalidPreparedConfig;
+        if (decoded_path.len == 0 or
+            std.mem.indexOfScalar(u8, decoded_path, 0) != null)
+        {
+            return error.InvalidPreparedConfig;
+        }
+        break :blk decoded_path;
+    };
+    const port_header = storage[source_newline + 1 .. port_newline];
+    if (!std.mem.startsWith(u8, port_header, prepared_port_prefix)) {
+        return error.InvalidPreparedConfig;
+    }
+    const port_encoded = port_header[prepared_port_prefix.len..];
+    const port_override: ?u16 = if (std.mem.eql(u8, port_encoded, "-"))
+        null
+    else blk: {
+        const port = std.fmt.parseInt(u16, port_encoded, 10) catch
+            return error.InvalidPreparedConfig;
+        if (port == 0) return error.InvalidPreparedConfig;
+        break :blk port;
+    };
+    return .{
+        .allocator = allocator,
+        .storage = storage,
+        .yaml = storage[port_newline + 1 ..],
+        .identity = identity,
+        .source_path = source_path,
+        .port_override = port_override,
+    };
+}
+
+pub const RuntimeInstance = struct {
+    pid: i32,
+    nonce: runtime_descriptor.Nonce,
+};
+
+pub const TrackedRuntime = struct {
+    invocation: TrackedInvocation,
+    instance: RuntimeInstance,
+
+    pub fn deinit(self: *TrackedRuntime, allocator: std.mem.Allocator) void {
+        self.invocation.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn captureTrackedRuntime(allocator: std.mem.Allocator) !?TrackedRuntime {
+    var default_store = (try runtime_descriptor.openDefault(
+        allocator,
+        false,
+    )) orelse return null;
+    defer default_store.deinit();
+    var descriptor = (try default_store.store().observe()) orelse return null;
+    defer descriptor.deinit();
+    if (!descriptor.ready or descriptor.pid > std.math.maxInt(i32)) {
+        return error.DaemonInvocationUntracked;
+    }
+    const source = descriptor.invocation orelse
+        return error.DaemonInvocationUntracked;
+    const pid: i32 = @intCast(descriptor.pid);
+    if (!try runtimeInstanceMatches(allocator, pid, descriptor.nonce)) {
+        return error.DaemonInstanceChanged;
+    }
+    const config_path: ?[]u8 = if (source.config_path) |path|
+        try allocator.dupe(u8, path)
+    else
+        null;
+    errdefer if (config_path) |path| allocator.free(path);
+    const source_path: ?[]u8 = if (source.source_path) |path|
+        try allocator.dupe(u8, path)
+    else
+        null;
+    errdefer if (source_path) |path| allocator.free(path);
+    return .{
+        .instance = .{ .pid = pid, .nonce = descriptor.nonce },
+        .invocation = .{
+            .pid = pid,
+            .foreground = source.foreground,
+            .prepared = source.prepared,
+            .config_path = config_path,
+            .source_path = source_path,
+            .port = source.port_override,
+        },
+    };
 }
 
 /// 运行时状态只信任本环境（XDG_RUNTIME_DIR）的 pid/lock 文件，绝不全局扫描
@@ -695,10 +1247,6 @@ fn rejectLiveTrackedPidAfterLockAcquire(
     {
         return error.RuntimeLockIntegrityLost;
     }
-}
-
-fn readTrackedPid(allocator: std.mem.Allocator) !?i32 {
-    return (try inspectRuntime(allocator)).pid;
 }
 
 const LockWaitOutcome = union(enum) {
@@ -1491,6 +2039,13 @@ fn clearStaleDescriptorBeforeStart(allocator: std.mem.Allocator) !void {
     const store = default_store.store();
     var descriptor = (try store.observe()) orelse return;
     defer descriptor.deinit();
+    if (descriptor.invocation) |invocation| {
+        if (invocation.prepared) {
+            const path = invocation.config_path orelse
+                return error.InvalidPreparedConfig;
+            try removePreparedConfig(allocator, path);
+        }
+    }
     var stop_name_buffer: [runtime_dir.stop_prefix.len + 32]u8 = undefined;
     const stop_name = stopRequestName(descriptor.nonce, &stop_name_buffer);
     default_store.runtime.deleteFile(stop_name) catch |err| switch (err) {
@@ -1578,12 +2133,94 @@ fn normalizeStandardDescriptors() !void {
 
 fn forwardedOverrideTimeoutMs(extra_args: []const []const u8) i64 {
     for (extra_args, 0..) |arg, index| {
-        if (!std.mem.eql(u8, arg, "--override-timeout-ms")) continue;
-        if (index + 1 >= extra_args.len) return override_timeout_ms_default;
-        return std.fmt.parseInt(i64, extra_args[index + 1], 10) catch
-            override_timeout_ms_default;
+        if (std.mem.eql(u8, arg, "--override-timeout-ms")) {
+            if (index + 1 >= extra_args.len) return override_timeout_ms_default;
+            return std.fmt.parseInt(i64, extra_args[index + 1], 10) catch
+                override_timeout_ms_default;
+        }
+        if (std.mem.startsWith(u8, arg, "--override-timeout-ms=")) {
+            return std.fmt.parseInt(
+                i64,
+                arg["--override-timeout-ms=".len..],
+                10,
+            ) catch override_timeout_ms_default;
+        }
     }
     return override_timeout_ms_default;
+}
+
+const ReplacementOps = struct {
+    context: *anyopaque,
+    stop: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        RuntimeInstance,
+    ) anyerror!void,
+    start: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        StartRequest,
+    ) anyerror!LifecycleOutcome,
+};
+
+fn replaceDaemonWithOps(
+    allocator: std.mem.Allocator,
+    target: StartRequest,
+    previous: ?PreviousRequest,
+    ops: ReplacementOps,
+) !LifecycleOutcome {
+    if (previous) |old| try ops.stop(ops.context, allocator, old.instance);
+    const target_outcome = ops.start(ops.context, allocator, target) catch |start_err| {
+        if (previous) |old| {
+            const restored = ops.start(ops.context, allocator, old.start) catch
+                return error.RestartRollbackFailed;
+            if (restored.detail != null or restored.pid == null) {
+                return error.RestartRollbackContended;
+            }
+            return error.RestartFailedRolledBack;
+        }
+        return start_err;
+    };
+    if (target_outcome.detail != null) return target_outcome;
+    if (target_outcome.pid != null) return target_outcome;
+    if (previous) |old| {
+        const restored = ops.start(ops.context, allocator, old.start) catch
+            return error.RestartRollbackFailed;
+        if (restored.detail != null or restored.pid == null) {
+            return error.RestartRollbackContended;
+        }
+        return error.RestartFailedRolledBack;
+    }
+    return error.StartFailed;
+}
+
+fn stopForReplacement(
+    _: *anyopaque,
+    allocator: std.mem.Allocator,
+    instance: RuntimeInstance,
+) !void {
+    _ = try stopDaemonInstance(allocator, instance);
+}
+
+fn startForReplacement(
+    _: *anyopaque,
+    allocator: std.mem.Allocator,
+    request: StartRequest,
+) !LifecycleOutcome {
+    return startDaemon(allocator, request.config_path, request.extra_args);
+}
+
+pub fn replaceDaemonWithRollback(
+    allocator: std.mem.Allocator,
+    target: StartRequest,
+    previous: ?PreviousRequest,
+) !LifecycleOutcome {
+    var context: u8 = 0;
+    return replaceDaemonWithOps(allocator, target, previous, .{
+        .context = &context,
+        .stop = stopForReplacement,
+        .start = startForReplacement,
+    });
 }
 
 /// 启动守护进程。只返回事实（LifecycleOutcome）或错误；envelope/文本由
@@ -1851,6 +2488,29 @@ fn removeDescriptor(
     _ = default_store.store().remove(nonce) catch return;
 }
 
+fn preparedConfigPathForInstanceAlloc(
+    allocator: std.mem.Allocator,
+    pid: i32,
+    nonce: runtime_descriptor.Nonce,
+) !?[]u8 {
+    var default_store = (try runtime_descriptor.openDefault(
+        allocator,
+        false,
+    )) orelse return null;
+    defer default_store.deinit();
+    var descriptor = (try default_store.store().observe()) orelse return null;
+    defer descriptor.deinit();
+    if (descriptor.pid != @as(u32, @intCast(pid))) return null;
+    if (!descriptor.nonce.eql(nonce)) return null;
+    const invocation = descriptor.invocation orelse return null;
+    if (!invocation.prepared) return null;
+    const path = invocation.config_path orelse return error.InvalidPreparedConfig;
+    if (!try isPreparedConfigNamespacePath(allocator, path)) {
+        return error.InvalidPreparedConfig;
+    }
+    return @as(?[]u8, try allocator.dupe(u8, path));
+}
+
 fn runtimeInstanceMatches(
     allocator: std.mem.Allocator,
     pid: i32,
@@ -1862,100 +2522,130 @@ fn runtimeInstanceMatches(
     return observed.eql(nonce);
 }
 
+fn stoppedInstanceOutcome(
+    allocator: std.mem.Allocator,
+    instance: RuntimeInstance,
+    prepared_path: ?[]const u8,
+    preserve_prepared_config: bool,
+) !?LifecycleOutcome {
+    if (try runtimeInstanceMatches(allocator, instance.pid, instance.nonce)) {
+        return null;
+    }
+    const current = try inspectRuntime(allocator);
+    if (current.lock_held) {
+        if (current.pid == null) return null;
+        const observed_nonce = descriptorNonceForPid(allocator, instance.pid);
+        if (observed_nonce) |value| {
+            if (value.eql(instance.nonce)) return null;
+        }
+        return error.DaemonInstanceChanged;
+    }
+    _ = try removePidIfMatches(allocator, instance.pid);
+    if (!preserve_prepared_config) {
+        if (prepared_path) |path| {
+            removePreparedConfig(allocator, path) catch
+                return error.DaemonPreparedCleanupFailed;
+        }
+    }
+    removeDescriptor(allocator, instance.nonce);
+    return .{ .pid = instance.pid };
+}
+
 /// 停止守护进程。只返回事实（LifecycleOutcome）或错误；envelope/文本由
 /// main.zig 经 cli/output.zig 恰好打印一次。
 pub fn stopDaemon(allocator: std.mem.Allocator) !LifecycleOutcome {
+    return stopDaemonExpected(allocator, null, false);
+}
+
+pub fn stopDaemonInstance(
+    allocator: std.mem.Allocator,
+    expected: RuntimeInstance,
+) !LifecycleOutcome {
+    return stopDaemonExpected(allocator, expected, true);
+}
+
+fn stopDaemonExpected(
+    allocator: std.mem.Allocator,
+    expected: ?RuntimeInstance,
+    preserve_prepared_config: bool,
+) !LifecycleOutcome {
     const runtime = try inspectRuntime(allocator);
     const pid = runtime.pid orelse {
+        if (expected != null) return error.DaemonInstanceChanged;
         if (runtime.lock_held) return error.DaemonPidUntracked;
         return .{ .detail = "already_stopped" };
     };
+    if (expected) |instance| {
+        if (instance.pid != pid) return error.DaemonInstanceChanged;
+    }
     const nonce = descriptorNonceForPid(allocator, pid) orelse
         return error.DaemonPidUntracked;
+    if (expected) |instance| {
+        if (!instance.nonce.eql(nonce)) return error.DaemonInstanceChanged;
+    }
     if (!try runtimeInstanceMatches(allocator, pid, nonce)) {
         return error.DaemonInstanceChanged;
     }
-    try publishStopRequest(allocator, nonce);
+    const prepared_path = try preparedConfigPathForInstanceAlloc(
+        allocator,
+        pid,
+        nonce,
+    );
+    defer if (prepared_path) |path| allocator.free(path);
+    const instance: RuntimeInstance = .{ .pid = pid, .nonce = nonce };
+    var stop_request_armed = true;
+    defer if (stop_request_armed) {
+        _ = removeStopRequest(allocator, nonce) catch false;
+    };
+    publishStopRequest(allocator, nonce) catch |publish_error| {
+        const request_removed = removeStopRequest(allocator, nonce) catch
+            return error.DaemonStopRequestCleanupFailed;
+        stop_request_armed = false;
+        if (!request_removed) {
+            var settle_attempt: u8 = 0;
+            while (settle_attempt < 10) : (settle_attempt += 1) {
+                compat.sleepNs(100 * std.time.ns_per_ms);
+                if (try stoppedInstanceOutcome(
+                    allocator,
+                    instance,
+                    prepared_path,
+                    preserve_prepared_config,
+                )) |outcome| return outcome;
+            }
+        }
+        return publish_error;
+    };
 
     var attempt: u8 = 0;
     while (attempt < 50) : (attempt += 1) {
         compat.sleepNs(100 * std.time.ns_per_ms);
-        if (!try runtimeInstanceMatches(allocator, pid, nonce)) {
-            const current = try inspectRuntime(allocator);
-            if (current.lock_held) return error.DaemonInstanceChanged;
-            _ = try removePidIfMatches(allocator, pid);
-            removeDescriptor(allocator, nonce);
-            return .{ .pid = pid };
+        if (try stoppedInstanceOutcome(
+            allocator,
+            instance,
+            prepared_path,
+            preserve_prepared_config,
+        )) |outcome| return outcome;
+    }
+    const request_removed = removeStopRequest(allocator, nonce) catch
+        return error.DaemonStopRequestCleanupFailed;
+    stop_request_armed = false;
+    if (!request_removed) {
+        attempt = 0;
+        while (attempt < 10) : (attempt += 1) {
+            compat.sleepNs(100 * std.time.ns_per_ms);
+            if (try stoppedInstanceOutcome(
+                allocator,
+                instance,
+                prepared_path,
+                preserve_prepared_config,
+            )) |outcome| return outcome;
         }
     }
     return error.DaemonStopTimeout;
 }
 
-/// 静默重启：供 reloadOrRestart（config update / config override / zc reload）
-/// 使用，不产生任何 CLI 输出，调用方负责唯一的 envelope。
-///
-/// 保留旧 daemon 的 `-c`/`--port` 启动参数：否则 fallback restart 会把端口
-/// 打回默认 mixed-port，绑定失败时旧 daemon 已被杀死、新 daemon 起不来。
-/// 受监管的前台 daemon（`start --foreground`，systemd/容器 PID 1）绝不接管：
-/// 杀掉它会让监管者陷入 respawn/锁竞争循环，直接拒绝。
-fn restartDaemonQuiet(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
-    var preserved: ?TrackedInvocation = null;
-    defer if (preserved) |*inv| inv.deinit(allocator);
-
-    if (try isRunning(allocator)) {
-        preserved = captureTrackedInvocation(allocator) catch null;
-        if (preserved) |inv| {
-            if (inv.foreground) return error.ForegroundDaemonSupervised;
-        }
-        _ = try stopDaemon(allocator);
-    }
-
-    const effective_config: ?[]const u8 = config_path orelse
-        (if (preserved) |inv| inv.config_path else null);
-
-    var port_buf: [32]u8 = undefined;
-    var extra_storage: [1][]const u8 = undefined;
-    var extra_args: []const []const u8 = &.{};
-    if (preserved) |inv| {
-        if (inv.port) |port| {
-            extra_storage[0] = try std.fmt.bufPrint(&port_buf, "--port={d}", .{port});
-            extra_args = extra_storage[0..1];
-        }
-    }
-
-    const outcome = try startDaemon(allocator, effective_config, extra_args);
-    if (outcome.detail != null) return error.RestartContended;
-    if ((try readTrackedPid(allocator)) == null) {
-        return error.StartFailed;
-    }
-}
-
 pub fn reloadDaemon(_: std.mem.Allocator, _: ?[]const u8) !void {
     return error.HotReloadUnsupported;
-}
-
-pub fn reloadOrRestart(allocator: std.mem.Allocator, config_path: ?[]const u8, apply_mode: ApplyMode) !ApplyResult {
-    if (!try isRunning(allocator)) {
-        return .hot_applied;
-    }
-
-    switch (apply_mode) {
-        .restart => {
-            try restartDaemonQuiet(allocator, config_path);
-            return .restart_applied;
-        },
-        .hot => {
-            try reloadDaemon(allocator, config_path);
-            return .hot_applied;
-        },
-        .auto => {
-            reloadDaemon(allocator, config_path) catch {
-                try restartDaemonQuiet(allocator, config_path);
-                return .restart_fallback;
-            };
-            return .hot_applied;
-        },
-    }
 }
 
 /// 获取状态并经 cli/output.zig 渲染（stdout）。
@@ -2321,10 +3011,34 @@ fn testPidNeverMatchesDaemon(_: std.mem.Allocator, _: i32) !bool {
     return false;
 }
 
+fn testPidAlwaysMatchesDaemon(_: std.mem.Allocator, _: i32) !bool {
+    return true;
+}
+
 fn testTmpRootAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
     const cwd = try std.process.currentPathAlloc(compat.io(), allocator);
     defer allocator.free(cwd);
     return try compat.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+}
+
+test "provisional descriptor remains startup in progress until ready" {
+    const allocator = std.testing.allocator;
+    const lock = try acquireDaemonLockFile(allocator);
+    defer lock.close(compat.io());
+    try clearStaleDescriptorBeforeStart(allocator);
+    const nonce = runtime_descriptor.Nonce.generate();
+    try publishStartupReservation(allocator, nonce, std.c.getpid());
+    try writePid(allocator, std.c.getpid());
+    defer {
+        _ = removePidIfMatches(allocator, std.c.getpid()) catch false;
+        removeDescriptor(allocator, nonce);
+    }
+    const runtime = try inspectRuntimeWithInspector(allocator, .{
+        .pid_is_daemon = testPidAlwaysMatchesDaemon,
+    });
+    try std.testing.expect(runtime.pid == null);
+    try std.testing.expect(runtime.lock_held);
+    try std.testing.expectEqualStrings("startup_in_progress", runtime.detail.?);
 }
 
 test "daemon lock prevents duplicate acquisition and can be reacquired after close" {
@@ -2539,6 +3253,46 @@ test "collectStatusSnapshot reports running when lock is held but pid is untrack
     try std.testing.expect(snapshot.active_config == null);
 }
 
+test "prepared config roundtrip preserves exact managed identity" {
+    const allocator = std.testing.allocator;
+    const identity: runtime_descriptor.Identity = .{
+        .key = "managed-profile",
+        .revision = try config_identity.Revision.parseHex(
+            "00112233445566778899aabbccddeeff",
+        ),
+    };
+    var published = try publishPreparedConfig(
+        allocator,
+        "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n",
+        identity,
+        "/tmp/source.yaml",
+        29090,
+    );
+    defer published.deinit();
+    var content = try readPreparedConfig(allocator, published.path);
+    try std.testing.expectEqualStrings(
+        "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n",
+        content.yaml,
+    );
+    try std.testing.expectEqualStrings(
+        identity.key,
+        content.identity.?.key,
+    );
+    try std.testing.expect(identity.revision.eql(content.identity.?.revision));
+    try std.testing.expectEqualStrings(
+        "/tmp/source.yaml",
+        content.source_path.?,
+    );
+    try std.testing.expectEqual(@as(?u16, 29090), content.port_override);
+    content.deinit();
+
+    try published.runtime.replaceFile(published.name, "tampered\n");
+    try std.testing.expectError(
+        error.InvalidPreparedConfig,
+        readPreparedConfig(allocator, published.path),
+    );
+}
+
 test "commandLineLooksLikeDaemon requires zc daemon-run invocation" {
     try std.testing.expect(commandLineLooksLikeDaemon("/Users/like/.local/bin/zc --daemon-run -c /tmp/demo.yaml"));
     try std.testing.expect(!commandLineLooksLikeDaemon("/Users/like/.local/bin/zc status"));
@@ -2562,34 +3316,90 @@ test "cmdlineBufferLooksLikeDaemon parses nul-separated argv" {
     try std.testing.expect(!cmdlineBufferLooksLikeDaemon(cli_cmdline));
 }
 
-test "parseTrackedInvocationFromCmdline extracts -c/--port/--foreground" {
-    const allocator = std.testing.allocator;
-
-    var bg = try parseTrackedInvocationFromCmdline(
-        allocator,
-        4321,
-        "/Users/like/.local/bin/zc --daemon-run -c /tmp/demo.yaml --port=29101",
+test "forwarded override timeout accepts split and equals forms" {
+    try std.testing.expectEqual(
+        @as(i64, 12_000),
+        forwardedOverrideTimeoutMs(&.{ "--override-timeout-ms", "12000" }),
     );
-    defer bg.deinit(allocator);
-    try std.testing.expect(!bg.foreground);
-    try std.testing.expectEqualStrings("/tmp/demo.yaml", bg.config_path.?);
-    try std.testing.expectEqual(@as(?u16, 29101), bg.port);
-
-    var fg = try parseTrackedInvocationFromCmdline(
-        allocator,
-        1,
-        "/usr/local/bin/zclash\x00start\x00--foreground\x00--port\x007901\x00",
+    try std.testing.expectEqual(
+        @as(i64, 15_000),
+        forwardedOverrideTimeoutMs(&.{"--override-timeout-ms=15000"}),
     );
-    defer fg.deinit(allocator);
-    try std.testing.expect(fg.foreground);
-    try std.testing.expect(fg.config_path == null);
-    try std.testing.expectEqual(@as(?u16, 7901), fg.port);
+}
 
-    var bare = try parseTrackedInvocationFromCmdline(allocator, 7, "/usr/bin/zc --daemon-run");
-    defer bare.deinit(allocator);
-    try std.testing.expect(!bare.foreground);
-    try std.testing.expect(bare.config_path == null);
-    try std.testing.expect(bare.port == null);
+test "daemon replacement restores the previous invocation after target failure" {
+    const Fake = struct {
+        const Context = struct {
+            events: [3]u8 = undefined,
+            event_count: usize = 0,
+            rollback_fails: bool = false,
+        };
+
+        fn record(context: *Context, event: u8) void {
+            context.events[context.event_count] = event;
+            context.event_count += 1;
+        }
+
+        fn stop(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: RuntimeInstance,
+        ) !void {
+            const context: *Context = @ptrCast(@alignCast(raw));
+            record(context, 'S');
+        }
+
+        fn start(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            request: StartRequest,
+        ) !LifecycleOutcome {
+            const context: *Context = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, request.config_path.?, "new")) {
+                record(context, 'N');
+                return error.InjectedTargetFailure;
+            }
+            record(context, 'O');
+            if (context.rollback_fails) return error.InjectedRollbackFailure;
+            return .{ .pid = 42 };
+        }
+    };
+
+    var restored = Fake.Context{};
+    try std.testing.expectError(
+        error.RestartFailedRolledBack,
+        replaceDaemonWithOps(
+            std.testing.allocator,
+            .{ .config_path = "new", .extra_args = &.{} },
+            .{
+                .start = .{ .config_path = "old", .extra_args = &.{} },
+                .instance = .{
+                    .pid = 7,
+                    .nonce = .{ .bytes = .{0} ** 16 },
+                },
+            },
+            .{ .context = &restored, .stop = Fake.stop, .start = Fake.start },
+        ),
+    );
+    try std.testing.expectEqualStrings("SNO", restored.events[0..restored.event_count]);
+
+    var failed = Fake.Context{ .rollback_fails = true };
+    try std.testing.expectError(
+        error.RestartRollbackFailed,
+        replaceDaemonWithOps(
+            std.testing.allocator,
+            .{ .config_path = "new", .extra_args = &.{} },
+            .{
+                .start = .{ .config_path = "old", .extra_args = &.{} },
+                .instance = .{
+                    .pid = 7,
+                    .nonce = .{ .bytes = .{0} ** 16 },
+                },
+            },
+            .{ .context = &failed, .stop = Fake.stop, .start = Fake.start },
+        ),
+    );
+    try std.testing.expectEqualStrings("SNO", failed.events[0..failed.event_count]);
 }
 
 test "tailLinesSlice returns whole content when fewer than n lines" {

@@ -30,7 +30,7 @@ When setting override:
 - the active profile and authority token are bound before materialization; a concurrent `config use` or head change fails with a retryable conflict
 - the candidate is parsed and validated offline before the profile head advances
 - the original script file is no longer required after a successful commit
-- if the daemon is running, config is auto-applied (`auto`: try hot, fallback restart)
+- if the daemon is running, the exact committed revision is auto-applied (`auto`: try hot, fallback to an instance-bound prepared restart)
 
 When clearing override, a new revision is published from the unchanged source bytes without the frozen override. Existing immutable revisions remain available for exact identity checks.
 

@@ -686,6 +686,7 @@ pub const ApiServer = struct {
                 .identity = identity,
                 .generation = request.generation,
                 .ready = descriptor.ready,
+                .invocation = descriptor.invocation,
             });
             switch (outcome) {
                 .committed, .durability_uncertain => return transaction.commit(),

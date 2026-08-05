@@ -53,6 +53,13 @@ pub const Nonce = struct {
 };
 
 pub const Identity = config_identity.ManagedIdentity;
+pub const InvocationInput = struct {
+    foreground: bool,
+    prepared: bool,
+    config_path: ?[]const u8,
+    source_path: ?[]const u8 = null,
+    port_override: ?u16 = null,
+};
 pub const DescriptorInput = struct {
     pid: u32,
     nonce: Nonce,
@@ -60,6 +67,7 @@ pub const DescriptorInput = struct {
     identity: ?Identity = null,
     generation: u64 = 0,
     ready: bool = true,
+    invocation: ?InvocationInput = null,
 };
 pub const Descriptor = struct {
     allocator: std.mem.Allocator,
@@ -69,10 +77,15 @@ pub const Descriptor = struct {
     identity: ?Identity,
     generation: u64,
     ready: bool,
+    invocation: ?InvocationInput,
 
     pub fn deinit(self: *Descriptor) void {
         if (self.endpoint) |value| self.allocator.free(value);
         if (self.identity) |value| self.allocator.free(value.key);
+        if (self.invocation) |value| {
+            if (value.config_path) |path| self.allocator.free(path);
+            if (value.source_path) |path| self.allocator.free(path);
+        }
         self.* = undefined;
     }
 };
@@ -98,6 +111,13 @@ pub const RemoveOutcome = union(enum) {
 };
 
 const DiskIdentity = struct { key: []const u8, revision: []const u8 };
+const DiskInvocation = struct {
+    foreground: bool,
+    prepared: bool,
+    config_path: ?[]const u8,
+    source_path: ?[]const u8,
+    port_override: ?u16,
+};
 const DiskDescriptor = struct {
     schema_version: u32,
     pid: u32,
@@ -106,6 +126,7 @@ const DiskDescriptor = struct {
     identity: ?DiskIdentity,
     generation: u64,
     ready: bool,
+    invocation: ?DiskInvocation,
 };
 
 pub const DefaultStore = struct {
@@ -274,11 +295,36 @@ fn validateInput(input: DescriptorInput) !void {
     if (input.identity) |value| {
         if (!config_catalog.isManagedKey(value.key)) return error.InvalidRuntimeDescriptor;
     } else if (input.generation != 0) return error.InvalidRuntimeDescriptor;
+    if (input.invocation) |invocation| {
+        if (invocation.prepared and invocation.foreground) {
+            return error.InvalidRuntimeDescriptor;
+        }
+        if (invocation.prepared and invocation.config_path == null) {
+            return error.InvalidRuntimeDescriptor;
+        }
+        if (invocation.config_path) |path| {
+            if (path.len == 0 or path.len > 4096 or
+                std.mem.indexOfScalar(u8, path, 0) != null)
+            {
+                return error.InvalidRuntimeDescriptor;
+            }
+        }
+        if (invocation.source_path) |path| {
+            if (path.len == 0 or path.len > 4096 or
+                std.mem.indexOfScalar(u8, path, 0) != null)
+            {
+                return error.InvalidRuntimeDescriptor;
+            }
+        }
+        if (invocation.port_override) |port| {
+            if (port == 0) return error.InvalidRuntimeDescriptor;
+        }
+    }
 }
 
 fn diskValue(input: DescriptorInput, nonce_hex: *[32]u8, revision_hex: *[32]u8) DiskDescriptor {
     return .{
-        .schema_version = 1,
+        .schema_version = 2,
         .pid = input.pid,
         .nonce = input.nonce.formatHex(nonce_hex),
         .endpoint = input.endpoint,
@@ -288,6 +334,13 @@ fn diskValue(input: DescriptorInput, nonce_hex: *[32]u8, revision_hex: *[32]u8) 
         } else null,
         .generation = input.generation,
         .ready = input.ready,
+        .invocation = if (input.invocation) |invocation| .{
+            .foreground = invocation.foreground,
+            .prepared = invocation.prepared,
+            .config_path = invocation.config_path,
+            .source_path = invocation.source_path,
+            .port_override = invocation.port_override,
+        } else null,
     };
 }
 
@@ -319,7 +372,7 @@ fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Descriptor {
     };
     defer parsed.deinit();
     const disk = parsed.value;
-    if (disk.schema_version != 1) return error.CorruptRuntimeDescriptor;
+    if (disk.schema_version != 2) return error.CorruptRuntimeDescriptor;
     const value: DescriptorInput = .{
         .pid = disk.pid,
         .nonce = Nonce.parseHex(disk.nonce) catch return error.CorruptRuntimeDescriptor,
@@ -331,6 +384,13 @@ fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Descriptor {
         } else null,
         .generation = disk.generation,
         .ready = disk.ready,
+        .invocation = if (disk.invocation) |invocation| .{
+            .foreground = invocation.foreground,
+            .prepared = invocation.prepared,
+            .config_path = invocation.config_path,
+            .source_path = invocation.source_path,
+            .port_override = invocation.port_override,
+        } else null,
     };
     validateInput(value) catch return error.CorruptRuntimeDescriptor;
     const canonical = try encode(allocator, value);
@@ -345,6 +405,23 @@ fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Descriptor {
         .key = try allocator.dupe(u8, item.key),
         .revision = item.revision,
     } else null;
+    errdefer if (identity) |item| allocator.free(item.key);
+    const invocation_config_path: ?[]u8 = if (value.invocation) |item|
+        if (item.config_path) |path| try allocator.dupe(u8, path) else null
+    else
+        null;
+    errdefer if (invocation_config_path) |path| allocator.free(path);
+    const invocation_source_path: ?[]u8 = if (value.invocation) |item|
+        if (item.source_path) |path| try allocator.dupe(u8, path) else null
+    else
+        null;
+    const invocation: ?InvocationInput = if (value.invocation) |item| .{
+        .foreground = item.foreground,
+        .prepared = item.prepared,
+        .config_path = invocation_config_path,
+        .source_path = invocation_source_path,
+        .port_override = item.port_override,
+    } else null;
     return .{
         .allocator = allocator,
         .pid = value.pid,
@@ -353,6 +430,7 @@ fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Descriptor {
         .identity = identity,
         .generation = value.generation,
         .ready = value.ready,
+        .invocation = invocation,
     };
 }
 

@@ -1167,8 +1167,13 @@ test "integration: provisional startup is not reported as running" {
     defer first.kill(compat.io());
 
     var saw_provisional = false;
+    var provisional_pid: ?i32 = null;
+    var daemon_paused = false;
+    defer if (daemon_paused) {
+        std.posix.kill(provisional_pid.?, std.posix.SIG.CONT) catch {};
+    };
     var attempt: u8 = 0;
-    while (attempt < 40) : (attempt += 1) {
+    while (attempt < 120) : (attempt += 1) {
         const bytes = tmp.dir.readFileAlloc(
             compat.io(),
             "run/zc.daemon.json",
@@ -1190,24 +1195,33 @@ test "integration: provisional startup is not reported as running" {
         );
         defer descriptor.deinit();
         if (!descriptor.value.object.get("ready").?.bool) {
+            const pid_value = descriptor.value.object.get("pid").?.integer;
+            if (pid_value <= 0 or pid_value > std.math.maxInt(i32)) {
+                return error.TestUnexpectedResult;
+            }
+            provisional_pid = @intCast(pid_value);
+            try std.posix.kill(provisional_pid.?, std.posix.SIG.STOP);
+            daemon_paused = true;
             saw_provisional = true;
             break;
         }
     }
-    try std.testing.expect(saw_provisional);
-
-    const status = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "status", "--json" },
-        .environ_map = &environment,
-        .stdout_limit = .limited(max_output),
-        .stderr_limit = .limited(max_output),
-    });
-    defer allocator.free(status.stdout);
-    defer allocator.free(status.stderr);
-    try std.testing.expectEqual(@as(u8, 1), try exitCode(status.term));
-    var status_envelope = try parseEnvelope(allocator, status.stdout);
-    defer status_envelope.deinit();
-    try expectErrorEnvelope(status_envelope.value, "status", "STATUS_FAILED");
+    if (saw_provisional) {
+        const status = try std.process.run(allocator, compat.io(), .{
+            .argv = &.{ zc_binary, "status", "--json" },
+            .environ_map = &environment,
+            .stdout_limit = .limited(max_output),
+            .stderr_limit = .limited(max_output),
+        });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+        try std.testing.expectEqual(@as(u8, 1), try exitCode(status.term));
+        var status_envelope = try parseEnvelope(allocator, status.stdout);
+        defer status_envelope.deinit();
+        try expectErrorEnvelope(status_envelope.value, "status", "STATUS_FAILED");
+        try std.posix.kill(provisional_pid.?, std.posix.SIG.CONT);
+        daemon_paused = false;
+    }
 
     const concurrent = try std.process.run(allocator, compat.io(), .{
         .argv = &start_argv,
@@ -1231,6 +1245,681 @@ test "integration: provisional startup is not reported as running" {
     try std.testing.expectEqual(@as(u8, 0), try exitCode(try first.wait(compat.io())));
     const ready = try connectController(mixed_port);
     ready.close();
+}
+
+test "integration: restart preparation failure keeps the old daemon running" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const old_path = try compat.fs.path.join(allocator, &.{ root, "old.yaml" });
+    defer allocator.free(old_path);
+    const target_path = try compat.fs.path.join(allocator, &.{ root, "target.yaml" });
+    defer allocator.free(target_path);
+    const old_port = try reserveClosedPort();
+    var target_port = try reserveClosedPort();
+    while (target_port == old_port) target_port = try reserveClosedPort();
+    var unavailable_port = try reserveClosedPort();
+    while (unavailable_port == old_port or unavailable_port == target_port) {
+        unavailable_port = try reserveClosedPort();
+    }
+    const old_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nproxies:\n  - name: DIRECT\n    type: direct\nrules:\n  - MATCH,DIRECT\n",
+        .{old_port},
+    );
+    defer allocator.free(old_source);
+    const target_source = try std.fmt.allocPrint(
+        allocator,
+        \\mixed-port: {d}
+        \\rule-providers:
+        \\  remote:
+        \\    type: http
+        \\    behavior: domain
+        \\    url: http://127.0.0.1:{d}/rules.yaml
+        \\    path: remote.yaml
+        \\rules:
+        \\  - RULE-SET,remote,DIRECT
+        \\  - MATCH,DIRECT
+        \\
+    ,
+        .{ target_port, unavailable_port },
+    );
+    defer allocator.free(target_source);
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "old.yaml", .data = old_source });
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "target.yaml", .data = target_source });
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+
+    const started = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", old_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(started.stdout);
+    defer allocator.free(started.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(started.term));
+    var start_envelope = try parseEnvelope(allocator, started.stdout);
+    defer start_envelope.deinit();
+    const old_pid = start_envelope.value.object.get("data").?.object.get("pid").?.integer;
+
+    const restarted = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "restart", "-c", target_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(restarted.stdout);
+    defer allocator.free(restarted.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(restarted.term));
+
+    const status = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "status", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(status.term));
+    var status_envelope = try parseEnvelope(allocator, status.stdout);
+    defer status_envelope.deinit();
+    try std.testing.expectEqual(
+        old_pid,
+        status_envelope.value.object.get("data").?.object.get("pid").?.integer,
+    );
+    const old_listener = try connectController(old_port);
+    old_listener.close();
+}
+
+test "integration: restart never stops a daemon that replaced its captured instance" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const first_path = try compat.fs.path.join(allocator, &.{ root, "first.yaml" });
+    defer allocator.free(first_path);
+    const second_path = try compat.fs.path.join(allocator, &.{ root, "second.yaml" });
+    defer allocator.free(second_path);
+    const target_path = try compat.fs.path.join(allocator, &.{ root, "target.yaml" });
+    defer allocator.free(target_path);
+    const script_path = try compat.fs.path.join(allocator, &.{ root, "slow.sh" });
+    defer allocator.free(script_path);
+    const marker_path = try compat.fs.path.join(allocator, &.{ root, "entered" });
+    defer allocator.free(marker_path);
+    const first_port = try reserveClosedPort();
+    var second_port = try reserveClosedPort();
+    while (second_port == first_port) second_port = try reserveClosedPort();
+    var target_port = try reserveClosedPort();
+    while (target_port == first_port or target_port == second_port) {
+        target_port = try reserveClosedPort();
+    }
+    const first_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{first_port},
+    );
+    defer allocator.free(first_source);
+    const second_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{second_port},
+    );
+    defer allocator.free(second_source);
+    const target_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{target_port},
+    );
+    defer allocator.free(target_source);
+    const script_source = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\ntouch \"{s}\"\nsleep 3\nprintf '{{}}\\n'\n",
+        .{marker_path},
+    );
+    defer allocator.free(script_source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "first.yaml",
+        .data = first_source,
+    });
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "second.yaml",
+        .data = second_source,
+    });
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "target.yaml",
+        .data = target_source,
+    });
+    const script = try tmp.dir.createFile(compat.io(), "slow.sh", .{
+        .permissions = std.Io.File.Permissions.fromMode(0o700),
+    });
+    try compat.fileWriteAll(script, script_source);
+    script.close(compat.io());
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+
+    const first = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", first_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(first.stdout);
+    defer allocator.free(first.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(first.term));
+
+    const restart_argv = [_][]const u8{
+        zc_binary,
+        "restart",
+        "-c",
+        target_path,
+        "--override-script",
+        script_path,
+        "--json",
+    };
+    var restart = try std.process.spawn(compat.io(), .{
+        .argv = &restart_argv,
+        .environ_map = &environment,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    var restart_running = true;
+    defer if (restart_running) restart.kill(compat.io());
+    var marker_seen = false;
+    var attempt: u8 = 0;
+    while (attempt < 80) : (attempt += 1) {
+        tmp.dir.access(compat.io(), "entered", .{}) catch {
+            compat.sleepNs(25 * std.time.ns_per_ms);
+            continue;
+        };
+        marker_seen = true;
+        break;
+    }
+    try std.testing.expect(marker_seen);
+
+    const stopped = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "stop", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(stopped.stdout);
+    defer allocator.free(stopped.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(stopped.term));
+    const second = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", second_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(second.stdout);
+    defer allocator.free(second.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(second.term));
+    var second_envelope = try parseEnvelope(allocator, second.stdout);
+    defer second_envelope.deinit();
+    const second_pid = second_envelope.value.object.get("data").?.object.get("pid").?.integer;
+
+    const restart_term = try restart.wait(compat.io());
+    restart_running = false;
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(restart_term));
+    const status = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "status", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(status.term));
+    var status_envelope = try parseEnvelope(allocator, status.stdout);
+    defer status_envelope.deinit();
+    try std.testing.expectEqual(
+        second_pid,
+        status_envelope.value.object.get("data").?.object.get("pid").?.integer,
+    );
+    const second_listener = try connectController(second_port);
+    second_listener.close();
+}
+
+test "integration: restart child uses the immutable parent-prepared config" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const old_path = try compat.fs.path.join(allocator, &.{ root, "old.yaml" });
+    defer allocator.free(old_path);
+    const target_path = try compat.fs.path.join(allocator, &.{ root, "target.yaml" });
+    defer allocator.free(target_path);
+    const script_path = try compat.fs.path.join(allocator, &.{ root, "slow.sh" });
+    defer allocator.free(script_path);
+    const marker_path = try compat.fs.path.join(allocator, &.{ root, "entered" });
+    defer allocator.free(marker_path);
+    const old_port = try reserveClosedPort();
+    var prepared_port = try reserveClosedPort();
+    while (prepared_port == old_port) prepared_port = try reserveClosedPort();
+    var mutated_port = try reserveClosedPort();
+    while (mutated_port == old_port or mutated_port == prepared_port) {
+        mutated_port = try reserveClosedPort();
+    }
+    const old_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{old_port},
+    );
+    defer allocator.free(old_source);
+    const prepared_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{prepared_port},
+    );
+    defer allocator.free(prepared_source);
+    const mutated_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{mutated_port},
+    );
+    defer allocator.free(mutated_source);
+    const script_source = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\ntouch \"{s}\"\nsleep 2\nprintf '{{}}\\n'\n",
+        .{marker_path},
+    );
+    defer allocator.free(script_source);
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "old.yaml", .data = old_source });
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "target.yaml",
+        .data = prepared_source,
+    });
+    const script = try tmp.dir.createFile(compat.io(), "slow.sh", .{
+        .permissions = std.Io.File.Permissions.fromMode(0o700),
+    });
+    try compat.fileWriteAll(script, script_source);
+    script.close(compat.io());
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+    const started = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", old_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(started.stdout);
+    defer allocator.free(started.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(started.term));
+
+    const restart_argv = [_][]const u8{
+        zc_binary,
+        "restart",
+        "-c",
+        target_path,
+        "--override-script",
+        script_path,
+        "--json",
+    };
+    var restart = try std.process.spawn(compat.io(), .{
+        .argv = &restart_argv,
+        .environ_map = &environment,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    var restart_running = true;
+    defer if (restart_running) restart.kill(compat.io());
+    var marker_seen = false;
+    var attempt: u8 = 0;
+    while (attempt < 80) : (attempt += 1) {
+        tmp.dir.access(compat.io(), "entered", .{}) catch {
+            compat.sleepNs(25 * std.time.ns_per_ms);
+            continue;
+        };
+        marker_seen = true;
+        break;
+    }
+    try std.testing.expect(marker_seen);
+    const old_listener = try connectController(old_port);
+    old_listener.close();
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "target.yaml",
+        .data = mutated_source,
+    });
+
+    const restart_term = try restart.wait(compat.io());
+    restart_running = false;
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(restart_term));
+    const prepared_listener = try connectController(prepared_port);
+    prepared_listener.close();
+    const reloaded = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "reload", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(reloaded.stdout);
+    defer allocator.free(reloaded.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(reloaded.term));
+    const reloaded_listener = try connectController(mutated_port);
+    reloaded_listener.close();
+    if (connectController(prepared_port)) |unexpected| {
+        unexpected.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    var override_port = try reserveClosedPort();
+    while (override_port == old_port or override_port == prepared_port or
+        override_port == mutated_port)
+    {
+        override_port = try reserveClosedPort();
+    }
+    var later_source_port = try reserveClosedPort();
+    while (later_source_port == old_port or later_source_port == prepared_port or
+        later_source_port == mutated_port or later_source_port == override_port)
+    {
+        later_source_port = try reserveClosedPort();
+    }
+    var override_port_text: [5]u8 = undefined;
+    const override_port_arg = try std.fmt.bufPrint(
+        &override_port_text,
+        "{d}",
+        .{override_port},
+    );
+    const port_restart = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "restart", "--port", override_port_arg, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(port_restart.stdout);
+    defer allocator.free(port_restart.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(port_restart.term));
+    const override_listener = try connectController(override_port);
+    override_listener.close();
+    const later_source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{later_source_port},
+    );
+    defer allocator.free(later_source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "target.yaml",
+        .data = later_source,
+    });
+    const second_reload = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "reload", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(second_reload.stdout);
+    defer allocator.free(second_reload.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(second_reload.term));
+    const preserved_override = try connectController(override_port);
+    preserved_override.close();
+    if (connectController(later_source_port)) |unexpected| {
+        unexpected.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "integration: timed out stop is disarmed before the daemon resumes" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const config_path = try compat.fs.path.join(allocator, &.{ root, "config.yaml" });
+    defer allocator.free(config_path);
+    const port = try reserveClosedPort();
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{port},
+    );
+    defer allocator.free(source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "config.yaml",
+        .data = source,
+    });
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+    const started = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(started.stdout);
+    defer allocator.free(started.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(started.term));
+    var start_envelope = try parseEnvelope(allocator, started.stdout);
+    defer start_envelope.deinit();
+    const pid_value = start_envelope.value.object.get("data").?.object.get("pid").?.integer;
+    if (pid_value <= 0 or pid_value > std.math.maxInt(i32)) {
+        return error.TestUnexpectedResult;
+    }
+    const pid: i32 = @intCast(pid_value);
+    try std.posix.kill(pid, std.posix.SIG.STOP);
+    var daemon_paused = true;
+    defer if (daemon_paused) std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+
+    const stopped = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "stop", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(10),
+        } },
+    });
+    defer allocator.free(stopped.stdout);
+    defer allocator.free(stopped.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(stopped.term));
+    var stop_envelope = try parseEnvelope(allocator, stopped.stdout);
+    defer stop_envelope.deinit();
+    try expectErrorEnvelope(stop_envelope.value, "stop", "STOP_TIMEOUT");
+    var iterator = runtime_handle.iterate();
+    while (try iterator.next(compat.io())) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, "zc.stop."));
+    }
+
+    try std.posix.kill(pid, std.posix.SIG.CONT);
+    daemon_paused = false;
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    const status = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "status", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(status.term));
+    const listener = try connectController(port);
+    listener.close();
+}
+
+test "integration: startup removes the exact snapshot left by a crashed daemon" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const config_path = try compat.fs.path.join(allocator, &.{ root, "config.yaml" });
+    defer allocator.free(config_path);
+    const port = try reserveClosedPort();
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nsecret: crash-secret\nrules:\n  - MATCH,DIRECT\n",
+        .{port},
+    );
+    defer allocator.free(source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "config.yaml",
+        .data = source,
+    });
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+
+    const first = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(first.stdout);
+    defer allocator.free(first.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(first.term));
+    var first_envelope = try parseEnvelope(allocator, first.stdout);
+    defer first_envelope.deinit();
+    const pid_value = first_envelope.value.object.get("data").?.object.get("pid").?.integer;
+    if (pid_value <= 0 or pid_value > std.math.maxInt(i32)) {
+        return error.TestUnexpectedResult;
+    }
+    const pid: i32 = @intCast(pid_value);
+    const descriptor_bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "run/zc.daemon.json",
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(descriptor_bytes);
+    var descriptor = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        descriptor_bytes,
+        .{},
+    );
+    defer descriptor.deinit();
+    const old_snapshot = try allocator.dupe(
+        u8,
+        descriptor.value.object.get("invocation").?.object.get(
+            "config_path",
+        ).?.string,
+    );
+    defer allocator.free(old_snapshot);
+    try std.posix.kill(pid, std.posix.SIG.KILL);
+    compat.sleepNs(100 * std.time.ns_per_ms);
+
+    const second = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(second.stdout);
+    defer allocator.free(second.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(second.term));
+    try std.testing.expectError(
+        error.FileNotFound,
+        compat.fs.accessAbsolute(old_snapshot, .{}),
+    );
+    const listener = try connectController(port);
+    listener.close();
 }
 
 test "integration: background start returns only after listeners are ready" {
@@ -1500,6 +2189,11 @@ test "integration: background start returns only after listeners are ready" {
     try std.testing.expect(
         applied_descriptor.value.object.get("ready").?.bool,
     );
+    const applied_invocation = applied_descriptor.value.object.get(
+        "invocation",
+    ).?.object;
+    try std.testing.expect(applied_invocation.get("prepared").?.bool);
+    try std.testing.expect(applied_invocation.get("config_path") != null);
     const descriptor_object = applied_descriptor.value.object;
     const metadata_free_body = "{\"name\":\"DIRECT\"}";
     const metadata_free_request = try std.fmt.allocPrint(
@@ -1719,6 +2413,15 @@ test "integration: background start returns only after listeners are ready" {
         error.FileNotFound,
         tmp.dir.access(compat.io(), descriptor_path, .{}),
     );
+    var runtime_entries = runtime_handle.iterate();
+    while (try runtime_entries.next(compat.io())) |entry| {
+        try std.testing.expect(!std.mem.startsWith(
+            u8,
+            entry.name,
+            "zc.prepared.",
+        ) or std.mem.eql(u8, entry.name, "zc.prepared.key") or
+            std.mem.eql(u8, entry.name, "zc.prepared.key.lock"));
+    }
 
     var follower = try std.process.spawn(compat.io(), .{
         .argv = &.{ zc_binary, "log", "-f", "-n", "1" },

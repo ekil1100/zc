@@ -57,8 +57,49 @@ test "RuntimeDescriptor publishes canonical tracked endpoint and exact identity"
     );
     defer allocator.free(bytes);
     try testing.expectEqualStrings(
-        "{\"schema_version\":1,\"pid\":1234,\"nonce\":\"11111111111111111111111111111111\",\"endpoint\":\"127.0.0.1:29001\",\"identity\":{\"key\":\"home\",\"revision\":\"00112233445566778899aabbccddeeff\"},\"generation\":7,\"ready\":true}\n",
+        "{\"schema_version\":2,\"pid\":1234," ++
+            "\"nonce\":\"11111111111111111111111111111111\"," ++
+            "\"endpoint\":\"127.0.0.1:29001\"," ++
+            "\"identity\":{\"key\":\"home\"," ++
+            "\"revision\":\"00112233445566778899aabbccddeeff\"}," ++
+            "\"generation\":7,\"ready\":true,\"invocation\":null}\n",
         bytes,
+    );
+}
+
+test "RuntimeDescriptor persists the exact prepared invocation" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = Store.init(allocator, tmp.dir);
+    const instance_nonce = try nonce("22222222222222222222222222222222");
+    _ = try store.publish(.missing, .{
+        .pid = 42,
+        .nonce = instance_nonce,
+        .ready = true,
+        .invocation = .{
+            .foreground = false,
+            .prepared = true,
+            .config_path = "/tmp/zc.prepared.snapshot.yaml",
+            .source_path = "/tmp/original.yaml",
+            .port_override = 29090,
+        },
+    });
+    var observed = (try store.observe()) orelse return error.TestExpectedEqual;
+    defer observed.deinit();
+    try testing.expect(!observed.invocation.?.foreground);
+    try testing.expect(observed.invocation.?.prepared);
+    try testing.expectEqualStrings(
+        "/tmp/zc.prepared.snapshot.yaml",
+        observed.invocation.?.config_path.?,
+    );
+    try testing.expectEqualStrings(
+        "/tmp/original.yaml",
+        observed.invocation.?.source_path.?,
+    );
+    try testing.expectEqual(
+        @as(?u16, 29090),
+        observed.invocation.?.port_override,
     );
 }
 

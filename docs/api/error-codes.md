@@ -64,7 +64,12 @@
 | `START_PREFLIGHT_FAILED` | failed to validate daemon start ports | check config and retry |
 | `STOP_FAILED` | failed to stop daemon | verify process permissions and retry `zc stop` |
 | `STOP_TIMEOUT` | daemon did not acknowledge the stop request within 5 seconds | inspect `zc status` and the daemon log before retrying |
+| `STOP_CLEANUP_FAILED` | daemon stopped without removing its prepared snapshot, or a timed-out stop request could not be disarmed | repair the owner-only runtime directory before retrying |
 | `RESTART_FAILED` | failed to restart daemon | check logs and retry `zc restart -c <config>` |
+| `RESTART_INVOCATION_UNTRACKED` | running daemon invocation could not be captured safely | restart it through its supervisor or original command |
+| `RESTART_FAILED_ROLLED_BACK` | new daemon failed, so the previous invocation was restored | fix the target config and retry |
+| `RESTART_ROLLBACK_FAILED` | new daemon failed and the previous invocation could not be restored | inspect status/logs and start the known-good config explicitly |
+| `RESTART_CONTENDED` | another daemon acquired the runtime during restart | inspect `zc status` before retrying |
 | `RESTART_READINESS_TIMEOUT` | daemon did not publish readiness before the startup deadline | check override duration, port ownership, and the daemon log |
 | `RESTART_PORT_IN_USE` | restart target port is already in use | free the occupied port, then retry `zc restart` |
 | `RESTART_CONTROLLER_PORT_IN_USE` | restart controller port is already in use | free the exact `external-controller` port before retrying `zc restart` |

@@ -241,6 +241,12 @@ pub fn main(init: std.process.Init) !void {
             &override_opts,
             "daemon-run",
             json_output,
+            .{
+                .foreground = false,
+                .prepared = hasFlag(args, "--prepared-runtime-config"),
+                .config_path = start_opts.config_path,
+                .port_override = start_opts.port,
+            },
         ) catch |err| {
             daemon.publishStartupSignal(
                 allocator,
@@ -292,7 +298,7 @@ pub fn main(init: std.process.Init) !void {
             printStartCommandOptionError(json_output, err, .start);
             std.process.exit(cli_output.exit_usage);
         };
-        _ = daemon.isRunning(allocator) catch {
+        const daemon_running = daemon.isRunning(allocator) catch {
             printCliError(
                 json_output,
                 "START_PREFLIGHT_FAILED",
@@ -356,6 +362,12 @@ pub fn main(init: std.process.Init) !void {
                 &override_opts,
                 "start",
                 json_output,
+                .{
+                    .foreground = true,
+                    .prepared = false,
+                    .config_path = start_opts.config_path,
+                    .port_override = start_opts.port,
+                },
             ) catch |err| {
                 _ = daemon.removeCurrentProcessPid(allocator) catch false;
                 if (isPortPreflightError(err)) {
@@ -384,7 +396,79 @@ pub fn main(init: std.process.Init) !void {
         try appendStartForwardArgs(allocator, &forward_args, start_opts);
         try override_opts.appendForwardArgs(allocator, &forward_args);
 
-        const outcome = daemon.startDaemon(allocator, start_opts.config_path, forward_args.items) catch |err| {
+        var daemon_args = std.ArrayList([]const u8).empty;
+        defer deinitForwardArgs(allocator, &daemon_args);
+        var prepared: ?daemon.PreparedConfig = null;
+        defer if (prepared) |*snapshot| snapshot.deinit();
+        var tracked: ?daemon.TrackedRuntime = null;
+        defer if (tracked) |*runtime| runtime.deinit(allocator);
+        if (daemon_running) {
+            tracked = daemon.captureTrackedRuntime(allocator) catch null;
+        }
+        if (tracked) |runtime| {
+            if (runtime.invocation.foreground) {
+                var streams = StdStreams{};
+                var out = streams.output(json_output);
+                if (json_output) {
+                    out.success(.{
+                        .action = "start",
+                        .state = "running",
+                        .detail = "already_running",
+                        .pid = runtime.instance.pid,
+                    }) catch {};
+                } else {
+                    out.print(
+                        "zc daemon already running (pid: {d})\n",
+                        .{runtime.instance.pid},
+                    ) catch {};
+                    out.flush() catch {};
+                }
+                return;
+            }
+        }
+        const daemon_config_path: []const u8 = if (tracked) |*runtime| blk: {
+            _ = validateTrackedPreparedRuntime(allocator, runtime) catch {
+                printCliError(
+                    json_output,
+                    "START_PREFLIGHT_FAILED",
+                    "running daemon does not have a trusted prepared config",
+                    "leave it running and restart it through its original command",
+                );
+                std.process.exit(cli_output.exit_failure);
+            };
+            try runtime.invocation.appendForwardArgs(allocator, &daemon_args);
+            break :blk runtime.invocation.config_path.?;
+        } else blk: {
+            prepared = prepareDaemonConfig(
+                allocator,
+                start_opts.config_path,
+                start_opts.port,
+                &override_opts,
+                null,
+                null,
+                !(daemon_running and tracked == null),
+            ) catch |err| {
+                if (isPortPreflightError(err)) {
+                    printRuntimeCommandPreflightError(.start, json_output, err);
+                } else if (!printOverrideRuntimeError(json_output, err)) {
+                    printCliError(
+                        json_output,
+                        "START_PREFLIGHT_FAILED",
+                        "failed to prepare daemon runtime artifacts",
+                        "check config providers, override output, and network access",
+                    );
+                }
+                std.process.exit(cli_output.exit_failure);
+            };
+            try appendPreparedMarker(allocator, &daemon_args);
+            break :blk prepared.?.path;
+        };
+
+        const outcome = daemon.startDaemon(
+            allocator,
+            daemon_config_path,
+            daemon_args.items,
+        ) catch |err| {
             switch (err) {
                 error.PortAlreadyInUse,
                 error.ControllerPortAlreadyInUse,
@@ -444,6 +528,9 @@ pub fn main(init: std.process.Init) !void {
             }
             std.process.exit(cli_output.exit_failure);
         };
+        if (outcome.detail == null and outcome.pid != null) {
+            if (prepared) |*snapshot| snapshot.retain();
+        }
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
@@ -483,6 +570,18 @@ pub fn main(init: std.process.Init) !void {
                     "daemon did not acknowledge the stop request within 5 seconds",
                     "inspect `zc status` and the daemon log before retrying",
                 ),
+                error.DaemonPreparedCleanupFailed => printCliError(
+                    json_output,
+                    "STOP_CLEANUP_FAILED",
+                    "daemon stopped but its prepared config could not be removed",
+                    "remove the owner-only prepared snapshot from the runtime directory",
+                ),
+                error.DaemonStopRequestCleanupFailed => printCliError(
+                    json_output,
+                    "STOP_CLEANUP_FAILED",
+                    "daemon stop timed out and the stop request could not be disarmed",
+                    "keep the daemon isolated and repair the runtime directory before retrying",
+                ),
                 else => printCliError(json_output, "STOP_FAILED", "failed to stop daemon", "verify process permissions and retry `zc stop`"),
             }
             std.process.exit(cli_output.exit_failure);
@@ -515,7 +614,13 @@ pub fn main(init: std.process.Init) !void {
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
-        runRestartCommand(allocator, start_opts, &out, &override_opts) catch |err| {
+        runRestartCommand(
+            allocator,
+            start_opts,
+            &out,
+            &override_opts,
+            hasExplicitOverrideArguments(args),
+        ) catch |err| {
             if (!printOverrideRuntimeError(json_output, err)) {
                 switch (err) {
                     error.PortAlreadyInUse,
@@ -525,6 +630,43 @@ pub fn main(init: std.process.Init) !void {
                     error.InvalidExternalController,
                     => printRuntimeCommandPreflightError(.restart, json_output, err),
                     error.ForegroundDaemonSupervised => printCliError(json_output, "RESTART_FAILED", "daemon is running in the foreground (likely under a supervisor)", "restart it via the supervisor (e.g. `systemctl restart`), or `zc stop` then `zc start --foreground`"),
+                    error.DaemonInvocationUntracked,
+                    error.InvalidPreparedConfig,
+                    => printCliError(
+                        json_output,
+                        "RESTART_INVOCATION_UNTRACKED",
+                        "running daemon invocation could not be captured safely",
+                        "leave it running and restart it through its supervisor " ++
+                            "or original command",
+                    ),
+                    error.DaemonInstanceChanged => printCliError(
+                        json_output,
+                        "RESTART_CONTENDED",
+                        "the captured daemon instance changed before replacement",
+                        "leave the current daemon running and retry only after " ++
+                            "`zc status` is stable",
+                    ),
+                    error.RestartFailedRolledBack => printCliError(
+                        json_output,
+                        "RESTART_FAILED_ROLLED_BACK",
+                        "new daemon failed, so the previous invocation was restored",
+                        "inspect `zc log --no-follow`, fix the target config, and retry",
+                    ),
+                    error.RestartRollbackFailed,
+                    error.RestartRollbackContended,
+                    => printCliError(
+                        json_output,
+                        "RESTART_ROLLBACK_FAILED",
+                        "new daemon failed and the previous invocation could not be restored",
+                        "run `zc status`, inspect the daemon log, then start " ++
+                            "the known-good config explicitly",
+                    ),
+                    error.RestartContended => printCliError(
+                        json_output,
+                        "RESTART_CONTENDED",
+                        "another daemon acquired the runtime during restart",
+                        "run `zc status` before deciding whether to retry",
+                    ),
                     error.StartFailed => printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details"),
                     error.StartupTimeout => printCliError(
                         json_output,
@@ -552,7 +694,13 @@ pub fn main(init: std.process.Init) !void {
             printCliError(json_output, "RELOAD_FAILED", "daemon is not running", "start it first with `zc start`");
             std.process.exit(cli_output.exit_failure);
         }
-        const result = daemon.reloadOrRestart(allocator, null, .auto) catch |err| {
+        const result = reloadOrRestartPrepared(
+            allocator,
+            null,
+            .auto,
+            true,
+            null,
+        ) catch |err| {
             switch (err) {
                 // 受监管的前台 daemon（systemd/容器）：restart 兜底会杀掉 MainPID
                 // 并逃逸监管，拒绝并把用户引向监管者。
@@ -1592,7 +1740,33 @@ fn runConfigCommand(
         // JSON 模式只输出一个最终 envelope（D6 同款），apply 结果折叠进 data。
         var apply_result: ?daemon.ApplyResult = null;
         if (daemon.isRunning(allocator) catch false) {
-            apply_result = daemon.reloadOrRestart(allocator, null, upd.apply_mode) catch |err| {
+            const updated_path = managedConfigPathForKey(
+                allocator,
+                updated_key,
+            ) catch |err| {
+                out.note(
+                    "config apply target resolution failed: {s}\n",
+                    .{@errorName(err)},
+                ) catch {};
+                printCliError(
+                    json_output,
+                    "CONFIG_UPDATE_APPLY_FAILED",
+                    "config updated but its exact apply target could not be resolved",
+                    "run `zc config list`, then apply the updated profile explicitly",
+                );
+                std.process.exit(cli_output.exit_failure);
+            };
+            defer allocator.free(updated_path);
+            apply_result = reloadOrRestartPrepared(
+                allocator,
+                updated_path,
+                upd.apply_mode,
+                false,
+                .{
+                    .key = updated_key,
+                    .revision = published.revision,
+                },
+            ) catch |err| {
                 switch (err) {
                     error.ForegroundDaemonSupervised => printCliError(json_output, "CONFIG_UPDATE_APPLY_FAILED", "config updated but daemon runs in the foreground (likely under a supervisor)", "restart it via the supervisor (e.g. `systemctl restart`)"),
                     else => printCliError(json_output, "CONFIG_UPDATE_APPLY_FAILED", "config updated but failed to apply to running daemon", "check `zc log --no-follow`, then run `zc restart`"),
@@ -1902,7 +2076,11 @@ fn runConfigCommand(
                 };
                 const health = root.healthWithReceipt(&published.receipt);
                 noteCatalogHealth(&out, health);
-                applyConfigOverrideToRunningDaemon(allocator) catch |err| {
+                applyConfigOverrideToRunningDaemon(
+                    allocator,
+                    key,
+                    published.revision,
+                ) catch |err| {
                     printConfigOverrideApplyError(json_output, err);
                     std.process.exit(cli_output.exit_failure);
                 };
@@ -1946,7 +2124,11 @@ fn runConfigCommand(
                 var health = stable.health;
                 if (published) |receipt| {
                     health = root.healthWithReceipt(&receipt.receipt);
-                    applyConfigOverrideToRunningDaemon(allocator) catch |err| {
+                    applyConfigOverrideToRunningDaemon(
+                        allocator,
+                        key,
+                        receipt.revision,
+                    ) catch |err| {
                         printConfigOverrideApplyError(json_output, err);
                         std.process.exit(cli_output.exit_failure);
                     };
@@ -2174,7 +2356,15 @@ fn loadProxyFamilyConfig(
     command_name: []const u8,
     load_msg: []const u8,
 ) config.Config {
-    return loadAndValidateConfig(allocator, config_path, mixed_port_override, !json_output, override_opts, command_name) catch |err| {
+    return loadAndValidateConfig(
+        allocator,
+        config_path,
+        mixed_port_override,
+        !json_output,
+        override_opts,
+        command_name,
+        null,
+    ) catch |err| {
         if (!printOverrideRuntimeError(json_output, err)) {
             printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", load_msg, proxy_config_load_hint);
         }
@@ -2271,6 +2461,8 @@ fn runProxyFamilyCommand(
             null,
             override_opts,
             text.select_cmd_name,
+            null,
+            false,
         ) catch |err| {
             if (!printOverrideRuntimeError(json_output, err)) {
                 printCliError(
@@ -2439,7 +2631,15 @@ fn runStandaloneTestCommand(
         std.process.exit(cli_output.exit_usage);
     };
 
-    var cfg = loadAndValidateConfig(allocator, parsed.config_path, parsed.port, !json_output, override_opts, "test") catch |err| {
+    var cfg = loadAndValidateConfig(
+        allocator,
+        parsed.config_path,
+        parsed.port,
+        !json_output,
+        override_opts,
+        "test",
+        null,
+    ) catch |err| {
         if (!printOverrideRuntimeError(json_output, err)) {
             printCliError(json_output, "PROXY_CONFIG_LOAD_FAILED", "failed to load/validate config for test", proxy_config_load_hint);
         }
@@ -2492,7 +2692,15 @@ fn runDoctorCommand(
     override_opts: *const override.CliOptions,
     command_name: []const u8,
 ) !void {
-    var cfg_check = loadRuntimeConfig(allocator, config_path, null, override_opts, command_name, false) catch |err| {
+    var cfg_check = loadRuntimeConfig(
+        allocator,
+        config_path,
+        null,
+        override_opts,
+        command_name,
+        false,
+        null,
+    ) catch |err| {
         if (!printOverrideRuntimeError(json_output, err)) {
             printCliError(json_output, "DIAG_DOCTOR_FAILED", "failed to run doctor diagnostics", "check config path/permissions and retry `zc doctor`");
         }
@@ -2546,9 +2754,21 @@ fn validateOverrideAndPrepareRuleProviders(allocator: std.mem.Allocator, script_
     try config.prepareRuleProvidersForRuntime(allocator, &cfg, null);
 }
 
-fn applyConfigOverrideToRunningDaemon(allocator: std.mem.Allocator) !void {
+fn applyConfigOverrideToRunningDaemon(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    revision: config_identity.Revision,
+) !void {
     if (!try daemon.isRunning(allocator)) return;
-    _ = try daemon.reloadOrRestart(allocator, null, .auto);
+    const config_path = try managedConfigPathForKey(allocator, key);
+    defer allocator.free(config_path);
+    _ = try reloadOrRestartPrepared(
+        allocator,
+        config_path,
+        .auto,
+        false,
+        .{ .key = key, .revision = revision },
+    );
 }
 
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
@@ -2659,13 +2879,94 @@ fn tryLoadExactManagedRuntime(
     return finishManagedRuntimeLoad(allocator, &loaded);
 }
 
+fn loadPreparedRuntimeConfig(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    mixed_port_override: ?u16,
+    provider_policy: ?config.RuleProviderSyncPolicy,
+) !RuntimeLoadedConfig {
+    var content = try daemon.readPreparedConfig(allocator, path);
+    defer content.deinit();
+    var cfg = try config.parseDocument(allocator, content.yaml);
+    errdefer cfg.deinit();
+    try requireRuntimeCapabilities(allocator, &cfg);
+    applyRuntimePortSelection(&cfg, mixed_port_override);
+    try config.prepareRuleProvidersForRuntimeWithPolicy(
+        allocator,
+        &cfg,
+        path,
+        provider_policy orelse .missing_only,
+    );
+    try validateRuntimeEndpointSyntax(&cfg);
+    var validation_result = try validator.validate(allocator, &cfg);
+    defer validation_result.deinit();
+    if (!validation_result.isValid()) return error.InvalidConfig;
+    const identity: ?config_identity.ManagedIdentity = if (content.identity) |value| .{
+        .key = try allocator.dupe(u8, value.key),
+        .revision = value.revision,
+    } else null;
+    return .{
+        .allocator = allocator,
+        .value = cfg,
+        .identity = identity,
+    };
+}
+
 fn loadExactRuntimeConfig(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
     mixed_port_override: ?u16,
     override_opts: *const override.CliOptions,
     command_name: []const u8,
+    provider_policy: ?config.RuleProviderSyncPolicy,
+    allow_prepared_override: bool,
 ) !RuntimeLoadedConfig {
+    if (config_path) |path| {
+        if (try daemon.isPreparedConfigNamespacePath(allocator, path)) {
+            const has_override = override_opts.script_path != null or
+                override_opts.args.items.len != 0 or
+                override_opts.timeout_ms != override.timeout_ms_default;
+            if (has_override and !allow_prepared_override) {
+                return error.InvalidPreparedConfig;
+            }
+            var prepared = try loadPreparedRuntimeConfig(
+                allocator,
+                path,
+                mixed_port_override,
+                provider_policy,
+            );
+            errdefer prepared.deinit();
+            if (has_override) {
+                var effective_override = override_opts.*;
+                try override.apply(
+                    allocator,
+                    &prepared.value,
+                    &effective_override,
+                    command_name,
+                    path,
+                );
+                if (prepared.identity) |identity| allocator.free(identity.key);
+                prepared.identity = null;
+                try requireRuntimeCapabilities(allocator, &prepared.value);
+                applyRuntimePortSelection(&prepared.value, mixed_port_override);
+                try config.prepareRuleProvidersForRuntimeWithPolicy(
+                    allocator,
+                    &prepared.value,
+                    path,
+                    provider_policy orelse
+                        ruleProviderSyncPolicyForCommand(command_name),
+                );
+                try validateRuntimeEndpointSyntax(&prepared.value);
+                var validation_result = try validator.validate(
+                    allocator,
+                    &prepared.value,
+                );
+                defer validation_result.deinit();
+                if (!validation_result.isValid()) return error.InvalidConfig;
+            }
+            return prepared;
+        }
+    }
     var loaded = (try tryLoadExactManagedRuntime(
         allocator,
         config_path,
@@ -2680,6 +2981,7 @@ fn loadExactRuntimeConfig(
                 true,
                 override_opts,
                 command_name,
+                provider_policy,
             ),
             .identity = null,
         };
@@ -2708,7 +3010,7 @@ fn loadExactRuntimeConfig(
             allocator,
             &loaded.value,
             config_path,
-            ruleProviderSyncPolicyForCommand(command_name),
+            provider_policy orelse ruleProviderSyncPolicyForCommand(command_name),
         );
     } else {
         for (loaded.value.rules.items) |rule| {
@@ -2783,6 +3085,7 @@ fn runProxy(
     override_opts: *const override.CliOptions,
     command_name: []const u8,
     json_output: bool,
+    invocation: runtime_descriptor.InvocationInput,
 ) !void {
     std.debug.print("zc v{s}\n", .{build_options.version});
 
@@ -2797,8 +3100,29 @@ fn runProxy(
         mixed_port_override,
         override_opts,
         command_name,
+        if (std.mem.eql(u8, command_name, "daemon-run"))
+            .missing_only
+        else
+            null,
+        false,
     );
     defer loaded.deinit();
+    var invocation_source_path: ?[]u8 = null;
+    defer if (invocation_source_path) |path| allocator.free(path);
+    var exact_invocation = invocation;
+    if (invocation.prepared) {
+        const path = config_path orelse return error.InvalidPreparedConfig;
+        var prepared_content = try daemon.readPreparedConfig(allocator, path);
+        defer prepared_content.deinit();
+        if (prepared_content.source_path) |source| {
+            invocation_source_path = try allocator.dupe(u8, source);
+        }
+        exact_invocation.source_path = invocation_source_path;
+        exact_invocation.port_override = prepared_content.port_override;
+    } else {
+        exact_invocation.source_path = config_path;
+        exact_invocation.port_override = mixed_port_override;
+    }
     const cfg = &loaded.value;
     try preflightPortCheck(cfg, true);
 
@@ -2929,6 +3253,7 @@ fn runProxy(
         applied_identity,
         applied_generation,
         cfg.external_controller,
+        exact_invocation,
     ) catch |err| abortStartedRuntime(
         allocator,
         json_output,
@@ -3200,6 +3525,7 @@ fn reconcileRuntimeDesired(
             .identity = observed_identity,
             .generation = desired.generation,
             .ready = descriptor.ready,
+            .invocation = descriptor.invocation,
         });
         switch (outcome) {
             .committed, .durability_uncertain => {
@@ -3241,6 +3567,7 @@ fn promoteRuntimeDescriptorReady(
             .identity = descriptor.identity,
             .generation = descriptor.generation,
             .ready = true,
+            .invocation = descriptor.invocation,
         });
         switch (outcome) {
             .committed, .durability_uncertain => return,
@@ -3255,6 +3582,7 @@ fn publishRuntimeDescriptor(
     applied_identity: ?config_identity.ManagedIdentity,
     applied_generation: u64,
     endpoint: ?[]const u8,
+    invocation: runtime_descriptor.InvocationInput,
 ) !runtime_descriptor.Nonce {
     var default_store = (try runtime_descriptor.openDefault(allocator, true)) orelse
         return error.RuntimeDirectoryUnavailable;
@@ -3279,6 +3607,7 @@ fn publishRuntimeDescriptor(
         .identity = applied_identity,
         .generation = applied_generation,
         .ready = false,
+        .invocation = invocation,
     });
     switch (outcome) {
         .committed, .durability_uncertain => return nonce,
@@ -3473,32 +3802,219 @@ fn printRuntimeCommandPreflightError(command: RuntimeCommand, json_output: bool,
     printCliError(json_output, info.code, info.message, info.hint);
 }
 
-fn runtimeCommandName(command: RuntimeCommand) []const u8 {
-    return switch (command) {
-        .start => "start",
-        .restart => "restart",
-    };
-}
-
-fn shouldPreflightRuntimePorts(command: RuntimeCommand, daemon_running: bool) bool {
-    return switch (command) {
-        .start => !daemon_running,
-        .restart => true,
-    };
-}
-
-fn preflightRuntimeCommand(
+fn deinitForwardArgs(
     allocator: std.mem.Allocator,
-    command: RuntimeCommand,
-    start_opts: StartCommandOptions,
-    override_opts: *const override.CliOptions,
-) !void {
-    const daemon_running = try daemon.isRunning(allocator);
-    if (!shouldPreflightRuntimePorts(command, daemon_running)) return;
+    args: *std.ArrayList([]const u8),
+) void {
+    for (args.items) |item| allocator.free(item);
+    args.deinit(allocator);
+}
 
-    var cfg = try loadRuntimeConfig(allocator, start_opts.config_path, start_opts.port, override_opts, runtimeCommandName(command), false);
-    defer cfg.deinit();
-    try preflightPortCheck(&cfg, false);
+fn hasExplicitOverrideArguments(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--override-script") or
+            std.mem.eql(u8, arg, "--override-timeout-ms") or
+            std.mem.eql(u8, arg, "--override-arg") or
+            std.mem.startsWith(u8, arg, "--override-script=") or
+            std.mem.startsWith(u8, arg, "--override-timeout-ms=") or
+            std.mem.startsWith(u8, arg, "--override-arg="))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendOwnedForwardArg(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    value: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try args.append(allocator, owned);
+}
+
+fn appendPreparedMarker(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+) !void {
+    try appendOwnedForwardArg(allocator, args, "--prepared-runtime-config");
+}
+
+const PreparedListenerPorts = struct {
+    mixed: u16,
+    controller: ?u16,
+};
+
+fn preparedListenerPorts(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !PreparedListenerPorts {
+    var no_override = override.CliOptions{};
+    defer no_override.deinit(allocator);
+    var loaded = try loadExactRuntimeConfig(
+        allocator,
+        path,
+        null,
+        &no_override,
+        "daemon-run",
+        .missing_only,
+        false,
+    );
+    defer loaded.deinit();
+    const controller = if (loaded.value.external_controller) |endpoint|
+        try parseExternalControllerPort(endpoint)
+    else
+        null;
+    try preflightPortCheckAllowing(
+        &loaded.value,
+        false,
+        loaded.value.mixed_port,
+        controller,
+    );
+    return .{ .mixed = loaded.value.mixed_port, .controller = controller };
+}
+
+fn managedConfigPathForKey(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) ![]u8 {
+    const root_path = (try config.getDefaultConfigDir(allocator)) orelse
+        return error.ConfigDirectoryUnavailable;
+    defer allocator.free(root_path);
+    const yaml_name = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
+    defer allocator.free(yaml_name);
+    return compat.fs.path.join(
+        allocator,
+        &.{ root_path, "configs", yaml_name },
+    );
+}
+
+fn prepareDaemonManagedIdentity(
+    allocator: std.mem.Allocator,
+    identity: config_identity.ManagedIdentity,
+    source_path: []const u8,
+    port_override: ?u16,
+    allowed_mixed_port: ?u16,
+    allowed_controller_port: ?u16,
+) !daemon.PreparedConfig {
+    var root = try openDefaultCatalogRoot(allocator);
+    defer root.deinit();
+    const loader = managed_config_loader.Loader.init(allocator, root.dir);
+    var managed = try loader.loadExact(identity);
+    var loaded = finishManagedRuntimeLoad(allocator, &managed);
+    defer loaded.deinit();
+    try requireRuntimeCapabilities(allocator, &loaded.value);
+    applyRuntimePortSelection(&loaded.value, port_override);
+    for (loaded.value.rules.items) |rule| {
+        if (rule.rule_type == .rule_set) {
+            return error.ManagedRemoteRuleProviderUnsupported;
+        }
+    }
+    try validateRuntimeEndpointSyntax(&loaded.value);
+    var validation_result = try validator.validate(allocator, &loaded.value);
+    defer validation_result.deinit();
+    if (!validation_result.isValid()) return error.InvalidConfig;
+    try preflightPortCheckAllowing(
+        &loaded.value,
+        false,
+        allowed_mixed_port,
+        allowed_controller_port,
+    );
+    const bytes = try override.dumpRuntimeConfigYaml(allocator, &loaded.value);
+    defer {
+        @memset(bytes, 0);
+        allocator.free(bytes);
+    }
+    return daemon.publishPreparedConfig(
+        allocator,
+        bytes,
+        loaded.identity,
+        source_path,
+        port_override,
+    );
+}
+
+fn prepareDaemonConfig(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    port: ?u16,
+    override_opts: *const override.CliOptions,
+    allowed_mixed_port: ?u16,
+    allowed_controller_port: ?u16,
+    check_ports: bool,
+) !daemon.PreparedConfig {
+    var source_path: ?[]u8 = null;
+    defer if (source_path) |path| allocator.free(path);
+    var effective_port = port;
+    if (config_path) |path| {
+        if (try daemon.isPreparedConfigNamespacePath(allocator, path)) {
+            var inherited = try daemon.readPreparedConfig(allocator, path);
+            defer inherited.deinit();
+            if (inherited.source_path) |source| {
+                source_path = try allocator.dupe(u8, source);
+            }
+            if (effective_port == null) {
+                effective_port = inherited.port_override;
+            }
+        } else {
+            const managed_key = try config.inferConfigKeyFromPath(
+                allocator,
+                path,
+            );
+            defer if (managed_key) |key| allocator.free(key);
+            if (managed_key != null) {
+                source_path = try compat.fs.path.resolve(allocator, &.{path});
+            } else {
+                source_path = try compat.fs.realpathAlloc(allocator, path);
+            }
+        }
+    }
+    var loaded = try loadExactRuntimeConfig(
+        allocator,
+        config_path,
+        effective_port,
+        override_opts,
+        "daemon-run",
+        .eager,
+        true,
+    );
+    defer loaded.deinit();
+    if (check_ports) {
+        try preflightPortCheckAllowing(
+            &loaded.value,
+            false,
+            allowed_mixed_port,
+            allowed_controller_port,
+        );
+    }
+    const bytes = try override.dumpRuntimeConfigYaml(allocator, &loaded.value);
+    defer {
+        @memset(bytes, 0);
+        allocator.free(bytes);
+    }
+    return daemon.publishPreparedConfig(
+        allocator,
+        bytes,
+        loaded.identity,
+        source_path,
+        effective_port,
+    );
+}
+
+fn validateTrackedPreparedRuntime(
+    allocator: std.mem.Allocator,
+    tracked: *const daemon.TrackedRuntime,
+) !PreparedListenerPorts {
+    const path = tracked.invocation.config_path orelse
+        return error.DaemonInvocationUntracked;
+    if (!tracked.invocation.prepared or
+        !try daemon.isPreparedConfigPath(allocator, path))
+    {
+        return error.DaemonInvocationUntracked;
+    }
+    return preparedListenerPorts(allocator, path);
 }
 
 fn runRestartCommand(
@@ -3506,76 +4022,204 @@ fn runRestartCommand(
     start_opts: StartCommandOptions,
     out: *cli_output.Output,
     override_opts: *const override.CliOptions,
+    explicit_override: bool,
 ) !void {
     const was_running = try daemon.isRunning(allocator);
-
-    // restart 语义 = 同一个 daemon 换个进程：未显式覆盖时保留旧 daemon 的
-    // `-c`/`--port` 启动参数，而不是悄悄退回默认配置/默认 mixed-port。
-    var preserved: ?daemon.TrackedInvocation = null;
-    defer if (preserved) |*inv| inv.deinit(allocator);
+    var tracked: ?daemon.TrackedRuntime = null;
+    defer if (tracked) |*runtime| runtime.deinit(allocator);
+    var old_ports: ?PreparedListenerPorts = null;
     if (was_running) {
-        preserved = daemon.captureTrackedInvocation(allocator) catch null;
-        if (preserved) |inv| {
-            // 受监管的前台 daemon（systemd/容器 PID 1）：杀掉它会触发监管者
-            // respawn/锁竞争循环，拒绝并把用户引向监管者。
-            if (inv.foreground) return error.ForegroundDaemonSupervised;
-        }
+        tracked = (try daemon.captureTrackedRuntime(allocator)) orelse
+            return error.DaemonInvocationUntracked;
+        if (tracked.?.invocation.foreground) return error.ForegroundDaemonSupervised;
+        old_ports = try validateTrackedPreparedRuntime(allocator, &tracked.?);
     }
 
-    const config_path: ?[]const u8 = start_opts.config_path orelse
-        (if (preserved) |inv| inv.config_path else null);
-    const port: ?u16 = start_opts.port orelse
-        (if (preserved) |inv| inv.port else null);
-
-    // Preflight before stop so a known failure does not kill a healthy daemon.
-    // Only listener ports published by the tracked daemon may be skipped.
-    const old_controller_port: ?u16 = if (was_running)
-        observedRuntimeControllerPort(allocator)
-    else
-        null;
-    {
-        var cfg = try loadRuntimeConfig(allocator, config_path, port, override_opts, "restart", false);
-        defer cfg.deinit();
-        const old_daemon_port: ?u16 = if (!was_running)
-            null
-        else if (preserved) |inv|
-            (inv.port orelse constants.MIXED_PORT)
-        else
-            constants.MIXED_PORT;
-        try preflightPortCheckAllowing(
-            &cfg,
-            false,
-            old_daemon_port,
-            old_controller_port,
+    const changed = start_opts.config_path != null or
+        start_opts.port != null or explicit_override or !was_running;
+    var prepared: ?daemon.PreparedConfig = null;
+    defer if (prepared) |*config_snapshot| config_snapshot.deinit();
+    const target_path: []const u8 = if (!changed) blk: {
+        break :blk tracked.?.invocation.config_path.?;
+    } else blk: {
+        var no_override = override.CliOptions{};
+        defer no_override.deinit(allocator);
+        const base_path = start_opts.config_path orelse
+            (if (tracked) |runtime|
+                if (explicit_override)
+                    runtime.invocation.source_path
+                else
+                    runtime.invocation.config_path
+            else
+                null);
+        const target_port = start_opts.port orelse
+            (if (tracked) |runtime| runtime.invocation.port else null);
+        prepared = try prepareDaemonConfig(
+            allocator,
+            base_path,
+            target_port,
+            if (explicit_override) override_opts else &no_override,
+            if (old_ports) |ports| ports.mixed else null,
+            if (old_ports) |ports| ports.controller else null,
+            true,
         );
+        break :blk prepared.?.path;
+    };
+    var target_args = std.ArrayList([]const u8).empty;
+    defer deinitForwardArgs(allocator, &target_args);
+    try appendPreparedMarker(allocator, &target_args);
+    var previous_args = std.ArrayList([]const u8).empty;
+    defer deinitForwardArgs(allocator, &previous_args);
+    if (tracked) |*runtime| {
+        try runtime.invocation.appendForwardArgs(allocator, &previous_args);
     }
 
-    // 决策 D6：restart 整体只输出一个最终 envelope；中间进度文本走 stderr。
     if (was_running) {
-        try out.note("stopping daemon...\n", .{});
-        _ = try daemon.stopDaemon(allocator);
+        try out.note("replacing daemon...\n", .{});
     } else {
         try out.note("daemon was not running; starting fresh\n", .{});
     }
-
-    var forward_args = std.ArrayList([]const u8).empty;
-    defer {
-        for (forward_args.items) |item| allocator.free(item);
-        forward_args.deinit(allocator);
-    }
-    try appendStartForwardArgs(allocator, &forward_args, .{ .config_path = config_path, .port = port });
-    try override_opts.appendForwardArgs(allocator, &forward_args);
-
-    try out.note("starting daemon...\n", .{});
-    const outcome = try daemon.startDaemon(allocator, config_path, forward_args.items);
+    const previous: ?daemon.PreviousRequest = if (tracked) |runtime| .{
+        .start = .{
+            .config_path = runtime.invocation.config_path,
+            .extra_args = previous_args.items,
+        },
+        .instance = runtime.instance,
+    } else null;
+    const outcome = daemon.replaceDaemonWithRollback(
+        allocator,
+        .{ .config_path = target_path, .extra_args = target_args.items },
+        previous,
+    ) catch |err| {
+        if (err == error.RestartFailedRolledBack) {
+            out.note("restart failed; previous daemon restored\n", .{}) catch {};
+        } else if (err == error.RestartRollbackFailed or
+            err == error.RestartRollbackContended)
+        {
+            out.note("restart and rollback both failed\n", .{}) catch {};
+        }
+        return err;
+    };
     if (outcome.detail != null) return error.RestartContended;
     const pid = outcome.pid orelse return error.StartFailed;
-
+    if (prepared) |*config_snapshot| config_snapshot.retain();
+    if (tracked) |runtime| {
+        if (!std.mem.eql(u8, runtime.invocation.config_path.?, target_path)) {
+            daemon.removePreparedConfig(
+                allocator,
+                runtime.invocation.config_path.?,
+            ) catch |err| out.note(
+                "old prepared config cleanup failed: {s}\n",
+                .{@errorName(err)},
+            ) catch {};
+        }
+    }
     if (out.mode == .json) {
         try out.success(.{ .action = "restart", .state = "running", .pid = pid });
     } else {
         try out.print("zc daemon restarted (pid: {d})\n", .{pid});
         try out.flush();
+    }
+}
+
+fn replaceRunningDaemonWithPrepared(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    use_tracked_source: bool,
+    exact_identity: ?config_identity.ManagedIdentity,
+) !void {
+    var tracked = (try daemon.captureTrackedRuntime(allocator)) orelse
+        return error.DaemonInvocationUntracked;
+    defer tracked.deinit(allocator);
+    if (tracked.invocation.foreground) return error.ForegroundDaemonSupervised;
+    const old_ports = try validateTrackedPreparedRuntime(allocator, &tracked);
+    var no_override = override.CliOptions{};
+    defer no_override.deinit(allocator);
+    const source_path = if (use_tracked_source)
+        tracked.invocation.source_path
+    else
+        config_path;
+    var prepared = if (exact_identity) |identity|
+        try prepareDaemonManagedIdentity(
+            allocator,
+            identity,
+            source_path orelse return error.ConfigPathRequired,
+            tracked.invocation.port,
+            old_ports.mixed,
+            old_ports.controller,
+        )
+    else
+        try prepareDaemonConfig(
+            allocator,
+            source_path,
+            tracked.invocation.port,
+            &no_override,
+            old_ports.mixed,
+            old_ports.controller,
+            true,
+        );
+    defer prepared.deinit();
+    var target_args = std.ArrayList([]const u8).empty;
+    defer deinitForwardArgs(allocator, &target_args);
+    try appendPreparedMarker(allocator, &target_args);
+    var previous_args = std.ArrayList([]const u8).empty;
+    defer deinitForwardArgs(allocator, &previous_args);
+    try tracked.invocation.appendForwardArgs(allocator, &previous_args);
+    const outcome = try daemon.replaceDaemonWithRollback(
+        allocator,
+        .{ .config_path = prepared.path, .extra_args = target_args.items },
+        .{
+            .start = .{
+                .config_path = tracked.invocation.config_path,
+                .extra_args = previous_args.items,
+            },
+            .instance = tracked.instance,
+        },
+    );
+    if (outcome.detail != null or outcome.pid == null) {
+        return error.RestartContended;
+    }
+    prepared.retain();
+    daemon.removePreparedConfig(
+        allocator,
+        tracked.invocation.config_path.?,
+    ) catch {};
+}
+
+fn reloadOrRestartPrepared(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    apply_mode: daemon.ApplyMode,
+    use_tracked_source: bool,
+    exact_identity: ?config_identity.ManagedIdentity,
+) !daemon.ApplyResult {
+    if (!try daemon.isRunning(allocator)) return .hot_applied;
+    switch (apply_mode) {
+        .restart => {
+            try replaceRunningDaemonWithPrepared(
+                allocator,
+                config_path,
+                use_tracked_source,
+                exact_identity,
+            );
+            return .restart_applied;
+        },
+        .hot => {
+            try daemon.reloadDaemon(allocator, config_path);
+            return .hot_applied;
+        },
+        .auto => {
+            daemon.reloadDaemon(allocator, config_path) catch {
+                try replaceRunningDaemonWithPrepared(
+                    allocator,
+                    config_path,
+                    use_tracked_source,
+                    exact_identity,
+                );
+                return .restart_fallback;
+            };
+            return .hot_applied;
+        },
     }
 }
 
@@ -3635,6 +4279,7 @@ fn loadRuntimeConfig(
     override_opts: *const override.CliOptions,
     command_name: []const u8,
     prepare_runtime_artifacts: bool,
+    provider_policy: ?config.RuleProviderSyncPolicy,
 ) !config.Config {
     var cfg = if (config_path) |path| blk: {
         if (try config.inferConfigKeyFromPath(allocator, path)) |managed_key| {
@@ -3662,7 +4307,7 @@ fn loadRuntimeConfig(
             allocator,
             &cfg,
             config_path,
-            ruleProviderSyncPolicyForCommand(command_name),
+            provider_policy orelse ruleProviderSyncPolicyForCommand(command_name),
         );
     }
     return cfg;
@@ -3675,8 +4320,17 @@ fn loadAndValidateConfig(
     print_validation: bool,
     override_opts: *const override.CliOptions,
     command_name: []const u8,
+    provider_policy: ?config.RuleProviderSyncPolicy,
 ) !config.Config {
-    var cfg = try loadRuntimeConfig(allocator, config_path, mixed_port_override, override_opts, command_name, true);
+    var cfg = try loadRuntimeConfig(
+        allocator,
+        config_path,
+        mixed_port_override,
+        override_opts,
+        command_name,
+        true,
+        provider_policy,
+    );
     errdefer cfg.deinit();
 
     try validateRuntimeEndpointSyntax(&cfg);
@@ -4632,53 +5286,6 @@ test "runtimeCommandPreflightErrorInfo maps restart port conflicts" {
     );
     try testing.expectEqualStrings("RESTART_CONTROLLER_PORT_IN_USE", controller.code);
     try testing.expect(std.mem.indexOf(u8, controller.hint, "external-controller") != null);
-}
-
-test "start skips port preflight when daemon is already running" {
-    const testing = std.testing;
-
-    try testing.expect(!shouldPreflightRuntimePorts(.start, true));
-    try testing.expect(shouldPreflightRuntimePorts(.start, false));
-    try testing.expect(shouldPreflightRuntimePorts(.restart, true));
-}
-
-test "runtime command preflight consults daemon state before port check" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/main.zig", 1024 * 1024);
-    defer allocator.free(content);
-
-    const fn_pos = std.mem.indexOf(u8, content, "fn preflightRuntimeCommand(") orelse return error.TestUnexpectedResult;
-    const next_fn_pos = std.mem.indexOfPos(u8, content, fn_pos, "fn runRestartCommand(") orelse return error.TestUnexpectedResult;
-    const fn_body = content[fn_pos..next_fn_pos];
-
-    const daemon_pos = std.mem.indexOf(u8, fn_body, "daemon.isRunning") orelse return error.TestUnexpectedResult;
-    const skip_pos = std.mem.indexOf(u8, fn_body, "shouldPreflightRuntimePorts") orelse return error.TestUnexpectedResult;
-    const port_pos = std.mem.indexOf(u8, fn_body, "preflightPortCheck") orelse return error.TestUnexpectedResult;
-
-    try testing.expect(daemon_pos < port_pos);
-    try testing.expect(skip_pos < port_pos);
-}
-
-test "restart command preflights ports before stopping the old daemon" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const content = try compat.fs.cwd().readFileAlloc(allocator, "src/main.zig", 1024 * 1024);
-    defer allocator.free(content);
-
-    const fn_pos = std.mem.indexOf(u8, content, "fn runRestartCommand(") orelse return error.TestUnexpectedResult;
-    const next_fn_pos = std.mem.indexOfPos(u8, content, fn_pos, "fn applyRuntimePortSelection(") orelse return error.TestUnexpectedResult;
-    const fn_body = content[fn_pos..next_fn_pos];
-
-    // 预检必须发生在 stopDaemon 之前（注定失败的 restart 不能先杀掉健康
-    // daemon），stopDaemon 在 startDaemon 之前。
-    const preflight_pos = std.mem.indexOf(u8, fn_body, "preflightPortCheckAllowing(") orelse return error.TestUnexpectedResult;
-    const stop_pos = std.mem.indexOf(u8, fn_body, "daemon.stopDaemon(") orelse return error.TestUnexpectedResult;
-    const start_pos = std.mem.indexOf(u8, fn_body, "daemon.startDaemon(") orelse return error.TestUnexpectedResult;
-    try testing.expect(preflight_pos < stop_pos);
-    try testing.expect(stop_pos < start_pos);
 }
 
 test "mixed handler should explicitly close client stream on success path" {

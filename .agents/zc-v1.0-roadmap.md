@@ -15,9 +15,9 @@
 2. ~~**CLI `test --json` 不生效**~~（已解决：全 CLI 输出契约对齐落地，`test --json` 走统一 envelope + `CHECKS_FAILED` 语义，见 `docs/cli/spec.md`）。
 3. **API v1 冻结为有界 minimal REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；连接数、header/body/response 大小和读写期限均有固定上界。当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
-5. **代理选择与本地 load 主路径已接 Authority**：CLI durable-first、daemon 启动恢复 desired state，并通过 exact revision runtime descriptor 发现实际 controller endpoint；其余 legacy config writer 仍需统一 cutover，避免后续命令重建 mirror 时形成状态漂移。
+5. **代理选择与 managed config 命令族已接 Authority**：CLI durable-first、daemon 启动恢复 desired state，并通过 exact revision runtime descriptor 发现实际 controller endpoint；legacy mirror 仅为派生兼容面。
 6. **minimal controller 端点已冻结**：v1 只接受显式 `127.0.0.1:<port>`，必须绑定精确配置端口；冲突时启动失败，不自动漂移或静默关闭控制面。
-7. **生命周期路径已按用户隔离**：pid/lock/log/runtime descriptor 统一位于经 owner/mode/no-follow 校验的 `XDG_RUNTIME_DIR`；未设置时使用规范化 `$HOME/.local/state/zc/runtime`，不再写共享 `/tmp/zc.*`；后台启动仅在 listener 就绪并发布 descriptor 后成功。
+7. **生命周期路径已按用户隔离并具备 instance-bound restart rollback**：pid/lock/log/runtime descriptor 统一位于经 owner/mode/no-follow 校验的 `XDG_RUNTIME_DIR`；未设置时使用规范化 `$HOME/.local/state/zc/runtime`。后台启动只消费 parent 发布的 owner-only HMAC snapshot；restart 在 stop 前完成 preparation，并以 PID/nonce 恢复 exact old snapshot。
 
 因此，v1.0 roadmap 现在应聚焦：**落地统一 capability gate，关闭所有未经互操作与生命周期验证的协议；完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import；修复安全审计阻断项后，再做最终 smoke gate 和 GA tag 判断。**
 
@@ -490,7 +490,7 @@ docs/
 - Batch 3 exact catalog / immutable RevisionStore / legacy bootstrap / frozen override / derived mirror：`052610f`–`01646d1`；
 - Batch 4 shadow exact loader / tracked runtime descriptor seams：`041578b`–`ee690e7`；
 - Batch 5 typed mutation、catalog coordinator/commands、downloaded writer 与 revisioned override writer：`0684a88`、`90e21b7`、`b81227c`、`ad4ce7f`、`1c2eb78`、`aabd81e`、`cdf7497`、`62d8a1e`、`f2eb2b4`；
-- 当前 748/748 tests passed（0 skipped）；最新 catalog writer cutover 后的 ReleaseFast 跨目标复验待完成；
+- 当前 755/755 tests passed（0 skipped）；最新 catalog/lifecycle hardening 后的 ReleaseFast 跨目标复验待完成；
 - `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与完整 managed config 命令族；`load/list/download/update/use/delete/dump/override` 以 catalog v2 为唯一 authority，legacy `meta.json` / `configs/` 只由 mirror 刷新。subscription update 使用读取 URL 时的 exact revision 做 CAS，persistent override 以 frozen immutable revision 发布。
 
 关键验收：

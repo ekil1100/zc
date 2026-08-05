@@ -1046,14 +1046,43 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
     return out.toOwnedSlice(allocator);
 }
 
+const DumpYamlOptions = struct {
+    redact_secrets: bool,
+    include_rule_providers: bool,
+};
+
 pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
+    return dumpConfigYamlWithOptions(allocator, cfg, .{
+        .redact_secrets = true,
+        .include_rule_providers = true,
+    });
+}
+
+pub fn dumpRuntimeConfigYaml(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+) ![]u8 {
+    return dumpConfigYamlWithOptions(allocator, cfg, .{
+        .redact_secrets = false,
+        .include_rule_providers = false,
+    });
+}
+
+fn dumpConfigYamlWithOptions(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    options: DumpYamlOptions,
+) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
     try out.print(allocator, "port: {d}\n", .{cfg.port});
     try out.print(allocator, "socks-port: {d}\n", .{cfg.socks_port});
     try out.print(allocator, "mixed-port: {d}\n", .{cfg.mixed_port});
+    try out.print(allocator, "redir-port: {d}\n", .{cfg.redir_port});
+    try out.print(allocator, "tproxy-port: {d}\n", .{cfg.tproxy_port});
     try out.print(allocator, "allow-lan: {s}\n", .{if (cfg.allow_lan) "true" else "false"});
+    try out.print(allocator, "ipv6: {s}\n", .{if (cfg.ipv6) "true" else "false"});
     try out.appendSlice(allocator, "bind-address: ");
     try writeYamlQuotedString(&out, allocator, cfg.bind_address);
     try out.append(allocator, '\n');
@@ -1068,11 +1097,33 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try writeYamlQuotedString(&out, allocator, ec);
         try out.append(allocator, '\n');
     }
-    if (cfg.secret != null) {
-        try out.appendSlice(allocator, "secret: \"******\"\n");
+    if (cfg.external_ui) |ui| {
+        try out.appendSlice(allocator, "external-ui: ");
+        try writeYamlQuotedString(&out, allocator, ui);
+        try out.append(allocator, '\n');
     }
+    if (cfg.secret) |secret| {
+        try out.appendSlice(allocator, "secret: ");
+        try writeYamlQuotedString(
+            &out,
+            allocator,
+            if (options.redact_secrets) "******" else secret,
+        );
+        try out.append(allocator, '\n');
+    }
+    try out.print(
+        allocator,
+        "idle-session-check-interval: {d}\n",
+        .{cfg.idle_session_check_interval},
+    );
+    try out.print(
+        allocator,
+        "idle-session-timeout: {d}\n",
+        .{cfg.idle_session_timeout},
+    );
+    try out.print(allocator, "min-idle-session: {d}\n", .{cfg.min_idle_session});
 
-    if (cfg.rule_providers.items.len > 0) {
+    if (options.include_rule_providers and cfg.rule_providers.items.len > 0) {
         try out.appendSlice(allocator, "rule-providers:\n");
         for (cfg.rule_providers.items) |provider| {
             try out.appendSlice(allocator, "  ");
@@ -1096,7 +1147,11 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
         }
     }
 
-    try out.appendSlice(allocator, "proxies:\n");
+    if (cfg.proxies.items.len == 0) {
+        try out.appendSlice(allocator, "proxies: []\n");
+    } else {
+        try out.appendSlice(allocator, "proxies:\n");
+    }
     for (cfg.proxies.items) |proxy| {
         try out.appendSlice(allocator, "  - name: ");
         try writeYamlQuotedString(&out, allocator, proxy.name);
@@ -1108,31 +1163,85 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try writeYamlQuotedString(&out, allocator, proxy.server);
         try out.append(allocator, '\n');
         try out.print(allocator, "    port: {d}\n", .{proxy.port});
-        if (proxy.password != null) try out.appendSlice(allocator, "    password: \"******\"\n");
+        if (proxy.password) |password| {
+            try out.appendSlice(allocator, "    password: ");
+            try writeYamlQuotedString(
+                &out,
+                allocator,
+                if (options.redact_secrets) "******" else password,
+            );
+            try out.append(allocator, '\n');
+        }
         if (proxy.cipher) |cipher| {
             try out.appendSlice(allocator, "    cipher: ");
             try writeYamlQuotedString(&out, allocator, cipher);
             try out.append(allocator, '\n');
         }
-        if (proxy.uuid != null) try out.appendSlice(allocator, "    uuid: \"******\"\n");
+        if (proxy.uuid) |uuid| {
+            try out.appendSlice(allocator, "    uuid: ");
+            try writeYamlQuotedString(
+                &out,
+                allocator,
+                if (options.redact_secrets) "******" else uuid,
+            );
+            try out.append(allocator, '\n');
+        }
         if (proxy.alter_id != 0) try out.print(allocator, "    alterId: {d}\n", .{proxy.alter_id});
         if (proxy.tls) try out.appendSlice(allocator, "    tls: true\n");
         if (proxy.skip_cert_verify) try out.appendSlice(allocator, "    skip-cert-verify: true\n");
-        if (proxy.sni != null) try out.appendSlice(allocator, "    sni: \"******\"\n");
-        if (proxy.ws) try out.appendSlice(allocator, "    ws: true\n");
-        if (proxy.ws_path) |ws_path| {
-            try out.appendSlice(allocator, "    ws-path: ");
-            try writeYamlQuotedString(&out, allocator, ws_path);
+        if (proxy.sni) |sni| {
+            try out.appendSlice(allocator, "    sni: ");
+            try writeYamlQuotedString(
+                &out,
+                allocator,
+                if (options.redact_secrets) "******" else sni,
+            );
             try out.append(allocator, '\n');
         }
-        if (proxy.ws_host) |ws_host| {
-            try out.appendSlice(allocator, "    ws-host: ");
-            try writeYamlQuotedString(&out, allocator, ws_host);
+        if (proxy.udp) try out.appendSlice(allocator, "    udp: true\n");
+        if (proxy.ws) {
+            if (proxy.ws_path == null and proxy.ws_host == null) {
+                try out.appendSlice(allocator, "    ws-opts: {}\n");
+            } else {
+                try out.appendSlice(allocator, "    ws-opts:\n");
+                if (proxy.ws_path) |ws_path| {
+                    try out.appendSlice(allocator, "      path: ");
+                    try writeYamlQuotedString(&out, allocator, ws_path);
+                    try out.append(allocator, '\n');
+                }
+                if (proxy.ws_host) |ws_host| {
+                    try out.appendSlice(allocator, "      headers:\n");
+                    try out.appendSlice(allocator, "        Host: ");
+                    try writeYamlQuotedString(&out, allocator, ws_host);
+                    try out.append(allocator, '\n');
+                }
+            }
+        }
+        if (proxy.plugin) |plugin| {
+            try out.appendSlice(allocator, "    plugin: ");
+            try writeYamlQuotedString(&out, allocator, plugin);
             try out.append(allocator, '\n');
+        }
+        if (proxy.obfs_mode != null or proxy.obfs_host != null) {
+            try out.appendSlice(allocator, "    plugin-opts:\n");
+            if (proxy.obfs_mode) |obfs_mode| {
+                try out.appendSlice(allocator, "      mode: ");
+                try writeYamlQuotedString(&out, allocator, obfs_mode);
+                try out.append(allocator, '\n');
+            }
+            if (proxy.obfs_host) |obfs_host| {
+                try out.appendSlice(allocator, "      host: ");
+                try writeYamlQuotedString(&out, allocator, obfs_host);
+                try out.append(allocator, '\n');
+            }
         }
     }
 
-    try out.appendSlice(allocator, "proxy-groups:\n");
+    if (cfg.proxy_groups.items.len == 0) {
+        try out.appendSlice(allocator, "proxy-groups: []\n");
+    } else {
+        try out.appendSlice(allocator, "proxy-groups:\n");
+    }
     for (cfg.proxy_groups.items) |group| {
         try out.appendSlice(allocator, "  - name: ");
         try writeYamlQuotedString(&out, allocator, group.name);
@@ -1157,7 +1266,11 @@ pub fn dumpConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try out.appendSlice(allocator, if (group.lazy) "true\n" else "false\n");
     }
 
-    try out.appendSlice(allocator, "rules:\n");
+    if (cfg.rules.items.len == 0) {
+        try out.appendSlice(allocator, "rules: []\n");
+    } else {
+        try out.appendSlice(allocator, "rules:\n");
+    }
     for (cfg.rules.items) |rule| {
         const as_text = try ruleToText(allocator, rule);
         defer allocator.free(as_text);
@@ -1417,6 +1530,66 @@ test "override parse options rejects deprecated dump flags" {
     };
 
     try std.testing.expectError(error.DeprecatedOverrideDumpOption, parseCliOptions(allocator, args[0..]));
+}
+
+test "runtime YAML snapshot preserves secrets and omits provider declarations" {
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\secret: controller-secret
+        \\proxies:
+        \\  - name: secure
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 443
+        \\    password: proxy-secret
+        \\    cipher: aes-128-gcm
+        \\    plugin: obfs
+        \\    plugin-opts:
+        \\      mode: tls
+        \\      host: cdn.example.com
+        \\  - name: websocket
+        \\    type: trojan
+        \\    server: ws.example.com
+        \\    port: 443
+        \\    password: trojan-secret
+        \\    ws-opts:
+        \\      path: /tunnel
+        \\      headers:
+        \\        Host: edge.example.com
+        \\rule-providers:
+        \\  unused:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: rules.yaml
+        \\rules:
+        \\  - MATCH,DIRECT
+        \\
+    );
+    defer cfg.deinit();
+    const snapshot = try dumpRuntimeConfigYaml(allocator, &cfg);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "controller-secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "proxy-secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "rule-providers:") == null);
+    var restored = try config.parseDocument(allocator, snapshot);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("controller-secret", restored.secret.?);
+    try std.testing.expectEqualStrings("proxy-secret", restored.proxies.items[0].password.?);
+    try std.testing.expectEqualStrings("tls", restored.proxies.items[0].obfs_mode.?);
+    try std.testing.expectEqualStrings(
+        "cdn.example.com",
+        restored.proxies.items[0].obfs_host.?,
+    );
+    try std.testing.expect(restored.proxies.items[1].ws);
+    try std.testing.expectEqualStrings(
+        "/tunnel",
+        restored.proxies.items[1].ws_path.?,
+    );
+    try std.testing.expectEqualStrings(
+        "edge.example.com",
+        restored.proxies.items[1].ws_host.?,
+    );
 }
 
 test "dumpConfigJson emits parseable std.json with escaping and masked secrets" {
