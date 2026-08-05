@@ -1180,6 +1180,18 @@ fn runConfigCommand(
             out.note("config download failed: {s}\n", .{@errorName(err)}) catch {};
             switch (err) {
                 error.InvalidConfigKey => printInvalidConfigName(json_output),
+                error.ConfigTooLarge => printCliError(
+                    json_output,
+                    "CONFIG_DOWNLOAD_TOO_LARGE",
+                    "downloaded config exceeds the 16 MiB limit",
+                    "reduce the config size and retry",
+                ),
+                error.DownloadTimeout => printCliError(
+                    json_output,
+                    "CONFIG_DOWNLOAD_TIMEOUT",
+                    "config download exceeded the 30 second deadline",
+                    "check the server or network and retry",
+                ),
                 error.NoConfigDir,
                 error.AccessDenied,
                 error.PermissionDenied,
@@ -1234,6 +1246,18 @@ fn runConfigCommand(
         const updated_key = config.updateConfig(allocator, target_name, &out) catch |err| {
             switch (err) {
                 error.InvalidConfigKey => printInvalidConfigName(json_output),
+                error.ConfigTooLarge => printCliError(
+                    json_output,
+                    "CONFIG_UPDATE_TOO_LARGE",
+                    "updated config exceeds the 16 MiB limit",
+                    "reduce the config size and retry",
+                ),
+                error.DownloadTimeout => printCliError(
+                    json_output,
+                    "CONFIG_UPDATE_TIMEOUT",
+                    "config update exceeded the 30 second deadline",
+                    "check the server or network and retry",
+                ),
                 error.NoSubscriptionUrl => printCliError(json_output, "CONFIG_UPDATE_NO_SUBSCRIPTION", "no subscription url recorded for this config", "use `zc config download <url>` to (re)create it"),
                 else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to update config", "check subscription url/network and retry"),
             }

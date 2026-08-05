@@ -54,8 +54,8 @@ group help on stdout, exit 0. Every subcommand accepts `help`, `--help`, or
 | --- | --- |
 | `zc config load <path> [--json]` | Validates and imports a local YAML plus its root-contained local provider assets into an immutable revision, makes it active, and never applies it to an already-running daemon (`data.applied:false`). Duplicate exact basename keys fail closed. |
 | `zc config list [--json]` | Alias `zc config ls`. Lists configs + active one (`data.configs`, `data.active`). |
-| `zc config download <url> [-n <name>] [-d] [--json]` | `-d` sets the downloaded config as default. Missing `<url>` ⇒ `CONFIG_DOWNLOAD_URL_REQUIRED`, exit 2. |
-| `zc config update [name] [--apply auto\|hot\|restart] [--json]` | Re-downloads a previously downloaded config; applies to a running daemon per `--apply`（默认 auto）。JSON 单 envelope：`data.applied` / `data.apply_result`。 |
+| `zc config download <url> [-n <name>] [-d] [--json]` | `-d` sets the downloaded config as default. Missing `<url>` ⇒ `CONFIG_DOWNLOAD_URL_REQUIRED`, exit 2. Response body is limited to 16 MiB with a 30-second total deadline. |
+| `zc config update [name] [--apply auto\|hot\|restart] [--json]` | Re-downloads a previously downloaded config under the same 16 MiB / 30-second limits; applies to a running daemon per `--apply`（默认 auto）。JSON 单 envelope：`data.applied` / `data.apply_result`。 |
 | `zc config use <name> [--json]` | Switches the active config. **绝不自动 apply**（决策 D8）：文本模式提示 `zc reload`；JSON `data.applied:false`。 |
 | `zc config dump [-c <config>] [--no-override] [--json]` | Prints the merged config as a **bare document** — YAML in text mode, bare JSON object with `--json`（唯一 envelope 例外，决策 D2）。可直接 `\| yq` / `\| jq`。Failures still use the envelope/error block。 |
 | `zc config override [<script>\|--clear] [--json]` | Bind/show/clear the persisted override for the current config; applies to a running daemon. |

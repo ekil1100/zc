@@ -1679,44 +1679,170 @@ pub const DownloadResult = struct {
     body: []const u8,
 };
 
-/// fetchConfig 内部函数：执行 HTTP 请求获取配置内容
-/// 可独立测试，验证 User-Agent 等头部设置
-pub fn fetchConfig(allocator: std.mem.Allocator, url: []const u8) !DownloadResult {
+const FetchConfigOptions = struct {
+    body_bytes_max: usize = legacy_config_bytes_max,
+    deadline_ms: u32 = 30_000,
+
+    fn validate(self: FetchConfigOptions) !void {
+        if (self.body_bytes_max > legacy_config_bytes_max) {
+            return error.LimitsExceedContract;
+        }
+        if (self.deadline_ms == 0 or self.deadline_ms > 60_000) {
+            return error.InvalidDownloadDeadline;
+        }
+    }
+};
+
+const FetchConfigEvent = union(enum) {
+    response: anyerror!DownloadResult,
+    deadline,
+};
+
+pub fn fetchConfig(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+) !DownloadResult {
+    return fetchConfigWithOptions(allocator, url, .{});
+}
+
+fn fetchConfigWithOptions(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    options: FetchConfigOptions,
+) !DownloadResult {
+    try options.validate();
+    var event_buffer: [1]FetchConfigEvent = undefined;
+    var events: std.Io.Queue(FetchConfigEvent) = .init(&event_buffer);
+    var fetch_future = compat.io().async(
+        fetchConfigWorker,
+        .{ allocator, url, options, &events },
+    );
+    var deadline_future = compat.io().async(
+        fetchConfigDeadlineWorker,
+        .{ options.deadline_ms, &events },
+    );
+
+    const event = events.getOne(compat.io()) catch |err| {
+        events.close(compat.io());
+        fetch_future.cancel(compat.io());
+        deadline_future.cancel(compat.io());
+        drainFetchConfigEvents(allocator, &events, event_buffer.len);
+        return err;
+    };
+    events.close(compat.io());
+    fetch_future.cancel(compat.io());
+    deadline_future.cancel(compat.io());
+    drainFetchConfigEvents(allocator, &events, event_buffer.len);
+    return switch (event) {
+        .response => |response| response,
+        .deadline => error.DownloadTimeout,
+    };
+}
+
+fn drainFetchConfigEvents(
+    allocator: std.mem.Allocator,
+    events: *std.Io.Queue(FetchConfigEvent),
+    event_count_max: usize,
+) void {
+    var event_count: usize = 0;
+    while (event_count < event_count_max) : (event_count += 1) {
+        const event = events.getOneUncancelable(compat.io()) catch |err| switch (err) {
+            error.Closed => return,
+        };
+        switch (event) {
+            .response => |response| {
+                if (response) |value| allocator.free(value.body) else |_| {}
+            },
+            .deadline => {},
+        }
+    }
+}
+
+fn fetchConfigWorker(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    options: FetchConfigOptions,
+    events: *std.Io.Queue(FetchConfigEvent),
+) void {
+    const response = fetchConfigHTTP(allocator, url, options);
+    events.putOne(compat.io(), .{ .response = response }) catch {
+        if (response) |value| allocator.free(value.body) else |_| {}
+    };
+}
+
+fn fetchConfigDeadlineWorker(
+    deadline_ms: u32,
+    events: *std.Io.Queue(FetchConfigEvent),
+) void {
+    std.Io.sleep(
+        compat.io(),
+        .fromMilliseconds(deadline_ms),
+        .awake,
+    ) catch return;
+    events.putOne(compat.io(), .deadline) catch {};
+}
+
+fn fetchConfigHTTP(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    options: FetchConfigOptions,
+) !DownloadResult {
     var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
 
     var proxy_arena = try initDefaultProxyEnv(allocator, &client);
     defer proxy_arena.deinit();
 
-    var response_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer response_writer.deinit();
+    const storage_size = options.body_bytes_max + 1;
+    const response_storage = try allocator.alloc(u8, storage_size);
+    var response_storage_owned = true;
+    defer if (response_storage_owned) allocator.free(response_storage);
+    var response_writer: std.Io.Writer = .fixed(response_storage);
 
     const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
-        .response_writer = &response_writer.writer,
+        .response_writer = &response_writer,
         .headers = .{
             .user_agent = .{ .override = "clash" },
             .accept_encoding = .{ .override = "identity" },
         },
     }) catch |err| {
+        if (err == error.WriteFailed and
+            response_writer.buffered().len == storage_size)
+        {
+            return error.ConfigTooLarge;
+        }
         if (shouldUseCurlFallback(url)) {
-            if (fetchConfigWithCurl(allocator, url)) |fallback| return fallback else |_| {}
+            if (fetchConfigWithCurl(allocator, url, options)) |fallback| {
+                return fallback;
+            } else |fallback_error| switch (fallback_error) {
+                error.ConfigTooLarge, error.DownloadTimeout => return fallback_error,
+                else => {},
+            }
         }
         std.debug.print("Failed to download config: {s}\n", .{@errorName(err)});
         return err;
     };
 
+    if (response_writer.buffered().len > options.body_bytes_max) {
+        return error.ConfigTooLarge;
+    }
     if (result.status == .bad_request and shouldUseCurlFallback(url)) {
-        if (fetchConfigWithCurl(allocator, url)) |fallback| return fallback else |_| {}
+        if (fetchConfigWithCurl(allocator, url, options)) |fallback| {
+            return fallback;
+        } else |fallback_error| switch (fallback_error) {
+            error.ConfigTooLarge, error.DownloadTimeout => return fallback_error,
+            else => {},
+        }
     }
 
-    const body = try allocator.dupe(u8, response_writer.written());
-
-    return DownloadResult{
-        .status = result.status,
-        .body = body,
-    };
+    const body = try allocator.realloc(
+        response_storage,
+        response_writer.buffered().len,
+    );
+    response_storage_owned = false;
+    return .{ .status = result.status, .body = body };
 }
 
 fn initDefaultProxyEnv(allocator: std.mem.Allocator, client: *std.http.Client) !std.heap.ArenaAllocator {
@@ -1743,25 +1869,62 @@ fn hasEnv(environ_map: *const std.process.Environ.Map, key: []const u8) bool {
     return value.len > 0;
 }
 
-fn fetchConfigWithCurl(allocator: std.mem.Allocator, url: []const u8) !DownloadResult {
-    const result = try compat.childRun(allocator, &.{
-        "curl",
-        "--location",
-        "--silent",
-        "--show-error",
-        "--user-agent",
-        "clash",
-        "--header",
-        "accept-encoding: identity",
-        "--write-out",
-        "\n%{http_code}",
-        url,
-    }, 64 * 1024 * 1024);
+fn fetchConfigWithCurl(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    options: FetchConfigOptions,
+) !DownloadResult {
+    var deadline_seconds_buffer: [16]u8 = undefined;
+    const deadline_seconds = try std.fmt.bufPrint(
+        &deadline_seconds_buffer,
+        "{d}",
+        .{@max(1, (options.deadline_ms + 999) / 1000)},
+    );
+    var body_bytes_max_buffer: [32]u8 = undefined;
+    const body_bytes_max = try std.fmt.bufPrint(
+        &body_bytes_max_buffer,
+        "{d}",
+        .{options.body_bytes_max},
+    );
+    const result = std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            "curl",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            deadline_seconds,
+            "--max-filesize",
+            body_bytes_max,
+            "--user-agent",
+            "clash",
+            "--header",
+            "accept-encoding: identity",
+            "--write-out",
+            "\n%{http_code}",
+            url,
+        },
+        .stdout_limit = .limited(options.body_bytes_max + 4),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(options.deadline_ms),
+        } },
+    }) catch |err| switch (err) {
+        error.StreamTooLong => return error.ConfigTooLarge,
+        error.Timeout => return error.DownloadTimeout,
+        else => return err,
+    };
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
 
     switch (result.term) {
-        .exited => |code| if (code != 0) return error.DownloadFailed,
+        .exited => |code| switch (code) {
+            0 => {},
+            28 => return error.DownloadTimeout,
+            63 => return error.ConfigTooLarge,
+            else => return error.DownloadFailed,
+        },
         else => return error.DownloadFailed,
     }
 
@@ -2908,6 +3071,75 @@ test "fetchConfig requests identity encoding to avoid compressed provider respon
     try std.testing.expectEqual(std.http.Status.ok, result.status);
     try std.testing.expectEqualStrings(response_body, result.body);
     try std.testing.expect(std.mem.indexOf(u8, request_bytes.items, "accept-encoding: identity\r\n") != null);
+}
+
+test "fetchConfig enforces the response body limit" {
+    const allocator = std.testing.allocator;
+    var server = try (try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        0,
+    )).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        fn run(http_server: *compat.net.Server) void {
+            var connection = http_server.accept() catch return;
+            defer connection.stream.close();
+            var request_buffer: [1024]u8 = undefined;
+            _ = connection.stream.read(&request_buffer) catch return;
+            const body = [_]u8{'x'} ** 64;
+            var response_buffer: [256]u8 = undefined;
+            const response = std.fmt.bufPrint(
+                &response_buffer,
+                "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ body.len, &body },
+            ) catch return;
+            connection.stream.writeAll(response) catch return;
+        }
+    }.run, .{&server});
+    defer thread.join();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/large.yaml",
+        .{server.listen_address.getPort()},
+    );
+    defer allocator.free(url);
+    try std.testing.expectError(
+        error.ConfigTooLarge,
+        fetchConfigWithOptions(allocator, url, .{
+            .body_bytes_max = 32,
+            .deadline_ms = 1_000,
+        }),
+    );
+}
+
+test "fetchConfig enforces the total deadline" {
+    const allocator = std.testing.allocator;
+    var server = try (try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        0,
+    )).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        fn run(http_server: *compat.net.Server) void {
+            var connection = http_server.accept() catch return;
+            defer connection.stream.close();
+            compat.sleepNs(250 * std.time.ns_per_ms);
+        }
+    }.run, .{&server});
+    defer thread.join();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/slow.yaml",
+        .{server.listen_address.getPort()},
+    );
+    defer allocator.free(url);
+    try std.testing.expectError(
+        error.DownloadTimeout,
+        fetchConfigWithOptions(allocator, url, .{
+            .body_bytes_max = 1024,
+            .deadline_ms = 25,
+        }),
+    );
 }
 
 test "initDefaultProxyEnv configures standard proxy variables" {

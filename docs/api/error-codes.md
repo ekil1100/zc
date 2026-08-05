@@ -102,11 +102,15 @@
 | `CONFIG_DOWNLOAD_URL_REQUIRED` | missing <url> for config download | use `zc config download <url> [-n <name>] [-d]` |
 | `CONFIG_DOWNLOAD_NAME_REQUIRED` | missing value for `-n` | use `zc config download <url> -n <name>` |
 | `CONFIG_DOWNLOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `config download` | use `zc config download <url> [-n <name>] [-d]` |
+| `CONFIG_DOWNLOAD_TOO_LARGE` | downloaded config exceeds the 16 MiB limit | reduce the config size and retry |
+| `CONFIG_DOWNLOAD_TIMEOUT` | config download exceeded the 30 second deadline | check the server or network and retry |
 | `CONFIG_DOWNLOAD_FAILED` | failed to download config | check the url/network and retry |
 | `CONFIG_UPDATE_APPLY_INVALID` | invalid `--apply` value | use `--apply auto\|hot\|restart` |
 | `CONFIG_UPDATE_ARGUMENT_INVALID` | unknown or unexpected argument for `config update` | use `zc config update [name] [--apply auto\|hot\|restart]` |
 | `CONFIG_UPDATE_NAME_REQUIRED` | no config name given and no active config | use `zc config update <name>`, or `zc config use <name>` first |
 | `CONFIG_UPDATE_NO_SUBSCRIPTION` | no subscription url recorded for this config | use `zc config download <url>` to (re)create it |
+| `CONFIG_UPDATE_TOO_LARGE` | updated config exceeds the 16 MiB limit | reduce the config size and retry |
+| `CONFIG_UPDATE_TIMEOUT` | config update exceeded the 30 second deadline | check the server or network and retry |
 | `CONFIG_UPDATE_FAILED` | failed to update config | check subscription url/network and retry |
 | `CONFIG_UPDATE_APPLY_FAILED` | config updated but failed to apply to running daemon | check `zc log --no-follow`, then run `zc restart` |
 | `CONFIG_USE_NAME_REQUIRED` | missing <name> for config use | use `zc config use <name>`; run `zc config list` to see candidates |
