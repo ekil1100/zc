@@ -155,9 +155,6 @@ pub const Engine = struct {
     }
 
     pub fn matchCtx(self: *Engine, ctx: MatchContext) ?[]const u8 {
-        std.debug.print("[Engine] Matching: host={s}, port={d}, is_domain={}\n", .{ ctx.target_host, ctx.target_port, ctx.is_domain });
-        std.debug.print("[Engine] DNS client present: {}\n", .{self.dns_client != null});
-
         // 1. PROCESS-NAME (最高优先级之一)
         if (ctx.process_name) |proc| {
             if (self.process_names.contains(proc)) {
@@ -194,18 +191,13 @@ pub const Engine = struct {
         if (ctx.is_domain) {
             const host = ctx.target_host;
 
-            std.debug.print("[Engine] Checking domain rules for {s}\n", .{host});
-            std.debug.print("[Engine] domain_set count: {}\n", .{self.domain_set.count()});
-
             // 5.1 DOMAIN - 精确匹配
             if (self.domain_set.contains(host)) {
-                std.debug.print("[Engine] Domain exact match: {s}\n", .{host});
                 return self.findRuleTarget(.domain, host);
             }
 
             // 5.2 DOMAIN-SUFFIX - 后缀匹配
             if (self.matchDomainSuffix(host)) {
-                std.debug.print("[Engine] Domain suffix match: {s}\n", .{host});
                 const suffix = self.findMatchingSuffix(host) orelse host;
                 return self.findRuleTarget(.domain_suffix, suffix);
             }
@@ -213,7 +205,6 @@ pub const Engine = struct {
             // 5.3 DOMAIN-KEYWORD - 关键词匹配
             for (self.domain_keywords.items) |keyword| {
                 if (std.mem.indexOf(u8, host, keyword) != null) {
-                    std.debug.print("[Engine] Domain keyword match: {s}\n", .{keyword});
                     return self.findRuleTarget(.domain_keyword, keyword);
                 }
             }
@@ -228,26 +219,20 @@ pub const Engine = struct {
 
             // 5.5 IP-CIDR (DNS 解析后检查，除非 no-resolve)
             if (self.dns_client) |*client| {
-                std.debug.print("[Engine] DNS client available, resolving {s}\n", .{host});
                 const addresses = client.resolve(host) catch {
                     // DNS 失败，继续检查 no-resolve 规则
-                    std.debug.print("[Engine] DNS resolve failed\n", .{});
                     return self.matchNoResolveRules(ctx);
                 };
                 defer self.allocator.free(addresses);
-                std.debug.print("[Engine] DNS resolved to {} addresses\n", .{addresses.len});
 
                 for (addresses) |addr| {
                     // IPv4
                     if (addr == .in) {
                         const ip = addr.in.sa.addr;
 
-                        std.debug.print("[Engine] IPv4: {}.{}.{}.{}\n", .{ (ip >> 0) & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF });
-
                         // GEOIP 检查
                         if (self.geoip_enabled) {
                             if (self.matchGeoIp(ip)) |country| {
-                                std.debug.print("[Engine] GEOIP match: {s}\n", .{country});
                                 if (self.findRuleTarget(.geoip, country)) |target| {
                                     return target;
                                 }
@@ -324,7 +309,6 @@ pub const Engine = struct {
         }
 
         // Final rule (MATCH)
-        std.debug.print("[Engine] Reached final rule, calling findRuleTarget\n", .{});
         return self.findRuleTarget(.final, "");
     }
 
@@ -377,25 +361,18 @@ pub const Engine = struct {
     }
 
     fn findRuleTarget(self: *const Engine, rule_type: RuleType, payload: []const u8) ?[]const u8 {
-        std.debug.print("[Engine] findRuleTarget: type={}, payload={s}\n", .{ rule_type, payload });
         for (self.rules.items) |rule| {
             if (rule.rule_type == rule_type) {
                 if (rule_type == .final or std.mem.eql(u8, rule.payload, payload)) {
-                    std.debug.print("[Engine] findRuleTarget found: {s}\n", .{rule.target});
                     return rule.target;
                 }
             }
         }
         if (rule_type == .final) {
-            std.debug.print("[Engine] findRuleTarget: searching for final rule again\n", .{});
             for (self.rules.items) |rule| {
-                if (rule.rule_type == .final) {
-                    std.debug.print("[Engine] findRuleTarget found final: {s}\n", .{rule.target});
-                    return rule.target;
-                }
+                if (rule.rule_type == .final) return rule.target;
             }
         }
-        std.debug.print("[Engine] findRuleTarget: not found\n", .{});
         return null;
     }
 

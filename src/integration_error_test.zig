@@ -1206,6 +1206,24 @@ test "integration: background start returns only after listeners are ready" {
 
     const mixed = try connectController(mixed_port);
     mixed.close();
+    const route_probe = try connectController(mixed_port);
+    try route_probe.writeAll(
+        "CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n",
+    );
+    var route_response: [1024]u8 = undefined;
+    _ = route_probe.read(&route_response) catch {};
+    route_probe.close();
+    compat.sleepNs(150 * std.time.ns_per_ms);
+    const route_log = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "run/zc.log",
+        allocator,
+        .limited(256 * 1024),
+    );
+    defer allocator.free(route_log);
+    try std.testing.expect(
+        std.mem.indexOf(u8, route_log, "[Engine]") == null,
+    );
     const controller = try connectController(controller_port);
     controller.close();
     try tmp.dir.access(compat.io(), "run/zc.pid", .{});
