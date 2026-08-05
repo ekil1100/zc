@@ -274,6 +274,34 @@ test "YAML strict inline maps reject duplicates and preserve scalar types" {
     try testing.expectEqualStrings("true", item.get("enabled").?.string);
 }
 
+test "YAML strict accepts 128 flow levels and rejects 129" {
+    const allocator = testing.allocator;
+    const build = struct {
+        fn source(allocator_: std.mem.Allocator, depth: usize) ![]u8 {
+            var bytes = std.ArrayList(u8).empty;
+            errdefer bytes.deinit(allocator_);
+            try bytes.appendSlice(allocator_, "root: ");
+            for (0..depth) |_| try bytes.appendSlice(allocator_, "{x: ");
+            try bytes.appendSlice(allocator_, "value");
+            for (0..depth) |_| try bytes.append(allocator_, '}');
+            try bytes.append(allocator_, '\n');
+            return bytes.toOwnedSlice(allocator_);
+        }
+    }.source;
+
+    const accepted_source = try build(allocator, 128);
+    defer allocator.free(accepted_source);
+    var accepted = try yaml.parseDocument(allocator, accepted_source);
+    accepted.deinit(allocator);
+
+    const rejected_source = try build(allocator, 129);
+    defer allocator.free(rejected_source);
+    try testing.expectError(
+        error.YamlNestingTooDeep,
+        yaml.parseDocument(allocator, rejected_source),
+    );
+}
+
 test "YAML strict rejects over-indented sequence items and excessive nesting" {
     const allocator = testing.allocator;
     try testing.expectError(error.InvalidYamlDocument, yaml.parseDocument(allocator,
@@ -290,6 +318,22 @@ test "YAML strict rejects over-indented sequence items and excessive nesting" {
     for (0..140) |_| try source.append(allocator, '}');
     try source.append(allocator, '\n');
     try testing.expectError(error.YamlNestingTooDeep, yaml.parseDocument(allocator, source.items));
+}
+
+test "YAML legacy parsing enforces the nesting limit" {
+    const allocator = testing.allocator;
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(allocator);
+    for (0..140) |depth| {
+        for (0..depth * 2) |_| try source.append(allocator, ' ');
+        try source.appendSlice(allocator, "key:\n");
+    }
+    for (0..280) |_| try source.append(allocator, ' ');
+    try source.appendSlice(allocator, "leaf: value\n");
+    try testing.expectError(
+        error.YamlNestingTooDeep,
+        yaml.parse(allocator, source.items),
+    );
 }
 
 test "YAML parse nested map" {

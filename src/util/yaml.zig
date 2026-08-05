@@ -473,19 +473,22 @@ const Parser = struct {
                     const next_indent = self.getIndentAt(next_line_start);
 
                     if (next_indent > indent) {
-                        if (self.strict and self.depth >= max_nesting_depth) {
+                        if (self.depth >= max_nesting_depth) {
                             return error.YamlNestingTooDeep;
                         }
-                        if (self.strict) self.depth += 1;
-                        defer if (self.strict) {
-                            self.depth -= 1;
-                        };
+                        self.depth += 1;
+                        defer self.depth -= 1;
                         val = try self.parseValue(next_indent);
                     }
                 }
             } else if (self.strict and
                 (self.source[self.pos] == '{' or self.source[self.pos] == '['))
             {
+                if (self.depth >= max_nesting_depth) {
+                    return error.YamlNestingTooDeep;
+                }
+                self.depth += 1;
+                defer self.depth -= 1;
                 val = if (self.source[self.pos] == '{')
                     try self.parseInlineMap()
                 else
@@ -553,13 +556,11 @@ const Parser = struct {
             if (self.pos < self.source.len and
                 (self.source[self.pos] == '{' or (self.strict and self.source[self.pos] == '[')))
             {
-                if (self.strict and self.depth >= max_nesting_depth) {
+                if (self.depth >= max_nesting_depth) {
                     return error.YamlNestingTooDeep;
                 }
-                if (self.strict) self.depth += 1;
-                defer if (self.strict) {
-                    self.depth -= 1;
-                };
+                self.depth += 1;
+                defer self.depth -= 1;
                 var item = if (self.source[self.pos] == '{')
                     try self.parseInlineMap()
                 else
@@ -618,13 +619,11 @@ const Parser = struct {
             };
 
             if (is_map) {
-                if (self.strict and self.depth >= max_nesting_depth) {
+                if (self.depth >= max_nesting_depth) {
                     return error.YamlNestingTooDeep;
                 }
-                if (self.strict) self.depth += 1;
-                defer if (self.strict) {
-                    self.depth -= 1;
-                };
+                self.depth += 1;
+                defer self.depth -= 1;
                 var item = try self.parseMap(base, true);
                 arr.append(self.allocator, item) catch |err| {
                     item.deinit(self.allocator);
@@ -902,14 +901,14 @@ const Parser = struct {
 
         const trimmed = scalar;
         if (trimmed.len > 1 and trimmed[0] == '[') {
-            if (self.strict and self.depth >= max_nesting_depth) {
+            if (self.depth >= max_nesting_depth) {
                 return error.YamlNestingTooDeep;
             }
             var nested = Parser{
                 .allocator = self.allocator,
                 .source = trimmed,
                 .strict = self.strict,
-                .depth = if (self.strict) self.depth + 1 else self.depth,
+                .depth = self.depth + 1,
             };
             var value = try nested.parseInlineSequence();
             errdefer value.deinit(self.allocator);
@@ -919,13 +918,11 @@ const Parser = struct {
 
         // Check if it's a nested inline map (starts with {)
         if (trimmed.len > 1 and trimmed[0] == '{') {
-            if (self.strict and self.depth >= max_nesting_depth) {
+            if (self.depth >= max_nesting_depth) {
                 return error.YamlNestingTooDeep;
             }
-            if (self.strict) self.depth += 1;
-            defer if (self.strict) {
-                self.depth -= 1;
-            };
+            self.depth += 1;
+            defer self.depth -= 1;
             if (self.strict and trimmed[trimmed.len - 1] != '}') {
                 return error.InvalidYamlDocument;
             }
