@@ -1134,7 +1134,13 @@ fn syncRuleProviderFilesIfNeeded(
         const file = compat.fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 if (provider.url) |url| {
-                    try downloadRuleProviderFile(allocator, provider.name, url, resolved_path, true);
+                    try downloadRuleProviderFile(
+                        allocator,
+                        provider,
+                        url,
+                        resolved_path,
+                        true,
+                    );
                     continue;
                 }
                 return error.RuleProviderFileNotFound;
@@ -1146,7 +1152,13 @@ fn syncRuleProviderFilesIfNeeded(
 
         if (provider.url) |url| {
             if (sync_policy == .eager and isRuleProviderRefreshDue(stat.mtime.nanoseconds, provider.interval)) {
-                downloadRuleProviderFile(allocator, provider.name, url, resolved_path, false) catch |err| {
+                downloadRuleProviderFile(
+                    allocator,
+                    provider,
+                    url,
+                    resolved_path,
+                    false,
+                ) catch |err| {
                     std.debug.print(
                         "rule-provider refresh failed (using cached file): name={s} url={s} path={s} error={s}\n",
                         .{ provider.name, url, resolved_path, @errorName(err) },
@@ -1159,11 +1171,12 @@ fn syncRuleProviderFilesIfNeeded(
 
 fn downloadRuleProviderFile(
     allocator: std.mem.Allocator,
-    provider_name: []const u8,
+    provider: *const RuleProvider,
     url: []const u8,
     resolved_path: []const u8,
     required: bool,
 ) !void {
+    const provider_name = provider.name;
     const result = fetchConfig(allocator, url) catch |err| {
         std.debug.print(
             "rule-provider download failed: name={s} url={s} path={s} error={s}\n",
@@ -1181,36 +1194,104 @@ fn downloadRuleProviderFile(
         return error.RuleProviderDownloadFailed;
     }
 
-    const parent = compat.fs.path.dirname(resolved_path) orelse return error.RuleProviderDownloadFailed;
-    compat.fs.cwd().makePath(parent) catch |err| {
+    const publish_outcome = installDownloadedRuleProvider(
+        allocator,
+        provider,
+        resolved_path,
+        result.body,
+    ) catch |err| {
         std.debug.print(
-            "rule-provider download failed: name={s} url={s} path={s} mkdir_error={s}\n",
+            "rule-provider download failed: name={s} url={s} path={s} " ++
+                "install_error={s}\n",
             .{ provider_name, url, resolved_path, @errorName(err) },
         );
         return error.RuleProviderDownloadFailed;
     };
-
-    const file = compat.fs.createFileAbsolute(resolved_path, .{}) catch |err| {
+    if (publish_outcome == .durability_uncertain) {
         std.debug.print(
-            "rule-provider download failed: name={s} url={s} path={s} file_error={s}\n",
-            .{ provider_name, url, resolved_path, @errorName(err) },
+            "rule-provider visible but durability uncertain: name={s} " ++
+                "path={s} error={s}\n",
+            .{
+                provider_name,
+                resolved_path,
+                @errorName(publish_outcome.durability_uncertain),
+            },
         );
-        return error.RuleProviderDownloadFailed;
-    };
-    defer file.close(compat.io());
-    compat.fileWriteAll(file, result.body) catch |err| {
-        std.debug.print(
-            "rule-provider download failed: name={s} url={s} path={s} write_error={s}\n",
-            .{ provider_name, url, resolved_path, @errorName(err) },
-        );
-        return error.RuleProviderDownloadFailed;
-    };
+    }
 
     if (required) {
         std.debug.print("rule-provider downloaded: name={s} path={s}\n", .{ provider_name, resolved_path });
     } else {
         std.debug.print("rule-provider refreshed: name={s} path={s}\n", .{ provider_name, resolved_path });
     }
+}
+
+const RuleProviderPublishOutcome = union(enum) {
+    committed,
+    durability_uncertain: anyerror,
+};
+
+fn installDownloadedRuleProvider(
+    allocator: std.mem.Allocator,
+    provider: *const RuleProvider,
+    resolved_path: []const u8,
+    content: []const u8,
+) !RuleProviderPublishOutcome {
+    try validateDownloadedRuleProvider(allocator, provider, content);
+    return publishRuleProviderFile(resolved_path, content);
+}
+
+fn validateDownloadedRuleProvider(
+    allocator: std.mem.Allocator,
+    provider: *const RuleProvider,
+    content: []const u8,
+) !void {
+    var candidate = RuleProvider{
+        .name = provider.name,
+        .provider_type = provider.provider_type,
+        .behavior = provider.behavior,
+        .url = provider.url,
+        .path = provider.path,
+        .interval = provider.interval,
+        .entries = .empty,
+    };
+    defer {
+        candidate.clearEntries(allocator);
+        candidate.entries.deinit(allocator);
+    }
+    try appendRuleProviderEntriesOffline(allocator, &candidate, content);
+    try validateRuleProviderEntries(allocator, &candidate);
+}
+
+fn publishRuleProviderFile(
+    resolved_path: []const u8,
+    content: []const u8,
+) !RuleProviderPublishOutcome {
+    const parent_path = compat.fs.path.dirname(resolved_path) orelse
+        return error.InvalidRuleProviderPath;
+    try compat.fs.cwd().makePath(parent_path);
+    const parent = try compat.fs.openDirAbsolute(parent_path, .{});
+    defer parent.close(compat.io());
+    const parent_file = try parent.openFile(
+        compat.io(),
+        ".",
+        .{ .allow_directory = true },
+    );
+    defer parent_file.close(compat.io());
+    const permissions = std.Io.File.Permissions.fromMode(0o600);
+    var atomic = try parent.createFileAtomic(
+        compat.io(),
+        compat.fs.path.basename(resolved_path),
+        .{ .replace = true, .permissions = permissions },
+    );
+    defer atomic.deinit(compat.io());
+    try atomic.file.setPermissions(compat.io(), permissions);
+    try compat.fileWriteAll(atomic.file, content);
+    try atomic.file.sync(compat.io());
+    try atomic.replace(compat.io());
+    parent_file.sync(compat.io()) catch |err|
+        return .{ .durability_uncertain = err };
+    return .committed;
 }
 
 fn isRuleProviderRefreshDue(mtime: i128, interval_seconds: u32) bool {
@@ -1247,10 +1328,18 @@ fn loadRuleProviderEntries(
         };
         defer file.close(compat.io());
 
-        const content = try compat.fileReadToEndAlloc(file, allocator, 8 * 1024 * 1024);
+        const content = try compat.fileReadToEndAlloc(
+            file,
+            allocator,
+            legacy_config_bytes_max + 1,
+        );
         defer allocator.free(content);
+        if (content.len > legacy_config_bytes_max) {
+            return error.RuleProviderFileTooLarge;
+        }
 
-        try appendRuleProviderEntriesLegacy(allocator, provider, content);
+        try appendRuleProviderEntriesOffline(allocator, provider, content);
+        try validateRuleProviderEntries(allocator, provider);
     }
 }
 
@@ -1353,26 +1442,43 @@ fn appendRuleProviderEntry(
 fn validateOfflineProviderEntries(allocator: std.mem.Allocator, cfg: *const Config) !void {
     for (cfg.rule_providers.items) |provider| {
         if (provider.url != null) continue;
-        for (provider.entries.items) |entry| switch (provider.behavior) {
-            .classical => {
-                var parsed = try parseClassicalProviderEntry(allocator, entry, "DIRECT");
-                defer parsed.deinit(allocator);
-                if (!isValidClassicalProviderRule(parsed)) return error.InvalidRuleProviderEntry;
-            },
-            .domain => {
-                const domain = normalizeDomainProviderEntry(entry) orelse
-                    return error.InvalidRuleProviderEntry;
-                if (domain.len == 0 or std.mem.indexOfAny(u8, domain, " \t\r\n,") != null) {
-                    return error.InvalidRuleProviderEntry;
-                }
-            },
-            .ipcidr => {
-                const cidr = normalizeIpCidrProviderEntry(entry) orelse
-                    return error.InvalidRuleProviderEntry;
-                if (!isValidRuleProviderCidr(cidr)) return error.InvalidRuleProviderEntry;
-            },
-        };
+        try validateRuleProviderEntries(allocator, &provider);
     }
+}
+
+fn validateRuleProviderEntries(
+    allocator: std.mem.Allocator,
+    provider: *const RuleProvider,
+) !void {
+    for (provider.entries.items) |entry| switch (provider.behavior) {
+        .classical => {
+            var parsed = try parseClassicalProviderEntry(
+                allocator,
+                entry,
+                "DIRECT",
+            );
+            defer parsed.deinit(allocator);
+            if (!isValidClassicalProviderRule(parsed)) {
+                return error.InvalidRuleProviderEntry;
+            }
+        },
+        .domain => {
+            const domain = normalizeDomainProviderEntry(entry) orelse
+                return error.InvalidRuleProviderEntry;
+            if (domain.len == 0 or
+                std.mem.indexOfAny(u8, domain, " \t\r\n,") != null)
+            {
+                return error.InvalidRuleProviderEntry;
+            }
+        },
+        .ipcidr => {
+            const cidr = normalizeIpCidrProviderEntry(entry) orelse
+                return error.InvalidRuleProviderEntry;
+            if (!isValidRuleProviderCidr(cidr)) {
+                return error.InvalidRuleProviderEntry;
+            }
+        },
+    };
 }
 
 fn isValidClassicalProviderRule(rule: Rule) bool {
@@ -2945,6 +3051,59 @@ fn testTmpPathAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir
     return try compat.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..], name });
 }
 
+test "rule-provider publication preserves the last valid cache" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const existing = try tmp.dir.createFile(compat.io(), "rules.yaml", .{});
+    try compat.fileWriteAll(existing, "payload:\n  - old.example\n");
+    existing.close(compat.io());
+    const path = try testTmpPathAlloc(allocator, &tmp, "rules.yaml");
+    defer allocator.free(path);
+    const provider = RuleProvider{
+        .name = "deny",
+        .provider_type = "file",
+        .behavior = .domain,
+        .url = "https://example.invalid/rules.yaml",
+        .path = path,
+        .entries = .empty,
+    };
+
+    try std.testing.expectError(
+        error.InvalidRuleProviderEntry,
+        installDownloadedRuleProvider(
+            allocator,
+            &provider,
+            path,
+            "payload:\n  - bad domain\n",
+        ),
+    );
+    const preserved = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "rules.yaml",
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(preserved);
+    try std.testing.expectEqualStrings("payload:\n  - old.example\n", preserved);
+
+    const replacement = "payload:\n  - new.example\n";
+    _ = try installDownloadedRuleProvider(
+        allocator,
+        &provider,
+        path,
+        replacement,
+    );
+    const published = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "rules.yaml",
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(published);
+    try std.testing.expectEqualStrings(replacement, published);
+}
+
 test "prepareRuleProvidersForRuntime expands rule-set rules" {
     const allocator = std.testing.allocator;
 
@@ -3002,6 +3161,7 @@ test "prepareRuleProvidersForRuntime supports yaml payload style classical provi
         const f = try tmp.dir.createFile(compat.io(), "applications.txt", .{});
         defer f.close(compat.io());
         try compat.fileWriteAll(f,
+            \\---
             \\payload:
             \\  - PROCESS-NAME,tailscale
             \\  - PROCESS-NAME,tailscaled
