@@ -20,12 +20,16 @@ const max_request_bytes = max_header_bytes + 4 + max_body_bytes;
 const request_timeout_ms: i64 = 2_000;
 const response_timeout_ms: i64 = 2_000;
 const max_connections: u32 = 16;
-const connection_stack_bytes: usize = 256 * 1024;
+// Linux glibc accounts the executable's static TLS against each pthread stack.
+const connection_stack_bytes: usize = 1024 * 1024;
 
 comptime {
     std.debug.assert(max_header_bytes < max_request_bytes);
     std.debug.assert(max_body_bytes < max_request_bytes);
     std.debug.assert(max_connections > 0);
+    std.debug.assert(
+        max_connections * connection_stack_bytes <= 16 * 1024 * 1024,
+    );
 }
 
 pub const Request = struct {
