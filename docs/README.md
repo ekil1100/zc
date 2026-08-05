@@ -27,8 +27,9 @@ zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当
 | Config | [`config/override.md`](config/override.md) | Runtime override behavior. |
 | Compatibility | [`compat/mihomo-clash.md`](compat/mihomo-clash.md) | mihomo/clash compatibility boundaries and unsupported features. |
 | Migrator | [`compat/migrator-rules-quickref.md`](compat/migrator-rules-quickref.md) | Config migrator rule reference. |
-| Install | [`install/README.md`](install/README.md) | Homebrew Tap 以及本地 install/verify/upgrade/rollback 流程。 |
+| Install | [`install/README.md`](install/README.md) | Standalone one-line installer、static release、Homebrew 与本地验证流程。 |
 | API | [`api/README.md`](api/README.md) | Minimal API endpoints currently implemented. |
+| E2E | [`reliability/e2e.md`](reliability/e2e.md) | PR/tag-only real binary, network and protocol interoperability gate. |
 | Reliability | [`reliability/soak-guide.md`](reliability/soak-guide.md) | Soak runner usage and release-gate evidence. |
 | Perf reports | [`perf/reports/README.md`](perf/reports/README.md) | Perf report storage used by scripts. |
 
@@ -56,7 +57,7 @@ Included:
 - non-production explicit port override via `zc start --port <port>`;
 - core rule matching and rule-provider expansion;
 - minimal REST API for version/proxies/rules/proxy selection;
-- install regression scripts and release validation gate.
+- checksum-verified standalone installer、static Linux artifacts、PR/tag-only real E2E and release validation gates.
 
 Not included in v1.0:
 

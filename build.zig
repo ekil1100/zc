@@ -117,6 +117,78 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&authority_process_cmd.step);
     test_step.dependOn(&config_flow_cmd.step);
 
+    const e2e_zc_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    e2e_zc_mod.link_libc = true;
+    e2e_zc_mod.addOptions("build_options", options);
+    const e2e_zc = b.addExecutable(.{
+        .name = "zc",
+        .root_module = e2e_zc_mod,
+    });
+    const e2e_origin_mod = b.createModule(.{
+        .root_source_file = b.path("src/e2e_origin.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .ReleaseSafe,
+    });
+    e2e_origin_mod.link_libc = true;
+    const e2e_origin = b.addExecutable(.{
+        .name = "zc-e2e-origin",
+        .root_module = e2e_origin_mod,
+    });
+    const e2e_fixture_root = b.pathFromRoot(".zig-cache/e2e-fixtures");
+    const fetch_e2e_fixtures = b.addSystemCommand(&.{
+        "bash",
+        b.pathFromRoot("scripts/e2e/fetch-static-fixtures.sh"),
+        e2e_fixture_root,
+    });
+    const run_core_e2e = b.addSystemCommand(&.{
+        "bash",
+        b.pathFromRoot("scripts/e2e/run-core.sh"),
+    });
+    run_core_e2e.addArtifactArg(e2e_zc);
+    run_core_e2e.addArtifactArg(e2e_origin);
+    run_core_e2e.addArgs(&.{
+        e2e_fixture_root,
+        b.pathFromRoot("testdata/e2e"),
+    });
+    run_core_e2e.step.dependOn(&fetch_e2e_fixtures.step);
+    const run_installer_e2e = b.addSystemCommand(&.{
+        "bash",
+        b.pathFromRoot("scripts/install/test-oneline-installer.sh"),
+    });
+    run_installer_e2e.addArtifactArg(e2e_zc);
+    run_installer_e2e.addArtifactArg(e2e_origin);
+    const e2e_step = b.step("e2e", "Run installer and real network end-to-end tests");
+    e2e_step.dependOn(&run_installer_e2e.step);
+    e2e_step.dependOn(&run_core_e2e.step);
+
+    const run_release_core_e2e = b.addSystemCommand(&.{
+        "bash",
+        b.pathFromRoot("scripts/e2e/run-core.sh"),
+    });
+    run_release_core_e2e.addArtifactArg(exe);
+    run_release_core_e2e.addArtifactArg(e2e_origin);
+    run_release_core_e2e.addArgs(&.{
+        e2e_fixture_root,
+        b.pathFromRoot("testdata/e2e"),
+    });
+    run_release_core_e2e.step.dependOn(&fetch_e2e_fixtures.step);
+    const run_release_installer_e2e = b.addSystemCommand(&.{
+        "bash",
+        b.pathFromRoot("scripts/install/test-oneline-installer.sh"),
+    });
+    run_release_installer_e2e.addArtifactArg(exe);
+    run_release_installer_e2e.addArtifactArg(e2e_origin);
+    const release_e2e_step = b.step(
+        "e2e-release",
+        "Run E2E against the configured release artifact",
+    );
+    release_e2e_step.dependOn(&run_release_installer_e2e.step);
+    release_e2e_step.dependOn(&run_release_core_e2e.step);
+
     // Fuzz test
     const fuzz_mod = b.createModule(.{
         .root_source_file = b.path("src/fuzz.zig"),

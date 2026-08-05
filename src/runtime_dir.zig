@@ -396,10 +396,11 @@ test "RuntimeDir requires owner-only real directories" {
     var runtime = (try openPath(allocator, path, false)).?;
     defer runtime.deinit();
     try testing.expectEqualStrings(path, runtime.path);
-
-    try tmp.dir.setPermissions(
+    try std.Io.Dir.cwd().setFilePermissions(
         compat.io(),
+        path,
         std.Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
     );
     try testing.expectError(
         error.RuntimeDirectoryPermissions,

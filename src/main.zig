@@ -5306,7 +5306,7 @@ test "mixed connection workers use bounded stack size" {
     const content = try compat.fs.cwd().readFileAlloc(allocator, "src/proxy/mixed.zig", 1024 * 1024);
     defer allocator.free(content);
 
-    try testing.expect(std.mem.indexOf(u8, content, "connection_task_stack_size: usize = 512 * 1024") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "connection_task_stack_size: usize = 1024 * 1024") != null);
     try testing.expect(std.mem.indexOf(u8, content, ".stack_size = connection_task_stack_size") != null);
 }
 

@@ -11,18 +11,17 @@ const ss = @import("outbound/shadowsocks.zig");
 const socket_options = @import("../socket_options.zig");
 const udp_uot = @import("udp_uot.zig");
 
-// macOS reserves 16MiB of virtual stack per pthread by default. The mixed
-// proxy creates one detached worker per accepted connection, so the default
-// stack size makes a small number of stale/idle tunnels look like hundreds of
-// megabytes in Activity Monitor. Keep the worker stack explicit and bounded.
-const connection_task_stack_size: usize = 512 * 1024;
+// macOS reserves 16MiB of virtual stack per pthread by default. Linux glibc
+// also needs enough room for the executable's static TLS before pthread_create
+// accepts a worker. Keep the worker stack explicit, portable, and bounded.
+const connection_task_stack_size: usize = 1024 * 1024;
 const max_connections: u32 = 128;
 const handshake_timeout_ms: i64 = 5_000;
 
 comptime {
     std.debug.assert(max_connections > 0);
     std.debug.assert(
-        max_connections * connection_task_stack_size <= 64 * 1024 * 1024,
+        max_connections * connection_task_stack_size <= 128 * 1024 * 1024,
     );
 }
 

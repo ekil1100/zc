@@ -8,9 +8,14 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Zig
         uses: step-security/setup-zig@v2.2.2
@@ -31,3 +36,27 @@ jobs:
 
       - name: Full validation
         run: bash scripts/run-full-validation.sh
+
+  e2e:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Zig
+        uses: step-security/setup-zig@v2.2.2
+        with:
+          version: 0.16.0
+
+      - name: End-to-end gate
+        run: >-
+          zig build e2e
+          -Dtarget=x86_64-linux-musl
+          -Dcpu=baseline
+          --summary all
