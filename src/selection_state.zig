@@ -63,7 +63,7 @@ pub fn persistDefault(
         return error.ManagedRevisionChanged;
     }
     try meta.setSelection(allocator, &metadata, identity.key, group, proxy);
-    try meta.save(allocator, &metadata);
+    try meta.saveVisible(allocator, &metadata);
     return .{ .identity = identity };
 }
 

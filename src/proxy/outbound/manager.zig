@@ -648,7 +648,7 @@ pub const OutboundManager = struct {
             };
         }
 
-        meta.save(self.allocator, &meta_data) catch {};
+        meta.saveVisible(self.allocator, &meta_data) catch {};
     }
 
     /// 从 meta.json 加载持久化的 selections

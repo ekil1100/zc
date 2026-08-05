@@ -491,7 +491,7 @@ docs/
 - Batch 4 shadow exact loader / tracked runtime descriptor seams：`041578b`–`ee690e7`；
 - Batch 5 typed mutation、catalog coordinator/commands、downloaded writer 与 revisioned override writer：`0684a88`、`90e21b7`、`b81227c`、`ad4ce7f`、`1c2eb78`、`aabd81e`、`cdf7497`、`62d8a1e`、`f2eb2b4`；
 - 666/666 tests passed（0 skipped），ReleaseFast 4/4；
-- `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与 `config load`；下一步让其余 managed writer 全部通过 Authority，消除 legacy mirror 写入。
+- `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与 `config load`；legacy `meta.json` 已采用 `0600`、file sync、原子替换和 parent sync；下一步让其余 managed writer 全部通过 Authority，消除 legacy mirror 写入。
 
 关键验收：
 

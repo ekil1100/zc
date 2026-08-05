@@ -1860,7 +1860,7 @@ pub fn downloadConfig(
         meta_data.active = try allocator.dupe(u8, key);
     }
 
-    try meta.save(allocator, &meta_data);
+    try meta.saveVisible(allocator, &meta_data);
 
     const display = meta.getDisplayName(&cm, key);
     if (out.mode == .text) {
@@ -2001,7 +2001,7 @@ pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, s
     if (cm.override_script) |old| allocator.free(old);
     cm.override_script = try allocator.dupe(u8, abs_script);
 
-    try meta.save(allocator, &meta_data);
+    try meta.saveVisible(allocator, &meta_data);
 }
 
 /// 为“当前配置”设置持久化 override 脚本，返回托管脚本路径
@@ -2039,7 +2039,7 @@ pub fn clearPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator
         }
         allocator.free(old);
         cm.override_script = null;
-        try meta.save(allocator, &meta_data);
+        try meta.saveVisible(allocator, &meta_data);
         return true;
     }
     return false;
@@ -2305,7 +2305,7 @@ pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_
     if (meta_data.active) |old| allocator.free(old);
     meta_data.active = try allocator.dupe(u8, key);
 
-    try meta.save(allocator, &meta_data);
+    try meta.saveVisible(allocator, &meta_data);
 
     if (out.mode == .text) {
         const display = if (meta_data.configs.getPtr(key)) |cm|
@@ -2395,7 +2395,7 @@ pub fn deleteConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_
         }
     }
 
-    try meta.save(allocator, &meta_data);
+    try meta.saveVisible(allocator, &meta_data);
 
     if (out.mode == .text) {
         try out.print("Deleted config: {s}\n", .{key});
@@ -3027,7 +3027,7 @@ test "deleteConfig removes file + meta entry and clears active when active" {
         _ = try ensureConfigMetaEntry(allocator, &md, key);
         if (md.active) |old| allocator.free(old);
         md.active = try allocator.dupe(u8, key);
-        try meta.save(allocator, &md);
+        try meta.saveVisible(allocator, &md);
     }
 
     var out_w: std.Io.Writer.Allocating = .init(allocator);
@@ -3082,7 +3082,7 @@ test "deleteConfig removes managed override script and leaves a different active
         cm.override_script = try allocator.dupe(u8, script_path);
         if (md.active) |old| allocator.free(old);
         md.active = try allocator.dupe(u8, "zc-delete-unit-other");
-        try meta.save(allocator, &md);
+        try meta.saveVisible(allocator, &md);
     }
 
     var out_w: std.Io.Writer.Allocating = .init(allocator);
@@ -3112,7 +3112,7 @@ test "deleteConfig removes managed override script and leaves a different active
         defer md.deinit();
         if (md.active) |old| allocator.free(old);
         md.active = null;
-        meta.save(allocator, &md) catch {};
+        meta.saveVisible(allocator, &md) catch {};
     }
 }
 
@@ -3132,7 +3132,7 @@ test "deleteConfig handles orphan meta entry (no file) and orphan file (no meta 
         try meta.ensureConfigsDir(allocator);
         var md = meta.load(allocator) catch meta.MetaData.init(allocator);
         _ = try ensureConfigMetaEntry(allocator, &md, key);
-        try meta.save(allocator, &md);
+        try meta.saveVisible(allocator, &md);
         md.deinit();
 
         var outcome = try deleteConfig(allocator, key, &out);

@@ -129,14 +129,32 @@ pub fn load(allocator: std.mem.Allocator) !MetaData {
     return meta;
 }
 
-/// 写入 meta.json
-pub fn save(allocator: std.mem.Allocator, meta: *const MetaData) !void {
-    const meta_path = try getMetaPath(allocator) orelse return;
+pub const SaveOutcome = union(enum) {
+    not_configured,
+    committed,
+    durability_uncertain: anyerror,
+};
+
+/// Publishes metadata and reports whether the visible commit has uncertain durability.
+pub fn save(allocator: std.mem.Allocator, meta: *const MetaData) !SaveOutcome {
+    const meta_path = try getMetaPath(allocator) orelse return .not_configured;
     defer allocator.free(meta_path);
-
-    // 确保目录存在
     try ensureConfigsDir(allocator);
+    const config_dir = compat.fs.path.dirname(meta_path) orelse
+        return error.InvalidMetaPath;
+    return saveInDirectory(allocator, meta, config_dir);
+}
 
+/// Treats an already-visible commit as success even if the parent sync is uncertain.
+pub fn saveVisible(allocator: std.mem.Allocator, meta: *const MetaData) !void {
+    _ = try save(allocator, meta);
+}
+
+fn saveInDirectory(
+    allocator: std.mem.Allocator,
+    meta: *const MetaData,
+    config_dir: []const u8,
+) !SaveOutcome {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
@@ -225,9 +243,27 @@ pub fn save(allocator: std.mem.Allocator, meta: *const MetaData) !void {
     }
     try buf.appendSlice(allocator, "\n  }\n}\n");
 
-    const file = try compat.fs.createFileAbsolute(meta_path, .{});
-    defer file.close(compat.io());
-    try compat.fileWriteAll(file, buf.items);
+    const dir = try compat.fs.openDirAbsolute(config_dir, .{});
+    defer dir.close(compat.io());
+    const permissions = std.Io.File.Permissions.fromMode(0o600);
+    var atomic = try dir.createFileAtomic(compat.io(), "meta.json", .{
+        .replace = true,
+        .permissions = permissions,
+    });
+    defer atomic.deinit(compat.io());
+    try atomic.file.setPermissions(compat.io(), permissions);
+    try compat.fileWriteAll(atomic.file, buf.items);
+    try atomic.file.sync(compat.io());
+    const parent = try dir.openFile(
+        compat.io(),
+        ".",
+        .{ .allow_directory = true },
+    );
+    defer parent.close(compat.io());
+    try atomic.replace(compat.io());
+    parent.sync(compat.io()) catch |err|
+        return .{ .durability_uncertain = err };
+    return .committed;
 }
 
 /// 扫描 configs/ 目录，为不在 meta 中的 .yaml 文件创建空 entry
@@ -753,6 +789,91 @@ test "getDisplayName returns filename or key" {
     // Has filename → return filename
     cm.filename = try allocator.dupe(u8, "Flower_SS.yaml");
     try std.testing.expectEqualStrings("Flower_SS.yaml", getDisplayName(&cm, "mykey"));
+}
+
+test "save publishes owner-only parseable metadata" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config_dir_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        ".",
+        allocator,
+    );
+    defer allocator.free(config_dir_path);
+
+    var metadata = MetaData.init(allocator);
+    defer metadata.deinit();
+    metadata.active = try allocator.dupe(u8, "safe-profile");
+    try std.testing.expectEqual(
+        SaveOutcome.committed,
+        try saveInDirectory(allocator, &metadata, config_dir_path),
+    );
+
+    const file = try tmp.dir.openFile(compat.io(), "meta.json", .{});
+    defer file.close(compat.io());
+    const stat = try file.stat(compat.io());
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o600),
+        stat.permissions.toMode() & 0o777,
+    );
+    const bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "meta.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    var loaded = MetaData.init(allocator);
+    defer loaded.deinit();
+    try parseMetaJson(allocator, bytes, &loaded);
+    try std.testing.expectEqualStrings("safe-profile", loaded.active.?);
+}
+
+test "save replaces a metadata symlink without touching its target" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config_dir_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        ".",
+        allocator,
+    );
+    defer allocator.free(config_dir_path);
+    const sentinel_name = "sentinel";
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = sentinel_name,
+        .data = "untouched",
+    });
+    tmp.dir.symLink(
+        compat.io(),
+        sentinel_name,
+        "meta.json",
+        .{},
+    ) catch return error.SkipZigTest;
+
+    var metadata = MetaData.init(allocator);
+    defer metadata.deinit();
+    metadata.active = try allocator.dupe(u8, "replacement");
+    try std.testing.expectEqual(
+        SaveOutcome.committed,
+        try saveInDirectory(allocator, &metadata, config_dir_path),
+    );
+
+    const sentinel = try tmp.dir.readFileAlloc(
+        compat.io(),
+        sentinel_name,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(sentinel);
+    try std.testing.expectEqualStrings("untouched", sentinel);
+    const stat = try tmp.dir.statFile(
+        compat.io(),
+        "meta.json",
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
 }
 
 test "meta json round trip" {
