@@ -322,6 +322,16 @@ pub fn setNonBlock(fd: std.posix.fd_t) !void {
     if (std.c.fcntl(fd, std.posix.F.SETFL, nb) < 0) return error.SetNonblockFailed;
 }
 
+pub fn setAppend(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.SetAppendFailed;
+    const append: c_int = flags |
+        @as(c_int, @bitCast(@as(u32, @bitCast(std.posix.O{ .APPEND = true }))));
+    if (std.c.fcntl(fd, std.posix.F.SETFL, append) < 0) {
+        return error.SetAppendFailed;
+    }
+}
+
 pub fn fileRead(file: std.Io.File, buffer: []u8) !usize {
     return posixRead(file.handle, buffer);
 }
@@ -879,6 +889,29 @@ test "Notifier: deinit sets fds to -1" {
     n.deinit();
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), n.read_fd);
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), n.write_fd);
+}
+
+test "append mode survives external copytruncate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io(), "daemon.log", .{
+        .read = true,
+    });
+    defer file.close(io());
+    try setAppend(file.handle);
+    try fileWriteAll(file, "before");
+    if (std.c.ftruncate(file.handle, 0) != 0) return error.TruncateFailed;
+    try fileWriteAll(file, "after");
+
+    const bytes = try tmp.dir.readFileAlloc(
+        io(),
+        "daemon.log",
+        allocator,
+        .limited(32),
+    );
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("after", bytes);
 }
 
 // ---------------------------------------------------------------------------

@@ -846,6 +846,7 @@ pub fn rotateDaemonLogIfNeeded(allocator: std.mem.Allocator) !void {
         compat.io(),
         runtime_dir.ownerFilePermissions(),
     );
+    try compat.setAppend(replacement.handle);
     if (std.c.dup2(replacement.handle, std.c.STDOUT_FILENO) < 0 or
         std.c.dup2(replacement.handle, std.c.STDERR_FILENO) < 0)
     {
@@ -886,8 +887,7 @@ fn openLogFileInRuntime(runtime: runtime_dir.RuntimeDir) !compat.fs.File {
         };
         errdefer file.close(compat.io());
         try file.setPermissions(compat.io(), runtime_dir.ownerFilePermissions());
-        const size = (try file.stat(compat.io())).size;
-        try compat.fileSeekTo(file, size);
+        try compat.setAppend(file.handle);
         return file;
     }
 }
