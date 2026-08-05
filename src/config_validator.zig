@@ -134,6 +134,13 @@ fn validateV1Capabilities(
                         .{proxy.name},
                     );
                 }
+                if (proxy.plugin != null) {
+                    try result.addError(
+                        "Proxy '{s}': Shadowsocks plugins are not supported " ++
+                            "in zc v1.0",
+                        .{proxy.name},
+                    );
+                }
                 if (proxy.cipher) |cipher| {
                     if (aead.parseCipherType(cipher) == null) {
                         try result.addError(
@@ -741,6 +748,43 @@ test "v1 capability gate rejects an unimplemented Shadowsocks cipher" {
         "Proxy 'legacy-ss': Shadowsocks cipher 'aes-128-cfb' is not " ++
             "supported in zc v1.0",
         result.errors.items[0].message,
+    );
+}
+
+test "v1 capability gate rejects Shadowsocks plugins" {
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: plugin-ss
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: v2ray-plugin
+        \\rules:
+        \\  - MATCH,plugin-ss
+    );
+    defer cfg.deinit();
+
+    var result = try validateRuntimeCapabilities(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(&result, "plugins"));
+    try std.testing.expectError(
+        error.InvalidProxyFormat,
+        config_mod.parse(allocator,
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: malformed-plugin
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: true
+        ),
     );
 }
 

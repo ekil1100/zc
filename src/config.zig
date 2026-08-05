@@ -697,7 +697,7 @@ fn parseProxy(
                     }
                 }
             }
-        } else if (managed) return error.InvalidProxyFormat;
+        } else return error.InvalidProxyFormat;
     }
 
     return proxy;

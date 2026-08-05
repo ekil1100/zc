@@ -52,7 +52,7 @@ Runtime outbound support currently includes:
 | --- | --- | --- |
 | `direct` | supported | Direct TCP connect. |
 | `reject` | supported | Fails connection intentionally. |
-| `ss` | partially supported | AEAD ciphers: `aes-128-gcm`, `aes-256-gcm`, `chacha20-poly1305`, `chacha20-ietf-poly1305`. |
+| `ss` | partially supported | AEAD ciphers: `aes-128-gcm`, `aes-256-gcm`, `chacha20-poly1305`, `chacha20-ietf-poly1305`. Plugins/transports are rejected before bind/dial. |
 | `vmess` | unsupported | v1.0 capability gate hard rejects it；现有代码未通过标准 wire/互操作验证。 |
 | `trojan` | supported subset | TLS + CONNECT（TCP）；支持 `password`/`server`/`port`/`sni`/`skip-cert-verify`。`udp:true` 与其他 transport 被拒绝；`skip-cert-verify:true` 产生安全告警。已知限制（M1/M5）见下文。 |
 | `vless` | unsupported | v1.0 capability gate hard rejects it；响应 framing 与 transport 尚未通过互操作门禁。 |
