@@ -5,6 +5,8 @@ const config_catalog = @import("config_catalog.zig");
 const revision_store = @import("revision_store.zig");
 const state_authority = @import("state_authority.zig");
 
+const max_mirror_file_bytes = 16 * 1024 * 1024;
+
 pub const RebuildReceipt = struct {
     sequence: u64,
     profile_count: usize,
@@ -16,6 +18,92 @@ pub const LegacyMirror = struct {
 
     pub fn init(allocator: std.mem.Allocator, root: std.Io.Dir) LegacyMirror {
         return .{ .allocator = allocator, .root = root };
+    }
+
+    pub fn verify(self: LegacyMirror) !RebuildReceipt {
+        const mirror_lock = try acquireMirrorLock(self.root);
+        defer mirror_lock.close(compat.io());
+        const authority = state_authority.Authority.init(self.allocator, self.root);
+        var inspection = try authority.inspect();
+        defer inspection.deinit();
+        const observed = switch (inspection) {
+            .catalog_v2 => |*value| value,
+            .missing, .legacy_v1 => return error.Schema2CatalogRequired,
+        };
+        const store = revision_store.RevisionStore.init(self.allocator, self.root);
+        const expected_meta = try encodeLegacyMeta(
+            self.allocator,
+            observed.catalog.state,
+            &store,
+        );
+        defer self.allocator.free(expected_meta);
+        const actual_meta = try readRegularBounded(
+            self.allocator,
+            self.root,
+            "meta.json",
+            config_catalog.max_catalog_bytes,
+        );
+        defer self.allocator.free(actual_meta);
+        if (!std.mem.eql(u8, expected_meta, actual_meta)) {
+            return error.LegacyMirrorOutOfSync;
+        }
+        const configs = try self.root.openDir(compat.io(), "configs", .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        defer configs.close(compat.io());
+        var expected_paths = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var iterator = expected_paths.iterator();
+            while (iterator.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            expected_paths.deinit();
+        }
+        for (observed.catalog.state.profiles) |profile| {
+            var view = try store.openVerified(profile.key, profile.head);
+            defer view.deinit();
+            const config_name = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}.yaml",
+                .{profile.key},
+            );
+            defer self.allocator.free(config_name);
+            try rememberExpectedPath(
+                self.allocator,
+                &expected_paths,
+                config_name,
+            );
+            try verifyFileBytes(
+                self.allocator,
+                configs,
+                config_name,
+                view.effectiveSourceBytes(),
+            );
+            for (view.assets) |asset| {
+                try rememberExpectedPath(
+                    self.allocator,
+                    &expected_paths,
+                    asset.logical_path,
+                );
+                try verifyFileBytes(
+                    self.allocator,
+                    configs,
+                    asset.logical_path,
+                    asset.bytes,
+                );
+            }
+        }
+        try verifyNoUnexpectedFiles(
+            self.allocator,
+            configs,
+            "",
+            &expected_paths,
+        );
+        return .{
+            .sequence = observed.catalog.state.sequence,
+            .profile_count = observed.catalog.state.profiles.len,
+        };
     }
 
     pub fn rebuild(self: LegacyMirror) !RebuildReceipt {
@@ -341,6 +429,70 @@ fn syncDir(dir: std.Io.Dir) !void {
     try file.sync(compat.io());
 }
 
+fn rememberExpectedPath(
+    allocator: std.mem.Allocator,
+    expected: *std.StringHashMap(void),
+    path: []const u8,
+) !void {
+    try validateRelativePath(path);
+    if (expected.contains(path)) return;
+    const owned = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned);
+    try expected.put(owned, {});
+}
+
+fn verifyNoUnexpectedFiles(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    prefix: []const u8,
+    expected: *const std.StringHashMap(void),
+) !void {
+    var iterator = dir.iterate();
+    while (try iterator.next(compat.io())) |entry| {
+        const path = if (prefix.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+        defer allocator.free(path);
+        switch (entry.kind) {
+            .file => if (!expected.contains(path)) {
+                return error.LegacyMirrorOutOfSync;
+            },
+            .directory => {
+                const child = try dir.openDir(compat.io(), entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                defer child.close(compat.io());
+                try verifyNoUnexpectedFiles(allocator, child, path, expected);
+            },
+            else => return error.LegacyMirrorOutOfSync,
+        }
+    }
+}
+
+fn verifyFileBytes(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    path: []const u8,
+    expected: []const u8,
+) !void {
+    if (expected.len > max_mirror_file_bytes) return error.LegacyMirrorOutOfSync;
+    const actual = readRegularBounded(
+        allocator,
+        dir,
+        path,
+        max_mirror_file_bytes,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.LegacyMirrorOutOfSync,
+    };
+    defer allocator.free(actual);
+    if (!std.mem.eql(u8, expected, actual)) {
+        return error.LegacyMirrorOutOfSync;
+    }
+}
+
 fn readRegularBounded(
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,
@@ -350,6 +502,7 @@ fn readRegularBounded(
     const file = try dir.openFile(compat.io(), path, .{
         .allow_directory = false,
         .follow_symlinks = false,
+        .resolve_beneath = true,
     });
     defer file.close(compat.io());
     const stat = try file.stat(compat.io());

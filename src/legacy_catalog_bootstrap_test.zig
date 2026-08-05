@@ -76,11 +76,20 @@ test "LegacyCatalogBootstrap migrates exact active metadata and desired selectio
     try tmp.dir.deleteFile(compat.io(), "meta.json");
     const repeated = try bootstrap.ensure();
     switch (repeated) {
-        .already_current => |receipt| try testing.expectEqual(@as(u64, 1), receipt.token.sequence),
+        .already_current => |receipt| {
+            try testing.expectEqual(@as(u64, 1), receipt.token.sequence);
+            try testing.expect(receipt.mirror_error != null);
+        },
         else => return error.TestExpectedEqual,
     }
-    try tmp.dir.access(compat.io(), "configs/home.yaml", .{});
-    try tmp.dir.access(compat.io(), "meta.json", .{});
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "configs/home.yaml", .{}),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "meta.json", .{}),
+    );
 }
 
 test "LegacyCatalogBootstrap remains bound to its root descriptor after pathname rebinding" {
@@ -223,9 +232,19 @@ test "LegacyCatalogBootstrap materializes persisted override exactly once" {
     try tmp.dir.deleteTree(compat.io(), "configs");
     try tmp.dir.deleteFile(compat.io(), "meta.json");
     try tmp.dir.deleteFile(compat.io(), "override.sh");
-    try testing.expect((try bootstrap.ensure()) == .already_current);
-    try tmp.dir.access(compat.io(), "configs/home.yaml", .{});
-    try tmp.dir.access(compat.io(), "meta.json", .{});
+    const repeated = try bootstrap.ensure();
+    switch (repeated) {
+        .already_current => |receipt| try testing.expect(receipt.mirror_error != null),
+        else => return error.TestExpectedEqual,
+    }
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "configs/home.yaml", .{}),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "meta.json", .{}),
+    );
     const counter_after = try tmp.dir.readFileAlloc(compat.io(), "counter", allocator, .limited(16));
     defer allocator.free(counter_after);
     try testing.expectEqualStrings("1\n", counter_after);
@@ -370,7 +389,11 @@ fn bootstrapAllocationFixture(allocator: std.mem.Allocator) !void {
     try writeFile(tmp.dir, "configs/home.yaml", "mixed-port: 7890\n");
     const bootstrap = LegacyCatalogBootstrap.init(allocator, tmp.dir);
     const outcome = try bootstrap.ensure();
-    if (outcome != .migrated) return error.TestUnexpectedResult;
+    switch (outcome) {
+        .migrated => |receipt| if (receipt.mirror_error) |err| return err,
+        .durability_uncertain => |uncertain| if (uncertain.receipt.mirror_error) |err| return err,
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "LegacyCatalogBootstrap releases every allocation failure path" {

@@ -2,6 +2,10 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
 const config_import = @import("config_import.zig");
+const catalog_commands = @import("catalog_commands.zig");
+const catalog_service = @import("catalog_service.zig");
+const legacy_catalog_bootstrap = @import("legacy_catalog_bootstrap.zig");
+const legacy_mirror = @import("legacy_mirror.zig");
 const config_identity = @import("config_identity.zig");
 const managed_config_loader = @import("managed_config_loader.zig");
 const controller_endpoint = @import("controller_endpoint.zig");
@@ -23,6 +27,7 @@ const state_authority = @import("state_authority.zig");
 const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
 const override = @import("override.zig");
+const override_materialization = @import("override_materialization.zig");
 const cli_output = @import("cli/output.zig");
 const cli_commands = @import("cli/commands.zig");
 const build_options = @import("build_options");
@@ -40,6 +45,7 @@ const RuntimeCommand = enum {
     restart,
 };
 
+const catalog_listing_attempts = 4;
 const listener_start_timeout_ms: i64 = 10_000;
 const daemon_listener_start_timeout_ms: i64 = 15_000;
 const listener_start_poll_ms: u64 = 10;
@@ -1077,8 +1083,225 @@ fn printInvalidConfigName(json_output: bool) void {
         json_output,
         "CONFIG_NAME_INVALID",
         "invalid config name",
-        "use 1-255 characters without control characters, '/' or '\\'",
+        "use 1-250 bytes of UTF-8 without control characters, '/' or '\\'",
     );
+}
+
+const CatalogHealth = struct {
+    state_sync_error: ?anyerror = null,
+    mirror_error: ?anyerror = null,
+
+    fn durabilityUncertain(self: CatalogHealth) bool {
+        return self.state_sync_error != null;
+    }
+
+    fn mirrorOutOfSync(self: CatalogHealth) bool {
+        return self.mirror_error != null;
+    }
+};
+
+const CatalogRoot = struct {
+    dir: std.Io.Dir,
+    bootstrap_health: CatalogHealth,
+
+    fn deinit(self: *CatalogRoot) void {
+        self.dir.close(compat.io());
+        self.* = undefined;
+    }
+
+    fn healthWithReceipt(
+        self: *const CatalogRoot,
+        receipt: ?*const catalog_service.ApplyReceipt,
+    ) CatalogHealth {
+        const applied = receipt orelse return self.bootstrap_health;
+        return .{
+            .state_sync_error = applied.state_sync_error,
+            .mirror_error = applied.mirror_error,
+        };
+    }
+};
+
+fn noteCatalogHealth(out: *cli_output.Output, health: CatalogHealth) void {
+    if (health.state_sync_error) |err| {
+        out.note("catalog committed, but durability is uncertain: {s}\n", .{
+            @errorName(err),
+        }) catch {};
+    }
+    if (health.mirror_error) |err| {
+        out.note("legacy mirror is out of sync: {s}\n", .{@errorName(err)}) catch {};
+    }
+}
+
+fn openDefaultCatalogRoot(allocator: std.mem.Allocator) !CatalogRoot {
+    const root_path = try config.getDefaultConfigDir(allocator) orelse
+        return error.NoConfigDir;
+    defer allocator.free(root_path);
+    if (!compat.fs.path.isAbsolute(root_path)) return error.NoConfigDir;
+    try compat.fs.cwd().makePath(root_path);
+    const root = try compat.fs.openDirAbsolute(root_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer root.close(compat.io());
+    const outcome = try legacy_catalog_bootstrap.LegacyCatalogBootstrap.init(
+        allocator,
+        root,
+    ).ensure();
+    const health: CatalogHealth = switch (outcome) {
+        .migrated, .already_current => |receipt| .{
+            .mirror_error = receipt.mirror_error,
+        },
+        .durability_uncertain => |uncertain| .{
+            .state_sync_error = uncertain.cause,
+            .mirror_error = uncertain.receipt.mirror_error,
+        },
+        .blocked => return error.LegacyMigrationBlocked,
+    };
+    return .{ .dir = root, .bootstrap_health = health };
+}
+
+const StableCatalogListing = struct {
+    listing: catalog_commands.Listing,
+    health: CatalogHealth,
+
+    fn deinit(self: *StableCatalogListing) void {
+        self.listing.deinit();
+        self.* = undefined;
+    }
+};
+
+fn listCatalogStable(
+    allocator: std.mem.Allocator,
+    root: *const CatalogRoot,
+    commands: catalog_commands.Commands,
+) !StableCatalogListing {
+    for (0..catalog_listing_attempts) |_| {
+        var listing = try commands.list();
+        const verified = legacy_mirror.LegacyMirror.init(
+            allocator,
+            root.dir,
+        ).verify() catch |err| return .{
+            .listing = listing,
+            .health = .{
+                .state_sync_error = root.bootstrap_health.state_sync_error,
+                .mirror_error = err,
+            },
+        };
+        if (verified.sequence == listing.token.sequence) {
+            return .{
+                .listing = listing,
+                .health = .{
+                    .state_sync_error = root.bootstrap_health.state_sync_error,
+                },
+            };
+        }
+        listing.deinit();
+    }
+    return error.StateConflict;
+}
+
+const StableActiveOverride = struct {
+    snapshot: catalog_commands.ActiveOverride,
+    health: CatalogHealth,
+
+    fn deinit(self: *StableActiveOverride) void {
+        self.snapshot.deinit();
+        self.* = undefined;
+    }
+};
+
+fn activeOverrideStable(
+    allocator: std.mem.Allocator,
+    root: *const CatalogRoot,
+    commands: catalog_commands.Commands,
+) !StableActiveOverride {
+    for (0..catalog_listing_attempts) |_| {
+        var snapshot = try commands.activeOverride();
+        const verified = legacy_mirror.LegacyMirror.init(
+            allocator,
+            root.dir,
+        ).verify() catch |err| return .{
+            .snapshot = snapshot,
+            .health = .{
+                .state_sync_error = root.bootstrap_health.state_sync_error,
+                .mirror_error = err,
+            },
+        };
+        if (verified.sequence == snapshot.token.sequence) {
+            return .{
+                .snapshot = snapshot,
+                .health = .{
+                    .state_sync_error = root.bootstrap_health.state_sync_error,
+                },
+            };
+        }
+        snapshot.deinit();
+    }
+    return error.StateConflict;
+}
+
+fn renderCatalogListing(
+    allocator: std.mem.Allocator,
+    listing: *const catalog_commands.Listing,
+    health: CatalogHealth,
+    out: *cli_output.Output,
+) !void {
+    if (out.mode == .json) {
+        const Entry = struct {
+            name: []const u8,
+            display: []const u8,
+            active: bool,
+        };
+        const entries = try allocator.alloc(Entry, listing.entries.len);
+        defer allocator.free(entries);
+        for (listing.entries, entries) |source, *entry| {
+            entry.* = .{
+                .name = source.key,
+                .display = source.display,
+                .active = source.active,
+            };
+        }
+        try out.success(.{
+            .configs = entries,
+            .active = listing.active,
+            .durability_uncertain = health.durabilityUncertain(),
+            .mirror_out_of_sync = health.mirrorOutOfSync(),
+        });
+        return;
+    }
+
+    noteCatalogHealth(out, health);
+    try out.print("Available configs:\n\n", .{});
+    for (listing.entries) |entry| {
+        if (entry.active) {
+            try out.print("  * {s}", .{entry.display});
+        } else {
+            try out.print("    {s}", .{entry.display});
+        }
+        if (!std.mem.eql(u8, entry.display, entry.key)) {
+            try out.print(" ({s})", .{entry.key});
+        }
+        if (entry.active) try out.print(" (active)", .{});
+        try out.print("\n", .{});
+    }
+    if (listing.entries.len == 0) {
+        try out.print("  (no config files found)\n", .{});
+    } else {
+        try out.print("\nUse 'zc config use <key>' to switch config\n", .{});
+    }
+    try out.flush();
+}
+
+fn catalogMirrorPathAlloc(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) ![]u8 {
+    const configs_dir = try meta.getConfigsDir(allocator) orelse
+        return error.NoConfigDir;
+    defer allocator.free(configs_dir);
+    const filename = try std.fmt.allocPrint(allocator, "{s}.yaml", .{key});
+    defer allocator.free(filename);
+    return compat.fs.path.join(allocator, &.{ configs_dir, filename });
 }
 
 /// config 命令树 dispatch。错误统一走 printCliError（envelope/error block）
@@ -1122,6 +1345,11 @@ fn runConfigCommand(
         defer receipt.deinit(allocator);
         var streams = StdStreams{};
         var out = streams.output(json_output);
+        const health: CatalogHealth = .{
+            .state_sync_error = receipt.state_sync_error,
+            .mirror_error = receipt.mirror_error,
+        };
+        noteCatalogHealth(&out, health);
         if (json_output) {
             var revision_hex: [32]u8 = undefined;
             out.success(.{
@@ -1130,6 +1358,8 @@ fn runConfigCommand(
                 .revision = receipt.revision.formatHex(&revision_hex),
                 .active = receipt.active,
                 .applied = false,
+                .durability_uncertain = health.durabilityUncertain(),
+                .mirror_out_of_sync = health.mirrorOutOfSync(),
             }) catch {};
         } else {
             out.print("Loaded local config: {s}\n", .{receipt.key}) catch {};
@@ -1150,8 +1380,24 @@ fn runConfigCommand(
         }
         var streams = StdStreams{};
         var out = streams.output(json_output);
-        config.listConfigs(allocator, &out) catch {
+        var root = openDefaultCatalogRoot(allocator) catch {
             printCliError(json_output, "CONFIG_LIST_FAILED", "failed to list configs", "ensure the config directory exists and is readable");
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer root.deinit();
+        const commands = catalog_commands.Commands.init(allocator, root.dir);
+        var stable = listCatalogStable(allocator, &root, commands) catch {
+            printCliError(json_output, "CONFIG_LIST_FAILED", "failed to list configs", "repair the managed catalog and retry");
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer stable.deinit();
+        renderCatalogListing(
+            allocator,
+            &stable.listing,
+            stable.health,
+            &out,
+        ) catch {
+            printCliError(json_output, "CONFIG_LIST_FAILED", "failed to render configs", "retry the command");
             std.process.exit(cli_output.exit_failure);
         };
         return;
@@ -1173,13 +1419,23 @@ fn runConfigCommand(
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
-        var outcome = config.downloadConfig(allocator, dl.url, dl.name, dl.set_default, &out) catch |err| {
-            // 诊断走 stderr：envelope 的 message/hint 是静态文案，必须另给出
-            // 真实错误名，否则文件系统失败会被误读成网络问题（零诊断违反
-            // “errors actionable” 契约）。
+        const key = if (dl.name) |name|
+            allocator.dupe(u8, config.normalizePortableManagedConfigKey(name) catch {
+                printInvalidConfigName(json_output);
+                std.process.exit(cli_output.exit_failure);
+            }) catch return error.OutOfMemory
+        else
+            meta.generateKey(allocator) catch return error.OutOfMemory;
+        defer allocator.free(key);
+        const mirror_path = catalogMirrorPathAlloc(allocator, key) catch |err| {
+            out.note("config path preparation failed: {s}\n", .{@errorName(err)}) catch {};
+            printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "config destination could not be prepared", "check the config directory and retry");
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer allocator.free(mirror_path);
+        const fetched = config.fetchConfig(allocator, dl.url) catch |err| {
             out.note("config download failed: {s}\n", .{@errorName(err)}) catch {};
             switch (err) {
-                error.InvalidConfigKey => printInvalidConfigName(json_output),
                 error.ConfigTooLarge => printCliError(
                     json_output,
                     "CONFIG_DOWNLOAD_TOO_LARGE",
@@ -1192,22 +1448,65 @@ fn runConfigCommand(
                     "config download exceeded the 30 second deadline",
                     "check the server or network and retry",
                 ),
-                error.NoConfigDir,
-                error.AccessDenied,
-                error.PermissionDenied,
-                error.ReadOnlyFileSystem,
-                error.NotDir,
-                error.IsDir,
-                error.NoSpaceLeft,
-                => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config could not be stored", "ensure `~/.config/zc` is creatable and writable, then retry"),
                 else => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "failed to download config", "check the url/network and retry"),
             }
             std.process.exit(cli_output.exit_failure);
         };
-        defer outcome.deinit(allocator);
-
+        defer allocator.free(fetched.body);
+        if (fetched.status != .ok) {
+            printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "config server returned a non-success status", "check the url and retry");
+            std.process.exit(cli_output.exit_failure);
+        }
+        var root = openDefaultCatalogRoot(allocator) catch |err| {
+            out.note("config catalog open failed: {s}\n", .{@errorName(err)}) catch {};
+            printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config could not be stored", "repair the managed catalog and retry");
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer root.deinit();
+        const commands = catalog_commands.Commands.init(allocator, root.dir);
+        const published = commands.publishDownloaded(.{
+            .key = key,
+            .source_bytes = fetched.body,
+            .metadata = .{ .url = dl.url, .filename = key },
+            .mode = .create,
+            .activate = dl.set_default,
+        }) catch |err| {
+            out.note("config catalog publish failed: {s}\n", .{@errorName(err)}) catch {};
+            switch (err) {
+                error.ManagedProfileAlreadyExists => printCliError(json_output, "CONFIG_ALREADY_EXISTS", "a config with this name already exists", "use `zc config update`, or choose another name"),
+                error.InvalidConfig, error.InvalidConfigKey => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config is invalid", "fix the source config and retry"),
+                else => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config could not be committed", "repair the managed catalog and retry"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        const health = root.healthWithReceipt(&published.receipt);
+        noteCatalogHealth(&out, health);
+        var listing: ?catalog_commands.Listing = commands.list() catch |err| blk: {
+            out.note("config committed, but active-state verification failed: {s}\n", .{@errorName(err)}) catch {};
+            break :blk null;
+        };
+        defer if (listing) |*value| value.deinit();
+        const is_active = if (listing) |*value|
+            if (value.active) |active| std.mem.eql(u8, active, key) else false
+        else
+            dl.set_default;
         if (json_output) {
-            out.success(.{ .name = outcome.key, .path = outcome.path, .set_default = outcome.set_default }) catch {};
+            var revision_hex: [32]u8 = undefined;
+            out.success(.{
+                .name = key,
+                .path = if (health.mirrorOutOfSync()) null else mirror_path,
+                .revision = published.revision.formatHex(&revision_hex),
+                .set_default = is_active,
+                .durability_uncertain = health.durabilityUncertain(),
+                .mirror_out_of_sync = health.mirrorOutOfSync(),
+            }) catch {};
+        } else {
+            out.print("Config downloaded: {s} (key: {s})\n", .{ key, key }) catch {};
+            if (!health.mirrorOutOfSync()) {
+                out.print("Config saved to: {s}\n", .{mirror_path}) catch {};
+            }
+            if (is_active) out.print("Config set as default: {s}\n", .{key}) catch {};
+            out.flush() catch {};
         }
         return;
     }
@@ -1226,44 +1525,68 @@ fn runConfigCommand(
             std.process.exit(cli_output.exit_usage);
         };
 
-        const current_config = config.getCurrentConfigName(allocator) catch {
-            printCliError(
-                json_output,
-                "CONFIG_UPDATE_FAILED",
-                "failed to read config metadata",
-                "repair `~/.config/zc/meta.json` and retry",
-            );
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        var root = openDefaultCatalogRoot(allocator) catch {
+            printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to open the managed catalog", "repair the managed catalog and retry");
             std.process.exit(cli_output.exit_failure);
         };
-        defer if (current_config) |c| allocator.free(c);
-        const target_name = upd.name orelse current_config orelse {
+        defer root.deinit();
+        const commands = catalog_commands.Commands.init(allocator, root.dir);
+        var listing = commands.list() catch {
+            printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to read the managed catalog", "repair the managed catalog and retry");
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer listing.deinit();
+        const target_name = upd.name orelse listing.active orelse {
             printCliError(json_output, "CONFIG_UPDATE_NAME_REQUIRED", "no config name given and no active config", "use `zc config update <name>`, or `zc config use <name>` first");
             std.process.exit(cli_output.exit_usage);
         };
-
-        var streams = StdStreams{};
-        var out = streams.output(json_output);
-        const updated_key = config.updateConfig(allocator, target_name, &out) catch |err| {
+        const updated_key = config.normalizeManagedConfigKey(target_name) catch {
+            printInvalidConfigName(json_output);
+            std.process.exit(cli_output.exit_failure);
+        };
+        var subscription = commands.subscription(updated_key) catch |err| {
             switch (err) {
-                error.InvalidConfigKey => printInvalidConfigName(json_output),
-                error.ConfigTooLarge => printCliError(
-                    json_output,
-                    "CONFIG_UPDATE_TOO_LARGE",
-                    "updated config exceeds the 16 MiB limit",
-                    "reduce the config size and retry",
-                ),
-                error.DownloadTimeout => printCliError(
-                    json_output,
-                    "CONFIG_UPDATE_TIMEOUT",
-                    "config update exceeded the 30 second deadline",
-                    "check the server or network and retry",
-                ),
-                error.NoSubscriptionUrl => printCliError(json_output, "CONFIG_UPDATE_NO_SUBSCRIPTION", "no subscription url recorded for this config", "use `zc config download <url>` to (re)create it"),
-                else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to update config", "check subscription url/network and retry"),
+                error.NoSubscriptionUrl => printCliError(json_output, "CONFIG_UPDATE_NO_SUBSCRIPTION", "no subscription url recorded for this config", "use `zc config download <url>` to recreate it"),
+                error.ManagedProfileNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and choose an existing config"),
+                else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to read the managed revision", "repair the managed catalog and retry"),
             }
             std.process.exit(cli_output.exit_failure);
         };
-        defer allocator.free(updated_key);
+        defer subscription.deinit();
+        const fetched = config.fetchConfig(allocator, subscription.url) catch |err| {
+            switch (err) {
+                error.ConfigTooLarge => printCliError(json_output, "CONFIG_UPDATE_TOO_LARGE", "updated config exceeds the 16 MiB limit", "reduce the config size and retry"),
+                error.DownloadTimeout => printCliError(json_output, "CONFIG_UPDATE_TIMEOUT", "config update exceeded the 30 second deadline", "check the server or network and retry"),
+                else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to download the updated config", "check the subscription url/network and retry"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer allocator.free(fetched.body);
+        if (fetched.status != .ok) {
+            printCliError(json_output, "CONFIG_UPDATE_FAILED", "config server returned a non-success status", "check the subscription url and retry");
+            std.process.exit(cli_output.exit_failure);
+        }
+        var process_runner = override_materialization.ProcessRunner.init(root.dir);
+        const published = commands.publishDownloaded(.{
+            .key = updated_key,
+            .source_bytes = fetched.body,
+            .mode = .update,
+            .expected_revision = subscription.revision,
+            .override_runner = process_runner.runner(),
+        }) catch |err| {
+            out.note("config catalog update failed: {s}\n", .{@errorName(err)}) catch {};
+            switch (err) {
+                error.InvalidConfig => printCliError(json_output, "CONFIG_UPDATE_FAILED", "updated config is invalid", "fix the subscription source and retry"),
+                error.ManagedProfileNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and choose an existing config"),
+                error.ProfileIdentityConflict, error.StateConflict => printCliError(json_output, "CONFIG_UPDATE_CONFLICT", "config changed while its update was downloading", "retry `zc config update` against the new profile revision"),
+                else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to commit the updated revision", "repair the managed catalog and retry"),
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        const health = root.healthWithReceipt(&published.receipt);
+        noteCatalogHealth(&out, health);
 
         // 应用策略：auto(默认)/hot/restart —— 只对运行中的 daemon 生效。
         // JSON 模式只输出一个最终 envelope（D6 同款），apply 结果折叠进 data。
@@ -1283,13 +1606,16 @@ fn runConfigCommand(
                 .name = updated_key,
                 .applied = apply_result != null,
                 .apply_result = applyResultToken(apply_result),
+                .durability_uncertain = health.durabilityUncertain(),
+                .mirror_out_of_sync = health.mirrorOutOfSync(),
             }) catch {};
-        } else if (apply_result) |result| {
-            switch (result) {
+        } else {
+            out.print("Config updated: {s}\n", .{updated_key}) catch {};
+            if (apply_result) |result| switch (result) {
                 .hot_applied => out.print("Config applied via hot reload\n", .{}) catch {},
                 .restart_applied => out.print("Config applied via restart\n", .{}) catch {},
                 .restart_fallback => out.print("Config hot reload unavailable, fell back to restart\n", .{}) catch {},
-            }
+            };
             out.flush() catch {};
         }
         return;
@@ -1311,19 +1637,40 @@ fn runConfigCommand(
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
-        config.switchConfig(allocator, args[3], &out) catch |err| {
+        const key = config.normalizeManagedConfigKey(args[3]) catch {
+            printInvalidConfigName(json_output);
+            std.process.exit(cli_output.exit_failure);
+        };
+        var root = openDefaultCatalogRoot(allocator) catch {
+            printCliError(json_output, "CONFIG_SWITCH_FAILED", "failed to open the managed catalog", "repair the managed catalog and retry");
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer root.deinit();
+        const receipt = catalog_commands.Commands.init(
+            allocator,
+            root.dir,
+        ).activate(key) catch |err| {
             switch (err) {
-                error.InvalidConfigKey => printInvalidConfigName(json_output),
-                error.ConfigNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
-                else => printCliError(json_output, "CONFIG_SWITCH_FAILED", "failed to switch active config", "verify file permission and retry"),
+                error.ManagedProfileNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
+                else => printCliError(json_output, "CONFIG_SWITCH_FAILED", "failed to switch active config", "repair the managed catalog and retry"),
             }
             std.process.exit(cli_output.exit_failure);
         };
+        const health = root.healthWithReceipt(&receipt);
+        noteCatalogHealth(&out, health);
 
         // 决策 D8：use 绝不自动 apply 到运行中的 daemon；data 注明 applied:false。
         if (json_output) {
-            // 与 switchConfig/downloadConfig 共用同一套 key 归一化。
-            out.success(.{ .name = config.normalizeConfigKey(args[3]), .applied = false }) catch {};
+            out.success(.{
+                .name = key,
+                .applied = false,
+                .durability_uncertain = health.durabilityUncertain(),
+                .mirror_out_of_sync = health.mirrorOutOfSync(),
+            }) catch {};
+        } else {
+            out.print("Switched to config: {s}\n", .{key}) catch {};
+            out.print("Run `zc reload` (or `zc restart`) to apply it\n", .{}) catch {};
+            out.flush() catch {};
         }
         return;
     }
@@ -1344,19 +1691,39 @@ fn runConfigCommand(
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
-        var outcome = config.deleteConfig(allocator, args[3], &out) catch |err| {
+        const key = config.normalizeManagedConfigKey(args[3]) catch {
+            printInvalidConfigName(json_output);
+            std.process.exit(cli_output.exit_failure);
+        };
+        var root = openDefaultCatalogRoot(allocator) catch {
+            printCliError(json_output, "CONFIG_DELETE_FAILED", "failed to open the managed catalog", "repair the managed catalog and retry");
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer root.deinit();
+        const commands = catalog_commands.Commands.init(allocator, root.dir);
+        const receipt = commands.delete(key) catch |err| {
             switch (err) {
-                error.InvalidConfigKey => printInvalidConfigName(json_output),
-                error.ConfigNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
-                else => printCliError(json_output, "CONFIG_DELETE_FAILED", "failed to delete config", "verify file permission and retry"),
+                error.ManagedProfileNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
+                else => printCliError(json_output, "CONFIG_DELETE_FAILED", "failed to delete config", "repair the managed catalog and retry"),
             }
             std.process.exit(cli_output.exit_failure);
         };
-        defer outcome.deinit(allocator);
+        const health = root.healthWithReceipt(&receipt.receipt);
+        noteCatalogHealth(&out, health);
 
         // 决策 D8 同款：delete 绝不自动 apply 到运行中的 daemon。
         if (json_output) {
-            out.success(.{ .name = outcome.key, .deleted = true, .was_active = outcome.was_active }) catch {};
+            out.success(.{
+                .name = key,
+                .deleted = true,
+                .was_active = receipt.was_active,
+                .durability_uncertain = health.durabilityUncertain(),
+                .mirror_out_of_sync = health.mirrorOutOfSync(),
+            }) catch {};
+        } else {
+            out.print("Deleted config: {s}\n", .{key}) catch {};
+            if (receipt.was_active) out.print("The active config was cleared; run `zc config use <name>` before the next restart\n", .{}) catch {};
+            out.flush() catch {};
         }
         return;
     }
@@ -1375,40 +1742,84 @@ fn runConfigCommand(
         };
         const config_path = dump_args.config_path;
         const no_override = dump_args.no_override;
-        var cfg = (if (config_path) |path|
-            config.load(allocator, path)
-        else
-            config.loadDefault(allocator)) catch |err|
-            {
-                // 配置加载失败也必须走 envelope/error block（不再裸 try 抛 trace）。
+        var loaded = if (config_path) |path| blk: {
+            const managed = tryLoadExactManagedRuntime(
+                allocator,
+                path,
+                !no_override,
+            ) catch |err| {
                 printConfigDumpError(json_output, err);
                 std.process.exit(cli_output.exit_failure);
             };
-        defer cfg.deinit();
+            if (managed) |exact| break :blk exact;
+            break :blk RuntimeLoadedConfig{
+                .allocator = allocator,
+                .value = config.load(allocator, path) catch |err| {
+                    printConfigDumpError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                },
+                .identity = null,
+            };
+        } else (tryLoadExactManagedRuntime(
+            allocator,
+            null,
+            !no_override,
+        ) catch |err| {
+            printConfigDumpError(json_output, err);
+            std.process.exit(cli_output.exit_failure);
+        }) orelse {
+            printConfigDumpError(json_output, error.NoActiveManagedConfig);
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer loaded.deinit();
 
         if (!no_override) {
-            var persisted_script: ?[]u8 = null;
-            defer if (persisted_script) |p| allocator.free(p);
-            var effective_override = resolveEffectiveOverrideOptions(
-                allocator,
-                override_opts,
-                config_path,
-                &persisted_script,
-            ) catch |err| {
-                if (!printOverrideRuntimeError(json_output, err)) printConfigDumpError(json_output, err);
-                std.process.exit(cli_output.exit_failure);
-            };
-
-            override.apply(allocator, &cfg, &effective_override, "config.dump", config_path) catch |err| {
-                if (!printOverrideRuntimeError(json_output, err)) printConfigDumpError(json_output, err);
-                std.process.exit(cli_output.exit_failure);
-            };
+            if (loaded.identity != null) {
+                if (override_opts.script_path != null) {
+                    var effective_override = override_opts.*;
+                    override.apply(
+                        allocator,
+                        &loaded.value,
+                        &effective_override,
+                        "config.dump",
+                        config_path,
+                    ) catch |err| {
+                        if (!printOverrideRuntimeError(json_output, err))
+                            printConfigDumpError(json_output, err);
+                        std.process.exit(cli_output.exit_failure);
+                    };
+                }
+            } else {
+                var persisted_script: ?[]u8 = null;
+                defer if (persisted_script) |path| allocator.free(path);
+                var effective_override = resolveEffectiveOverrideOptions(
+                    allocator,
+                    override_opts,
+                    config_path,
+                    &persisted_script,
+                ) catch |err| {
+                    if (!printOverrideRuntimeError(json_output, err))
+                        printConfigDumpError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+                override.apply(
+                    allocator,
+                    &loaded.value,
+                    &effective_override,
+                    "config.dump",
+                    config_path,
+                ) catch |err| {
+                    if (!printOverrideRuntimeError(json_output, err))
+                        printConfigDumpError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+            }
         }
 
         const dumped = if (json_output)
-            override.dumpConfigJson(allocator, &cfg)
+            override.dumpConfigJson(allocator, &loaded.value)
         else
-            override.dumpConfigYaml(allocator, &cfg);
+            override.dumpConfigYaml(allocator, &loaded.value);
         const dumped_text = dumped catch |err| {
             printConfigDumpError(json_output, err);
             std.process.exit(cli_output.exit_failure);
@@ -1434,66 +1845,123 @@ fn runConfigCommand(
             std.process.exit(cli_output.exit_usage);
         };
 
-        const runtime_key = config.resolveRuntimeConfigKey(
-            allocator,
-            null,
-        ) catch |err| {
+        var streams = StdStreams{};
+        var out = streams.output(json_output);
+        var root = openDefaultCatalogRoot(allocator) catch |err| {
             printConfigOverrideError(json_output, err);
             std.process.exit(cli_output.exit_failure);
         };
-        defer if (runtime_key) |key| allocator.free(key);
-        const profile_name = runtime_key orelse "(none)";
-
-        var streams = StdStreams{};
-        var out = streams.output(json_output);
+        defer root.deinit();
+        const commands = catalog_commands.Commands.init(allocator, root.dir);
+        var stable = activeOverrideStable(allocator, &root, commands) catch |err| {
+            printConfigOverrideError(json_output, err);
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer stable.deinit();
+        const snapshot = &stable.snapshot;
+        const profile_name = snapshot.key orelse "(none)";
 
         switch (action) {
-            .set => |script| {
-                const managed_path = config.copyOverrideScriptForCurrentConfig(allocator, script) catch |err| {
+            .set => |script_path| {
+                const key = snapshot.key orelse {
+                    printConfigOverrideError(json_output, error.NoActiveConfig);
+                    std.process.exit(cli_output.exit_failure);
+                };
+                const script_bytes = compat.fs.cwd().readFileAlloc(
+                    allocator,
+                    script_path,
+                    override_materialization.max_script_bytes,
+                ) catch |err| {
                     printConfigOverrideError(json_output, err);
                     std.process.exit(cli_output.exit_failure);
                 };
-                defer allocator.free(managed_path);
-
-                validateOverrideAndPrepareRuleProviders(allocator, managed_path) catch |err| {
-                    compat.fs.deleteFileAbsolute(managed_path) catch {};
-                    if (!printOverrideRuntimeError(json_output, err)) printConfigOverridePrepareError(json_output, err);
+                defer allocator.free(script_bytes);
+                var process_runner = override_materialization.ProcessRunner.init(root.dir);
+                const published = commands.setOverride(.{
+                    .key = key,
+                    .script = .{
+                        .name = compat.fs.path.basename(script_path),
+                        .bytes = script_bytes,
+                    },
+                    .invocation = .{ .command = "config.override" },
+                    .runner = process_runner.runner(),
+                    .expected_token = snapshot.token,
+                    .require_active = true,
+                }) catch |err| {
+                    switch (err) {
+                        error.StateConflict, error.ActiveManagedProfileChanged => printCliError(
+                            json_output,
+                            "CONFIG_OVERRIDE_FAILED",
+                            "active config changed while preparing the override",
+                            "retry against the new active config",
+                        ),
+                        else => if (!printOverrideRuntimeError(json_output, err))
+                            printConfigOverridePrepareError(json_output, err),
+                    }
                     std.process.exit(cli_output.exit_failure);
                 };
-
-                config.persistOverrideScriptPathForCurrentConfig(allocator, managed_path) catch |err| {
-                    compat.fs.deleteFileAbsolute(managed_path) catch {};
-                    printConfigOverrideError(json_output, err);
-                    std.process.exit(cli_output.exit_failure);
-                };
-
+                const health = root.healthWithReceipt(&published.receipt);
+                noteCatalogHealth(&out, health);
                 applyConfigOverrideToRunningDaemon(allocator) catch |err| {
                     printConfigOverrideApplyError(json_output, err);
                     std.process.exit(cli_output.exit_failure);
                 };
 
                 if (json_output) {
-                    out.success(.{ .action = "config_override_set", .profile = profile_name, .enabled = true, .script = managed_path }) catch {};
+                    out.success(.{
+                        .action = "config_override_set",
+                        .profile = profile_name,
+                        .enabled = true,
+                        .script = script_path,
+                        .durability_uncertain = health.durabilityUncertain(),
+                        .mirror_out_of_sync = health.mirrorOutOfSync(),
+                    }) catch {};
                 } else {
-                    out.print("Persisted override set for config {s}: {s}\n", .{ profile_name, managed_path }) catch {};
+                    out.print("Persisted override set for config {s}: {s}\n", .{ profile_name, script_path }) catch {};
                     out.flush() catch {};
                 }
             },
             .clear => {
-                const had_override = config.clearPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
-                    printConfigOverrideError(json_output, err);
+                const key = snapshot.key orelse {
+                    printConfigOverrideError(json_output, error.NoActiveConfig);
                     std.process.exit(cli_output.exit_failure);
                 };
-
-                if (had_override) {
+                const published = commands.clearOverride(.{
+                    .key = key,
+                    .expected_token = snapshot.token,
+                    .require_active = true,
+                }) catch |err| {
+                    switch (err) {
+                        error.StateConflict, error.ActiveManagedProfileChanged => printCliError(
+                            json_output,
+                            "CONFIG_OVERRIDE_FAILED",
+                            "active config changed while clearing the override",
+                            "retry against the new active config",
+                        ),
+                        else => printConfigOverrideError(json_output, err),
+                    }
+                    std.process.exit(cli_output.exit_failure);
+                };
+                const had_override = published != null;
+                var health = stable.health;
+                if (published) |receipt| {
+                    health = root.healthWithReceipt(&receipt.receipt);
                     applyConfigOverrideToRunningDaemon(allocator) catch |err| {
                         printConfigOverrideApplyError(json_output, err);
                         std.process.exit(cli_output.exit_failure);
                     };
                 }
 
+                noteCatalogHealth(&out, health);
                 if (json_output) {
-                    out.success(.{ .action = "config_override_clear", .profile = profile_name, .enabled = false, .cleared = had_override }) catch {};
+                    out.success(.{
+                        .action = "config_override_clear",
+                        .profile = profile_name,
+                        .enabled = false,
+                        .cleared = had_override,
+                        .durability_uncertain = health.durabilityUncertain(),
+                        .mirror_out_of_sync = health.mirrorOutOfSync(),
+                    }) catch {};
                 } else if (had_override) {
                     out.print("Cleared persisted override for config {s}\n", .{profile_name}) catch {};
                     out.flush() catch {};
@@ -1503,20 +1971,31 @@ fn runConfigCommand(
                 }
             },
             .show => {
-                const current_script = config.getPersistedOverrideScriptForCurrentConfig(allocator) catch |err| {
-                    printConfigOverrideError(json_output, err);
-                    std.process.exit(cli_output.exit_failure);
-                };
-                defer if (current_script) |s| allocator.free(s);
-
+                const current_script = snapshot.script_name;
+                const health = stable.health;
+                if (!json_output) noteCatalogHealth(&out, health);
                 if (json_output) {
-                    if (current_script) |s| {
-                        out.success(.{ .action = "config_override_get", .profile = profile_name, .enabled = true, .script = s }) catch {};
+                    if (current_script) |script| {
+                        out.success(.{
+                            .action = "config_override_get",
+                            .profile = profile_name,
+                            .enabled = true,
+                            .script = script,
+                            .durability_uncertain = health.durabilityUncertain(),
+                            .mirror_out_of_sync = health.mirrorOutOfSync(),
+                        }) catch {};
                     } else {
-                        out.success(.{ .action = "config_override_get", .profile = profile_name, .enabled = false, .script = null }) catch {};
+                        out.success(.{
+                            .action = "config_override_get",
+                            .profile = profile_name,
+                            .enabled = false,
+                            .script = null,
+                            .durability_uncertain = health.durabilityUncertain(),
+                            .mirror_out_of_sync = health.mirrorOutOfSync(),
+                        }) catch {};
                     }
-                } else if (current_script) |s| {
-                    out.print("Config {s} persisted override: {s}\n", .{ profile_name, s }) catch {};
+                } else if (current_script) |script| {
+                    out.print("Config {s} persisted override: {s}\n", .{ profile_name, script }) catch {};
                     out.flush() catch {};
                 } else {
                     out.print("Config {s} persisted override: (none)\n", .{profile_name}) catch {};
@@ -2124,41 +2603,60 @@ const RuntimeLoadedConfig = struct {
     }
 };
 
-fn tryLoadExactManagedRuntime(
+fn finishManagedRuntimeLoad(
     allocator: std.mem.Allocator,
-    config_path: ?[]const u8,
-) !?RuntimeLoadedConfig {
-    const root_path = (try config.getDefaultConfigDir(allocator)) orelse return null;
-    defer allocator.free(root_path);
-    const root = compat.fs.openDirAbsolute(root_path, .{
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer root.close(compat.io());
-    const loader = managed_config_loader.Loader.init(allocator, root);
-
-    var loaded = if (config_path) |path| blk: {
-        const key = (try config.inferConfigKeyFromPath(allocator, path)) orelse
-            return null;
-        defer allocator.free(key);
-        break :blk loader.loadHead(key) catch |err| switch (err) {
-            error.Schema2CatalogRequired,
-            error.ManagedProfileNotFound,
-            => return null,
-            else => return err,
-        };
-    } else loader.loadActive() catch |err| switch (err) {
-        error.Schema2CatalogRequired, error.NoActiveManagedConfig => return null,
-        else => return err,
-    };
+    loaded: *managed_config_loader.LoadedConfig,
+) RuntimeLoadedConfig {
     loaded.validation.deinit();
     return .{
         .allocator = allocator,
         .value = loaded.config,
         .identity = loaded.identity,
     };
+}
+
+fn tryLoadExactManagedRuntime(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    include_frozen_override: bool,
+) !?RuntimeLoadedConfig {
+    if (config_path) |path| {
+        const key = (try config.inferConfigKeyFromPath(allocator, path)) orelse
+            return null;
+        defer allocator.free(key);
+        const root_path = (try config.getDefaultConfigDir(allocator)) orelse
+            return null;
+        defer allocator.free(root_path);
+        const root = compat.fs.openDirAbsolute(root_path, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer root.close(compat.io());
+        const loader = managed_config_loader.Loader.init(allocator, root);
+        var loaded = (if (include_frozen_override)
+            loader.loadHead(key)
+        else
+            loader.loadHeadWithoutOverride(key)) catch |err| switch (err) {
+            error.Schema2CatalogRequired => return null,
+            error.ManagedProfileNotFound => return err,
+            else => return err,
+        };
+        return finishManagedRuntimeLoad(allocator, &loaded);
+    }
+
+    var root = try openDefaultCatalogRoot(allocator);
+    defer root.deinit();
+    if (root.bootstrap_health.state_sync_error != null) {
+        return error.CatalogDurabilityUncertain;
+    }
+    const loader = managed_config_loader.Loader.init(allocator, root.dir);
+    var loaded = if (include_frozen_override)
+        try loader.loadActive()
+    else
+        try loader.loadActiveWithoutOverride();
+    return finishManagedRuntimeLoad(allocator, &loaded);
 }
 
 fn loadExactRuntimeConfig(
@@ -2168,7 +2666,11 @@ fn loadExactRuntimeConfig(
     override_opts: *const override.CliOptions,
     command_name: []const u8,
 ) !RuntimeLoadedConfig {
-    var loaded = (try tryLoadExactManagedRuntime(allocator, config_path)) orelse
+    var loaded = (try tryLoadExactManagedRuntime(
+        allocator,
+        config_path,
+        true,
+    )) orelse
         return .{
             .allocator = allocator,
             .value = try loadAndValidateConfig(
@@ -2183,22 +2685,19 @@ fn loadExactRuntimeConfig(
         };
     errdefer loaded.deinit();
 
-    var persisted_script: ?[]u8 = null;
-    defer if (persisted_script) |path| allocator.free(path);
-    var effective_override = try resolveEffectiveOverrideOptions(
-        allocator,
-        override_opts,
-        config_path,
-        &persisted_script,
-    );
-    try override.apply(
-        allocator,
-        &loaded.value,
-        &effective_override,
-        command_name,
-        config_path,
-    );
-    if (effective_override.script_path != null) {
+    // Managed revisions already contain the frozen override result. Legacy
+    // metadata is only a derived mirror and must never be reapplied to an
+    // exact managed identity. An explicit one-shot CLI override intentionally
+    // makes this runtime unmanaged.
+    if (override_opts.script_path != null) {
+        var effective_override = override_opts.*;
+        try override.apply(
+            allocator,
+            &loaded.value,
+            &effective_override,
+            command_name,
+            config_path,
+        );
         if (loaded.identity) |identity| allocator.free(identity.key);
         loaded.identity = null;
     }

@@ -58,6 +58,8 @@ test "CatalogCommands lists exact keys and immutable display metadata" {
     var listing = try commands.list();
     defer listing.deinit();
     try testing.expectEqual(@as(usize, 2), listing.entries.len);
+    try testing.expectEqual(state_authority.StateFormat.catalog_v2, listing.token.format);
+    try testing.expectEqual(@as(u64, 3), listing.token.sequence);
     try testing.expectEqualStrings("Home", listing.entries[0].key);
     try testing.expectEqualStrings("Home", listing.entries[0].display);
     try testing.expectEqualStrings("alpha", listing.entries[1].key);
@@ -96,6 +98,11 @@ test "CatalogCommands publishes and updates validated downloaded revisions" {
         .mode = .create,
     });
     try testing.expect(created.receipt.mirror_error == null);
+    var subscription = try commands.subscription("home");
+    defer subscription.deinit();
+    try testing.expectEqualStrings("https://example.invalid/sub", subscription.url);
+    try testing.expect(subscription.revision.eql(created.revision));
+    try testing.expectError(error.ManagedProfileNotFound, commands.subscription("missing"));
     try testing.expectError(error.ManagedProfileAlreadyExists, commands.publishDownloaded(.{
         .key = "home",
         .source_bytes = first_source,
@@ -123,8 +130,15 @@ test "CatalogCommands publishes and updates validated downloaded revisions" {
         .key = "home",
         .source_bytes = second_source,
         .mode = .update,
+        .expected_revision = subscription.revision,
     });
     try testing.expect(!updated.revision.eql(created.revision));
+    try testing.expectError(error.ProfileIdentityConflict, commands.publishDownloaded(.{
+        .key = "home",
+        .source_bytes = first_source,
+        .mode = .update,
+        .expected_revision = subscription.revision,
+    }));
     var after = try authority.inspect();
     defer after.deinit();
     switch (after) {
@@ -137,6 +151,56 @@ test "CatalogCommands publishes and updates validated downloaded revisions" {
         },
         else => return error.TestExpectedEqual,
     }
+}
+
+test "CatalogCommands update preserves captured local assets" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "legacy", .default_dir);
+    const source =
+        "mixed-port: 7890\nrule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: rules.yaml\nrules:\n  - RULE-SET,local,DIRECT\n";
+    try writeFile(tmp.dir, "legacy/config.yaml", source);
+    try writeFile(tmp.dir, "legacy/rules.yaml", "payload:\n  - example.com\n");
+    const path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "legacy/config.yaml",
+        allocator,
+    );
+    defer allocator.free(path);
+    var bundle = try config_bundle.ConfigBundle.capture(allocator, path, .{});
+    defer bundle.deinit();
+    const token = try bootstrapEmpty(allocator, tmp.dir);
+    const created = switch (try catalog_service.Service.init(
+        allocator,
+        tmp.dir,
+    ).publish(token, .{
+        .key = "home",
+        .expected = .missing,
+        .bundle = &bundle,
+        .metadata = .{ .url = "https://example.invalid/sub" },
+        .desired = .clear,
+        .activate = true,
+    })) {
+        .applied => |receipt| receipt,
+        else => return error.TestExpectedEqual,
+    };
+    const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+    const updated = try commands.publishDownloaded(.{
+        .key = "home",
+        .source_bytes = source,
+        .mode = .update,
+        .expected_revision = created.revision,
+    });
+    var view = try @import("revision_store.zig").RevisionStore.init(
+        allocator,
+        tmp.dir,
+    ).openVerified("home", updated.revision);
+    defer view.deinit();
+    try testing.expectEqualStrings(
+        "payload:\n  - example.com\n",
+        try view.resolveLocal("rules.yaml"),
+    );
 }
 
 fn fixedOverridePatch(
@@ -181,6 +245,10 @@ test "CatalogCommands sets and clears a frozen override as exact revisions" {
     });
     try testing.expectEqual(@as(u8, 1), runner_context);
     try testing.expect(!overridden.revision.eql(created.revision));
+    var override_status = try commands.activeOverride();
+    defer override_status.deinit();
+    try testing.expectEqualStrings("home", override_status.key.?);
+    try testing.expectEqualStrings("override.sh", override_status.script_name.?);
     var view = try @import("revision_store.zig").RevisionStore.init(allocator, tmp.dir).openVerified(
         "home",
         overridden.revision,
@@ -189,7 +257,30 @@ test "CatalogCommands sets and clears a frozen override as exact revisions" {
     try testing.expect(std.mem.indexOf(u8, view.effectiveSourceBytes(), "mixed-port: 9000") != null);
     view.deinit();
 
-    const cleared = (try commands.clearOverride("home")) orelse return error.TestExpectedEqual;
+    _ = try commands.publishDownloaded(.{
+        .key = "other",
+        .source_bytes = "mixed-port: 7000\n",
+        .mode = .create,
+    });
+    try testing.expectError(error.StateConflict, commands.setOverride(.{
+        .key = "home",
+        .script = .{ .name = "override.sh", .bytes = "#!/bin/sh\n" },
+        .invocation = .{ .command = "config.override" },
+        .runner = .{ .context = &runner_context, .run = fixedOverridePatch },
+        .expected_token = override_status.token,
+        .require_active = true,
+    }));
+    _ = try commands.activate("other");
+    try testing.expectError(error.ActiveManagedProfileChanged, commands.setOverride(.{
+        .key = "home",
+        .script = .{ .name = "override.sh", .bytes = "#!/bin/sh\n" },
+        .invocation = .{ .command = "config.override" },
+        .runner = .{ .context = &runner_context, .run = fixedOverridePatch },
+        .require_active = true,
+    }));
+    _ = try commands.activate("home");
+    const cleared = (try commands.clearOverride(.{ .key = "home" })) orelse
+        return error.TestExpectedEqual;
     try testing.expect(!cleared.revision.eql(overridden.revision));
     var clear_view = try @import("revision_store.zig").RevisionStore.init(allocator, tmp.dir).openVerified(
         "home",
@@ -198,7 +289,10 @@ test "CatalogCommands sets and clears a frozen override as exact revisions" {
     defer clear_view.deinit();
     try testing.expect(clear_view.override == null);
     try testing.expectEqualStrings("mixed-port: 7890\n", clear_view.effectiveSourceBytes());
-    try testing.expect(try commands.clearOverride("home") == null);
+    var cleared_status = try commands.activeOverride();
+    defer cleared_status.deinit();
+    try testing.expect(cleared_status.script_name == null);
+    try testing.expect(try commands.clearOverride(.{ .key = "home" }) == null);
 }
 
 test "CatalogCommands update blocks instead of dropping frozen override provenance" {
@@ -262,6 +356,11 @@ test "CatalogCommands downloaded writer rejects invalid and ambient local config
     defer tmp.cleanup();
     _ = try bootstrapEmpty(allocator, tmp.dir);
     const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+    try testing.expectError(error.InvalidConfigKey, commands.publishDownloaded(.{
+        .key = "a" ** (@import("config_catalog.zig").max_portable_key_bytes + 1),
+        .source_bytes = "mixed-port: 7890\n",
+        .mode = .create,
+    }));
     try testing.expectError(error.AssetNotDeclared, commands.publishDownloaded(.{
         .key = "local",
         .source_bytes = "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: ambient.yaml\n",

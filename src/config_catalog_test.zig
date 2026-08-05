@@ -105,6 +105,28 @@ test "ConfigCatalog rejects invalid managed keys and duplicate desired groups" {
     }));
 }
 
+test "ConfigCatalog grandfathers persisted keys but reserves new filename space" {
+    const portable_key = "a" ** catalog.max_portable_key_bytes;
+    const grandfathered_key = "a" ** catalog.max_key_bytes;
+    const oversized_key = "a" ** (catalog.max_key_bytes + 1);
+    try testing.expect(catalog.isPortableManagedKey(portable_key));
+    try testing.expect(!catalog.isPortableManagedKey(grandfathered_key));
+    try testing.expect(catalog.isManagedKey(grandfathered_key));
+    try testing.expect(!catalog.isManagedKey(oversized_key));
+    const profiles = [_]catalog.Profile{.{
+        .key = grandfathered_key,
+        .storage_id = identity.StorageId.derive(grandfathered_key),
+        .head = revision_a,
+    }};
+    const encoded = try catalog.encodeCanonical(testing.allocator, .{
+        .profiles = &profiles,
+    });
+    defer testing.allocator.free(encoded);
+    var decoded = try catalog.decodeCanonical(testing.allocator, encoded);
+    defer decoded.deinit();
+    try testing.expectEqualStrings(grandfathered_key, decoded.state.profiles[0].key);
+}
+
 test "ConfigCatalog enforces its persisted byte limit" {
     const bytes = try testing.allocator.alloc(u8, catalog.max_catalog_bytes + 1);
     defer testing.allocator.free(bytes);

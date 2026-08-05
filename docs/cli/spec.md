@@ -54,13 +54,15 @@ group help on stdout, exit 0. Every subcommand accepts `help`, `--help`, or
 | --- | --- |
 | `zc config load <path> [--json]` | Validates and imports a local YAML plus its root-contained local provider assets into an immutable revision, makes it active, and never applies it to an already-running daemon (`data.applied:false`). Duplicate exact basename keys fail closed. |
 | `zc config list [--json]` | Alias `zc config ls`. Lists configs + active one (`data.configs`, `data.active`). |
-| `zc config download <url> [-n <name>] [-d] [--json]` | `-d` sets the downloaded config as default. Missing `<url>` ⇒ `CONFIG_DOWNLOAD_URL_REQUIRED`, exit 2. Response body is limited to 16 MiB with a 30-second total deadline. |
-| `zc config update [name] [--apply auto\|hot\|restart] [--json]` | Re-downloads a previously downloaded config under the same 16 MiB / 30-second limits; applies to a running daemon per `--apply`（默认 auto）。JSON 单 envelope：`data.applied` / `data.apply_result`。 |
+| `zc config download <url> [-n <name>] [-d] [--json]` | Publishes a validated immutable revision through the catalog authority. `-d` sets it as default; the first managed config is active even without `-d`. Existing names fail closed. Missing `<url>` ⇒ `CONFIG_DOWNLOAD_URL_REQUIRED`, exit 2. Response body is limited to 16 MiB with a 30-second total deadline. `data.path` is null when compatibility mirror publication failed; the catalog commit still remains authoritative. |
+| `zc config update [name] [--apply auto\|hot\|restart] [--json]` | Re-downloads a previously downloaded config under the same 16 MiB / 30-second limits and commits only if the fetched subscription revision is still the profile head. Concurrent head changes fail rather than publishing bytes fetched for stale metadata. Applies to a running daemon per `--apply`（默认 auto）。JSON 单 envelope：`data.applied` / `data.apply_result`。 |
 | `zc config use <name> [--json]` | Switches the active config. **绝不自动 apply**（决策 D8）：文本模式提示 `zc reload`；JSON `data.applied:false`。 |
-| `zc config dump [-c <config>] [--no-override] [--json]` | Prints the merged config as a **bare document** — YAML in text mode, bare JSON object with `--json`（唯一 envelope 例外，决策 D2）。可直接 `\| yq` / `\| jq`。Failures still use the envelope/error block。 |
-| `zc config override [<script>\|--clear] [--json]` | Bind/show/clear the persisted override for the current config; applies to a running daemon. |
+| `zc config dump [-c <config>] [--no-override] [--json]` | Without `-c`, reads the exact active catalog revision; `--no-override` reads that revision's immutable source instead of its frozen materialization. Prints a **bare document** — YAML in text mode, bare JSON object with `--json`（唯一 envelope 例外，决策 D2）。可直接 `\| yq` / `\| jq`。Failures still use the envelope/error block。 |
+| `zc config override [<script>\|--clear] [--json]` | Bind/show/clear a frozen override by publishing a new immutable revision for the active config; applies to a running daemon. |
 
-托管配置名在剥除一个 `.yaml` 后必须为 1–255 字节的有效 UTF-8，且不能是 `.`、`..`，也不能包含控制字符、`/` 或 `\`。`download/update/use/delete` 共用此约束；无效名称返回 `CONFIG_NAME_INVALID`，并且不会发起网络或文件访问。损坏或不可读的 `meta.json`、非法 active key、缺失的 active YAML 均明确失败，不回退到内置 `DIRECT`。
+新托管配置名在剥除一个 `.yaml` 后必须为 1–250 字节的有效 UTF-8，且不能是 `.`、`..`，也不能包含控制字符、`/` 或 `\`。无效新名称返回 `CONFIG_NAME_INVALID`，并且不会发起网络或文件访问。旧版本已持久化的 251–255 字节 key 可继续读取和删除，避免升级时把 catalog 判坏；它们不再允许作为新 key，且兼容 mirror 可能报告 `mirror_out_of_sync:true`。bootstrap 通过共享 legacy cutover lock 冻结最终 snapshot 与 authority CAS；完成后，catalog v2 是 `load/list/download/update/use/delete/dump/override` 的唯一权威状态；`meta.json` 与 `configs/` 仅为派生兼容镜像，镜像损坏或不可写不会阻断健康 catalog 的读取。损坏 catalog、缺失 active identity 或缺失 immutable revision 均明确失败，不回退到内置 `DIRECT`。
+
+Managed config JSON success data includes `durability_uncertain` and `mirror_out_of_sync`. A visible state commit whose parent-directory sync failed remains a success with `durability_uncertain:true`; callers must verify again before treating it as crash-durable. Mirror refresh failure is separately reported as `mirror_out_of_sync:true` and never changes catalog authority.
 
 ### proxy / profile
 

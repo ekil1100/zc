@@ -22,6 +22,7 @@ test "include zc test modules" {
     _ = @import("integration_error_test.zig");
     _ = @import("legacy_catalog_bootstrap_test.zig");
     _ = @import("legacy_mirror_test.zig");
+    _ = @import("legacy_write_lock.zig");
     _ = @import("meta.zig");
     _ = @import("managed_config_loader_test.zig");
     _ = @import("mixed_repro_test.zig");

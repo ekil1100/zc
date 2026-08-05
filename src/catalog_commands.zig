@@ -22,6 +22,7 @@ pub const Listing = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
     active: ?[]const u8,
+    token: state_authority.StateToken,
 
     pub fn deinit(self: *Listing) void {
         for (self.entries) |entry| {
@@ -45,8 +46,20 @@ pub const DownloadedInput = struct {
     source_bytes: []const u8,
     metadata: revision_store.MetadataInput = .{},
     mode: DownloadedMode,
+    expected_revision: ?config_identity.Revision = null,
     activate: bool = false,
     override_runner: ?override_materialization.Runner = null,
+};
+
+pub const Subscription = struct {
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    revision: config_identity.Revision,
+
+    pub fn deinit(self: *Subscription) void {
+        self.allocator.free(self.url);
+        self.* = undefined;
+    }
 };
 
 pub const OverrideChange = struct {
@@ -54,6 +67,28 @@ pub const OverrideChange = struct {
     script: override_materialization.Script,
     invocation: override_materialization.Invocation,
     runner: override_materialization.Runner,
+    expected_token: ?state_authority.StateToken = null,
+    require_active: bool = false,
+};
+
+pub const OverrideClear = struct {
+    key: []const u8,
+    expected_token: ?state_authority.StateToken = null,
+    require_active: bool = false,
+};
+
+pub const ActiveOverride = struct {
+    allocator: std.mem.Allocator,
+    key: ?[]const u8,
+    revision: ?config_identity.Revision,
+    script_name: ?[]const u8,
+    token: state_authority.StateToken,
+
+    pub fn deinit(self: *ActiveOverride) void {
+        if (self.key) |key| self.allocator.free(key);
+        if (self.script_name) |name| self.allocator.free(name);
+        self.* = undefined;
+    }
 };
 pub const DownloadedReceipt = catalog_service.PublishReceipt;
 
@@ -110,10 +145,88 @@ pub const Commands = struct {
             try self.allocator.dupe(u8, value.key)
         else
             null;
-        return .{ .allocator = self.allocator, .entries = entries, .active = active };
+        return .{
+            .allocator = self.allocator,
+            .entries = entries,
+            .active = active,
+            .token = inspection.token(),
+        };
+    }
+
+    pub fn subscription(
+        self: Commands,
+        key: []const u8,
+    ) !Subscription {
+        const authority = state_authority.Authority.init(self.allocator, self.root);
+        var inspection = try authority.inspect();
+        defer inspection.deinit();
+        const state = switch (inspection) {
+            .catalog_v2 => |*observed| observed.catalog.state,
+            .missing, .legacy_v1 => return error.Schema2CatalogRequired,
+        };
+        const profile = findProfile(state.profiles, key) orelse
+            return error.ManagedProfileNotFound;
+        var view = try revision_store.RevisionStore.init(
+            self.allocator,
+            self.root,
+        ).openVerified(profile.key, profile.head);
+        defer view.deinit();
+        const url = view.metadata.url orelse return error.NoSubscriptionUrl;
+        return .{
+            .allocator = self.allocator,
+            .url = try self.allocator.dupe(u8, url),
+            .revision = profile.head,
+        };
+    }
+
+    pub fn activeOverride(self: Commands) !ActiveOverride {
+        const authority = state_authority.Authority.init(self.allocator, self.root);
+        var inspection = try authority.inspect();
+        defer inspection.deinit();
+        const token = inspection.token();
+        const state = switch (inspection) {
+            .catalog_v2 => |*observed| observed.catalog.state,
+            .missing, .legacy_v1 => return error.Schema2CatalogRequired,
+        };
+        const active = state.active orelse return .{
+            .allocator = self.allocator,
+            .key = null,
+            .revision = null,
+            .script_name = null,
+            .token = token,
+        };
+        const profile = findProfile(state.profiles, active.key) orelse
+            return error.CorruptState;
+        if (!profile.head.eql(active.revision)) return error.CorruptState;
+        var view = try revision_store.RevisionStore.init(
+            self.allocator,
+            self.root,
+        ).openVerified(profile.key, profile.head);
+        defer view.deinit();
+        const key = try self.allocator.dupe(u8, profile.key);
+        errdefer self.allocator.free(key);
+        const script_name = if (view.override) |frozen|
+            try self.allocator.dupe(u8, frozen.script_name)
+        else
+            null;
+        return .{
+            .allocator = self.allocator,
+            .key = key,
+            .revision = profile.head,
+            .script_name = script_name,
+            .token = token,
+        };
     }
 
     pub fn publishDownloaded(self: Commands, input: DownloadedInput) !DownloadedReceipt {
+        switch (input.mode) {
+            .create => if (!config_catalog.isPortableManagedKey(input.key)) {
+                return error.InvalidConfigKey;
+            },
+            .update => if (!config_catalog.isManagedKey(input.key)) {
+                return error.InvalidConfigKey;
+            },
+        }
         var bundle: ?config_bundle.ConfigBundle = null;
         defer if (bundle) |*value| value.deinit();
         var loaded: ?config_bundle.OfflineLoad = null;
@@ -165,6 +278,12 @@ pub const Commands = struct {
                 inspection.deinit();
                 return error.ManagedProfileNotFound;
             };
+            if (input.expected_revision) |expected| {
+                if (!expected.eql(profile.head)) {
+                    inspection.deinit();
+                    return error.ProfileIdentityConflict;
+                }
+            }
             if (original_head) |head| {
                 if (!head.eql(profile.head)) {
                     inspection.deinit();
@@ -297,15 +416,27 @@ pub const Commands = struct {
                 };
             }
             if (bundle == null) {
-                bundle = config_bundle.ConfigBundle.captureMemory(
-                    self.allocator,
-                    input.source_bytes,
-                    null,
-                    .{},
-                ) catch |err| {
-                    view.deinit();
-                    inspection.deinit();
-                    return err;
+                bundle = blk: {
+                    const available = memoryAssets(
+                        self.allocator,
+                        view.assets,
+                    ) catch |err| {
+                        view.deinit();
+                        inspection.deinit();
+                        return err;
+                    };
+                    defer self.allocator.free(available);
+                    break :blk config_bundle.ConfigBundle.reconstructMemory(
+                        self.allocator,
+                        input.source_bytes,
+                        null,
+                        available,
+                        .{},
+                    ) catch |err| {
+                        view.deinit();
+                        inspection.deinit();
+                        return err;
+                    };
                 };
                 loaded = bundle.?.loadOffline(self.allocator) catch |err| {
                     view.deinit();
@@ -365,6 +496,13 @@ pub const Commands = struct {
             .catalog_v2 => |*observed| observed.catalog.state,
             .missing, .legacy_v1 => return error.Schema2CatalogRequired,
         };
+        try validateOverrideTarget(
+            state,
+            token,
+            change.key,
+            change.expected_token,
+            change.require_active,
+        );
         const profile = findProfile(state.profiles, change.key) orelse return error.ManagedProfileNotFound;
         var view = try revision_store.RevisionStore.init(self.allocator, self.root).openVerified(
             profile.key,
@@ -428,7 +566,7 @@ pub const Commands = struct {
         };
     }
 
-    pub fn clearOverride(self: Commands, key: []const u8) !?DownloadedReceipt {
+    pub fn clearOverride(self: Commands, change: OverrideClear) !?DownloadedReceipt {
         const authority = state_authority.Authority.init(self.allocator, self.root);
         var inspection = try authority.inspect();
         defer inspection.deinit();
@@ -437,7 +575,15 @@ pub const Commands = struct {
             .catalog_v2 => |*observed| observed.catalog.state,
             .missing, .legacy_v1 => return error.Schema2CatalogRequired,
         };
-        const profile = findProfile(state.profiles, key) orelse return error.ManagedProfileNotFound;
+        try validateOverrideTarget(
+            state,
+            token,
+            change.key,
+            change.expected_token,
+            change.require_active,
+        );
+        const profile = findProfile(state.profiles, change.key) orelse
+            return error.ManagedProfileNotFound;
         var view = try revision_store.RevisionStore.init(self.allocator, self.root).openVerified(
             profile.key,
             profile.head,
@@ -537,6 +683,23 @@ pub const Commands = struct {
         return error.StateConflict;
     }
 };
+
+fn validateOverrideTarget(
+    state: config_catalog.State,
+    actual_token: state_authority.StateToken,
+    key: []const u8,
+    expected_token: ?state_authority.StateToken,
+    require_active: bool,
+) !void {
+    if (expected_token) |expected| {
+        if (!expected.eql(actual_token)) return error.StateConflict;
+    }
+    if (!require_active) return;
+    const active = state.active orelse return error.ActiveManagedProfileChanged;
+    if (!std.mem.eql(u8, active.key, key)) {
+        return error.ActiveManagedProfileChanged;
+    }
+}
 
 fn memoryAssets(
     allocator: std.mem.Allocator,

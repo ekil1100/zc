@@ -1,9 +1,10 @@
 const std = @import("std");
 const compat = @import("../../compat.zig");
 const net = compat.net;
-const Config = @import("../../config.zig").Config;
-const Proxy = @import("../../config.zig").Proxy;
-const ProxyType = @import("../../config.zig").ProxyType;
+const config = @import("../../config.zig");
+const Config = config.Config;
+const Proxy = config.Proxy;
+const ProxyType = config.ProxyType;
 const meta = @import("../../meta.zig");
 const ss = @import("shadowsocks.zig");
 const anytls = @import("../../protocol/anytls.zig");
@@ -726,6 +727,8 @@ pub const OutboundManager = struct {
         const key = self.config_key orelse return;
         self.persist_invocations +|= 1;
 
+        var legacy_guard = try config.acquireLegacyWriteGuard(self.allocator);
+        defer legacy_guard.deinit();
         var meta_data = try meta.load(self.allocator);
         defer meta_data.deinit();
         const entry = meta_data.configs.getPtr(key) orelse

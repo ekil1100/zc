@@ -2,7 +2,11 @@ const std = @import("std");
 const config_identity = @import("config_identity.zig");
 
 pub const max_catalog_bytes = 4 * 1024 * 1024;
+// Persisted catalogs grandfather keys accepted by earlier releases. New keys
+// reserve room for the derived legacy mirror's `.yaml` suffix on filesystems
+// with the common 255-byte NAME_MAX limit.
 pub const max_key_bytes = 255;
+pub const max_portable_key_bytes = 250;
 
 pub const Selection = struct {
     group: []const u8,
@@ -278,6 +282,10 @@ pub fn isManagedKey(key: []const u8) bool {
         return false;
     }
     return isNonemptyText(key);
+}
+
+pub fn isPortableManagedKey(key: []const u8) bool {
+    return key.len <= max_portable_key_bytes and isManagedKey(key);
 }
 
 fn isNonemptyText(text: []const u8) bool {

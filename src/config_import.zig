@@ -14,6 +14,8 @@ pub const Receipt = struct {
     key: []const u8,
     revision: config_identity.Revision,
     active: bool,
+    state_sync_error: ?anyerror = null,
+    mirror_error: ?anyerror = null,
 
     pub fn deinit(self: *Receipt, allocator: std.mem.Allocator) void {
         allocator.free(self.key);
@@ -53,8 +55,7 @@ pub const Importer = struct {
 
         const migration = try legacy_bootstrap.LegacyCatalogBootstrap.init(self.allocator, self.root).ensure();
         switch (migration) {
-            .migrated, .already_current => {},
-            .durability_uncertain => {},
+            .migrated, .already_current, .durability_uncertain => {},
             .blocked => return error.LegacyMigrationBlocked,
         }
 
@@ -84,11 +85,14 @@ pub const Importer = struct {
             });
             switch (outcome) {
                 .conflict => continue,
-                .applied => |published| {
-                    if (published.receipt.mirror_error != null) {
-                        return error.LegacyMirrorRefreshFailedAfterCommit;
-                    }
-                    return .{ .key = key, .revision = published.revision, .active = true };
+                .applied => |published| return .{
+                    .key = key,
+                    .revision = published.revision,
+                    .active = true,
+                    // A successful later publication rewrites and syncs both
+                    // authority and mirror, superseding bootstrap health.
+                    .state_sync_error = published.receipt.state_sync_error,
+                    .mirror_error = published.receipt.mirror_error,
                 },
             }
         }
@@ -104,7 +108,7 @@ fn deriveKey(allocator: std.mem.Allocator, source_path: []const u8) ![]u8 {
         basename[0 .. basename.len - 4]
     else
         basename;
-    if (!config_catalog.isManagedKey(key)) return error.InvalidConfigKey;
+    if (!config_catalog.isPortableManagedKey(key)) return error.InvalidConfigKey;
     return allocator.dupe(u8, key);
 }
 

@@ -467,7 +467,7 @@ docs/
 
 ### P0-6：revisioned config identity、可靠代理选择与本地 config import
 
-状态：**In Progress；用户要求的 durable `proxy select` 与 `config load <path>` 已实现，其余 writer/API cutover 尚未完成**。
+状态：**In Progress；durable `proxy select`、`config load <path>` 与其余 managed CLI writer cutover 已实现，最终 fault/crash、ReleaseFast 与 smoke 门禁尚未完成**。
 
 目标：
 
@@ -490,8 +490,8 @@ docs/
 - Batch 3 exact catalog / immutable RevisionStore / legacy bootstrap / frozen override / derived mirror：`052610f`–`01646d1`；
 - Batch 4 shadow exact loader / tracked runtime descriptor seams：`041578b`–`ee690e7`；
 - Batch 5 typed mutation、catalog coordinator/commands、downloaded writer 与 revisioned override writer：`0684a88`、`90e21b7`、`b81227c`、`ad4ce7f`、`1c2eb78`、`aabd81e`、`cdf7497`、`62d8a1e`、`f2eb2b4`；
-- 666/666 tests passed（0 skipped），ReleaseFast 4/4；
-- `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与 `config load`；legacy `meta.json` 已采用 `0600`、file sync、原子替换和 parent sync；下一步让其余 managed writer 全部通过 Authority，消除 legacy mirror 写入。
+- 当前 748/748 tests passed（0 skipped）；最新 catalog writer cutover 后的 ReleaseFast 跨目标复验待完成；
+- `main`/daemon/proxy CLI 已接 durable selection、startup restore、exact runtime descriptor 与完整 managed config 命令族；`load/list/download/update/use/delete/dump/override` 以 catalog v2 为唯一 authority，legacy `meta.json` / `configs/` 只由 mirror 刷新。subscription update 使用读取 URL 时的 exact revision 做 CAS，persistent override 以 frozen immutable revision 发布。
 
 关键验收：
 
@@ -499,7 +499,7 @@ docs/
 - daemon 启动在开放监听前完成 desired/runtime 对账；
 - 离线、其他 key、旧 revision、identity unverified、apply failed 均有稳定 exit/JSON 语义；
 - desired/runtime/selected/resolved 可同时观测，旧字段仅作兼容投影；
-- `config import` 默认不 active、不 apply；force active key 只推进 active revision，旧 runtime 不自动切换；
+- `config load` 导入后设为 active 但不 apply；active key 只推进 catalog identity，旧 runtime 不自动切换；
 - 主配置 16 MiB 边界、bundle containment、symlink、离线验证、remote provider 零网络和 fault atomicity 有自动化证据；
 - `--close-connections` 精确覆盖旧 generation 的 TCP/UDP/逻辑 flow，不误关共享物理连接，恢复时不重放；
 - 默认连接路径、flow registry、close storm 和控制面事务通过真实 ReleaseFast 性能门禁。
@@ -686,8 +686,8 @@ git push origin v1.0.0
 
 按风险排序：
 
-1. **实现已冻结的 capability gate**：validator / doctor / runtime / migrator / README 一致拒绝 HTTP、SOCKS5、VMess、VLESS、AnyTLS 与 unsupported Shadowsocks cipher。
-2. **继续 P0-6 writer cutover**：durable selection、startup restore、actual endpoint descriptor 与 local `config load` 已完成；下一步将 `list/use/download/update/delete/override` 全部 legacy writer 路由 Authority。
+1. ~~**实现已冻结的 capability gate**~~：validator / doctor / runtime / migrator / README 已一致拒绝 HTTP、SOCKS5、VMess、VLESS、AnyTLS 与 unsupported Shadowsocks cipher。
+2. **完成 P0-6 最终门禁**：managed writer cutover 已完成；下一步补齐 fault/crash 回归、复跑 ReleaseFast 跨目标与 selection/config smoke。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
 5. ~~**等待 GitHub Actions 验证 release job**~~：`v1.0.0-rc6` 已通过三平台 release 与 Homebrew Tap 实际验证；GA 前仍需在 P0-2、P0-6 关闭后重跑最终 gate。
@@ -705,11 +705,11 @@ git push origin v1.0.0
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0，`v1.0.0-rc6` 三平台 CD 与 Homebrew Tap 发布已通过
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
-- ❌ v1 capability gate 决策已冻结，但 validator/doctor/runtime/migrator 尚未全部落地
-- ✅ `proxy select` durable/runtime identity、daemon startup restore、tracked controller discovery 与 `config load` CLI 已进入生产路径；其余 config writer 尚待统一 cutover
+- ✅ v1 capability gate 已在 validator/doctor/runtime/migrator 与兼容性文档统一落地
+- ✅ `proxy select` durable/runtime identity、daemon startup restore、tracked controller discovery 与完整 managed config 命令族已进入 production path；legacy mirror 不再是 writer authority
 - ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档
 
 结论：
 
-> **暂不建议立即打 `v1.0.0` tag。先落地统一 fail-closed capability gate、修复安全审计阻断项，并按 P0-6 完成剩余 writer cutover，再进入最终 GA gate。**
+> **暂不建议立即打 `v1.0.0` tag。先完成剩余安全审计修复、P0-6 fault/crash 与 ReleaseFast 门禁，再进入最终 GA gate。**

@@ -94,9 +94,13 @@ test "ManagedConfigLoader distinguishes head from an older exact revision" {
     const loader = managed_loader.Loader.init(allocator, tmp.dir);
     var head = try loader.loadHead("home");
     defer head.deinit();
+    var source = try loader.loadHeadWithoutOverride("home");
+    defer source.deinit();
     var old = try loader.loadExact(.{ .key = "home", .revision = first.revision });
     defer old.deinit();
     try testing.expectEqual(@as(u16, 9000), head.config.mixed_port);
+    try testing.expectEqual(@as(u16, 7890), source.config.mixed_port);
+    try testing.expect(source.identity.?.revision.eql(head.identity.?.revision));
     try testing.expectEqual(@as(u16, 7890), old.config.mixed_port);
     try testing.expect(!head.identity.?.revision.eql(old.identity.?.revision));
 }
@@ -105,6 +109,53 @@ fn managedLoadAllocationFixture(allocator: std.mem.Allocator, root: std.Io.Dir) 
     const loader = managed_loader.Loader.init(allocator, root);
     var loaded = try loader.loadHead("home");
     loaded.deinit();
+}
+
+test "ManagedConfigLoader can inspect source replaced by a frozen override" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(
+        tmp.dir,
+        "config.yaml",
+        "rule-providers:\n  missing:\n    type: file\n    behavior: domain\n    path: absent.yaml\nrules:\n  - RULE-SET,missing,DIRECT\n",
+    );
+    const path = try realPath(allocator, tmp.dir, "config.yaml");
+    defer allocator.free(path);
+    const published = try publish(
+        allocator,
+        tmp.dir,
+        "home",
+        path,
+        "mixed-port: 9000\nrules:\n  - MATCH,DIRECT\n",
+    );
+    const profiles = [_]config_catalog.Profile{.{
+        .key = "home",
+        .storage_id = config_identity.StorageId.derive("home"),
+        .head = published.revision,
+    }};
+    const authority = state_authority.Authority.init(allocator, tmp.dir);
+    var initial = try authority.inspect();
+    defer initial.deinit();
+    _ = try authority.bootstrapCatalog(initial.token(), .{
+        .active = .{ .key = "home", .revision = published.revision },
+        .profiles = &profiles,
+    });
+
+    const loader = managed_loader.Loader.init(allocator, tmp.dir);
+    var effective = try loader.loadActive();
+    defer effective.deinit();
+    try testing.expectEqual(@as(u16, 9000), effective.config.mixed_port);
+    var source_config = try loader.loadActiveWithoutOverride();
+    defer source_config.deinit();
+    try testing.expectEqual(
+        @as(usize, 1),
+        source_config.config.rule_providers.items.len,
+    );
+    try testing.expectEqualStrings(
+        "missing",
+        source_config.config.rule_providers.items[0].name,
+    );
 }
 
 test "ManagedConfigLoader releases every managed load allocation failure path" {

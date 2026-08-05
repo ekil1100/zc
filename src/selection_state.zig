@@ -54,6 +54,8 @@ pub fn persistDefault(
         }
     }
 
+    var legacy_guard = try config.acquireLegacyWriteGuard(allocator);
+    defer legacy_guard.deinit();
     var metadata = try meta.load(allocator);
     defer metadata.deinit();
     if (!metadata.configs.contains(identity.key)) {

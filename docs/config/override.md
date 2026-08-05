@@ -2,8 +2,8 @@
 
 `zc` supports runtime config override for commands that load config (`start`, `test`, `doctor`, `proxy ...`).
 
-Override is in-memory only and does not rewrite profile files.
-You can bind a persistent override script to the current config profile via `zc config override`.
+A one-shot CLI override is in-memory only. A persistent override is captured as a new immutable managed revision; the source profile bytes remain unchanged, while the validated materialized result is frozen in that revision.
+You can bind a persistent override script to the active config profile via `zc config override`.
 
 ## CLI Flags
 
@@ -23,17 +23,16 @@ For merged config output, use:
 - `zc config override --clear`: clear persistent binding for current config.
 - `zc config override`: show current config binding status.
 
-Persistence scope is `meta.json -> configs.<key>.override_script` (per-config only).
+Persistence scope is the active profile's immutable catalog revision. `meta.json` and `configs/` are compatibility mirrors and are never authoritative writers.
 When setting override:
 
-- script is copied into managed directory: `~/.config/zc/override/`
-- merged config is prepared immediately and missing rule-provider files are auto-downloaded
-- if daemon is running, config is auto-applied (`auto`: try hot, fallback restart)
+- script bytes, invocation metadata, emitted patch, and materialized config are captured in a new revision
+- the active profile and authority token are bound before materialization; a concurrent `config use` or head change fails with a retryable conflict
+- the candidate is parsed and validated offline before the profile head advances
+- the original script file is no longer required after a successful commit
+- if the daemon is running, config is auto-applied (`auto`: try hot, fallback restart)
 
-When clearing override:
-
-- only managed override script copy is removed
-- downloaded ruleset files are kept as cache
+When clearing override, a new revision is published from the unchanged source bytes without the frozen override. Existing immutable revisions remain available for exact identity checks.
 
 Runtime priority:
 
@@ -105,7 +104,7 @@ Runtime preparation behavior:
 ## Dump Output
 
 `zc config dump` prints merged config with sensitive fields redacted (`password`, `uuid`, `secret`, `sni`).
-Persistent override (`zc config override ...`) and temporary override flags are both applied before dump.
+`zc config dump` reads the frozen materialized bytes from the exact active revision. A temporary override flag is then applied once, if supplied. `--no-override` reads the immutable source bytes instead.
 
 ## Error Codes
 

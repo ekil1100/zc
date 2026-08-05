@@ -42,6 +42,17 @@ pub const Loader = struct {
     }
 
     pub fn loadActive(self: Loader) !LoadedConfig {
+        return self.loadActiveWithMaterialization(.effective);
+    }
+
+    pub fn loadActiveWithoutOverride(self: Loader) !LoadedConfig {
+        return self.loadActiveWithMaterialization(.source);
+    }
+
+    fn loadActiveWithMaterialization(
+        self: Loader,
+        materialization: Materialization,
+    ) !LoadedConfig {
         const authority = state_authority.Authority.init(self.allocator, self.root);
         var inspection = try authority.inspect();
         defer inspection.deinit();
@@ -52,10 +63,22 @@ pub const Loader = struct {
         const active = state.active orelse return error.NoActiveManagedConfig;
         const profile = findProfile(state.profiles, active.key) orelse return error.CorruptState;
         if (!profile.head.eql(active.revision)) return error.CorruptState;
-        return self.loadManagedRevision(active.key, active.revision);
+        return self.loadManagedRevision(active.key, active.revision, materialization);
     }
 
     pub fn loadHead(self: Loader, key: []const u8) !LoadedConfig {
+        return self.loadHeadWithMaterialization(key, .effective);
+    }
+
+    pub fn loadHeadWithoutOverride(self: Loader, key: []const u8) !LoadedConfig {
+        return self.loadHeadWithMaterialization(key, .source);
+    }
+
+    fn loadHeadWithMaterialization(
+        self: Loader,
+        key: []const u8,
+        materialization: Materialization,
+    ) !LoadedConfig {
         const authority = state_authority.Authority.init(self.allocator, self.root);
         var inspection = try authority.inspect();
         defer inspection.deinit();
@@ -64,7 +87,7 @@ pub const Loader = struct {
             .missing, .legacy_v1 => return error.Schema2CatalogRequired,
         };
         const profile = findProfile(state.profiles, key) orelse return error.ManagedProfileNotFound;
-        return self.loadManagedRevision(profile.key, profile.head);
+        return self.loadManagedRevision(profile.key, profile.head, materialization);
     }
 
     pub fn loadExact(self: Loader, identity: Identity) !LoadedConfig {
@@ -77,7 +100,7 @@ pub const Loader = struct {
         };
         const profile = findProfile(state.profiles, identity.key) orelse
             return error.ManagedProfileNotFound;
-        return self.loadManagedRevision(profile.key, identity.revision);
+        return self.loadManagedRevision(profile.key, identity.revision, .effective);
     }
 
     pub fn loadUnmanagedPath(self: Loader, path: []const u8) !LoadedConfig {
@@ -94,17 +117,26 @@ pub const Loader = struct {
         };
     }
 
+    const Materialization = enum { source, effective };
+
     fn loadManagedRevision(
         self: Loader,
         key: []const u8,
         revision: config_identity.Revision,
+        materialization: Materialization,
     ) !LoadedConfig {
         const store = revision_store.RevisionStore.init(self.allocator, self.root);
         var view = try store.openVerified(key, revision);
         defer view.deinit();
-        var parsed = try config.parseDocument(self.allocator, view.effectiveSourceBytes());
+        const bytes = switch (materialization) {
+            .source => view.sourceBytes(),
+            .effective => view.effectiveSourceBytes(),
+        };
+        var parsed = try config.parseDocument(self.allocator, bytes);
         errdefer parsed.deinit();
-        try config.prepareRuleProvidersOffline(self.allocator, &parsed, &view);
+        if (materialization == .effective) {
+            try config.prepareRuleProvidersOffline(self.allocator, &parsed, &view);
+        }
         var validation = try config_validator.validate(self.allocator, &parsed);
         errdefer validation.deinit();
         const key_copy = try self.allocator.dupe(u8, key);

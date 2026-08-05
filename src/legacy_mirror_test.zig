@@ -116,6 +116,15 @@ test "LegacyMirror rebuilds effective heads metadata selections and local assets
     const repeated_meta = try tmp.dir.readFileAlloc(compat.io(), "meta.json", allocator, .limited(1024 * 1024));
     defer allocator.free(repeated_meta);
     try testing.expectEqualStrings(meta_bytes, repeated_meta);
+    _ = try mirror.verify();
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "configs/home.yaml",
+        .data = "mixed-port: 1\n",
+    });
+    try testing.expectError(error.LegacyMirrorOutOfSync, mirror.verify());
+    _ = try mirror.rebuild();
+    try writeFile(tmp.dir, "configs/ghost.yaml", "mixed-port: 1\n");
+    try testing.expectError(error.LegacyMirrorOutOfSync, mirror.verify());
 }
 
 test "LegacyMirror exports logical asset aliases rather than canonical source paths" {

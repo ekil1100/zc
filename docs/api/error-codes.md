@@ -96,7 +96,7 @@
 | `CONFIG_CAPABILITY_UNSUPPORTED` | config uses a capability not supported in zc v1.0 | run `zc doctor -c <config>` and use direct/reject/ss/trojan |
 | `CONFIG_LOAD_FAILED` | failed to load local config | check the path, local dependencies, and file permissions |
 | `CONFIG_ALREADY_EXISTS` | a config with this name already exists | rename the file or delete the existing config first |
-| `CONFIG_NAME_INVALID` | invalid config name | use 1-255 characters without control characters, `/` or `\` |
+| `CONFIG_NAME_INVALID` | invalid config name | use 1-250 bytes of UTF-8 without control characters, `/` or `\` |
 | `CONFIG_LIST_FAILED` | failed to list configs | ensure the config directory exists and is readable |
 | `CONFIG_LIST_ARGUMENT_INVALID` | unknown or unexpected argument for `config list` | use `zc config list [--json]` |
 | `CONFIG_DOWNLOAD_URL_REQUIRED` | missing <url> for config download | use `zc config download <url> [-n <name>] [-d]` |
@@ -111,6 +111,7 @@
 | `CONFIG_UPDATE_NO_SUBSCRIPTION` | no subscription url recorded for this config | use `zc config download <url>` to (re)create it |
 | `CONFIG_UPDATE_TOO_LARGE` | updated config exceeds the 16 MiB limit | reduce the config size and retry |
 | `CONFIG_UPDATE_TIMEOUT` | config update exceeded the 30 second deadline | check the server or network and retry |
+| `CONFIG_UPDATE_CONFLICT` | config changed while its update was downloading | retry against the new profile revision |
 | `CONFIG_UPDATE_FAILED` | failed to update config | check subscription url/network and retry |
 | `CONFIG_UPDATE_APPLY_FAILED` | config updated but failed to apply to running daemon | check `zc log --no-follow`, then run `zc restart` |
 | `CONFIG_USE_NAME_REQUIRED` | missing <name> for config use | use `zc config use <name>`; run `zc config list` to see candidates |

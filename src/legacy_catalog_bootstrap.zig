@@ -5,6 +5,7 @@ const config_bundle = @import("config_bundle.zig");
 const config_catalog = @import("config_catalog.zig");
 const config_identity = @import("config_identity.zig");
 const legacy_mirror = @import("legacy_mirror.zig");
+const legacy_write_lock = @import("legacy_write_lock.zig");
 const override_materialization = @import("override_materialization.zig");
 const revision_store = @import("revision_store.zig");
 const state_authority = @import("state_authority.zig");
@@ -20,6 +21,7 @@ pub const BlockedReason = enum {
 pub const EnsureReceipt = struct {
     token: state_authority.StateToken,
     profile_count: usize,
+    mirror_error: ?anyerror = null,
 };
 
 pub const EnsureOutcome = union(enum) {
@@ -93,6 +95,8 @@ pub const LegacyCatalogBootstrap = struct {
     }
 
     pub fn ensure(self: LegacyCatalogBootstrap) !EnsureOutcome {
+        var cutover_guard = try legacy_write_lock.acquire(self.root);
+        defer cutover_guard.deinit();
         const authority = state_authority.Authority.init(self.allocator, self.root);
         const store = revision_store.RevisionStore.init(self.allocator, self.root);
         var inspection = try authority.inspect();
@@ -100,10 +104,13 @@ pub const LegacyCatalogBootstrap = struct {
         switch (inspection) {
             .catalog_v2 => |*observed| {
                 try verifyCatalog(&store, observed.catalog.state);
-                _ = try legacy_mirror.LegacyMirror.init(self.allocator, self.root).rebuild();
                 return .{ .already_current = .{
                     .token = observed.token,
                     .profile_count = observed.catalog.state.profiles.len,
+                    .mirror_error = if (legacy_mirror.LegacyMirror.init(
+                        self.allocator,
+                        self.root,
+                    ).verify()) |_| null else |err| err,
                 } };
             },
             .missing, .legacy_v1 => {},
@@ -243,17 +250,22 @@ pub const LegacyCatalogBootstrap = struct {
             else => return err,
         };
         return switch (outcome) {
-            .committed => |receipt| blk: {
-                _ = try legacy_mirror.LegacyMirror.init(self.allocator, self.root).rebuild();
-                break :blk .{ .migrated = .{
-                    .token = receipt.token,
-                    .profile_count = profiles.len,
-                } };
-            },
+            .committed => |receipt| .{ .migrated = .{
+                .token = receipt.token,
+                .profile_count = profiles.len,
+                .mirror_error = if (legacy_mirror.LegacyMirror.init(
+                    self.allocator,
+                    self.root,
+                ).rebuild()) |_| null else |err| err,
+            } },
             .durability_uncertain => |uncertain| .{ .durability_uncertain = .{
                 .receipt = .{
                     .token = uncertain.receipt.token,
                     .profile_count = profiles.len,
+                    .mirror_error = if (legacy_mirror.LegacyMirror.init(
+                        self.allocator,
+                        self.root,
+                    ).rebuild()) |_| null else |err| err,
                 },
                 .cause = uncertain.cause,
             } },
@@ -271,10 +283,13 @@ pub const LegacyCatalogBootstrap = struct {
         return switch (current) {
             .catalog_v2 => |*observed| blk: {
                 try verifyCatalog(store, observed.catalog.state);
-                _ = try legacy_mirror.LegacyMirror.init(self.allocator, self.root).rebuild();
                 break :blk .{ .already_current = .{
                     .token = observed.token,
                     .profile_count = observed.catalog.state.profiles.len,
+                    .mirror_error = if (legacy_mirror.LegacyMirror.init(
+                        self.allocator,
+                        self.root,
+                    ).verify()) |_| null else |err| err,
                 } };
             },
             .missing, .legacy_v1 => .{ .blocked = .state_conflict },

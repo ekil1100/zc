@@ -72,6 +72,39 @@ fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !CliRun {
     };
 }
 
+fn runCliWithHome(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    args: []const []const u8,
+) !CliRun {
+    try ensureZcBinary(allocator);
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zc_binary);
+    for (args) |arg| try argv.append(allocator, arg);
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = argv.items,
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    errdefer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .code = try exitCode(result.term),
+    };
+}
+
 /// stdout 必须是恰好一行可解析的 JSON envelope。
 fn parseEnvelope(
     allocator: std.mem.Allocator,
@@ -745,6 +778,102 @@ test "integration: corrupt metadata fails closed without replacement" {
     }
 }
 
+test "integration: catalog without active config does not fall back during dump" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "source.yaml",
+        .data = "mixed-port: 7890\n",
+    });
+    const home = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home",
+        allocator,
+    );
+    defer allocator.free(home);
+    const source = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "source.yaml",
+        allocator,
+    );
+    defer allocator.free(source);
+
+    var loaded = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source, "--json" },
+    );
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), loaded.code);
+    var load_envelope = try parseEnvelope(allocator, loaded.stdout);
+    defer load_envelope.deinit();
+    const load_data = load_envelope.value.object.get("data").?.object;
+    try std.testing.expect(!load_data.get("durability_uncertain").?.bool);
+    try std.testing.expect(!load_data.get("mirror_out_of_sync").?.bool);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "home/.config/zc/configs/ghost.yaml",
+        .data = "mixed-port: 7000\n",
+    });
+    const ghost_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home/.config/zc/configs/ghost.yaml",
+        allocator,
+    );
+    defer allocator.free(ghost_path);
+    var ghost_dump = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "dump", "-c", ghost_path, "--json" },
+    );
+    defer ghost_dump.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), ghost_dump.code);
+    var ghost_envelope = try parseEnvelope(allocator, ghost_dump.stdout);
+    defer ghost_envelope.deinit();
+    try expectErrorEnvelope(
+        ghost_envelope.value,
+        "config dump",
+        "CONFIG_DUMP_FAILED",
+    );
+
+    var deleted = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "delete", "source", "--json" },
+    );
+    defer deleted.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), deleted.code);
+
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "home/.config/zc/meta.json",
+        .data = "{not-a-mirror\n",
+    });
+    var listed = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "list", "--json" },
+    );
+    defer listed.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), listed.code);
+    var list_envelope = try parseEnvelope(allocator, listed.stdout);
+    defer list_envelope.deinit();
+    const list_data = list_envelope.value.object.get("data").?.object;
+    try std.testing.expect(!list_data.get("durability_uncertain").?.bool);
+    try std.testing.expect(list_data.get("mirror_out_of_sync").?.bool);
+
+    var dumped = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "dump", "--json" },
+    );
+    defer dumped.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), dumped.code);
+    var envelope = try parseEnvelope(allocator, dumped.stdout);
+    defer envelope.deinit();
+    try expectErrorEnvelope(envelope.value, "config dump", "CONFIG_DUMP_FAILED");
+}
+
 test "integration: missing active config does not fall back to direct" {
     const allocator = std.testing.allocator;
     try ensureZcBinary(allocator);
@@ -875,6 +1004,11 @@ test "integration: startup preserves endpoint validation errors" {
     defer environment.deinit();
     try environment.put("HOME", home);
     try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    try tmp.dir.createDirPath(compat.io(), "home/.config/zc");
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "home/.config/zc/meta.json",
+        .data = "{corrupt-legacy-metadata\n",
+    });
 
     try tmp.dir.writeFile(compat.io(), .{
         .sub_path = "invalid.yaml",

@@ -4,6 +4,7 @@ const yaml = @import("util/yaml.zig");
 const meta = @import("meta.zig");
 const cli_output = @import("cli/output.zig");
 const config_catalog = @import("config_catalog.zig");
+const legacy_write_lock = @import("legacy_write_lock.zig");
 
 pub const ProxyType = enum {
     direct,
@@ -2093,13 +2094,39 @@ pub fn normalizeConfigKey(name: []const u8) []const u8 {
     return name;
 }
 
-fn normalizeManagedConfigKey(name: []const u8) ![]const u8 {
+pub fn normalizeManagedConfigKey(name: []const u8) ![]const u8 {
     const key = normalizeConfigKey(name);
     if (!config_catalog.isManagedKey(key)) return error.InvalidConfigKey;
     return key;
 }
 
+pub fn normalizePortableManagedConfigKey(name: []const u8) ![]const u8 {
+    const key = normalizeConfigKey(name);
+    if (!config_catalog.isPortableManagedKey(key)) {
+        return error.InvalidConfigKey;
+    }
+    return key;
+}
+
 /// 下载结果（key/path 均为 caller 所有）。
+pub fn acquireLegacyWriteGuard(
+    allocator: std.mem.Allocator,
+) !legacy_write_lock.Guard {
+    const root_path = try getDefaultConfigDir(allocator) orelse
+        return error.NoConfigDir;
+    defer allocator.free(root_path);
+    if (!compat.fs.path.isAbsolute(root_path)) return error.NoConfigDir;
+    try compat.fs.cwd().makePath(root_path);
+    const root = try compat.fs.openDirAbsolute(root_path, .{
+        .follow_symlinks = false,
+    });
+    defer root.close(compat.io());
+    var guard = try legacy_write_lock.acquire(root);
+    errdefer guard.deinit();
+    try legacy_write_lock.rejectCatalogAuthority(root);
+    return guard;
+}
+
 pub const DownloadOutcome = struct {
     key: []const u8,
     path: []const u8,
@@ -2211,9 +2238,11 @@ pub fn downloadConfig(
     out: *cli_output.Output,
 ) !DownloadOutcome {
     const normalized_name = if (name) |value|
-        try normalizeManagedConfigKey(value)
+        try normalizePortableManagedConfigKey(value)
     else
         null;
+    var legacy_guard = try acquireLegacyWriteGuard(allocator);
+    defer legacy_guard.deinit();
 
     const fetch_result = try fetchConfig(allocator, url);
     defer allocator.free(fetch_result.body);
@@ -2392,7 +2421,7 @@ pub fn getOverrideScriptsDir(allocator: std.mem.Allocator) !?[]const u8 {
 }
 
 /// 为当前配置复制 override 脚本到托管目录，返回托管脚本绝对路径
-pub fn copyOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) ![]u8 {
+fn copyOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) ![]u8 {
     const key = (try resolveRuntimeConfigKey(allocator, null)) orelse return error.NoActiveConfig;
     defer allocator.free(key);
 
@@ -2421,7 +2450,7 @@ pub fn copyOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_p
 }
 
 /// 将已存在的脚本路径绑定为当前配置持久化 override
-pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) !void {
+fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) !void {
     const key = (try resolveRuntimeConfigKey(allocator, null)) orelse return error.NoActiveConfig;
     defer allocator.free(key);
 
@@ -2458,6 +2487,8 @@ pub fn persistOverrideScriptPathForCurrentConfig(allocator: std.mem.Allocator, s
 
 /// 为“当前配置”设置持久化 override 脚本，返回托管脚本路径
 pub fn setPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, script_path: []const u8) ![]u8 {
+    var legacy_guard = try acquireLegacyWriteGuard(allocator);
+    defer legacy_guard.deinit();
     const managed_path = try copyOverrideScriptForCurrentConfig(allocator, script_path);
     errdefer {
         compat.fs.deleteFileAbsolute(managed_path) catch {};
@@ -2470,6 +2501,8 @@ pub fn setPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator, 
 
 /// 清除“当前配置”的持久化 override 脚本
 pub fn clearPersistedOverrideScriptForCurrentConfig(allocator: std.mem.Allocator) !bool {
+    var legacy_guard = try acquireLegacyWriteGuard(allocator);
+    defer legacy_guard.deinit();
     const key = (try resolveRuntimeConfigKey(allocator, null)) orelse return error.NoActiveConfig;
     defer allocator.free(key);
 
@@ -2549,7 +2582,8 @@ fn inferConfigKeyFromPathWithConfigsDir(allocator: std.mem.Allocator, path: []co
     const resolved_configs_dir = try toResolvedPathForKey(allocator, configs_dir);
     defer allocator.free(resolved_configs_dir);
 
-    if (!isPathWithinDir(resolved_path, resolved_configs_dir)) return null;
+    const parent = compat.fs.path.dirname(resolved_path) orelse return null;
+    if (!std.mem.eql(u8, parent, resolved_configs_dir)) return null;
 
     const basename = compat.fs.path.basename(resolved_path);
     if (!std.mem.endsWith(u8, basename, ".yaml")) return null;
@@ -2606,6 +2640,8 @@ pub fn getSubscriptionUrl(allocator: std.mem.Allocator, config_name: []const u8)
 pub fn updateConfig(allocator: std.mem.Allocator, config_name: []const u8, out: *cli_output.Output) ![]const u8 {
     // config_name 可能带 .yaml 后缀
     const key = try normalizeManagedConfigKey(config_name);
+    var legacy_guard = try acquireLegacyWriteGuard(allocator);
+    defer legacy_guard.deinit();
 
     const url = (try getSubscriptionUrl(allocator, key)) orelse return error.NoSubscriptionUrl;
     defer allocator.free(url);
@@ -2729,6 +2765,8 @@ pub fn listConfigs(allocator: std.mem.Allocator, out: *cli_output.Output) !void 
 pub fn switchConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_output.Output) !void {
     // target 可能带 .yaml 后缀
     const key = try normalizeManagedConfigKey(target);
+    var legacy_guard = try acquireLegacyWriteGuard(allocator);
+    defer legacy_guard.deinit();
 
     var meta_data = try meta.load(allocator);
     defer meta_data.deinit();
@@ -2791,6 +2829,8 @@ pub const DeleteOutcome = struct {
 pub fn deleteConfig(allocator: std.mem.Allocator, target: []const u8, out: *cli_output.Output) !DeleteOutcome {
     // target 可能带 .yaml 后缀（与 use/update/download 共用同一套归一化）。
     const key = try normalizeManagedConfigKey(target);
+    var legacy_guard = try acquireLegacyWriteGuard(allocator);
+    defer legacy_guard.deinit();
 
     const configs_dir = try meta.getConfigsDir(allocator) orelse return error.ConfigNotFound;
     defer allocator.free(configs_dir);
@@ -3657,6 +3697,36 @@ test "inferConfigKeyFromPath resolves symlinked config path for non-download con
     const key = (try inferConfigKeyFromPathWithConfigsDir(allocator, link_abs, configs_abs)).?;
     defer allocator.free(key);
     try std.testing.expectEqualStrings("manual", key);
+}
+
+test "inferConfigKeyFromPath rejects nested config descendants" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "configs/assets");
+    const file = try tmp.dir.createFile(compat.io(), "configs/assets/home.yaml", .{});
+    file.close(compat.io());
+    const cwd = try std.process.currentPathAlloc(compat.io(), allocator);
+    defer allocator.free(cwd);
+    const root = try compat.fs.path.join(
+        allocator,
+        &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] },
+    );
+    defer allocator.free(root);
+    const configs_path = try compat.fs.path.join(allocator, &.{ root, "configs" });
+    defer allocator.free(configs_path);
+    const nested_path = try compat.fs.path.join(
+        allocator,
+        &.{ configs_path, "assets", "home.yaml" },
+    );
+    defer allocator.free(nested_path);
+    try std.testing.expect(
+        try inferConfigKeyFromPathWithConfigsDir(
+            allocator,
+            nested_path,
+            configs_path,
+        ) == null,
+    );
 }
 
 test "isRuleProviderRefreshDue supports second and nanosecond timestamps" {
