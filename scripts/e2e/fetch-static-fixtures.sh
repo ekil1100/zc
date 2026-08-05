@@ -99,9 +99,22 @@ chmod 755 "$work_root/ssserver" "$work_root/trojan-go"
 "$work_root/ssserver" --version >/dev/null
 "$work_root/trojan-go" -version >/dev/null
 
+assert_static_fixture() {
+    local path="$1"
+    local description
+    description="$(file "$path")"
+    case "$description" in
+        *'static-pie linked'* | *'statically linked'*) ;;
+        *)
+            echo "E2E fixture is not statically linked: $description" >&2
+            exit 1
+            ;;
+    esac
+}
+
 if [ "$require_static" -eq 1 ]; then
-    file "$work_root/ssserver" | grep -q 'statically linked'
-    file "$work_root/trojan-go" | grep -q 'statically linked'
+    assert_static_fixture "$work_root/ssserver"
+    assert_static_fixture "$work_root/trojan-go"
 fi
 
 mkdir -p "$cache_root"

@@ -613,6 +613,30 @@ fn waitForController(port: u16) !void {
     return error.ControllerStartTimeout;
 }
 
+fn waitForControllerResponse(port: u16) !void {
+    for (0..100) |_| {
+        if (connectController(port)) |stream| {
+            defer stream.close();
+            stream.writeAll("GET /version HTTP/1.1\r\nHost: local\r\n\r\n") catch {
+                compat.sleepNs(20 * std.time.ns_per_ms);
+                continue;
+            };
+            var response_buffer: [4096]u8 = undefined;
+            const response = readResponseWithin(
+                stream,
+                &response_buffer,
+                100,
+            ) catch {
+                compat.sleepNs(20 * std.time.ns_per_ms);
+                continue;
+            };
+            if (std.mem.indexOf(u8, response, "200 OK") != null) return;
+        } else |_| {}
+        compat.sleepNs(20 * std.time.ns_per_ms);
+    }
+    return error.ControllerResponseTimeout;
+}
+
 fn responseContentLength(header: []const u8) !usize {
     var lines = std.mem.splitSequence(u8, header, "\r\n");
     _ = lines.next() orelse return error.InvalidHttpResponse;
@@ -654,7 +678,10 @@ fn readResponseWithin(
             @intCast(@min(remaining, std.math.maxInt(i32))),
         );
         if (ready == 0) return error.ResponseTimeout;
-        const count = try stream.read(buffer[used..]);
+        const count = stream.read(buffer[used..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
         if (count == 0) return error.UnexpectedEndOfStream;
         used += count;
     }
@@ -1734,11 +1761,11 @@ test "integration: timed out stop is disarmed before the daemon resumes" {
     try tmp.dir.createDirPath(compat.io(), "home");
     try tmp.dir.createDirPath(compat.io(), "run");
     const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
-    defer runtime_handle.close(compat.io());
     try compat.setDirPermissions(
         runtime_handle,
         std.Io.File.Permissions.fromMode(0o700),
     );
+    runtime_handle.close(compat.io());
     const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
     defer allocator.free(root);
     const home = try compat.fs.path.join(allocator, &.{ root, "home" });
@@ -1802,7 +1829,13 @@ test "integration: timed out stop is disarmed before the daemon resumes" {
     var stop_envelope = try parseEnvelope(allocator, stopped.stdout);
     defer stop_envelope.deinit();
     try expectErrorEnvelope(stop_envelope.value, "stop", "STOP_TIMEOUT");
-    var iterator = runtime_handle.iterate();
+    const runtime_check = try std.Io.Dir.openDirAbsolute(
+        compat.io(),
+        runtime_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer runtime_check.close(compat.io());
+    var iterator = runtime_check.iterate();
     while (try iterator.next(compat.io())) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, "zc.stop."));
     }
@@ -1930,11 +1963,11 @@ test "integration: background start returns only after listeners are ready" {
     try tmp.dir.createDirPath(compat.io(), "home");
     try tmp.dir.createDirPath(compat.io(), "run");
     const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
-    defer runtime_handle.close(compat.io());
     try compat.setDirPermissions(
         runtime_handle,
         std.Io.File.Permissions.fromMode(0o700),
     );
+    runtime_handle.close(compat.io());
 
     const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
     defer allocator.free(root);
@@ -2136,6 +2169,7 @@ test "integration: background start returns only after listeners are ready" {
     restored_pid.close(compat.io());
     try std.posix.kill(tracked_pid, std.posix.SIG.CONT);
     daemon_paused = false;
+    try waitForControllerResponse(controller_port);
 
     const selected = try std.process.run(allocator, compat.io(), .{
         .argv = &.{
@@ -2412,7 +2446,13 @@ test "integration: background start returns only after listeners are ready" {
         error.FileNotFound,
         tmp.dir.access(compat.io(), descriptor_path, .{}),
     );
-    var runtime_entries = runtime_handle.iterate();
+    const runtime_check = try std.Io.Dir.openDirAbsolute(
+        compat.io(),
+        runtime_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer runtime_check.close(compat.io());
+    var runtime_entries = runtime_check.iterate();
     while (try runtime_entries.next(compat.io())) |entry| {
         try std.testing.expect(!std.mem.startsWith(
             u8,

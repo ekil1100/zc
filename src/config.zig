@@ -3404,7 +3404,7 @@ test "fetchConfig enforces the response body limit" {
         0,
     )).listen(.{ .reuse_address = true });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+    const thread = try std.Thread.spawn(.{}, struct {
         fn run(http_server: *compat.net.Server) void {
             var connection = http_server.accept() catch return;
             defer connection.stream.close();
@@ -3443,7 +3443,7 @@ test "fetchConfig enforces the total deadline" {
         0,
     )).listen(.{ .reuse_address = true });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+    const thread = try std.Thread.spawn(.{}, struct {
         fn run(http_server: *compat.net.Server) void {
             var connection = http_server.accept() catch return;
             defer connection.stream.close();

@@ -588,7 +588,7 @@ test "write splits 0x4000 bytes at the Shadowsocks AEAD limit" {
     const payload = [_]u8{0x5a} ** 0x4000;
     var context = WriteTestContext{ .client = &client, .payload = &payload };
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 128 * 1024 },
+        .{},
         WriteTestContext.run,
         .{&context},
     );
