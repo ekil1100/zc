@@ -1891,12 +1891,12 @@ pub fn getCurrentConfigName(allocator: std.mem.Allocator) !?[]const u8 {
 }
 
 /// 解析运行时配置 key：
-/// 1) 优先从显式配置路径推导（仅当位于 ~/.config/zc/configs 且为 *.yaml）
-/// 2) 回退到 meta.active
-/// 3) 回退到默认配置路径推导
+/// 1) 显式路径只按自身推导；unmanaged 路径不得回退到 active
+/// 2) 无显式路径时回退到 meta.active
+/// 3) 再从默认配置路径推导
 pub fn resolveRuntimeConfigKey(allocator: std.mem.Allocator, explicit_config_path: ?[]const u8) !?[]const u8 {
     if (explicit_config_path) |path| {
-        if (try inferConfigKeyFromPath(allocator, path)) |k| return k;
+        return try inferConfigKeyFromPath(allocator, path);
     }
 
     if (try getCurrentConfigName(allocator)) |active| {
@@ -2906,6 +2906,16 @@ test "downloadConfig validates the managed key before network access" {
             &output,
         ),
     );
+}
+
+test "resolveRuntimeConfigKey never aliases an unmanaged explicit path" {
+    const allocator = std.testing.allocator;
+    const key = try resolveRuntimeConfigKey(
+        allocator,
+        "testdata/config/minimal.yaml",
+    );
+    defer if (key) |value| allocator.free(value);
+    try std.testing.expect(key == null);
 }
 
 test "resolveRuntimeConfigKey infers key from explicit configs path" {

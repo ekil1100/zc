@@ -1,13 +1,14 @@
 const std = @import("std");
 
 pub const Error = error{InvalidControllerEndpoint};
+pub const loopback_host = "127.0.0.1";
 
 pub const Endpoint = struct {
     port: u16,
 };
 
 pub fn parse(value: []const u8) Error!Endpoint {
-    const prefix = "127.0.0.1:";
+    const prefix = loopback_host ++ ":";
     if (!std.mem.startsWith(u8, value, prefix)) {
         return error.InvalidControllerEndpoint;
     }

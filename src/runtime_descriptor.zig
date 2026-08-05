@@ -2,11 +2,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const config_catalog = @import("config_catalog.zig");
+const controller_endpoint = @import("controller_endpoint.zig");
 const config_identity = @import("config_identity.zig");
+const runtime_dir = @import("runtime_dir.zig");
 
-const file_name = "daemon.json";
-const lock_name = "daemon.lock";
+pub const file_name = runtime_dir.descriptor_name;
+pub const lock_name = "zc.daemon.lock";
 const max_bytes = 64 * 1024;
+const lock_timeout_ms: i64 = 1_000;
+const lock_backoff_ms: u64 = 25;
 
 fn ownerOnly() std.Io.File.Permissions {
     if (builtin.os.tag == .windows) return .default_file;
@@ -52,25 +56,35 @@ pub const Identity = config_identity.ManagedIdentity;
 pub const DescriptorInput = struct {
     pid: u32,
     nonce: Nonce,
-    endpoint: []const u8,
+    endpoint: ?[]const u8 = null,
     identity: ?Identity = null,
     generation: u64 = 0,
+    ready: bool = true,
 };
 pub const Descriptor = struct {
     allocator: std.mem.Allocator,
     pid: u32,
     nonce: Nonce,
-    endpoint: []const u8,
+    endpoint: ?[]const u8,
     identity: ?Identity,
     generation: u64,
+    ready: bool,
 
     pub fn deinit(self: *Descriptor) void {
-        self.allocator.free(self.endpoint);
+        if (self.endpoint) |value| self.allocator.free(value);
         if (self.identity) |value| self.allocator.free(value.key);
         self.* = undefined;
     }
 };
-pub const Expected = union(enum) { missing, nonce: Nonce };
+pub const Expected = union(enum) {
+    missing,
+    nonce: Nonce,
+    state: struct {
+        nonce: Nonce,
+        generation: u64,
+        ready: ?bool = null,
+    },
+};
 pub const PublishOutcome = union(enum) {
     committed,
     conflict: ?Nonce,
@@ -88,48 +102,28 @@ const DiskDescriptor = struct {
     schema_version: u32,
     pid: u32,
     nonce: []const u8,
-    endpoint: []const u8,
+    endpoint: ?[]const u8,
     identity: ?DiskIdentity,
     generation: u64,
+    ready: bool,
 };
 
 pub const DefaultStore = struct {
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    dir: std.Io.Dir,
+    runtime: runtime_dir.RuntimeDir,
 
     pub fn store(self: DefaultStore) Store {
-        return Store.init(self.allocator, self.dir);
+        return Store.init(self.runtime.allocator, self.runtime.dir);
     }
 
     pub fn deinit(self: *DefaultStore) void {
-        self.dir.close(compat.io());
-        self.allocator.free(self.path);
+        self.runtime.deinit();
         self.* = undefined;
     }
 };
 
 pub fn openDefault(allocator: std.mem.Allocator, create: bool) !?DefaultStore {
-    const base = compat.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR") catch
-        try allocator.dupe(u8, "/tmp");
-    defer allocator.free(base);
-    if (!compat.fs.path.isAbsolute(base)) return error.InvalidRuntimeDirectory;
-    const path = try compat.fs.path.join(allocator, &.{ base, "zc-runtime" });
-    errdefer allocator.free(path);
-    if (create) {
-        compat.fs.cwd().makePath(path) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    }
-    const dir = compat.fs.openDirAbsolute(path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => {
-            allocator.free(path);
-            return null;
-        },
-        else => return err,
-    };
-    return .{ .allocator = allocator, .path = path, .dir = dir };
+    const runtime = (try runtime_dir.openDefault(allocator, create)) orelse return null;
+    return .{ .runtime = runtime };
 }
 
 pub const Store = struct {
@@ -147,6 +141,18 @@ pub const Store = struct {
 
     pub fn publish(self: Store, expected: Expected, next: DescriptorInput) !PublishOutcome {
         try validateInput(next);
+        switch (expected) {
+            .state => |state| {
+                if (!next.nonce.eql(state.nonce) or
+                    next.generation < state.generation or
+                    (next.generation == state.generation and
+                        !(state.ready == false and next.ready)))
+                {
+                    return error.InvalidRuntimeGeneration;
+                }
+            },
+            .missing, .nonce => {},
+        }
         try compat.setDirPermissions(self.dir, ownerOnlyDir());
         const lock = try self.acquireLock();
         defer lock.close(compat.io());
@@ -155,8 +161,17 @@ pub const Store = struct {
         const matches = switch (expected) {
             .missing => current == null,
             .nonce => |value| current != null and current.?.nonce.eql(value),
+            .state => |value| current != null and
+                current.?.nonce.eql(value.nonce) and
+                current.?.generation == value.generation and
+                (value.ready == null or current.?.ready == value.ready.?),
         };
         if (!matches) return .{ .conflict = if (current) |value| value.nonce else null };
+        if (current) |value| {
+            if (value.nonce.eql(next.nonce) and value.ready and !next.ready) {
+                return error.RuntimeReadinessRegression;
+            }
+        }
         const bytes = try encode(self.allocator, next);
         defer self.allocator.free(bytes);
         var atomic = try self.dir.createFileAtomic(compat.io(), file_name, .{
@@ -164,6 +179,7 @@ pub const Store = struct {
             .permissions = ownerOnly(),
         });
         defer atomic.deinit(compat.io());
+        try atomic.file.setPermissions(compat.io(), ownerOnly());
         try compat.fileWriteAll(atomic.file, bytes);
         try atomic.file.sync(compat.io());
         const parent = try self.dir.openFile(compat.io(), ".", .{ .allow_directory = true });
@@ -188,11 +204,10 @@ pub const Store = struct {
     }
 
     fn acquireLock(self: Store) !std.Io.File {
+        const deadline = compat.monotonicMilliTimestamp() + lock_timeout_ms;
         while (true) {
-            const lock = self.dir.openFile(compat.io(), lock_name, .{
-                .mode = .read_write,
+            const stat = self.dir.statFile(compat.io(), lock_name, .{
                 .follow_symlinks = false,
-                .lock = .exclusive,
             }) catch |err| switch (err) {
                 error.FileNotFound => {
                     const created = self.dir.createFile(compat.io(), lock_name, .{
@@ -204,7 +219,25 @@ pub const Store = struct {
                         error.PathAlreadyExists => continue,
                         else => return create_err,
                     };
+                    try created.setPermissions(compat.io(), ownerOnly());
                     created.close(compat.io());
+                    continue;
+                },
+                else => return err,
+            };
+            if (stat.kind != .file) return error.InvalidRuntimeLock;
+            const lock = self.dir.openFile(compat.io(), lock_name, .{
+                .mode = .read_write,
+                .follow_symlinks = false,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                error.WouldBlock => {
+                    if (compat.monotonicMilliTimestamp() >= deadline) {
+                        return error.RuntimeDescriptorBusy;
+                    }
+                    compat.sleepNs(lock_backoff_ms * std.time.ns_per_ms);
                     continue;
                 },
                 error.SymLinkLoop, error.IsDir => return error.InvalidRuntimeLock,
@@ -233,9 +266,11 @@ pub const Store = struct {
 };
 
 fn validateInput(input: DescriptorInput) !void {
-    if (input.pid == 0 or input.endpoint.len == 0 or input.endpoint.len > 1024 or
-        !std.unicode.utf8ValidateSlice(input.endpoint)) return error.InvalidRuntimeDescriptor;
-    for (input.endpoint) |c| if (c < 0x20 or c == 0x7f) return error.InvalidRuntimeDescriptor;
+    if (input.pid == 0) return error.InvalidRuntimeDescriptor;
+    if (input.endpoint) |endpoint| {
+        _ = controller_endpoint.parse(endpoint) catch
+            return error.InvalidRuntimeDescriptor;
+    }
     if (input.identity) |value| {
         if (!config_catalog.isManagedKey(value.key)) return error.InvalidRuntimeDescriptor;
     } else if (input.generation != 0) return error.InvalidRuntimeDescriptor;
@@ -252,6 +287,7 @@ fn diskValue(input: DescriptorInput, nonce_hex: *[32]u8, revision_hex: *[32]u8) 
             .revision = value.revision.formatHex(revision_hex),
         } else null,
         .generation = input.generation,
+        .ready = input.ready,
     };
 }
 
@@ -294,13 +330,17 @@ fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Descriptor {
                 return error.CorruptRuntimeDescriptor,
         } else null,
         .generation = disk.generation,
+        .ready = disk.ready,
     };
     validateInput(value) catch return error.CorruptRuntimeDescriptor;
     const canonical = try encode(allocator, value);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, bytes, canonical)) return error.CorruptRuntimeDescriptor;
-    const endpoint = try allocator.dupe(u8, value.endpoint);
-    errdefer allocator.free(endpoint);
+    const endpoint: ?[]u8 = if (value.endpoint) |endpoint|
+        try allocator.dupe(u8, endpoint)
+    else
+        null;
+    errdefer if (endpoint) |allocated| allocator.free(allocated);
     const identity: ?Identity = if (value.identity) |item| .{
         .key = try allocator.dupe(u8, item.key),
         .revision = item.revision,
@@ -312,6 +352,7 @@ fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Descriptor {
         .endpoint = endpoint,
         .identity = identity,
         .generation = value.generation,
+        .ready = value.ready,
     };
 }
 

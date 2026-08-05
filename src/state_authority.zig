@@ -222,6 +222,27 @@ pub const Authority = struct {
         return self.inspectUnlocked();
     }
 
+    pub const Guard = struct {
+        authority: Authority,
+        lock: std.Io.File,
+
+        pub fn inspect(self: Guard) !Inspection {
+            return self.authority.inspectUnlocked();
+        }
+
+        pub fn deinit(self: *Guard) void {
+            self.lock.close(compat.io());
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquireGuard(self: Authority) !Guard {
+        return .{
+            .authority = self,
+            .lock = try self.acquireLock(),
+        };
+    }
+
     pub fn bootstrapCatalog(
         self: Authority,
         expected: StateToken,

@@ -9,6 +9,11 @@
 
 const std = @import("std");
 const compat = @import("compat.zig");
+const daemon = @import("daemon.zig");
+const runtime_descriptor = @import("runtime_descriptor.zig");
+const runtime_dir = @import("runtime_dir.zig");
+const config_identity = @import("config_identity.zig");
+const selection_state = @import("selection_state.zig");
 
 const max_output = 1024 * 1024;
 const zc_binary = "zig-out/bin/zc";
@@ -623,6 +628,1172 @@ fn readResponseWithin(
     }
 }
 
+fn stopIsolatedDaemon(
+    allocator: std.mem.Allocator,
+    environment: *std.process.Environ.Map,
+) void {
+    const result = std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "stop", "--json" },
+        .environ_map = environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    }) catch return;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+}
+
+test "integration: special pid files fail without blocking" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.setDirPermissions(
+        tmp.dir,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const pid_path = try compat.fs.path.join(allocator, &.{ root, "zc.pid" });
+    defer allocator.free(pid_path);
+    const made = try compat.childRun(allocator, &.{ "mkfifo", pid_path }, max_output);
+    defer allocator.free(made.stdout);
+    defer allocator.free(made.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(made.term));
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("XDG_RUNTIME_DIR", root);
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "status", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(1),
+        } },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(result.term));
+    var envelope = try parseEnvelope(allocator, result.stdout);
+    defer envelope.deinit();
+    try expectErrorEnvelope(envelope.value, "status", "STATUS_FAILED");
+}
+
+test "integration: configured missing runtime directory fails closed" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const missing = try compat.fs.path.join(allocator, &.{ root, "missing" });
+    defer allocator.free(missing);
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("XDG_RUNTIME_DIR", missing);
+
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "status", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(result.term));
+    var envelope = try parseEnvelope(allocator, result.stdout);
+    defer envelope.deinit();
+    try expectErrorEnvelope(envelope.value, "status", "STATUS_FAILED");
+}
+
+test "integration: startup preserves endpoint validation errors" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const config_path = try compat.fs.path.join(
+        allocator,
+        &.{ root, "invalid.yaml" },
+    );
+    defer allocator.free(config_path);
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "invalid.yaml",
+        .data =
+        \\allow-lan: true
+        \\bind-address: invalid-address
+        \\mixed-port: 7891
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\rules:
+        \\  - MATCH,DIRECT
+        \\
+        ,
+    });
+    for ([_][]const []const u8{
+        &.{
+            zc_binary,
+            "start",
+            "--foreground",
+            "-c",
+            config_path,
+            "--json",
+        },
+        &.{ zc_binary, "start", "-c", config_path, "--json" },
+    }) |argv| {
+        const result = try std.process.run(allocator, compat.io(), .{
+            .argv = argv,
+            .environ_map = &environment,
+            .stdout_limit = .limited(max_output),
+            .stderr_limit = .limited(max_output),
+            .timeout = .{ .duration = .{
+                .clock = .awake,
+                .raw = std.Io.Duration.fromSeconds(5),
+            } },
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expectEqual(@as(u8, 1), try exitCode(result.term));
+        var envelope = try parseEnvelope(allocator, result.stdout);
+        defer envelope.deinit();
+        try expectErrorEnvelope(
+            envelope.value,
+            "start",
+            "START_BIND_ADDRESS_INVALID",
+        );
+    }
+
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "invalid.yaml",
+        .data =
+        \\mixed-port: 7891
+        \\external-controller: localhost:9090
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\rules:
+        \\  - MATCH,DIRECT
+        \\
+        ,
+    });
+    const controller = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(controller.stdout);
+    defer allocator.free(controller.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(controller.term));
+    var controller_envelope = try parseEnvelope(allocator, controller.stdout);
+    defer controller_envelope.deinit();
+    try expectErrorEnvelope(
+        controller_envelope.value,
+        "start",
+        "START_EXTERNAL_CONTROLLER_INVALID",
+    );
+}
+
+test "integration: provisional startup is not reported as running" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const config_path = try compat.fs.path.join(
+        allocator,
+        &.{ root, "startup.yaml" },
+    );
+    defer allocator.free(config_path);
+    const script_path = try compat.fs.path.join(
+        allocator,
+        &.{ root, "slow-override.sh" },
+    );
+    defer allocator.free(script_path);
+    const mixed_port = try reserveClosedPort();
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nproxies:\n  - name: DIRECT\n    type: direct\nrules:\n  - MATCH,DIRECT\n",
+        .{mixed_port},
+    );
+    defer allocator.free(source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "startup.yaml",
+        .data = source,
+    });
+    const script = try tmp.dir.createFile(
+        compat.io(),
+        "slow-override.sh",
+        .{ .permissions = std.Io.File.Permissions.fromMode(0o700) },
+    );
+    try compat.fileWriteAll(script, "#!/bin/sh\nsleep 1\nprintf '{}\\n'\n");
+    script.close(compat.io());
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+
+    const start_argv = [_][]const u8{
+        zc_binary,
+        "start",
+        "-c",
+        config_path,
+        "--override-script",
+        script_path,
+        "--json",
+    };
+    var first = try std.process.spawn(compat.io(), .{
+        .argv = &start_argv,
+        .environ_map = &environment,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer first.kill(compat.io());
+
+    var saw_provisional = false;
+    var attempt: u8 = 0;
+    while (attempt < 40) : (attempt += 1) {
+        const bytes = tmp.dir.readFileAlloc(
+            compat.io(),
+            "run/zc.daemon.json",
+            allocator,
+            .limited(64 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                compat.sleepNs(25 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        var descriptor = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            bytes,
+            .{},
+        );
+        defer descriptor.deinit();
+        if (!descriptor.value.object.get("ready").?.bool) {
+            saw_provisional = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_provisional);
+
+    const status = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "status", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(status.term));
+    var status_envelope = try parseEnvelope(allocator, status.stdout);
+    defer status_envelope.deinit();
+    try expectErrorEnvelope(status_envelope.value, "status", "STATUS_FAILED");
+
+    const concurrent = try std.process.run(allocator, compat.io(), .{
+        .argv = &start_argv,
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(concurrent.stdout);
+    defer allocator.free(concurrent.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(concurrent.term));
+    var concurrent_envelope = try parseEnvelope(allocator, concurrent.stdout);
+    defer concurrent_envelope.deinit();
+    try std.testing.expectEqualStrings(
+        "already_running",
+        concurrent_envelope.value.object.get("data").?.object.get("detail").?.string,
+    );
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(try first.wait(compat.io())));
+    const ready = try connectController(mixed_port);
+    ready.close();
+}
+
+test "integration: background start returns only after listeners are ready" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const config_home = try compat.fs.path.join(allocator, &.{ home, ".config" });
+    defer allocator.free(config_home);
+    const state_home = try compat.fs.path.join(allocator, &.{ home, ".local", "state" });
+    defer allocator.free(state_home);
+    const config_path = try compat.fs.path.join(allocator, &.{ root, "config.yaml" });
+    defer allocator.free(config_path);
+
+    const mixed_port = try reserveClosedPort();
+    var controller_port = try reserveClosedPort();
+    while (controller_port == mixed_port) controller_port = try reserveClosedPort();
+    const source = try std.fmt.allocPrint(allocator,
+        \\mixed-port: {d}
+        \\external-controller: 127.0.0.1:{d}
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\  - name: REJECT
+        \\    type: reject
+        \\proxy-groups:
+        \\  - name: Proxy
+        \\    type: select
+        \\    proxies: [DIRECT, REJECT]
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: rules.yaml
+        \\rules:
+        \\  - RULE-SET,local,Proxy
+        \\  - MATCH,DIRECT
+        \\
+    , .{ mixed_port, controller_port });
+    defer allocator.free(source);
+    const file = try tmp.dir.createFile(compat.io(), "config.yaml", .{});
+    defer file.close(compat.io());
+    try compat.fileWriteAll(file, source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "rules.yaml",
+        .data = "payload:\n  - example.com\n",
+    });
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_CONFIG_HOME", config_home);
+    try environment.put("XDG_STATE_HOME", state_home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+
+    const imported = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "config", "load", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(imported.stdout);
+    defer allocator.free(imported.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(imported.term));
+    try tmp.dir.deleteFile(compat.io(), "rules.yaml");
+
+    const started = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(15),
+        } },
+    });
+    defer allocator.free(started.stdout);
+    defer allocator.free(started.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(started.term));
+    var envelope = try parseEnvelope(allocator, started.stdout);
+    defer envelope.deinit();
+    try std.testing.expect(envelope.value.object.get("ok").?.bool);
+    try std.testing.expectEqualStrings(
+        "running",
+        envelope.value.object.get("data").?.object.get("state").?.string,
+    );
+
+    const mixed = try connectController(mixed_port);
+    mixed.close();
+    const controller = try connectController(controller_port);
+    controller.close();
+    try tmp.dir.access(compat.io(), "run/zc.pid", .{});
+    var descriptor_path_buffer: [64]u8 = undefined;
+    const descriptor_path = try std.fmt.bufPrint(
+        &descriptor_path_buffer,
+        "run/{s}",
+        .{runtime_descriptor.file_name},
+    );
+    try tmp.dir.access(compat.io(), descriptor_path, .{});
+
+    var lock_path_buffer: [128]u8 = undefined;
+    const lock_path = try std.fmt.bufPrint(
+        &lock_path_buffer,
+        "run/{s}",
+        .{runtime_dir.lock_name},
+    );
+    var old_lock_path_buffer: [160]u8 = undefined;
+    const old_lock_path = try std.fmt.bufPrint(
+        &old_lock_path_buffer,
+        "run/{s}.old",
+        .{runtime_dir.lock_name},
+    );
+    const tracked_pid_bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "run/zc.pid",
+        allocator,
+        .limited(32),
+    );
+    defer allocator.free(tracked_pid_bytes);
+    try tmp.dir.deleteFile(compat.io(), "run/zc.pid");
+    try tmp.dir.rename(lock_path, tmp.dir, old_lock_path, compat.io());
+    const replacement_lock = try tmp.dir.createFile(
+        compat.io(),
+        lock_path,
+        .{ .read = true, .truncate = false },
+    );
+    replacement_lock.close(compat.io());
+    const uncertain_status = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "status", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(uncertain_status.stdout);
+    defer allocator.free(uncertain_status.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(uncertain_status.term));
+    var uncertain_envelope = try parseEnvelope(
+        allocator,
+        uncertain_status.stdout,
+    );
+    defer uncertain_envelope.deinit();
+    try expectErrorEnvelope(uncertain_envelope.value, "status", "STATUS_FAILED");
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "run/zc.pid", .{}),
+    );
+
+    const duplicate_start = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(duplicate_start.stdout);
+    defer allocator.free(duplicate_start.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(duplicate_start.term));
+    try tmp.dir.deleteFile(compat.io(), lock_path);
+    try tmp.dir.rename(old_lock_path, tmp.dir, lock_path, compat.io());
+    const restored_pid = try tmp.dir.createFile(compat.io(), "run/zc.pid", .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try compat.fileWriteAll(restored_pid, tracked_pid_bytes);
+    restored_pid.close(compat.io());
+
+    const selected = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            zc_binary,
+            "proxy",
+            "select",
+            "-g",
+            "Proxy",
+            "-p",
+            "REJECT",
+            "--json",
+        },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(selected.stdout);
+    defer allocator.free(selected.stderr);
+    const selected_exit = try exitCode(selected.term);
+    if (selected_exit != 0) {
+        std.debug.print(
+            "proxy select failed: stdout={s} stderr={s}\n",
+            .{ selected.stdout, selected.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), selected_exit);
+    var selected_envelope = try parseEnvelope(allocator, selected.stdout);
+    defer selected_envelope.deinit();
+    try std.testing.expect(
+        selected_envelope.value.object.get("data").?.object.get("applied").?.bool,
+    );
+    const applied_descriptor_bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        descriptor_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(applied_descriptor_bytes);
+    var applied_descriptor = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        applied_descriptor_bytes,
+        .{},
+    );
+    defer applied_descriptor.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        applied_descriptor.value.object.get("generation").?.integer,
+    );
+    try std.testing.expect(
+        applied_descriptor.value.object.get("ready").?.bool,
+    );
+    const descriptor_object = applied_descriptor.value.object;
+    const stale_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"name\":\"DIRECT\",\"instance_nonce\":\"{s}\",\"identity_key\":\"{s}\",\"identity_revision\":\"{s}\",\"generation\":1}}",
+        .{
+            descriptor_object.get("nonce").?.string,
+            descriptor_object.get("identity").?.object.get("key").?.string,
+            descriptor_object.get("identity").?.object.get("revision").?.string,
+        },
+    );
+    defer allocator.free(stale_body);
+    const stale_request = try std.fmt.allocPrint(
+        allocator,
+        "PUT /proxies/Proxy HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n\r\n{s}",
+        .{ stale_body.len, stale_body },
+    );
+    defer allocator.free(stale_request);
+    const stale_connection = try connectController(controller_port);
+    defer stale_connection.close();
+    try stale_connection.writeAll(stale_request);
+    var stale_response_buffer: [4096]u8 = undefined;
+    const stale_response = try readResponseWithin(
+        stale_connection,
+        &stale_response_buffer,
+        1_000,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, stale_response, "HTTP/1.1 409 ") != null,
+    );
+
+    const managed_identity: config_identity.ManagedIdentity = .{
+        .key = descriptor_object.get("identity").?.object.get("key").?.string,
+        .revision = try config_identity.Revision.parseHex(
+            descriptor_object.get("identity").?.object.get("revision").?.string,
+        ),
+    };
+    const state_root = try tmp.dir.openDir(
+        compat.io(),
+        "home/.config/zc",
+        .{},
+    );
+    defer state_root.close(compat.io());
+    const desired_state = selection_state.State.init(allocator, state_root);
+    const generation_two = try desired_state.persist(
+        managed_identity,
+        "Proxy",
+        "DIRECT",
+    );
+    try std.testing.expectEqual(@as(?u64, 2), generation_two.generation);
+    const generation_three = try desired_state.persist(
+        managed_identity,
+        "Proxy",
+        "REJECT",
+    );
+    try std.testing.expectEqual(@as(?u64, 3), generation_three.generation);
+
+    const jumped = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            zc_binary,
+            "proxy",
+            "select",
+            "-g",
+            "Proxy",
+            "-p",
+            "DIRECT",
+            "--json",
+        },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+    });
+    defer allocator.free(jumped.stdout);
+    defer allocator.free(jumped.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(jumped.term));
+    var jumped_envelope = try parseEnvelope(allocator, jumped.stdout);
+    defer jumped_envelope.deinit();
+    try std.testing.expect(
+        jumped_envelope.value.object.get("data").?.object.get("applied").?.bool,
+    );
+    const jumped_descriptor_bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        descriptor_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(jumped_descriptor_bytes);
+    var jumped_descriptor = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        jumped_descriptor_bytes,
+        .{},
+    );
+    defer jumped_descriptor.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 4),
+        jumped_descriptor.value.object.get("generation").?.integer,
+    );
+
+    const oversized_log = try tmp.dir.openFile(
+        compat.io(),
+        "run/zc.log",
+        .{ .mode = .read_write },
+    );
+    const oversized_log_inode = (try oversized_log.stat(compat.io())).inode;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.ftruncate(
+            oversized_log.handle,
+            @intCast(daemon.daemon_log_max_bytes + 1),
+        ),
+    );
+    oversized_log.close(compat.io());
+    var log_rotated = false;
+    const rotation_deadline = compat.monotonicMilliTimestamp() + 2_000;
+    while (compat.monotonicMilliTimestamp() < rotation_deadline) {
+        const current_log = try tmp.dir.statFile(
+            compat.io(),
+            "run/zc.log",
+            .{ .follow_symlinks = false },
+        );
+        if (current_log.inode != oversized_log_inode) {
+            log_rotated = true;
+            break;
+        }
+        compat.sleepNs(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(log_rotated);
+
+    try tmp.dir.rename(
+        "run/zc.log",
+        tmp.dir,
+        "run/zc.log.old",
+        compat.io(),
+    );
+    var log_recreated = false;
+    var log_attempt: u8 = 0;
+    while (log_attempt < 20) : (log_attempt += 1) {
+        if (tmp.dir.access(compat.io(), "run/zc.log", .{})) |_| {
+            log_recreated = true;
+            break;
+        } else |_| {}
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(log_recreated);
+
+    const stopped = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "stop", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(15),
+        } },
+    });
+    defer allocator.free(stopped.stdout);
+    defer allocator.free(stopped.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(stopped.term));
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "run/zc.pid", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), descriptor_path, .{}),
+    );
+
+    var follower = try std.process.spawn(compat.io(), .{
+        .argv = &.{ zc_binary, "log", "-f", "-n", "1" },
+        .environ_map = &environment,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer follower.kill(compat.io());
+    const follower_stdout = follower.stdout orelse
+        return error.TestUnexpectedResult;
+    try compat.setNonBlock(follower_stdout.handle);
+    compat.sleepNs(100 * std.time.ns_per_ms);
+    try tmp.dir.rename(
+        "run/zc.log",
+        tmp.dir,
+        "run/zc.log.gap-old",
+        compat.io(),
+    );
+    const old_log = try tmp.dir.openFile(
+        compat.io(),
+        "run/zc.log.gap-old",
+        .{ .mode = .read_write },
+    );
+    try compat.fileSeekTo(old_log, (try old_log.stat(compat.io())).size);
+    try compat.fileWriteAll(old_log, "old-after-rename\n");
+    old_log.close(compat.io());
+    compat.sleepNs(700 * std.time.ns_per_ms);
+    const new_log = try tmp.dir.createFile(compat.io(), "run/zc.log", .{});
+    try new_log.setPermissions(
+        compat.io(),
+        std.Io.File.Permissions.fromMode(0o600),
+    );
+    try compat.fileWriteAll(new_log, "new-after-gap\n");
+    new_log.close(compat.io());
+
+    var followed = std.ArrayList(u8).empty;
+    defer followed.deinit(allocator);
+    const follow_deadline = compat.monotonicMilliTimestamp() + 2_000;
+    var read_buffer: [1024]u8 = undefined;
+    while (compat.monotonicMilliTimestamp() < follow_deadline) {
+        const count = compat.posixRead(
+            follower_stdout.handle,
+            &read_buffer,
+        ) catch |err| switch (err) {
+            error.WouldBlock => {
+                compat.sleepNs(25 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        if (count == 0) break;
+        try followed.appendSlice(allocator, read_buffer[0..count]);
+        if (std.mem.indexOf(u8, followed.items, "new-after-gap") != null) break;
+    }
+    try std.testing.expect(
+        std.mem.indexOf(u8, followed.items, "old-after-rename") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, followed.items, "new-after-gap") != null,
+    );
+
+    try tmp.dir.rename("run", tmp.dir, "run.previous", compat.io());
+    compat.sleepNs(700 * std.time.ns_per_ms);
+    try tmp.dir.createDir(compat.io(), "run", .default_dir);
+    const replacement_runtime = try tmp.dir.openDir(compat.io(), "run", .{});
+    try compat.setDirPermissions(
+        replacement_runtime,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const replacement_runtime_log = try replacement_runtime.createFile(
+        compat.io(),
+        "zc.log",
+        .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    );
+    try compat.fileWriteAll(replacement_runtime_log, "new-runtime-dir\n");
+    replacement_runtime_log.close(compat.io());
+    replacement_runtime.close(compat.io());
+    const runtime_reopen_deadline = compat.monotonicMilliTimestamp() + 2_000;
+    while (compat.monotonicMilliTimestamp() < runtime_reopen_deadline) {
+        const count = compat.posixRead(
+            follower_stdout.handle,
+            &read_buffer,
+        ) catch |err| switch (err) {
+            error.WouldBlock => {
+                compat.sleepNs(25 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        if (count == 0) break;
+        try followed.appendSlice(allocator, read_buffer[0..count]);
+        if (std.mem.indexOf(u8, followed.items, "new-runtime-dir") != null) break;
+    }
+    try std.testing.expect(
+        std.mem.indexOf(u8, followed.items, "new-runtime-dir") != null,
+    );
+    follower.kill(compat.io());
+
+    try tmp.dir.deleteFile(compat.io(), "run/zc.log");
+    var initial_missing_follower = try std.process.spawn(compat.io(), .{
+        .argv = &.{ zc_binary, "log", "-f", "-n", "1" },
+        .environ_map = &environment,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer initial_missing_follower.kill(compat.io());
+    const initial_missing_stdout = initial_missing_follower.stdout orelse
+        return error.TestUnexpectedResult;
+    try compat.setNonBlock(initial_missing_stdout.handle);
+    compat.sleepNs(100 * std.time.ns_per_ms);
+    try tmp.dir.rename("run", tmp.dir, "run.initial-old", compat.io());
+    compat.sleepNs(700 * std.time.ns_per_ms);
+    try tmp.dir.createDir(compat.io(), "run", .default_dir);
+    const initial_replacement_runtime = try tmp.dir.openDir(
+        compat.io(),
+        "run",
+        .{},
+    );
+    try compat.setDirPermissions(
+        initial_replacement_runtime,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const initial_replacement_log = try initial_replacement_runtime.createFile(
+        compat.io(),
+        "zc.log",
+        .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    );
+    try compat.fileWriteAll(initial_replacement_log, "initial-log-appeared\n");
+    initial_replacement_log.close(compat.io());
+    initial_replacement_runtime.close(compat.io());
+    var initial_followed = std.ArrayList(u8).empty;
+    defer initial_followed.deinit(allocator);
+    const initial_follow_deadline = compat.monotonicMilliTimestamp() + 2_000;
+    while (compat.monotonicMilliTimestamp() < initial_follow_deadline) {
+        const count = compat.posixRead(
+            initial_missing_stdout.handle,
+            &read_buffer,
+        ) catch |err| switch (err) {
+            error.WouldBlock => {
+                compat.sleepNs(25 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        if (count == 0) break;
+        try initial_followed.appendSlice(allocator, read_buffer[0..count]);
+        if (std.mem.indexOf(
+            u8,
+            initial_followed.items,
+            "initial-log-appeared",
+        ) != null) break;
+    }
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            initial_followed.items,
+            "initial-log-appeared",
+        ) != null,
+    );
+    initial_missing_follower.kill(compat.io());
+
+    const no_controller_port = try reserveClosedPort();
+    const no_controller_source = try std.fmt.allocPrint(allocator,
+        \\mixed-port: {d}
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\rules:
+        \\  - MATCH,DIRECT
+        \\
+    , .{no_controller_port});
+    defer allocator.free(no_controller_source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "config.yaml",
+        .data = no_controller_source,
+    });
+    const no_controller_start = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(15),
+        } },
+    });
+    defer allocator.free(no_controller_start.stdout);
+    defer allocator.free(no_controller_start.stderr);
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        try exitCode(no_controller_start.term),
+    );
+    const no_controller = try connectController(no_controller_port);
+    no_controller.close();
+    const descriptor_bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        descriptor_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(descriptor_bytes);
+    var parsed_descriptor = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        descriptor_bytes,
+        .{},
+    );
+    defer parsed_descriptor.deinit();
+    try std.testing.expect(
+        parsed_descriptor.value.object.get("endpoint").? == .null,
+    );
+    const replaced_runtime_pid: i32 = @intCast(
+        parsed_descriptor.value.object.get("pid").?.integer,
+    );
+    try tmp.dir.rename(
+        "run",
+        tmp.dir,
+        "run.daemon-replaced",
+        compat.io(),
+    );
+    compat.sleepNs(700 * std.time.ns_per_ms);
+    try tmp.dir.createDir(compat.io(), "run", .default_dir);
+    const recreated_runtime = try tmp.dir.openDir(compat.io(), "run", .{});
+    try compat.setDirPermissions(
+        recreated_runtime,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    recreated_runtime.close(compat.io());
+    var exited = false;
+    var exit_attempt: u8 = 0;
+    while (exit_attempt < 40) : (exit_attempt += 1) {
+        std.posix.kill(replaced_runtime_pid, @enumFromInt(0)) catch {
+            exited = true;
+            break;
+        };
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(exited);
+    const replacement_start = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(15),
+        } },
+    });
+    defer allocator.free(replacement_start.stdout);
+    defer allocator.free(replacement_start.stderr);
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        try exitCode(replacement_start.term),
+    );
+    const final_stop = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "stop", "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(15),
+        } },
+    });
+    defer allocator.free(final_stop.stdout);
+    defer allocator.free(final_stop.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(final_stop.term));
+
+    try tmp.dir.deleteFile(compat.io(), "run/zc.log");
+    try tmp.dir.createDir(compat.io(), "run/zc.log", .default_dir);
+    const bootstrap_failure = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(bootstrap_failure.stdout);
+    defer allocator.free(bootstrap_failure.stderr);
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try exitCode(bootstrap_failure.term),
+    );
+    var bootstrap_envelope = try parseEnvelope(
+        allocator,
+        bootstrap_failure.stdout,
+    );
+    defer bootstrap_envelope.deinit();
+    try expectErrorEnvelope(bootstrap_envelope.value, "start", "START_FAILED");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, bootstrap_failure.stdout, "{\"ok\":"),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "run/zc.pid", .{}),
+    );
+    const restart_bootstrap_failure = try std.process.run(
+        allocator,
+        compat.io(),
+        .{
+            .argv = &.{ zc_binary, "restart", "-c", config_path, "--json" },
+            .environ_map = &environment,
+            .stdout_limit = .limited(max_output),
+            .stderr_limit = .limited(max_output),
+            .timeout = .{ .duration = .{
+                .clock = .awake,
+                .raw = std.Io.Duration.fromSeconds(5),
+            } },
+        },
+    );
+    defer allocator.free(restart_bootstrap_failure.stdout);
+    defer allocator.free(restart_bootstrap_failure.stderr);
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try exitCode(restart_bootstrap_failure.term),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(
+            u8,
+            restart_bootstrap_failure.stdout,
+            "{\"ok\":",
+        ),
+    );
+    try tmp.dir.deleteTree(compat.io(), "run/zc.log");
+
+    const descriptor_lock_path = try std.fmt.bufPrint(
+        &descriptor_path_buffer,
+        "run/{s}",
+        .{runtime_descriptor.lock_name},
+    );
+    const held_descriptor_lock = try tmp.dir.createFile(
+        compat.io(),
+        descriptor_lock_path,
+        .{ .read = true, .truncate = false, .lock = .exclusive },
+    );
+    defer held_descriptor_lock.close(compat.io());
+    const rejected_publish = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            zc_binary,
+            "start",
+            "--foreground",
+            "-c",
+            config_path,
+            "--json",
+        },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(rejected_publish.stdout);
+    defer allocator.free(rejected_publish.stderr);
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try exitCode(rejected_publish.term),
+    );
+    var rejected_envelope = try parseEnvelope(
+        allocator,
+        rejected_publish.stdout,
+    );
+    defer rejected_envelope.deinit();
+    try expectErrorEnvelope(
+        rejected_envelope.value,
+        "start",
+        "START_RUNTIME_PUBLISH_FAILED",
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "run/zc.pid", .{}),
+    );
+
+    const rejected_background = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(rejected_background.stdout);
+    defer allocator.free(rejected_background.stderr);
+    const rejected_background_exit = try exitCode(rejected_background.term);
+    if (std.mem.indexOf(u8, rejected_background.stdout, "START_RUNTIME_PUBLISH_FAILED") == null) {
+        std.debug.print(
+            "background publish rejection: stdout={s} stderr={s}\n",
+            .{ rejected_background.stdout, rejected_background.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 1), rejected_background_exit);
+    var background_envelope = try parseEnvelope(
+        allocator,
+        rejected_background.stdout,
+    );
+    defer background_envelope.deinit();
+    try expectErrorEnvelope(
+        background_envelope.value,
+        "start",
+        "START_RUNTIME_PUBLISH_FAILED",
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "run/zc.pid", .{}),
+    );
+}
+
 test "integration: minimal API isolates idle clients and frames PUT bodies" {
     const allocator = std.testing.allocator;
     try ensureZcBinary(allocator);
@@ -631,13 +1802,19 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(compat.io(), "home/.config");
     try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
 
     const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
     defer allocator.free(root);
     const home = try compat.fs.path.join(allocator, &.{ root, "home" });
     defer allocator.free(home);
-    const runtime_dir = try compat.fs.path.join(allocator, &.{ root, "run" });
-    defer allocator.free(runtime_dir);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
     const config_path = try compat.fs.path.join(allocator, &.{ root, "config.yaml" });
     defer allocator.free(config_path);
 
@@ -663,6 +1840,11 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
     const file = try tmp.dir.createFile(compat.io(), "config.yaml", .{});
     defer file.close(compat.io());
     try compat.fileWriteAll(file, source);
+    const sentinel = try tmp.dir.createFile(compat.io(), "sentinel", .{});
+    try compat.fileWriteAll(sentinel, "unchanged");
+    sentinel.close(compat.io());
+    tmp.dir.symLink(compat.io(), "../sentinel", "run/zc.pid", .{}) catch
+        return error.SkipZigTest;
 
     var environment = try std.process.Environ.createMap(
         std.testing.environ,
@@ -670,7 +1852,33 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
     );
     defer environment.deinit();
     try environment.put("HOME", home);
-    try environment.put("XDG_RUNTIME_DIR", runtime_dir);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+
+    const rejected = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            zc_binary,
+            "start",
+            "--foreground",
+            "-c",
+            config_path,
+            "--json",
+        },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(1),
+        } },
+    });
+    defer allocator.free(rejected.stdout);
+    defer allocator.free(rejected.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(rejected.term));
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stdout, "START_PREFLIGHT_FAILED") != null,
+    );
+    try tmp.dir.deleteFile(compat.io(), "run/zc.pid");
+
     var child = try std.process.spawn(compat.io(), .{
         .argv = &.{ zc_binary, "start", "--foreground", "-c", config_path },
         .environ_map = &environment,
@@ -679,6 +1887,14 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
     });
     defer child.kill(compat.io());
     try waitForController(controller_port);
+    const sentinel_bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "sentinel",
+        allocator,
+        .limited(32),
+    );
+    defer allocator.free(sentinel_bytes);
+    try std.testing.expectEqualStrings("unchanged", sentinel_bytes);
 
     const idle = try connectController(controller_port);
     defer idle.close();

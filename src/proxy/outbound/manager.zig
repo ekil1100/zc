@@ -10,6 +10,7 @@ const anytls = @import("../../protocol/anytls.zig");
 const anytls_pool = @import("anytls_pool.zig");
 const udp_uot = @import("../udp_uot.zig");
 const runtime_selection = @import("../../runtime_selection.zig");
+const config_catalog = @import("../../config_catalog.zig");
 
 /// The production UoT v2 codec instantiated over a real borrowed anytls.Stream.
 /// The ProxyStream UDP arm owns a heap instance of this; the relay (D6) drives
@@ -257,6 +258,8 @@ pub const OutboundManager = struct {
     /// 每个代理组的当前选择（group_name → proxy_name）
     group_selections: std.StringHashMap([]const u8),
     group_selections_mutex: std.Io.Mutex = .init,
+    selection_generation: u64 = 0,
+    traffic_ready: std.atomic.Value(bool) = .init(true),
 
     /// 当前配置 key（用于持久化 selections 到 meta.json）
     config_key: ?[]const u8 = null,
@@ -369,12 +372,177 @@ pub const OutboundManager = struct {
     /// 设置代理组的选择（由 TUI/API 调用）
     /// 注意：存储 config 中的稳定字符串引用，而非调用者的临时切片
     pub fn selectProxy(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8) void {
-        self.selectProxyInternal(group_name, proxy_name, true);
+        _ = self.selectProxyInternal(group_name, proxy_name, true) catch |err| {
+            std.debug.print("[Manager] Selection update failed: {}\n", .{err});
+        };
     }
 
     /// Applies a selection already committed by the CLI authority path.
-    pub fn applyPersistedSelection(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8) void {
-        self.selectProxyInternal(group_name, proxy_name, false);
+    pub fn applyPersistedSelection(
+        self: *OutboundManager,
+        group_name: []const u8,
+        proxy_name: []const u8,
+    ) !bool {
+        return self.selectProxyInternal(group_name, proxy_name, false);
+    }
+
+    pub const PersistedSelectionTransaction = struct {
+        manager: *OutboundManager,
+        selections: []const config_catalog.Selection,
+        generation: u64,
+        active: bool = true,
+
+        pub fn commit(self: *PersistedSelectionTransaction) bool {
+            std.debug.assert(self.active);
+            defer {
+                self.active = false;
+                self.manager.unlockSelections();
+            }
+            if (self.generation < self.manager.selection_generation) {
+                return false;
+            }
+            self.manager.commitPersistedSelectionsLocked(
+                self.selections,
+                self.generation,
+            );
+            return true;
+        }
+
+        pub fn deinit(self: *PersistedSelectionTransaction) void {
+            if (!self.active) return;
+            self.active = false;
+            self.manager.unlockSelections();
+        }
+    };
+
+    fn validateAndReservePersistedSelectionsLocked(
+        self: *OutboundManager,
+        selections: []const config_catalog.Selection,
+        generation: u64,
+    ) !bool {
+        if (generation < self.selection_generation) return false;
+        for (selections) |selection| {
+            var valid = false;
+            for (self.config.proxy_groups.items) |group| {
+                if (!std.mem.eql(u8, group.name, selection.group)) continue;
+                for (group.proxies.items) |proxy| {
+                    if (std.mem.eql(u8, proxy, selection.proxy)) {
+                        valid = true;
+                        break;
+                    }
+                }
+                break;
+            }
+            if (!valid) return false;
+        }
+        try self.group_selections.ensureUnusedCapacity(@intCast(selections.len));
+        return true;
+    }
+
+    pub fn beginPersistedSelections(
+        self: *OutboundManager,
+        selections: []const config_catalog.Selection,
+        generation: u64,
+    ) !?PersistedSelectionTransaction {
+        self.lockSelections();
+        errdefer self.unlockSelections();
+        if (!try self.validateAndReservePersistedSelectionsLocked(
+            selections,
+            generation,
+        )) {
+            self.unlockSelections();
+            return null;
+        }
+        return .{
+            .manager = self,
+            .selections = selections,
+            .generation = generation,
+        };
+    }
+
+    pub fn preparePersistedSelections(
+        self: *OutboundManager,
+        selections: []const config_catalog.Selection,
+        generation: u64,
+    ) !bool {
+        var transaction = (try self.beginPersistedSelections(
+            selections,
+            generation,
+        )) orelse return false;
+        transaction.deinit();
+        return true;
+    }
+
+    fn commitPersistedSelectionsLocked(
+        self: *OutboundManager,
+        selections: []const config_catalog.Selection,
+        generation: u64,
+    ) void {
+        self.group_selections.clearRetainingCapacity();
+        for (selections) |selection| {
+            for (self.config.proxy_groups.items) |group| {
+                if (!std.mem.eql(u8, group.name, selection.group)) continue;
+                for (group.proxies.items) |proxy| {
+                    if (!std.mem.eql(u8, proxy, selection.proxy)) continue;
+                    self.group_selections.putAssumeCapacity(group.name, proxy);
+                    break;
+                }
+                break;
+            }
+        }
+        self.selection_generation = generation;
+    }
+
+    pub fn commitPersistedSelections(
+        self: *OutboundManager,
+        selections: []const config_catalog.Selection,
+        generation: u64,
+    ) bool {
+        self.lockSelections();
+        defer self.unlockSelections();
+        if (generation < self.selection_generation) return false;
+        self.commitPersistedSelectionsLocked(selections, generation);
+        return true;
+    }
+
+    pub const SelectionBarrier = struct {
+        manager: *OutboundManager,
+        active: bool = true,
+
+        pub fn deinit(self: *SelectionBarrier) void {
+            if (!self.active) return;
+            self.active = false;
+            self.manager.unlockSelections();
+        }
+    };
+
+    pub fn acquireSelectionBarrier(self: *OutboundManager) SelectionBarrier {
+        self.lockSelections();
+        return .{ .manager = self };
+    }
+
+    pub fn waitForPersistedSelectionUpdates(self: *OutboundManager) void {
+        var barrier = self.acquireSelectionBarrier();
+        barrier.deinit();
+    }
+
+    pub fn persistedSelectionGeneration(self: *OutboundManager) u64 {
+        self.lockSelections();
+        defer self.unlockSelections();
+        return self.selection_generation;
+    }
+
+    pub fn applyPersistedSelections(
+        self: *OutboundManager,
+        selections: []const config_catalog.Selection,
+        generation: u64,
+    ) !bool {
+        var transaction = (try self.beginPersistedSelections(
+            selections,
+            generation,
+        )) orelse return false;
+        defer transaction.deinit();
+        return transaction.commit();
     }
 
     /// daemon 实际加载的配置 key（启动时设定）。status 经 IPC 读取此值而非
@@ -414,7 +582,12 @@ pub const OutboundManager = struct {
         return entries.toOwnedSlice(allocator);
     }
 
-    fn selectProxyInternal(self: *OutboundManager, group_name: []const u8, proxy_name: []const u8, persist: bool) void {
+    fn selectProxyInternal(
+        self: *OutboundManager,
+        group_name: []const u8,
+        proxy_name: []const u8,
+        persist: bool,
+    ) !bool {
         self.lockSelections();
         defer self.unlockSelections();
 
@@ -422,21 +595,22 @@ pub const OutboundManager = struct {
             if (std.mem.eql(u8, grp.name, group_name)) {
                 for (grp.proxies.items) |pname| {
                     if (std.mem.eql(u8, pname, proxy_name)) {
-                        self.group_selections.put(grp.name, pname) catch {};
+                        try self.group_selections.put(grp.name, pname);
                         std.debug.print("[Manager] Group '{s}' selected: {s}\n", .{ grp.name, pname });
 
                         if (persist) {
                             // 持久化到 meta.json
                             self.persistSelections();
                         }
-                        return;
+                        return true;
                     }
                 }
                 std.debug.print("[Manager] Proxy '{s}' not found in group '{s}'\n", .{ proxy_name, group_name });
-                return;
+                return false;
             }
         }
         std.debug.print("[Manager] Group '{s}' not found\n", .{group_name});
+        return false;
     }
 
     /// 持久化当前 selections 到 meta.json
@@ -478,7 +652,7 @@ pub const OutboundManager = struct {
     }
 
     /// 从 meta.json 加载持久化的 selections
-    pub fn loadPersistedSelections(self: *OutboundManager) void {
+    pub fn loadPersistedSelections(self: *OutboundManager) !void {
         const key = self.config_key orelse return;
 
         var meta_data = meta.load(self.allocator) catch return;
@@ -488,12 +662,29 @@ pub const OutboundManager = struct {
 
         var it = cm.selections.iterator();
         while (it.next()) |entry| {
-            self.selectProxyInternal(entry.key_ptr.*, entry.value_ptr.*, false);
+            if (!try self.selectProxyInternal(
+                entry.key_ptr.*,
+                entry.value_ptr.*,
+                false,
+            )) {
+                return error.InvalidDesiredSelection;
+            }
+        }
+    }
+
+    pub fn setTrafficReady(self: *OutboundManager, ready: bool) void {
+        self.traffic_ready.store(ready, .release);
+    }
+
+    fn waitForTrafficReady(self: *OutboundManager) void {
+        while (!self.traffic_ready.load(.acquire)) {
+            compat.sleepNs(1 * std.time.ns_per_ms);
         }
     }
 
     /// 根据代理名称建立连接（返回加密的代理流）
     pub fn connect(self: *OutboundManager, proxy_name: []const u8, target: []const u8, port: u16) !ProxyStream {
+        self.waitForTrafficReady();
         std.debug.print("[Manager] connect: proxy={s}, target={s}:{d}\n", .{ proxy_name, target, port });
 
         // Resolve policy before applying the private-target loop guard. A deny
@@ -506,13 +697,15 @@ pub const OutboundManager = struct {
             return error.ConnectionRejected;
         }
 
+        self.lockSelections();
         var current_name = proxy_name;
         var iteration: usize = 0;
         while (iteration < 10) : (iteration += 1) {
-            const next = self.resolveProxyGroup(current_name) orelse break;
+            const next = self.resolveProxyGroupLocked(current_name) orelse break;
             std.debug.print("[Manager] Resolved {s} to {s}\n", .{ current_name, next });
             current_name = next;
         }
+        self.unlockSelections();
 
         if (std.mem.eql(u8, current_name, "DIRECT")) {
             return try self.connectDirectTarget(target, port);
@@ -541,21 +734,22 @@ pub const OutboundManager = struct {
     /// Reject all v1 UDP proxy paths before dialing. DIRECT and REJECT preserve
     /// their narrower policy errors so SOCKS5 can report an accurate denial.
     pub fn connectUdp(self: *OutboundManager, proxy_name: []const u8) !ProxyStream {
+        self.waitForTrafficReady();
         if (std.mem.eql(u8, proxy_name, "DIRECT")) return error.UdpNotSupportedForDirect;
         if (std.mem.eql(u8, proxy_name, "REJECT")) return error.ConnectionRejected;
 
         // Resolve nested proxy groups exactly like connect() (lines 416-424).
+        self.lockSelections();
         var current_name = proxy_name;
-        var resolved_name: ?[]const u8 = undefined;
         var iter: usize = 0;
         while (iter < 10) : (iter += 1) {
-            resolved_name = self.resolveProxyGroup(current_name);
-            if (resolved_name) |next| {
+            if (self.resolveProxyGroupLocked(current_name)) |next| {
                 current_name = next;
             } else {
                 break;
             }
         }
+        self.unlockSelections();
 
         // A group may resolve to the literal DIRECT/REJECT names.
         if (std.mem.eql(u8, current_name, "DIRECT")) return error.UdpNotSupportedForDirect;
@@ -688,13 +882,14 @@ pub const OutboundManager = struct {
     }
 
     /// 解析代理组为实际代理名称
-    fn resolveProxyGroup(self: *OutboundManager, group_name: []const u8) ?[]const u8 {
+    fn resolveProxyGroupLocked(
+        self: *OutboundManager,
+        group_name: []const u8,
+    ) ?[]const u8 {
         for (self.config.proxy_groups.items) |grp| {
             if (std.mem.eql(u8, grp.name, group_name)) {
-                // 优先使用用户选择的代理
-                self.lockSelections();
+                // Prefer the user selection while the caller holds the lock.
                 const selected = self.group_selections.get(group_name);
-                self.unlockSelections();
                 if (selected) |value| {
                     std.debug.print("[Manager] Proxy group {s} -> {s} (selected)\n", .{ group_name, value });
                     return value;
@@ -1087,7 +1282,7 @@ test "selectProxyInternal with persist=false skips persist" {
     var mgr = try OutboundManager.init(allocator, &cfg);
     defer mgr.deinit();
 
-    mgr.selectProxyInternal("G1", "P1", false);
+    try std.testing.expect(try mgr.selectProxyInternal("G1", "P1", false));
     try std.testing.expectEqual(@as(usize, 0), mgr.persist_invocations);
 }
 
@@ -1124,12 +1319,33 @@ test "configKey and snapshotSelections expose daemon runtime state" {
     try std.testing.expectEqual(@as(usize, 0), snap0.len);
 
     // Select P2 in G1 (persist=false: no meta.json writes) -> snapshot reflects it.
-    mgr.selectProxyInternal("G1", "P2", false);
+    try std.testing.expect(try mgr.selectProxyInternal("G1", "P2", false));
     const snap1 = try mgr.snapshotSelections(allocator);
     defer runtime_selection.freeSelectionEntries(allocator, snap1);
     try std.testing.expectEqual(@as(usize, 1), snap1.len);
     try std.testing.expectEqualStrings("G1", snap1[0].group);
     try std.testing.expectEqualStrings("P2", snap1[0].proxy);
+
+    const generation_two = [_]config_catalog.Selection{.{
+        .group = "G1",
+        .proxy = "P1",
+    }};
+    try std.testing.expect(try mgr.applyPersistedSelections(&generation_two, 2));
+    const stale = [_]config_catalog.Selection{.{
+        .group = "G1",
+        .proxy = "P2",
+    }};
+    try std.testing.expect(!try mgr.preparePersistedSelections(&stale, 1));
+    try std.testing.expect(!mgr.commitPersistedSelections(&stale, 1));
+    const snap2 = try mgr.snapshotSelections(allocator);
+    defer runtime_selection.freeSelectionEntries(allocator, snap2);
+    try std.testing.expectEqualStrings("P1", snap2[0].proxy);
+
+    try std.testing.expect(try mgr.selectProxyInternal("G1", "P2", false));
+    try std.testing.expect(try mgr.applyPersistedSelections(&.{}, 3));
+    const snap3 = try mgr.snapshotSelections(allocator);
+    defer runtime_selection.freeSelectionEntries(allocator, snap3);
+    try std.testing.expectEqual(@as(usize, 0), snap3.len);
 }
 
 test "shouldBypassProxyForTarget detects loopback and private targets" {

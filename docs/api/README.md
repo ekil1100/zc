@@ -27,6 +27,8 @@ external-controller: 127.0.0.1:9090
 
 所有 JSON 响应均由标准序列化器生成；配置中的引号、反斜杠、控制字符与 Unicode 会按 JSON 规则转义并可无损还原。
 
+直接发送仅含 `name` 的 PUT 是当前 daemon 的临时 runtime 选择，重启后不保证保留。`zc proxy select` 会先提交 durable desired generation，再附带 instance nonce、exact identity 与 generation 调用同一端点；daemon 拒绝过期或乱序 generation；当 durable desired 已领先多个 generation 时，可从旧 descriptor 原子前跳到最新完整 snapshot，并在数据面提交后推进 runtime descriptor。
+
 ## 资源与 framing 上界
 
 - 同时最多处理 16 个连接；超出 admission 上界的连接立即关闭。

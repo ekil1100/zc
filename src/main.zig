@@ -3,6 +3,7 @@ const compat = @import("compat.zig");
 const config = @import("config.zig");
 const config_import = @import("config_import.zig");
 const config_identity = @import("config_identity.zig");
+const managed_config_loader = @import("managed_config_loader.zig");
 const controller_endpoint = @import("controller_endpoint.zig");
 const constants = @import("constants.zig");
 const validator = @import("config_validator.zig");
@@ -18,6 +19,7 @@ const proxy_cli = @import("proxy_cli.zig");
 const runtime_selection = @import("runtime_selection.zig");
 const runtime_descriptor = @import("runtime_descriptor.zig");
 const selection_state = @import("selection_state.zig");
+const state_authority = @import("state_authority.zig");
 const test_cli = @import("test_cli.zig");
 const doctor_cli = @import("doctor_cli.zig");
 const override = @import("override.zig");
@@ -38,6 +40,23 @@ const RuntimeCommand = enum {
     restart,
 };
 
+const listener_start_timeout_ms: i64 = 10_000;
+const daemon_listener_start_timeout_ms: i64 = 15_000;
+const listener_start_poll_ms: u64 = 10;
+
+const ListenerStartupPhase = enum(u8) {
+    initializing,
+    committed,
+    failed,
+};
+
+const ListenerStartup = struct {
+    ready: std.atomic.Value(u8) = .init(0),
+    phase: std.atomic.Value(ListenerStartupPhase) = .init(.initializing),
+    control_available: std.atomic.Value(bool) = .init(false),
+    committed: std.atomic.Value(bool) = .init(false),
+};
+
 const StartCommandOptions = struct {
     config_path: ?[]const u8 = null,
     port: ?u16 = null,
@@ -54,6 +73,35 @@ var gpa_holder: ?*std.heap.DebugAllocator(.{}) = null;
 var g_cli_command: []const u8 = "";
 var g_cmd_buf: [64]u8 = undefined;
 var g_no_color: bool = false;
+var g_startup_token: ?runtime_descriptor.Nonce = null;
+var g_runtime_nonce: ?runtime_descriptor.Nonce = null;
+var g_daemon_lock_fd: ?std.posix.fd_t = null;
+
+fn parseStartupToken(args: []const []const u8) !runtime_descriptor.Nonce {
+    const prefix = "--startup-token=";
+    var parsed: ?runtime_descriptor.Nonce = null;
+    for (args) |arg| {
+        if (!std.mem.startsWith(u8, arg, prefix)) continue;
+        if (parsed != null) return error.DuplicateStartupToken;
+        parsed = runtime_descriptor.Nonce.parseHex(arg[prefix.len..]) catch
+            return error.InvalidStartupToken;
+    }
+    return parsed orelse error.MissingStartupToken;
+}
+
+fn parseDaemonLockFd(args: []const []const u8) !std.posix.fd_t {
+    const prefix = "--daemon-lock-fd=";
+    var parsed: ?std.posix.fd_t = null;
+    for (args) |arg| {
+        if (!std.mem.startsWith(u8, arg, prefix)) continue;
+        if (parsed != null) return error.DuplicateDaemonLockFd;
+        const value = std.fmt.parseInt(std.posix.fd_t, arg[prefix.len..], 10) catch
+            return error.InvalidDaemonLockFd;
+        if (value < 0) return error.InvalidDaemonLockFd;
+        parsed = value;
+    }
+    return parsed orelse error.MissingDaemonLockFd;
+}
 
 fn collectArgs(allocator: std.mem.Allocator, raw_args: std.process.Args) ![]const []const u8 {
     var it = try std.process.Args.Iterator.initAllocator(raw_args, allocator);
@@ -114,12 +162,88 @@ pub fn main(init: std.process.Init) !void {
 
     // 处理 daemon 运行模式（内部使用）
     if (std.mem.eql(u8, cmd, "--daemon-run")) {
+        const startup_token = parseStartupToken(args) catch {
+            printCliError(
+                json_output,
+                "START_LOCK_HANDOFF_INVALID",
+                "daemon startup token is missing or invalid",
+                "launch the daemon through `zc start`",
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
+        g_startup_token = startup_token;
+        const lock_fd = parseDaemonLockFd(args) catch {
+            daemon.publishStartupSignal(
+                allocator,
+                startup_token,
+                .{ .failed = .lock_handoff },
+            ) catch {};
+            printCliError(
+                json_output,
+                "START_LOCK_HANDOFF_INVALID",
+                "daemon lock handoff is missing or invalid",
+                "launch the daemon through `zc start`",
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
+        daemon.adoptInheritedDaemonLock(allocator, lock_fd) catch {
+            daemon.publishStartupSignal(
+                allocator,
+                startup_token,
+                .{ .failed = .lock_handoff },
+            ) catch {};
+            printCliError(
+                json_output,
+                "START_LOCK_HANDOFF_INVALID",
+                "failed to protect the inherited daemon lock",
+                "launch the daemon through `zc start`",
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
+        g_daemon_lock_fd = lock_fd;
         const start_opts = parseStartCommandOptions(args, 2, .forwarded) catch |err| {
             printStartCommandOptionError(json_output, err, .start);
             std.process.exit(cli_output.exit_failure);
         };
-        daemon.writePid(allocator, std.c.getpid()) catch {};
-        try runProxy(allocator, start_opts.config_path, start_opts.port, &override_opts, "daemon-run");
+        daemon.publishStartupReservation(
+            allocator,
+            startup_token,
+            std.c.getpid(),
+        ) catch |err| {
+            daemon.publishStartupSignal(
+                allocator,
+                startup_token,
+                .{ .failed = .runtime_publish },
+            ) catch {};
+            daemon.cleanupCurrentProcessRuntime(allocator);
+            return err;
+        };
+        daemon.writePid(allocator, std.c.getpid()) catch |err| {
+            daemon.publishStartupSignal(
+                allocator,
+                startup_token,
+                .{ .failed = .runtime_publish },
+            ) catch {};
+            daemon.cleanupCurrentProcessRuntime(allocator);
+            return err;
+        };
+        g_runtime_nonce = startup_token;
+        runProxy(
+            allocator,
+            start_opts.config_path,
+            start_opts.port,
+            &override_opts,
+            "daemon-run",
+            json_output,
+        ) catch |err| {
+            daemon.publishStartupSignal(
+                allocator,
+                startup_token,
+                .{ .failed = startupFailureForError(err) },
+            ) catch {};
+            daemon.cleanupCurrentProcessRuntime(allocator);
+            return err;
+        };
         return;
     }
 
@@ -162,11 +286,13 @@ pub fn main(init: std.process.Init) !void {
             printStartCommandOptionError(json_output, err, .start);
             std.process.exit(cli_output.exit_usage);
         };
-
-        preflightRuntimeCommand(allocator, .start, start_opts, &override_opts) catch |err| {
-            if (!printOverrideRuntimeError(json_output, err)) {
-                printRuntimeCommandPreflightError(.start, json_output, err);
-            }
+        _ = daemon.isRunning(allocator) catch {
+            printCliError(
+                json_output,
+                "START_PREFLIGHT_FAILED",
+                "failed to validate daemon runtime artifacts",
+                "remove unsafe runtime artifacts and retry",
+            );
             std.process.exit(cli_output.exit_failure);
         };
 
@@ -180,10 +306,62 @@ pub fn main(init: std.process.Init) !void {
                 }
                 std.process.exit(cli_output.exit_failure);
             };
-            _ = lock_file; // 锁的 fd 故意持有到进程退出
-            daemon.writePid(allocator, std.c.getpid()) catch {};
-            runProxy(allocator, start_opts.config_path, start_opts.port, &override_opts, "start") catch |err| {
-                if (!printOverrideRuntimeError(json_output, err)) {
+            // Keep the lock file live until process exit.
+            g_daemon_lock_fd = lock_file.handle;
+            daemon.prepareForegroundRuntime(allocator) catch {
+                printCliError(
+                    json_output,
+                    "START_RUNTIME_PUBLISH_FAILED",
+                    "failed to prepare the foreground runtime descriptor",
+                    "remove unsafe runtime artifacts and retry",
+                );
+                std.process.exit(cli_output.exit_failure);
+            };
+            const foreground_nonce = runtime_descriptor.Nonce.generate();
+            daemon.publishStartupReservation(
+                allocator,
+                foreground_nonce,
+                std.c.getpid(),
+            ) catch {
+                daemon.cleanupCurrentProcessRuntime(allocator);
+                printCliError(
+                    json_output,
+                    "START_RUNTIME_PUBLISH_FAILED",
+                    "failed to reserve foreground runtime state",
+                    "remove unsafe runtime artifacts and retry",
+                );
+                std.process.exit(cli_output.exit_failure);
+            };
+            daemon.writePid(allocator, std.c.getpid()) catch {
+                daemon.cleanupCurrentProcessRuntime(allocator);
+                printCliError(
+                    json_output,
+                    "START_RUNTIME_PUBLISH_FAILED",
+                    "failed to publish the daemon pid",
+                    "remove unsafe runtime artifacts and retry",
+                );
+                std.process.exit(cli_output.exit_failure);
+            };
+            g_runtime_nonce = foreground_nonce;
+            runProxy(
+                allocator,
+                start_opts.config_path,
+                start_opts.port,
+                &override_opts,
+                "start",
+                json_output,
+            ) catch |err| {
+                _ = daemon.removeCurrentProcessPid(allocator) catch false;
+                if (isPortPreflightError(err)) {
+                    printRuntimeCommandPreflightError(.start, json_output, err);
+                } else if (err == error.ListenerStartupTimeout) {
+                    printCliError(
+                        json_output,
+                        "START_READINESS_TIMEOUT",
+                        "daemon listeners did not become ready within 10 seconds",
+                        "check port ownership and retry",
+                    );
+                } else if (!printOverrideRuntimeError(json_output, err)) {
                     printCliError(json_output, "START_FAILED", "failed to start proxy in foreground", "check config path and `zc log --no-follow`");
                 }
                 std.process.exit(cli_output.exit_failure);
@@ -202,8 +380,61 @@ pub fn main(init: std.process.Init) !void {
 
         const outcome = daemon.startDaemon(allocator, start_opts.config_path, forward_args.items) catch |err| {
             switch (err) {
-                error.StartFailed => printCliError(json_output, "START_FAILED", "daemon exited during startup", "check `zc log --no-follow` for details"),
-                else => printCliError(json_output, "START_FAILED", "failed to start daemon", "check config path and logs via `zc log --no-follow`"),
+                error.PortAlreadyInUse,
+                error.ControllerPortAlreadyInUse,
+                error.PortConflict,
+                error.InvalidBindAddress,
+                error.InvalidExternalController,
+                => printRuntimeCommandPreflightError(.start, json_output, err),
+                error.UnsupportedCapability,
+                error.OverrideScriptNotFound,
+                error.OverrideScriptExecFailed,
+                error.OverrideScriptTimeout,
+                error.OverrideOutputInvalid,
+                error.OverrideMergeFailed,
+                => {
+                    _ = printOverrideRuntimeError(json_output, err);
+                },
+                error.StartLockHandoffInvalid => printCliError(
+                    json_output,
+                    "START_LOCK_HANDOFF_INVALID",
+                    "daemon lock handoff is invalid",
+                    "remove replaced runtime locks and retry",
+                ),
+                error.ListenerStartupFailed => printCliError(
+                    json_output,
+                    "START_FAILED",
+                    "daemon listener failed during startup",
+                    "check port ownership and `zc log --no-follow`",
+                ),
+                error.StartRuntimePublishFailed,
+                error.RuntimeDescriptorBusy,
+                error.RuntimeDescriptorLockTimeout,
+                error.RuntimeDescriptorLockFailed,
+                => printCliError(
+                    json_output,
+                    "START_RUNTIME_PUBLISH_FAILED",
+                    "failed to publish daemon runtime state",
+                    "remove unsafe runtime artifacts and retry",
+                ),
+                error.StartFailed => printCliError(
+                    json_output,
+                    "START_FAILED",
+                    "daemon exited before startup completed",
+                    "check `zc log --no-follow` for details",
+                ),
+                error.StartupTimeout => printCliError(
+                    json_output,
+                    "START_READINESS_TIMEOUT",
+                    "daemon did not publish readiness before the startup deadline",
+                    "check override duration, port ownership, and the daemon log",
+                ),
+                else => printCliError(
+                    json_output,
+                    "START_FAILED",
+                    "failed to start daemon",
+                    "check the runtime directory, config path, and daemon log",
+                ),
             }
             std.process.exit(cli_output.exit_failure);
         };
@@ -240,6 +471,12 @@ pub fn main(init: std.process.Init) !void {
         const outcome = daemon.stopDaemon(allocator) catch |err| {
             switch (err) {
                 error.DaemonPidUntracked => printCliError(json_output, "STOP_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc stop`"),
+                error.DaemonStopTimeout => printCliError(
+                    json_output,
+                    "STOP_TIMEOUT",
+                    "daemon did not acknowledge the stop request within 5 seconds",
+                    "inspect `zc status` and the daemon log before retrying",
+                ),
                 else => printCliError(json_output, "STOP_FAILED", "failed to stop daemon", "verify process permissions and retry `zc stop`"),
             }
             std.process.exit(cli_output.exit_failure);
@@ -283,6 +520,12 @@ pub fn main(init: std.process.Init) !void {
                     => printRuntimeCommandPreflightError(.restart, json_output, err),
                     error.ForegroundDaemonSupervised => printCliError(json_output, "RESTART_FAILED", "daemon is running in the foreground (likely under a supervisor)", "restart it via the supervisor (e.g. `systemctl restart`), or `zc stop` then `zc start --foreground`"),
                     error.StartFailed => printCliError(json_output, "RESTART_FAILED", "daemon did not become trackable after restart", "check `zc status` and `zc log --no-follow` for recovery details"),
+                    error.StartupTimeout => printCliError(
+                        json_output,
+                        "RESTART_READINESS_TIMEOUT",
+                        "daemon did not publish readiness before the startup deadline",
+                        "check override duration, port ownership, and the daemon log",
+                    ),
                     error.DaemonPidUntracked => printCliError(json_output, "RESTART_FAILED", "daemon appears to be running but pid is not trackable", "check `zc status`, `ps`, and runtime files before retrying `zc restart`"),
                     else => printCliError(json_output, "RESTART_FAILED", "failed to restart daemon", "check logs and retry `zc restart -c <config>`"),
                 }
@@ -342,7 +585,12 @@ pub fn main(init: std.process.Init) !void {
         var streams = StdStreams{};
         var out = streams.output(json_output);
         daemon.getStatus(allocator, &out) catch {
-            printCliError(json_output, "STATUS_FAILED", "failed to read daemon status", "check pid file permissions and retry `zc status`");
+            printCliError(
+                json_output,
+                "STATUS_FAILED",
+                "failed to read daemon status",
+                "use a canonical owner-only runtime directory and retry",
+            );
             std.process.exit(cli_output.exit_failure);
         };
         return;
@@ -1477,8 +1725,25 @@ fn runProxyFamilyCommand(
             std.process.exit(cli_output.exit_usage);
         };
 
-        var cfg = loadProxyFamilyConfig(allocator, parsed.config_path, null, json_output, override_opts, text.select_cmd_name, text.load_select_msg);
-        defer cfg.deinit();
+        var loaded = loadExactRuntimeConfig(
+            allocator,
+            parsed.config_path,
+            null,
+            override_opts,
+            text.select_cmd_name,
+        ) catch |err| {
+            if (!printOverrideRuntimeError(json_output, err)) {
+                printCliError(
+                    json_output,
+                    "PROXY_CONFIG_LOAD_FAILED",
+                    text.load_select_msg,
+                    proxy_config_load_hint,
+                );
+            }
+            std.process.exit(cli_output.exit_failure);
+        };
+        defer loaded.deinit();
+        const cfg = &loaded.value;
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
@@ -1486,16 +1751,33 @@ fn runProxyFamilyCommand(
         if (parsed.proxy) |proxy_name| {
             // 非交互路径：两种模式同语义 —— 只在 select 组里解析、应用、
             // 通知 daemon（修复 JSON 模式 state:"selected" 假成功的无操作）。
-            const group = proxy_cli.resolveSelectGroup(&cfg, parsed.group) catch |err| exitProxySelectError(json_output, err, text);
-            const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
-            defer if (config_key) |key| allocator.free(key);
-            var persisted_identity: ?config_identity.ManagedIdentity = null;
-            if (config_key) |key| {
-                const receipt = selection_state.persistDefault(allocator, key, group.name, proxy_name) catch |err|
-                    exitProxySelectError(json_output, err, text);
-                persisted_identity = receipt.identity;
-            }
-            const applied = proxy_cli.applySelection(allocator, &cfg, group, proxy_name, persisted_identity, &out) catch |err| exitProxySelectError(json_output, err, text);
+            const group = proxy_cli.resolveSelectGroup(cfg, parsed.group) catch |err|
+                exitProxySelectError(json_output, err, text);
+            proxy_cli.validateSelection(group, proxy_name) catch |err|
+                exitProxySelectError(json_output, err, text);
+            const managed_identity = loaded.identity orelse {
+                printCliError(
+                    json_output,
+                    "PROXY_SELECTION_MANAGED_CONFIG_REQUIRED",
+                    "selection requires a managed config revision",
+                    "import the config with `zc config load <path>` first",
+                );
+                std.process.exit(cli_output.exit_failure);
+            };
+            const receipt = selection_state.persistDefault(
+                allocator,
+                managed_identity,
+                group.name,
+                proxy_name,
+            ) catch |err| exitProxySelectError(json_output, err, text);
+            const applied = proxy_cli.applySelection(
+                allocator,
+                group,
+                proxy_name,
+                receipt.identity,
+                receipt.generation,
+                &out,
+            ) catch |err| exitProxySelectError(json_output, err, text);
             if (json_output) {
                 // data.applied 反映是否真的通知到了运行中的 daemon（工作项 7）。
                 out.success(.{ .action = "proxy_select", .group = group.name, .proxy = proxy_name, .state = "selected", .applied = applied }) catch {};
@@ -1505,28 +1787,53 @@ fn runProxyFamilyCommand(
 
         if (json_output) {
             // JSON 无 `-p`：只读列出候选，不改任何选择。
-            const group = proxy_cli.resolveSelectGroup(&cfg, parsed.group) catch |err| exitProxySelectError(json_output, err, text);
+            const group = proxy_cli.resolveSelectGroup(cfg, parsed.group) catch |err|
+                exitProxySelectError(json_output, err, text);
             out.success(.{ .action = "proxy_select", .group = group.name, .choices = group.proxies.items }) catch {};
             return;
         }
 
         // 文本交互（仅 TTY）：非 TTY 缺 `-p` 一律报错退出，绝不静默选第一个节点。
-        const config_key = config.resolveRuntimeConfigKey(allocator, parsed.config_path) catch null;
-        defer if (config_key) |key| allocator.free(key);
+        const managed_identity = loaded.identity orelse {
+            printCliError(
+                json_output,
+                "PROXY_SELECTION_MANAGED_CONFIG_REQUIRED",
+                "selection requires a managed config revision",
+                "import the config with `zc config load <path>` first",
+            );
+            std.process.exit(cli_output.exit_failure);
+        };
         const selections_opt: ?[]runtime_selection.SelectedProxy =
-            runtime_selection.collectSelectedProxies(allocator, &cfg, config_key) catch null;
+            runtime_selection.collectSelectedProxies(
+                allocator,
+                cfg,
+                managed_identity.key,
+            ) catch null;
         defer if (selections_opt) |s| runtime_selection.deinitSelectedProxies(allocator, s);
         const selections: []const runtime_selection.SelectedProxy = selections_opt orelse &.{};
 
-        const picked = proxy_cli.selectProxyInteractive(allocator, &cfg, parsed.group, selections, &out) catch |err| exitProxySelectError(json_output, err, text);
+        const picked = proxy_cli.selectProxyInteractive(
+            allocator,
+            cfg,
+            parsed.group,
+            selections,
+            &out,
+        ) catch |err| exitProxySelectError(json_output, err, text);
         if (picked) |selection| {
-            var persisted_identity: ?config_identity.ManagedIdentity = null;
-            if (config_key) |key| {
-                const receipt = selection_state.persistDefault(allocator, key, selection.group.name, selection.proxy) catch |err|
-                    exitProxySelectError(json_output, err, text);
-                persisted_identity = receipt.identity;
-            }
-            _ = proxy_cli.applySelection(allocator, &cfg, selection.group, selection.proxy, persisted_identity, &out) catch |err| exitProxySelectError(json_output, err, text);
+            const receipt = selection_state.persistDefault(
+                allocator,
+                managed_identity,
+                selection.group.name,
+                selection.proxy,
+            ) catch |err| exitProxySelectError(json_output, err, text);
+            _ = proxy_cli.applySelection(
+                allocator,
+                selection.group,
+                selection.proxy,
+                receipt.identity,
+                receipt.generation,
+                &out,
+            ) catch |err| exitProxySelectError(json_output, err, text);
         }
         // picker 取消（q/Esc）：无输出，exit 0。
         return;
@@ -1733,12 +2040,178 @@ fn parseUpdateApplyMode(s: []const u8) !UpdateApplyMode {
     return error.InvalidApplyMode;
 }
 
+const RuntimeLoadedConfig = struct {
+    allocator: std.mem.Allocator,
+    value: config.Config,
+    identity: ?config_identity.ManagedIdentity,
+
+    fn deinit(self: *RuntimeLoadedConfig) void {
+        self.value.deinit();
+        if (self.identity) |identity| self.allocator.free(identity.key);
+        self.* = undefined;
+    }
+};
+
+fn tryLoadExactManagedRuntime(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+) !?RuntimeLoadedConfig {
+    const root_path = (try config.getDefaultConfigDir(allocator)) orelse return null;
+    defer allocator.free(root_path);
+    const root = compat.fs.openDirAbsolute(root_path, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer root.close(compat.io());
+    const loader = managed_config_loader.Loader.init(allocator, root);
+
+    var loaded = if (config_path) |path| blk: {
+        const key = (try config.inferConfigKeyFromPath(allocator, path)) orelse
+            return null;
+        defer allocator.free(key);
+        break :blk loader.loadHead(key) catch |err| switch (err) {
+            error.Schema2CatalogRequired,
+            error.ManagedProfileNotFound,
+            => return null,
+            else => return err,
+        };
+    } else loader.loadActive() catch |err| switch (err) {
+        error.Schema2CatalogRequired, error.NoActiveManagedConfig => return null,
+        else => return err,
+    };
+    loaded.validation.deinit();
+    return .{
+        .allocator = allocator,
+        .value = loaded.config,
+        .identity = loaded.identity,
+    };
+}
+
+fn loadExactRuntimeConfig(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    mixed_port_override: ?u16,
+    override_opts: *const override.CliOptions,
+    command_name: []const u8,
+) !RuntimeLoadedConfig {
+    var loaded = (try tryLoadExactManagedRuntime(allocator, config_path)) orelse
+        return .{
+            .allocator = allocator,
+            .value = try loadAndValidateConfig(
+                allocator,
+                config_path,
+                mixed_port_override,
+                true,
+                override_opts,
+                command_name,
+            ),
+            .identity = null,
+        };
+    errdefer loaded.deinit();
+
+    var persisted_script: ?[]u8 = null;
+    defer if (persisted_script) |path| allocator.free(path);
+    var effective_override = try resolveEffectiveOverrideOptions(
+        allocator,
+        override_opts,
+        config_path,
+        &persisted_script,
+    );
+    try override.apply(
+        allocator,
+        &loaded.value,
+        &effective_override,
+        command_name,
+        config_path,
+    );
+    if (effective_override.script_path != null) {
+        if (loaded.identity) |identity| allocator.free(identity.key);
+        loaded.identity = null;
+    }
+    try requireRuntimeCapabilities(allocator, &loaded.value);
+    applyRuntimePortSelection(&loaded.value, mixed_port_override);
+    if (loaded.identity == null) {
+        try config.prepareRuleProvidersForRuntimeWithPolicy(
+            allocator,
+            &loaded.value,
+            config_path,
+            ruleProviderSyncPolicyForCommand(command_name),
+        );
+    } else {
+        for (loaded.value.rules.items) |rule| {
+            if (rule.rule_type == .rule_set) {
+                return error.ManagedRemoteRuleProviderUnsupported;
+            }
+        }
+    }
+    try validateRuntimeEndpointSyntax(&loaded.value);
+    var validation_result = try validator.validate(allocator, &loaded.value);
+    defer validation_result.deinit();
+    validator.printResult(&validation_result);
+    if (!validation_result.isValid()) return error.InvalidConfig;
+    return loaded;
+}
+
+fn startupFailureForError(err: anyerror) daemon.StartupFailure {
+    return switch (err) {
+        error.PortAlreadyInUse => .port_in_use,
+        error.ControllerPortAlreadyInUse => .controller_port_in_use,
+        error.PortConflict => .port_conflict,
+        error.InvalidBindAddress => .invalid_bind_address,
+        error.InvalidExternalController => .invalid_controller,
+        error.ListenerStartupFailed => .listener_failed,
+        error.ListenerStartupTimeout => .readiness,
+        error.InvalidInheritedDaemonLock => .lock_handoff,
+        error.UnsupportedCapability => .capability,
+        error.OverrideScriptNotFound => .override_not_found,
+        error.OverrideScriptExecFailed => .override_exec,
+        error.OverrideScriptTimeout => .override_timeout,
+        error.OverrideOutputInvalid => .override_output,
+        error.OverrideMergeFailed => .override_merge,
+        else => .generic,
+    };
+}
+
+fn abortStartedRuntime(
+    allocator: std.mem.Allocator,
+    json_output: bool,
+    code: []const u8,
+    message: []const u8,
+    hint: []const u8,
+    err: anyerror,
+) noreturn {
+    std.debug.print("Runtime startup error: {}\n", .{err});
+    if (g_startup_token) |token| {
+        const failure: daemon.StartupFailure = if (std.mem.eql(
+            u8,
+            code,
+            "START_RUNTIME_PUBLISH_FAILED",
+        ))
+            .runtime_publish
+        else if (std.mem.eql(u8, code, "START_LOCK_HANDOFF_INVALID"))
+            .lock_handoff
+        else
+            startupFailureForError(err);
+        daemon.publishStartupSignal(
+            allocator,
+            token,
+            .{ .failed = failure },
+        ) catch {};
+    }
+    daemon.cleanupCurrentProcessRuntime(allocator);
+    printCliError(json_output, code, message, hint);
+    std.process.exit(cli_output.exit_failure);
+}
+
 fn runProxy(
     allocator: std.mem.Allocator,
     config_path: ?[]const u8,
     mixed_port_override: ?u16,
     override_opts: *const override.CliOptions,
     command_name: []const u8,
+    json_output: bool,
 ) !void {
     std.debug.print("zc v{s}\n", .{build_options.version});
 
@@ -1747,51 +2220,248 @@ fn runProxy(
         g_config_path = try allocator.dupe(u8, path);
     }
 
-    // 加载并验证配置
-    var cfg = try loadAndValidateConfig(allocator, config_path, mixed_port_override, true, override_opts, command_name);
-    defer cfg.deinit();
+    var loaded = try loadExactRuntimeConfig(
+        allocator,
+        config_path,
+        mixed_port_override,
+        override_opts,
+        command_name,
+    );
+    defer loaded.deinit();
+    const cfg = &loaded.value;
+    try preflightPortCheck(cfg, true);
 
-    // 启动前端口占用预检（可能修改 external-controller 端口）
-    try preflightPortCheck(&cfg, true);
-
-    // 获取运行时配置 key（优先显式 -c 路径，其次 active/default）
-    const config_key = config.resolveRuntimeConfigKey(allocator, config_path) catch null;
-    defer if (config_key) |k| allocator.free(k);
-
-    // Initialize outbound manager with config key
-    var manager = try outbound.OutboundManager.initWithKey(allocator, &cfg, config_key);
+    var legacy_config_key: ?[]const u8 = null;
+    defer if (legacy_config_key) |key| allocator.free(key);
+    const config_key: ?[]const u8 = if (loaded.identity) |identity|
+        identity.key
+    else if (config_path == null) blk: {
+        legacy_config_key = config.resolveRuntimeConfigKey(
+            allocator,
+            null,
+        ) catch null;
+        break :blk legacy_config_key;
+    } else null;
+    var manager = try outbound.OutboundManager.initWithKey(allocator, cfg, config_key);
     defer manager.deinit();
+    manager.setTrafficReady(false);
 
     // Authority desired state is restored before any listener opens. Legacy
     // meta.json remains a fallback until every existing profile is migrated.
-    var desired_snapshot: ?selection_state.DesiredSnapshot = if (config_key) |key|
-        try selection_state.loadDesiredDefault(allocator, key)
+    var desired_snapshot: ?selection_state.DesiredSnapshot = if (loaded.identity) |identity|
+        try selection_state.loadDesiredDefault(allocator, identity.key)
     else
         null;
     defer if (desired_snapshot) |*snapshot| snapshot.deinit();
     if (desired_snapshot) |snapshot| {
-        for (snapshot.selections) |selection| {
-            manager.applyPersistedSelection(selection.group, selection.proxy);
+        const exact = loaded.identity orelse return error.RuntimeIdentityChanged;
+        if (!std.mem.eql(u8, exact.key, snapshot.identity.key) or
+            !exact.revision.eql(snapshot.identity.revision))
+        {
+            return error.RuntimeIdentityChanged;
+        }
+        if (!try manager.applyPersistedSelections(
+            snapshot.selections,
+            snapshot.generation,
+        )) {
+            return error.InvalidDesiredSelection;
         }
     } else {
-        manager.loadPersistedSelections();
+        try manager.loadPersistedSelections();
     }
+    const applied_identity: ?config_identity.ManagedIdentity = if (desired_snapshot) |snapshot|
+        snapshot.identity
+    else
+        loaded.identity;
+    const applied_generation: u64 = if (desired_snapshot) |snapshot|
+        snapshot.generation
+    else
+        0;
 
     // Initialize rule engine
     var engine = try rule_engine.Engine.init(allocator, &cfg.rules);
     defer engine.deinit();
 
-    // Start proxy servers in background thread
-    const proxy_thread = try std.Thread.spawn(.{}, proxyThreadFn, .{ allocator, &cfg, &engine, &manager });
+    var listener_startup = ListenerStartup{};
+    var expected_listeners: u8 = 0;
+    if (cfg.mixed_port > 0) {
+        expected_listeners += 1;
+    } else {
+        if (cfg.port > 0) expected_listeners += 1;
+        if (cfg.socks_port > 0) expected_listeners += 1;
+    }
+
+    const proxy_thread = try std.Thread.spawn(
+        .{},
+        proxyThreadFn,
+        .{ allocator, cfg, &engine, &manager, &listener_startup },
+    );
     proxy_thread.detach();
 
-    // Start API server if configured
     if (cfg.external_controller) |ec| {
-        const port = try parseExternalControllerPort(ec);
-        const api_thread = try std.Thread.spawn(.{}, apiThreadFn, .{ allocator, &cfg, &engine, &manager, port });
+        expected_listeners += 1;
+        const port = parseExternalControllerPort(ec) catch |err|
+            abortStartedRuntime(
+                allocator,
+                json_output,
+                "START_FAILED",
+                "controller endpoint failed during startup",
+                "check the configured external-controller endpoint",
+                err,
+            );
+        const api_thread = std.Thread.spawn(
+            .{},
+            apiThreadFn,
+            .{ allocator, cfg, &engine, &manager, port, &listener_startup },
+        ) catch |err| abortStartedRuntime(
+            allocator,
+            json_output,
+            "START_FAILED",
+            "controller thread failed during startup",
+            "check process thread limits and retry",
+            err,
+        );
         api_thread.detach();
     }
-    try publishRuntimeDescriptor(allocator, config_key, cfg.external_controller);
+    const readiness_timeout_ms = if (std.mem.eql(u8, command_name, "daemon-run"))
+        daemon_listener_start_timeout_ms
+    else
+        listener_start_timeout_ms;
+    waitForListenerReadiness(
+        &listener_startup,
+        expected_listeners,
+        readiness_timeout_ms,
+    ) catch |err| abortStartedRuntime(
+        allocator,
+        json_output,
+        if (err == error.ListenerStartupTimeout)
+            "START_READINESS_TIMEOUT"
+        else
+            "START_FAILED",
+        if (err == error.ListenerStartupTimeout)
+            "daemon listeners did not become ready before the deadline"
+        else
+            "daemon listener failed during startup",
+        "check port ownership and the daemon log",
+        err,
+    );
+    const runtime_nonce = publishRuntimeDescriptor(
+        allocator,
+        applied_identity,
+        applied_generation,
+        cfg.external_controller,
+    ) catch |err| abortStartedRuntime(
+        allocator,
+        json_output,
+        "START_RUNTIME_PUBLISH_FAILED",
+        "failed to publish the runtime descriptor",
+        "remove unsafe runtime artifacts and retry",
+        err,
+    );
+    _ = reconcileRuntimeDesired(
+        allocator,
+        &manager,
+        applied_identity,
+        runtime_nonce,
+    ) catch |err| abortStartedRuntime(
+        allocator,
+        json_output,
+        "START_FAILED",
+        "desired runtime state changed during startup",
+        "retry after config and selection updates settle",
+        err,
+    );
+    listener_startup.control_available.store(true, .release);
+    var final_guard: ?FinalDesiredGuard = null;
+    if (applied_identity) |identity| {
+        var attempt: u8 = 0;
+        while (attempt < 16) : (attempt += 1) {
+            _ = reconcileRuntimeDesired(
+                allocator,
+                &manager,
+                applied_identity,
+                runtime_nonce,
+            ) catch |err| abortStartedRuntime(
+                allocator,
+                json_output,
+                "START_FAILED",
+                "desired runtime state did not stabilize during startup",
+                "retry after config and selection updates settle",
+                err,
+            );
+            manager.waitForPersistedSelectionUpdates();
+            final_guard = acquireFinalDesiredGuard(
+                allocator,
+                identity,
+                runtime_nonce,
+            ) catch |err| abortStartedRuntime(
+                allocator,
+                json_output,
+                "START_FAILED",
+                "failed to lock the final desired runtime state",
+                "retry after config and selection updates settle",
+                err,
+            );
+            if (final_guard != null) break;
+        }
+        if (final_guard == null) {
+            abortStartedRuntime(
+                allocator,
+                json_output,
+                "START_FAILED",
+                "desired runtime state remained unstable",
+                "retry after config and selection updates settle",
+                error.RuntimeDesiredStateUnstable,
+            );
+        }
+    }
+    if (g_daemon_lock_fd) |lock_fd| {
+        daemon.validateInheritedDaemonLockIdentity(
+            allocator,
+            lock_fd,
+        ) catch |err| abortStartedRuntime(
+            allocator,
+            json_output,
+            "START_LOCK_HANDOFF_INVALID",
+            "daemon lock identity changed during startup",
+            "restore the canonical runtime lock and retry",
+            err,
+        );
+    }
+    if (listener_startup.phase.cmpxchgStrong(
+        .initializing,
+        .committed,
+        .acq_rel,
+        .acquire,
+    ) != null) {
+        abortStartedRuntime(
+            allocator,
+            json_output,
+            "START_FAILED",
+            "daemon listener failed while startup was committing",
+            "check port ownership and the daemon log",
+            error.ListenerStartupFailed,
+        );
+    }
+    var selection_barrier = manager.acquireSelectionBarrier();
+    listener_startup.committed.store(true, .release);
+    promoteRuntimeDescriptorReady(allocator, runtime_nonce) catch |err|
+        abortStartedRuntime(
+            allocator,
+            json_output,
+            "START_RUNTIME_PUBLISH_FAILED",
+            "failed to publish final daemon readiness",
+            "remove unsafe runtime artifacts and retry",
+            err,
+        );
+    manager.setTrafficReady(true);
+    selection_barrier.deinit();
+    if (final_guard) |*guard| guard.deinit();
+    if (g_startup_token) |token| {
+        daemon.publishStartupSignal(allocator, token, .ready) catch |err| {
+            std.debug.print("Failed to publish startup signal: {}\n", .{err});
+        };
+    }
 
     std.debug.print("Configuration loaded:\n", .{});
     std.debug.print("  Port: {}\n", .{cfg.port});
@@ -1802,41 +2472,237 @@ fn runProxy(
     std.debug.print("  Rules: {}\n", .{cfg.rules.items.len});
     std.debug.print("\nProxy server running. Press Ctrl+C to stop.\n", .{});
 
+    const background_daemon = std.mem.eql(u8, command_name, "daemon-run");
     while (true) {
-        compat.sleepNs(1 * std.time.ns_per_s);
+        if (g_daemon_lock_fd) |lock_fd| {
+            daemon.validateInheritedDaemonLockIdentity(
+                allocator,
+                lock_fd,
+            ) catch std.process.exit(cli_output.exit_failure);
+        }
+        if (background_daemon) {
+            daemon.rotateDaemonLogIfNeeded(allocator) catch
+                std.process.exit(cli_output.exit_failure);
+        }
+        if (daemon.consumeStopRequest(allocator, runtime_nonce) catch false) {
+            std.process.exit(cli_output.exit_ok);
+        }
+        compat.sleepNs(100 * std.time.ns_per_ms);
     }
+}
+
+const FinalDesiredGuard = struct {
+    root: std.Io.Dir,
+    guard: state_authority.Authority.Guard,
+
+    fn deinit(self: *FinalDesiredGuard) void {
+        self.guard.deinit();
+        self.root.close(compat.io());
+        self.* = undefined;
+    }
+};
+
+fn acquireFinalDesiredGuard(
+    allocator: std.mem.Allocator,
+    identity: config_identity.ManagedIdentity,
+    instance_nonce: runtime_descriptor.Nonce,
+) !?FinalDesiredGuard {
+    const root_path = try config.getDefaultConfigDir(allocator) orelse
+        return error.NoConfigDir;
+    defer allocator.free(root_path);
+    var root = try compat.fs.openDirAbsolute(root_path, .{
+        .follow_symlinks = false,
+    });
+    var root_owned = true;
+    defer if (root_owned) root.close(compat.io());
+    var guard = try state_authority.Authority.init(
+        allocator,
+        root,
+    ).acquireGuard();
+    var guard_owned = true;
+    defer if (guard_owned) guard.deinit();
+    var inspection = try guard.inspect();
+    defer inspection.deinit();
+    const profiles = switch (inspection) {
+        .catalog_v2 => |*observed| observed.catalog.state.profiles,
+        .missing, .legacy_v1 => return error.RuntimeIdentityChanged,
+    };
+    var profile_generation: ?u64 = null;
+    for (profiles) |profile| {
+        if (!std.mem.eql(u8, profile.key, identity.key)) continue;
+        if (!profile.head.eql(identity.revision)) {
+            return error.RuntimeIdentityChanged;
+        }
+        profile_generation = profile.desired.generation;
+        break;
+    }
+    const generation = profile_generation orelse
+        return error.RuntimeIdentityChanged;
+
+    var default_store = (try runtime_descriptor.openDefault(
+        allocator,
+        false,
+    )) orelse return error.RuntimeDescriptorMissing;
+    defer default_store.deinit();
+    var descriptor = (try default_store.store().observe()) orelse
+        return error.RuntimeDescriptorMissing;
+    defer descriptor.deinit();
+    const descriptor_identity = descriptor.identity orelse
+        return error.RuntimeIdentityChanged;
+    if (!descriptor.nonce.eql(instance_nonce) or descriptor.ready or
+        generation != descriptor.generation or
+        !std.mem.eql(u8, descriptor_identity.key, identity.key) or
+        !descriptor_identity.revision.eql(identity.revision))
+    {
+        return null;
+    }
+    guard_owned = false;
+    root_owned = false;
+    return .{ .root = root, .guard = guard };
+}
+
+fn reconcileRuntimeDesired(
+    allocator: std.mem.Allocator,
+    manager: *outbound.OutboundManager,
+    applied_identity: ?config_identity.ManagedIdentity,
+    instance_nonce: runtime_descriptor.Nonce,
+) !u64 {
+    const identity = applied_identity orelse return 0;
+    var attempt: u8 = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var default_store = (try runtime_descriptor.openDefault(
+            allocator,
+            false,
+        )) orelse return error.RuntimeDescriptorMissing;
+        defer default_store.deinit();
+        const store = default_store.store();
+        var descriptor = (try store.observe()) orelse
+            return error.RuntimeDescriptorMissing;
+        defer descriptor.deinit();
+        const observed_identity = descriptor.identity orelse
+            return error.RuntimeIdentityChanged;
+        if (!descriptor.nonce.eql(instance_nonce) or
+            !std.mem.eql(u8, observed_identity.key, identity.key) or
+            !observed_identity.revision.eql(identity.revision))
+        {
+            return error.RuntimeIdentityChanged;
+        }
+
+        var desired = (try selection_state.loadDesiredDefault(
+            allocator,
+            identity.key,
+        )) orelse return error.RuntimeIdentityChanged;
+        defer desired.deinit();
+        if (!desired.identity.revision.eql(identity.revision) or
+            desired.generation < descriptor.generation)
+        {
+            return error.RuntimeIdentityChanged;
+        }
+        if (desired.generation == descriptor.generation) {
+            return descriptor.generation;
+        }
+        var transaction = (try manager.beginPersistedSelections(
+            desired.selections,
+            desired.generation,
+        )) orelse {
+            if (desired.generation < manager.persistedSelectionGeneration()) {
+                continue;
+            }
+            return error.InvalidDesiredSelection;
+        };
+        defer transaction.deinit();
+        const outcome = try store.publish(.{ .state = .{
+            .nonce = descriptor.nonce,
+            .generation = descriptor.generation,
+        } }, .{
+            .pid = descriptor.pid,
+            .nonce = descriptor.nonce,
+            .endpoint = descriptor.endpoint,
+            .identity = observed_identity,
+            .generation = desired.generation,
+            .ready = descriptor.ready,
+        });
+        switch (outcome) {
+            .committed, .durability_uncertain => {
+                if (!transaction.commit()) continue;
+            },
+            .conflict => continue,
+        }
+    }
+    return error.RuntimeDesiredStateUnstable;
+}
+
+fn promoteRuntimeDescriptorReady(
+    allocator: std.mem.Allocator,
+    instance_nonce: runtime_descriptor.Nonce,
+) !void {
+    var attempt: u8 = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var default_store = (try runtime_descriptor.openDefault(
+            allocator,
+            false,
+        )) orelse return error.RuntimeDescriptorMissing;
+        defer default_store.deinit();
+        const store = default_store.store();
+        var descriptor = (try store.observe()) orelse
+            return error.RuntimeDescriptorMissing;
+        defer descriptor.deinit();
+        if (!descriptor.nonce.eql(instance_nonce)) {
+            return error.RuntimeIdentityChanged;
+        }
+        if (descriptor.ready) return;
+        const outcome = try store.publish(.{ .state = .{
+            .nonce = descriptor.nonce,
+            .generation = descriptor.generation,
+            .ready = false,
+        } }, .{
+            .pid = descriptor.pid,
+            .nonce = descriptor.nonce,
+            .endpoint = descriptor.endpoint,
+            .identity = descriptor.identity,
+            .generation = descriptor.generation,
+            .ready = true,
+        });
+        switch (outcome) {
+            .committed, .durability_uncertain => return,
+            .conflict => continue,
+        }
+    }
+    return error.RuntimeDesiredStateUnstable;
 }
 
 fn publishRuntimeDescriptor(
     allocator: std.mem.Allocator,
-    config_key: ?[]const u8,
+    applied_identity: ?config_identity.ManagedIdentity,
+    applied_generation: u64,
     endpoint: ?[]const u8,
-) !void {
+) !runtime_descriptor.Nonce {
     var default_store = (try runtime_descriptor.openDefault(allocator, true)) orelse
         return error.RuntimeDirectoryUnavailable;
     defer default_store.deinit();
     const store = default_store.store();
     var existing = try store.observe();
     defer if (existing) |*value| value.deinit();
-    const expected: runtime_descriptor.Expected = if (existing) |value|
-        .{ .nonce = value.nonce }
+    const nonce = g_runtime_nonce orelse runtime_descriptor.Nonce.generate();
+    const expected: runtime_descriptor.Expected = if (g_runtime_nonce != null)
+        .{ .nonce = nonce }
     else
         .missing;
-    const nonce = runtime_descriptor.Nonce.generate();
-    const observed_identity = if (config_key) |key|
-        try selection_state.observeDefault(allocator, key)
-    else
-        selection_state.Receipt{};
-    const actual_endpoint = endpoint orelse "unavailable";
+    if (g_runtime_nonce != null and
+        (existing == null or !existing.?.nonce.eql(nonce)))
+    {
+        return error.RuntimeDescriptorConflict;
+    }
     const outcome = try store.publish(expected, .{
         .pid = @intCast(std.c.getpid()),
         .nonce = nonce,
-        .endpoint = actual_endpoint,
-        .identity = observed_identity.identity,
-        .generation = observed_identity.generation orelse 0,
+        .endpoint = endpoint,
+        .identity = applied_identity,
+        .generation = applied_generation,
+        .ready = false,
     });
     switch (outcome) {
-        .committed, .durability_uncertain => {},
+        .committed, .durability_uncertain => return nonce,
         .conflict => return error.RuntimeDescriptorConflict,
     }
 }
@@ -1933,6 +2799,18 @@ fn printStartCommandOptionError(json_output: bool, err: anyerror, command: Runti
         ),
         else => printCliError(json_output, "START_ARGS_INVALID", if (restart) "invalid restart arguments" else "invalid start arguments", "check `zc help`"),
     }
+}
+
+fn isPortPreflightError(err: anyerror) bool {
+    return switch (err) {
+        error.PortAlreadyInUse,
+        error.ControllerPortAlreadyInUse,
+        error.PortConflict,
+        error.InvalidBindAddress,
+        error.InvalidExternalController,
+        => true,
+        else => false,
+    };
 }
 
 const CliErrorInfo = struct {
@@ -2111,7 +2989,8 @@ fn runRestartCommand(
 
     try out.note("starting daemon...\n", .{});
     const outcome = try daemon.startDaemon(allocator, config_path, forward_args.items);
-    const pid = outcome.pid orelse (try daemon.readPid(allocator)) orelse return error.StartFailed;
+    if (outcome.detail != null) return error.RestartContended;
+    const pid = outcome.pid orelse return error.StartFailed;
 
     if (out.mode == .json) {
         try out.success(.{ .action = "restart", .state = "running", .pid = pid });
@@ -2122,12 +3001,16 @@ fn runRestartCommand(
 }
 
 fn observedRuntimeControllerPort(allocator: std.mem.Allocator) ?u16 {
+    const pid = (daemon.readPid(allocator) catch return null) orelse return null;
+    if (pid <= 0 or !(daemon.isRunning(allocator) catch false)) return null;
     var default_store = (runtime_descriptor.openDefault(allocator, false) catch return null) orelse
         return null;
     defer default_store.deinit();
     var descriptor = (default_store.store().observe() catch return null) orelse return null;
     defer descriptor.deinit();
-    return parseExternalControllerPort(descriptor.endpoint) catch null;
+    if (descriptor.pid != @as(u32, @intCast(pid))) return null;
+    const endpoint = descriptor.endpoint orelse return null;
+    return parseExternalControllerPort(endpoint) catch null;
 }
 
 fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) void {
@@ -2217,6 +3100,7 @@ fn loadAndValidateConfig(
     var cfg = try loadRuntimeConfig(allocator, config_path, mixed_port_override, override_opts, command_name, true);
     errdefer cfg.deinit();
 
+    try validateRuntimeEndpointSyntax(&cfg);
     var validation_result = try validator.validate(allocator, &cfg);
     defer validation_result.deinit();
     if (print_validation) {
@@ -2247,16 +3131,59 @@ fn resolveEffectiveOverrideOptions(
     return effective;
 }
 
-fn proxyThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine: *rule_engine.Engine, manager: *outbound.OutboundManager) void {
-    compat.sleepNs(100 * std.time.ns_per_ms);
+fn reportListenerFailure(
+    startup: *ListenerStartup,
+    label: []const u8,
+    err: anyerror,
+) void {
+    std.debug.print("{s} fatal error: {}\n", .{ label, err });
+    const previous = startup.phase.swap(.failed, .acq_rel);
+    if (previous == .committed) std.process.exit(cli_output.exit_failure);
+}
 
+fn waitForListenerReadiness(
+    startup: *ListenerStartup,
+    expected: u8,
+    timeout_ms: i64,
+) !void {
+    std.debug.assert(timeout_ms > 0);
+    const deadline = compat.monotonicMilliTimestamp() + timeout_ms;
+    while (startup.ready.load(.acquire) < expected) {
+        if (startup.phase.load(.acquire) == .failed) {
+            return error.ListenerStartupFailed;
+        }
+        if (compat.monotonicMilliTimestamp() >= deadline) {
+            return error.ListenerStartupTimeout;
+        }
+        compat.sleepNs(listener_start_poll_ms * std.time.ns_per_ms);
+    }
+    if (startup.phase.load(.acquire) == .failed) {
+        return error.ListenerStartupFailed;
+    }
+}
+
+fn proxyThreadFn(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    engine: *rule_engine.Engine,
+    manager: *outbound.OutboundManager,
+    startup: *ListenerStartup,
+) void {
     const bind_ip = effectiveBindAddress(cfg);
 
     if (cfg.mixed_port > 0) {
         std.debug.print("Starting mixed proxy on {s}:{}\n", .{ bind_ip, cfg.mixed_port });
-        mixed_proxy.start(allocator, bind_ip, cfg.mixed_port, engine, manager) catch |err| {
-            std.debug.print("Mixed proxy fatal error: {}\n", .{err});
-            std.process.exit(1);
+        mixed_proxy.startWithReady(
+            allocator,
+            bind_ip,
+            cfg.mixed_port,
+            engine,
+            manager,
+            &startup.ready,
+            &startup.committed,
+        ) catch |err| {
+            reportListenerFailure(startup, "Mixed proxy", err);
+            return;
         };
         return;
     }
@@ -2266,17 +3193,25 @@ fn proxyThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine
 
     if (cfg.port > 0) {
         std.debug.print("Starting HTTP proxy on {s}:{}\n", .{ bind_ip, cfg.port });
-        http_thread = std.Thread.spawn(.{}, httpThreadFn, .{ allocator, bind_ip, cfg.port, engine, manager }) catch |err| {
-            std.debug.print("Failed to start HTTP proxy thread: {}\n", .{err});
-            std.process.exit(1);
+        http_thread = std.Thread.spawn(
+            .{},
+            httpThreadFn,
+            .{ allocator, bind_ip, cfg.port, engine, manager, startup },
+        ) catch |err| {
+            reportListenerFailure(startup, "HTTP proxy thread", err);
+            return;
         };
     }
 
     if (cfg.socks_port > 0) {
         std.debug.print("Starting SOCKS5 proxy on {s}:{}\n", .{ bind_ip, cfg.socks_port });
-        socks_thread = std.Thread.spawn(.{}, socksThreadFn, .{ allocator, bind_ip, cfg.socks_port, engine, manager }) catch |err| {
-            std.debug.print("Failed to start SOCKS5 proxy thread: {}\n", .{err});
-            std.process.exit(1);
+        socks_thread = std.Thread.spawn(
+            .{},
+            socksThreadFn,
+            .{ allocator, bind_ip, cfg.socks_port, engine, manager, startup },
+        ) catch |err| {
+            reportListenerFailure(startup, "SOCKS5 proxy thread", err);
+            return;
         };
     }
 
@@ -2284,25 +3219,63 @@ fn proxyThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine
     if (socks_thread) |t| t.join();
 }
 
-fn apiThreadFn(allocator: std.mem.Allocator, cfg: *const config.Config, engine: *rule_engine.Engine, manager: *outbound.OutboundManager, port: u16) void {
+fn apiThreadFn(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    engine: *rule_engine.Engine,
+    manager: *outbound.OutboundManager,
+    port: u16,
+    startup: *ListenerStartup,
+) void {
     var api_server = api.ApiServer.init(allocator, cfg, engine, manager, port);
-    api_server.start() catch |err| {
-        std.debug.print("API server fatal error: {}\n", .{err});
-        std.process.exit(1);
+    api_server.startWithAcceptGate(
+        &startup.ready,
+        &startup.control_available,
+        &startup.committed,
+    ) catch |err| {
+        reportListenerFailure(startup, "API server", err);
     };
 }
 
-fn httpThreadFn(allocator: std.mem.Allocator, bind_ip: []const u8, port: u16, engine: *rule_engine.Engine, manager: *outbound.OutboundManager) void {
-    http_proxy.start(allocator, bind_ip, port, engine, manager) catch |err| {
-        std.debug.print("HTTP proxy fatal error: {}\n", .{err});
-        std.process.exit(1);
+fn httpThreadFn(
+    allocator: std.mem.Allocator,
+    bind_ip: []const u8,
+    port: u16,
+    engine: *rule_engine.Engine,
+    manager: *outbound.OutboundManager,
+    startup: *ListenerStartup,
+) void {
+    http_proxy.startWithReady(
+        allocator,
+        bind_ip,
+        port,
+        engine,
+        manager,
+        &startup.ready,
+        &startup.committed,
+    ) catch |err| {
+        reportListenerFailure(startup, "HTTP proxy", err);
     };
 }
 
-fn socksThreadFn(allocator: std.mem.Allocator, bind_ip: []const u8, port: u16, engine: *rule_engine.Engine, manager: *outbound.OutboundManager) void {
-    socks5_proxy.start(allocator, bind_ip, port, engine, manager) catch |err| {
-        std.debug.print("SOCKS5 proxy fatal error: {}\n", .{err});
-        std.process.exit(1);
+fn socksThreadFn(
+    allocator: std.mem.Allocator,
+    bind_ip: []const u8,
+    port: u16,
+    engine: *rule_engine.Engine,
+    manager: *outbound.OutboundManager,
+    startup: *ListenerStartup,
+) void {
+    socks5_proxy.startWithReady(
+        allocator,
+        bind_ip,
+        port,
+        engine,
+        manager,
+        &startup.ready,
+        &startup.committed,
+    ) catch |err| {
+        reportListenerFailure(startup, "SOCKS5 proxy", err);
     };
 }
 
@@ -2331,6 +3304,15 @@ fn hasInProcessPortConflict(cfg: *const config.Config) !bool {
     }
 
     return false;
+}
+
+fn validateRuntimeEndpointSyntax(cfg: *const config.Config) !void {
+    _ = compat.net.Address.parseIp4(effectiveBindAddress(cfg), 1) catch
+        return error.InvalidBindAddress;
+    if (cfg.external_controller) |value| {
+        _ = parseExternalControllerPort(value) catch
+            return error.InvalidExternalController;
+    }
 }
 
 fn preflightPortCheck(cfg: *config.Config, emit_errors: bool) !void {

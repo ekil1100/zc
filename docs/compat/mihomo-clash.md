@@ -37,6 +37,7 @@ Known gaps:
 - `dns:` is not wired as a full runtime DNS config;
 - `redir-port` / `tproxy-port` are not active runtime listeners;
 - `proxy-providers` are not supported;
+- managed revisions use captured local `rule-providers`; remote providers that remain unresolved at exact-load time fail before listener startup rather than falling back to cwd/source paths;
 - `external-controller` is restricted to an explicit `127.0.0.1:<port>` endpoint；端口冲突时启动失败，不自动漂移或静默关闭控制面；
 - TUN/fake-ip/enhanced-mode are not supported.
 

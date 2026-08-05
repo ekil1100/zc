@@ -17,6 +17,7 @@
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
 5. **代理选择与本地 load 主路径已接 Authority**：CLI durable-first、daemon 启动恢复 desired state，并通过 exact revision runtime descriptor 发现实际 controller endpoint；其余 legacy config writer 仍需统一 cutover，避免后续命令重建 mirror 时形成状态漂移。
 6. **minimal controller 端点已冻结**：v1 只接受显式 `127.0.0.1:<port>`，必须绑定精确配置端口；冲突时启动失败，不自动漂移或静默关闭控制面。
+7. **生命周期路径已按用户隔离**：pid/lock/log/runtime descriptor 统一位于经 owner/mode/no-follow 校验的 `XDG_RUNTIME_DIR`；未设置时使用规范化 `$HOME/.local/state/zc/runtime`，不再写共享 `/tmp/zc.*`；后台启动仅在 listener 就绪并发布 descriptor 后成功。
 
 因此，v1.0 roadmap 现在应聚焦：**落地统一 capability gate，关闭所有未经互操作与生命周期验证的协议；完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import；修复安全审计阻断项后，再做最终 smoke gate 和 GA tag 判断。**
 

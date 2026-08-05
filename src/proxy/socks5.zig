@@ -32,7 +32,33 @@ const Reply = struct {
     const AddressNotSupported: u8 = 0x08;
 };
 
-pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, engine: *Engine, manager: *OutboundManager) !void {
+pub fn start(
+    allocator: std.mem.Allocator,
+    bind_address: []const u8,
+    port: u16,
+    engine: *Engine,
+    manager: *OutboundManager,
+) !void {
+    return startWithReady(
+        allocator,
+        bind_address,
+        port,
+        engine,
+        manager,
+        null,
+        null,
+    );
+}
+
+pub fn startWithReady(
+    allocator: std.mem.Allocator,
+    bind_address: []const u8,
+    port: u16,
+    engine: *Engine,
+    manager: *OutboundManager,
+    ready_count: ?*std.atomic.Value(u8),
+    accept_gate: ?*std.atomic.Value(bool),
+) !void {
     const listen_ip = if (std.mem.eql(u8, bind_address, "*")) "0.0.0.0" else bind_address;
     const address = try net.Address.parseIp4(listen_ip, port);
     // SO_REUSEADDR-only (see compat.net.listenReuseAddr): rebind past TIME_WAIT
@@ -41,6 +67,12 @@ pub fn start(allocator: std.mem.Allocator, bind_address: []const u8, port: u16, 
     defer server.deinit();
 
     std.debug.print("SOCKS5 proxy listening on port {}\n", .{port});
+    if (ready_count) |count| _ = count.fetchAdd(1, .release);
+    if (accept_gate) |gate| {
+        while (!gate.load(.acquire)) {
+            compat.sleepNs(1 * std.time.ns_per_ms);
+        }
+    }
 
     while (true) {
         const conn = try server.accept();

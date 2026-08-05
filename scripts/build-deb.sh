@@ -48,6 +48,9 @@ After=network.target
 
 [Service]
 Type=simple
+RuntimeDirectory=zc
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/zc
 ExecStart=/usr/bin/zc start --foreground
 # No ExecReload: \`zc reload\` falls back to a full restart, which would kill
 # the supervised --foreground MainPID. Use \`systemctl restart zc\` instead.

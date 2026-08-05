@@ -34,6 +34,10 @@ frozen `START_*` argument-error codes (messages/hints rendered for restart);
 
 v1 的 `external-controller` 只接受显式 `127.0.0.1:<port>`。启动必须绑定配置中的精确端口；端口已占用时返回 `START_CONTROLLER_PORT_IN_USE` / `RESTART_CONTROLLER_PORT_IN_USE`，不得自动改用相邻端口，也不得静默禁用控制面。
 
+生命周期文件 `zc.pid`、`zc.lock`、`zc.log`、`zc.daemon.json` 与 `zc.daemon.lock` 统一位于经过校验的 runtime directory。设置 `XDG_RUNTIME_DIR` 时，它必须是绝对、规范化、由当前 euid 所有且权限为 `0700` 的既有目录；未设置时使用规范化 `$HOME/.local/state/zc/runtime`，其父目录不得由 group/other 写入，最终目录权限为 `0700`。不安全路径与 symlink fail closed；文件明确收敛为 `0600`，特殊文件不得在类型校验前阻塞读取。后台日志超过 8 MiB 后重置到新的 owner-only 文件，避免 runtime filesystem 无界增长；`zc log -f` 在日志暂时缺失或整个 runtime directory 被安全重建时持续重开，不退出也不永久钉住旧目录。
+
+后台 `zc start` 先绑定所有配置 listener，并发布 `ready:false` 的 provisional descriptor；并发 `status`/`start` 不把它当作 running。exact desired reconciliation 完成后，daemon 持有 authority guard 与 selection barrier，并以独立 data-plane readiness barrier 阻塞包括 `DIRECT`/`REJECT` 在内的所有出站；descriptor 提升为 `ready:true` 后才释放数据面；并发 `start` 也以该 descriptor 作为最终就绪事实。`zc stop` 通过 descriptor nonce 认证的 runtime 请求让目标实例自行退出；descriptor/lock/PID 不一致时拒绝按数值 PID 发信号。运行中 lock path 缺失、inode 被替换或整个 runtime directory 被重建时，实例会校验继承 lock identity 并退出；`status`/`start` fail closed，不删除 live PID，也不形成永久双实例。`zc status` 返回 pid/lock/log 的实际路径；descriptor 位于同一 runtime directory，但不是冻结的 `paths` 字段。`proxy select` 只向 PID、instance nonce、revision、generation 与 endpoint 均匹配的 live descriptor 发送运行时变更；daemon 以 generation CAS 拒绝过期/乱序 apply；durable desired 领先时允许前跳到最新完整 snapshot，并在成功后推进 descriptor。descriptor 缺失、损坏或过期时只保留 durable selection，绝不回退猜测配置端点。显式 unmanaged 配置没有可比较 revision，`proxy select` 不做 live apply；需先 `zc config load` 导入。
+
 The TUI command is excluded from v1.0 and is not present in help/dispatch.
 `zc --daemon-run` is an internal mode used by `zc start` and is intentionally
 undocumented in help.

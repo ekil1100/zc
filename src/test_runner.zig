@@ -30,6 +30,7 @@ test "include zc test modules" {
     _ = @import("perf_runner.zig");
     _ = @import("perf_stats.zig");
     _ = @import("runtime_selection.zig");
+    _ = @import("runtime_dir.zig");
     _ = @import("runtime_descriptor_test.zig");
     _ = @import("selection_state_test.zig");
     _ = @import("revision_store_test.zig");

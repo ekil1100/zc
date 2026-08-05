@@ -33,7 +33,7 @@ pub const DesiredSnapshot = struct {
 
 pub fn persistDefault(
     allocator: std.mem.Allocator,
-    key: []const u8,
+    identity: config_identity.ManagedIdentity,
     group: []const u8,
     proxy: []const u8,
 ) !Receipt {
@@ -43,7 +43,7 @@ pub fn persistDefault(
         if (compat.fs.openDirAbsolute(root_path, .{ .follow_symlinks = false })) |root| {
             defer root.close(compat.io());
             if (root.access(compat.io(), "state-v2.json", .{})) |_| {
-                return State.init(allocator, root).persist(key, group, proxy);
+                return State.init(allocator, root).persist(identity, group, proxy);
             } else |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
@@ -56,10 +56,15 @@ pub fn persistDefault(
 
     var metadata = try meta.load(allocator);
     defer metadata.deinit();
-    if (!metadata.configs.contains(key)) return error.ManagedProfileNotFound;
-    try meta.setSelection(allocator, &metadata, key, group, proxy);
+    if (!metadata.configs.contains(identity.key)) {
+        return error.ManagedProfileNotFound;
+    }
+    if (!identity.revision.eql(config_identity.legacyRevision(identity.key))) {
+        return error.ManagedRevisionChanged;
+    }
+    try meta.setSelection(allocator, &metadata, identity.key, group, proxy);
     try meta.save(allocator, &metadata);
-    return .{ .identity = .{ .key = key, .revision = config_identity.legacyRevision(key) } };
+    return .{ .identity = identity };
 }
 
 pub fn loadDesiredDefault(
@@ -143,13 +148,21 @@ pub const State = struct {
         return .{ .allocator = allocator, .root = root };
     }
 
-    pub fn persist(self: State, key: []const u8, group: []const u8, proxy: []const u8) !Receipt {
+    pub fn persist(
+        self: State,
+        identity: config_identity.ManagedIdentity,
+        group: []const u8,
+        proxy: []const u8,
+    ) !Receipt {
         for (0..max_attempts) |_| {
             const authority = state_authority.Authority.init(self.allocator, self.root);
             var inspection = try authority.inspect();
             const token = inspection.token();
             const profile = switch (inspection) {
-                .catalog_v2 => |*observed| findProfile(observed.catalog.state.profiles, key) orelse {
+                .catalog_v2 => |*observed| findProfile(
+                    observed.catalog.state.profiles,
+                    identity.key,
+                ) orelse {
                     inspection.deinit();
                     return error.ManagedProfileNotFound;
                 },
@@ -158,17 +171,20 @@ pub const State = struct {
                     return error.Schema2CatalogRequired;
                 },
             };
+            if (!profile.head.eql(identity.revision)) {
+                inspection.deinit();
+                return error.ManagedRevisionChanged;
+            }
             const next = try replaceSelection(
                 self.allocator,
                 profile.desired.selections,
                 group,
                 proxy,
             );
-            const revision = profile.head;
             const generation = profile.desired.generation;
             const outcome = catalog_service.Service.init(self.allocator, self.root).mutate(token, .{
                 .set_desired = .{
-                    .identity = .{ .key = key, .revision = revision },
+                    .identity = identity,
                     .expected_generation = generation,
                     .selections = next,
                 },
@@ -181,7 +197,7 @@ pub const State = struct {
             inspection.deinit();
             switch (outcome) {
                 .applied => return .{
-                    .identity = .{ .key = key, .revision = revision },
+                    .identity = identity,
                     .generation = generation + 1,
                 },
                 .conflict => continue,

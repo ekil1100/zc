@@ -5,6 +5,9 @@ After=network.target
 
 [Service]
 Type=simple
+RuntimeDirectory=zc
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/zc
 ExecStart=/usr/local/bin/zclash start --foreground
 # No ExecReload: `zclash reload` falls back to a full restart, which would kill
 # the supervised --foreground MainPID and escape systemd. Use

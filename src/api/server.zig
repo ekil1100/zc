@@ -8,6 +8,9 @@ const OutboundManager = @import("../proxy/outbound/manager.zig").OutboundManager
 const build_options = @import("build_options");
 const socket_options = @import("../socket_options.zig");
 const runtime_selection = @import("../runtime_selection.zig");
+const runtime_descriptor = @import("../runtime_descriptor.zig");
+const selection_state = @import("../selection_state.zig");
+const config_identity = @import("../config_identity.zig");
 
 pub const max_header_bytes: usize = 16 * 1024;
 pub const max_body_bytes: usize = 64 * 1024;
@@ -263,6 +266,8 @@ pub const ApiServer = struct {
     manager: *OutboundManager,
     port: u16,
     active_connections: std.atomic.Value(u32) = .init(0),
+    selection_apply_lock: std.atomic.Mutex = .unlocked,
+    runtime_ready: ?*std.atomic.Value(bool) = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -281,6 +286,23 @@ pub const ApiServer = struct {
     }
 
     pub fn start(self: *ApiServer) !void {
+        return self.startWithReady(null);
+    }
+
+    pub fn startWithReady(
+        self: *ApiServer,
+        ready_count: ?*std.atomic.Value(u8),
+    ) !void {
+        return self.startWithAcceptGate(ready_count, null, null);
+    }
+
+    pub fn startWithAcceptGate(
+        self: *ApiServer,
+        ready_count: ?*std.atomic.Value(u8),
+        accept_gate: ?*std.atomic.Value(bool),
+        runtime_ready: ?*std.atomic.Value(bool),
+    ) !void {
+        self.runtime_ready = runtime_ready;
         const address = try net.Address.parseIp4("127.0.0.1", self.port);
         // SO_REUSEADDR-only (see compat.net.listenReuseAddr): rebind past
         // TIME_WAIT on restart, but a 2nd active listener still fails.
@@ -288,6 +310,12 @@ pub const ApiServer = struct {
         defer server.deinit();
 
         std.debug.print("REST API listening on port {}\n", .{self.port});
+        if (ready_count) |count| _ = count.fetchAdd(1, .release);
+        if (accept_gate) |gate| {
+            while (!gate.load(.acquire)) {
+                compat.sleepNs(1 * std.time.ns_per_ms);
+            }
+        }
 
         while (true) {
             const conn = server.accept() catch |err| switch (err) {
@@ -568,6 +596,94 @@ pub const ApiServer = struct {
         return stringifyOwned(allocator, Response{ .rules = views });
     }
 
+    fn applyManagedSelection(
+        self: *ApiServer,
+        group_name: []const u8,
+        proxy_name: []const u8,
+        request: ManagedSelectionRequest,
+    ) !bool {
+        while (!self.selection_apply_lock.tryLock()) {
+            compat.sleepNs(1 * std.time.ns_per_ms);
+        }
+        defer self.selection_apply_lock.unlock();
+
+        for (0..4) |_| {
+            var default_store = (try runtime_descriptor.openDefault(
+                self.allocator,
+                false,
+            )) orelse return false;
+            defer default_store.deinit();
+            const store = default_store.store();
+            var descriptor = (try store.observe()) orelse return false;
+            defer descriptor.deinit();
+            const identity = descriptor.identity orelse return false;
+            if (descriptor.pid != @as(u32, @intCast(std.c.getpid())) or
+                !descriptor.nonce.eql(request.instance_nonce) or
+                !std.mem.eql(u8, identity.key, request.identity_key) or
+                !identity.revision.eql(request.identity_revision) or
+                request.generation <= descriptor.generation)
+            {
+                return false;
+            }
+
+            var desired = (try selection_state.loadDesiredDefault(
+                self.allocator,
+                request.identity_key,
+            )) orelse return false;
+            defer desired.deinit();
+            if (!desired.identity.revision.eql(request.identity_revision) or
+                desired.generation != request.generation)
+            {
+                return false;
+            }
+            var requested_selection_found = false;
+            for (desired.selections) |selection| {
+                if (std.mem.eql(u8, selection.group, group_name) and
+                    std.mem.eql(u8, selection.proxy, proxy_name))
+                {
+                    requested_selection_found = true;
+                    break;
+                }
+            }
+            if (!requested_selection_found) return false;
+            var transaction = (try self.manager.beginPersistedSelections(
+                desired.selections,
+                desired.generation,
+            )) orelse return false;
+            defer transaction.deinit();
+
+            const outcome = try store.publish(.{ .state = .{
+                .nonce = descriptor.nonce,
+                .generation = descriptor.generation,
+                .ready = descriptor.ready,
+            } }, .{
+                .pid = descriptor.pid,
+                .nonce = descriptor.nonce,
+                .endpoint = descriptor.endpoint,
+                .identity = identity,
+                .generation = request.generation,
+                .ready = descriptor.ready,
+            });
+            switch (outcome) {
+                .committed, .durability_uncertain => return transaction.commit(),
+                .conflict => continue,
+            }
+        }
+        return false;
+    }
+
+    fn applyTransientSelection(
+        self: *ApiServer,
+        group_name: []const u8,
+        proxy_name: []const u8,
+    ) !bool {
+        while (!self.selection_apply_lock.tryLock()) {
+            compat.sleepNs(1 * std.time.ns_per_ms);
+        }
+        defer self.selection_apply_lock.unlock();
+        return self.manager.applyPersistedSelection(group_name, proxy_name);
+    }
+
     /// PUT /proxies/<group_name> body: {"name":"proxy_name"}
     ///
     /// body 经 std.json 解析（真实反转义 —— 节点名可含 `"`/`\`/换行等，
@@ -599,7 +715,26 @@ pub const ApiServer = struct {
         }
 
         std.debug.print("[API] Switch proxy: group={s}, proxy={s}\n", .{ group_name, proxy_name });
-        self.manager.applyPersistedSelection(group_name, proxy_name);
+        var managed_request = parseManagedSelectionRequest(
+            self.allocator,
+            body,
+        ) catch {
+            try self.sendError(conn, 400, "Invalid managed selection metadata");
+            return;
+        };
+        defer if (managed_request) |*request| request.deinit(self.allocator);
+        const applied = if (managed_request) |request|
+            try self.applyManagedSelection(group_name, proxy_name, request)
+        else blk: {
+            if (self.runtime_ready) |ready| {
+                if (!ready.load(.acquire)) break :blk false;
+            }
+            break :blk try self.applyTransientSelection(group_name, proxy_name);
+        };
+        if (!applied) {
+            try self.sendError(conn, 409, "Selection changed during apply");
+            return;
+        }
 
         // 响应体经 std.json 序列化（名称真实转义，禁止手拼 JSON）。
         var resp: std.Io.Writer.Allocating = .init(self.allocator);
@@ -710,6 +845,57 @@ fn ruleTypeName(rule_type: config_mod.RuleType) []const u8 {
 
 /// 从 PUT body 解析 `name` 字段（std.json，真实反转义）。返回 owned slice，
 /// 调用方负责 free；body 非法/缺字段/非字符串返回 null。
+const ManagedSelectionRequest = struct {
+    instance_nonce: runtime_descriptor.Nonce,
+    identity_key: []u8,
+    identity_revision: config_identity.Revision,
+    generation: u64,
+
+    fn deinit(self: *ManagedSelectionRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.identity_key);
+        self.* = undefined;
+    }
+};
+
+fn parseManagedSelectionRequest(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+) !?ManagedSelectionRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return error.InvalidManagedSelection;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidManagedSelection;
+    const object = parsed.value.object;
+    const nonce_value = object.get("instance_nonce");
+    const key_value = object.get("identity_key");
+    const revision_value = object.get("identity_revision");
+    const generation_value = object.get("generation");
+    var metadata_count: u8 = 0;
+    if (nonce_value != null) metadata_count += 1;
+    if (key_value != null) metadata_count += 1;
+    if (revision_value != null) metadata_count += 1;
+    if (generation_value != null) metadata_count += 1;
+    if (metadata_count == 0) return null;
+    if (metadata_count != 4 or nonce_value.? != .string or
+        key_value.? != .string or revision_value.? != .string or
+        generation_value.? != .integer or generation_value.?.integer <= 0)
+    {
+        return error.InvalidManagedSelection;
+    }
+    const key = try allocator.dupe(u8, key_value.?.string);
+    errdefer allocator.free(key);
+    return .{
+        .instance_nonce = runtime_descriptor.Nonce.parseHex(
+            nonce_value.?.string,
+        ) catch return error.InvalidManagedSelection,
+        .identity_key = key,
+        .identity_revision = config_identity.Revision.parseHex(
+            revision_value.?.string,
+        ) catch return error.InvalidManagedSelection,
+        .generation = @intCast(generation_value.?.integer),
+    };
+}
+
 pub fn parseSelectionName(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();

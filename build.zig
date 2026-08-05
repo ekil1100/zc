@@ -97,7 +97,13 @@ pub fn build(b: *std.Build) void {
         b.pathFromRoot(".zig-cache/zc-test-home/.config"),
         b.pathFromRoot(".zig-cache/zc-test-run"),
     });
-    run_exe_unit_tests.step.dependOn(&prepare_test_home.step);
+    const secure_test_runtime = b.addSystemCommand(&.{
+        "chmod",
+        "700",
+        b.pathFromRoot(".zig-cache/zc-test-run"),
+    });
+    secure_test_runtime.step.dependOn(&prepare_test_home.step);
+    run_exe_unit_tests.step.dependOn(&secure_test_runtime.step);
     run_exe_unit_tests.setEnvironmentVariable("HOME", b.pathFromRoot(".zig-cache/zc-test-home"));
     run_exe_unit_tests.setEnvironmentVariable("XDG_RUNTIME_DIR", b.pathFromRoot(".zig-cache/zc-test-run"));
     const config_flow_cmd = b.addSystemCommand(&.{

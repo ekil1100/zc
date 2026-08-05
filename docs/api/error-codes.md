@@ -48,7 +48,10 @@
 
 | code | message 示例 | hint 示例 |
 |---|---|---|
-| `START_FAILED` | daemon exited during startup | check `zc log --no-follow` for details |
+| `START_FAILED` | daemon exited before startup completed | check `zc log --no-follow` for details |
+| `START_READINESS_TIMEOUT` | daemon did not publish readiness before the startup deadline | check override duration, port ownership, and the daemon log |
+| `START_RUNTIME_PUBLISH_FAILED` | failed to publish the daemon pid or descriptor | remove unsafe runtime artifacts and retry |
+| `START_LOCK_HANDOFF_INVALID` | daemon lock handoff is missing or invalid | launch the daemon through `zc start` |
 | `START_ARGS_INVALID` | unknown or unexpected argument for `start` | use `zc start [-c <config>] [--port <port>] [--foreground] [--json]` |
 | `START_PORT_REQUIRED` | missing value for `--port` | use `zc start --port <port>` |
 | `START_PORT_INVALID` | invalid `--port` value | use an integer between 1 and 65535 |
@@ -60,7 +63,9 @@
 | `START_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | use an explicit loopback endpoint such as `127.0.0.1:9090` |
 | `START_PREFLIGHT_FAILED` | failed to validate daemon start ports | check config and retry |
 | `STOP_FAILED` | failed to stop daemon | verify process permissions and retry `zc stop` |
+| `STOP_TIMEOUT` | daemon did not acknowledge the stop request within 5 seconds | inspect `zc status` and the daemon log before retrying |
 | `RESTART_FAILED` | failed to restart daemon | check logs and retry `zc restart -c <config>` |
+| `RESTART_READINESS_TIMEOUT` | daemon did not publish readiness before the startup deadline | check override duration, port ownership, and the daemon log |
 | `RESTART_PORT_IN_USE` | restart target port is already in use | free the occupied port, then retry `zc restart` |
 | `RESTART_CONTROLLER_PORT_IN_USE` | restart controller port is already in use | free the exact `external-controller` port before retrying `zc restart` |
 | `RESTART_PORT_CONFLICT` | restart target port conflicts with another runtime listener | fix the conflicting runtime config before retrying `zc restart` |
@@ -70,7 +75,7 @@
 | `RELOAD_FAILED` | daemon is not running | start it first with `zc start` |
 | `RELOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `reload` | use `zc reload [--json]` |
 | `STOP_ARGUMENT_INVALID` | unknown or unexpected argument for `stop` | use `zc stop [--json]` |
-| `STATUS_FAILED` | failed to read daemon status | check pid file permissions and retry `zc status` |
+| `STATUS_FAILED` | failed to read daemon status | use a canonical owner-only runtime directory and retry `zc status` |
 | `STATUS_ARGUMENT_INVALID` | unknown or unexpected argument for `status` | use `zc status [--json]` |
 | `LOG_FAILED` | failed to read daemon log | check log file permissions; `zc status` shows the log path |
 | `LOG_ARGUMENT_INVALID` | invalid `-n` value (use a non-negative integer) | use `zc log [-n <lines>] [-f\|--no-follow] [--json]` |
@@ -132,6 +137,7 @@
 | `PROXY_SELECT_GROUP_MISSING` | no select-type proxy group found | check profile proxy-groups config |
 | `PROXY_SELECT_NOT_INTERACTIVE` | interactive selection requires a TTY on stdin | stdin is not a TTY; use `zc proxy select -g <group> -p <proxy>` |
 | `PROXY_SELECT_FAILED` | failed to select proxy | retry with valid group/proxy arguments |
+| `PROXY_SELECTION_MANAGED_CONFIG_REQUIRED` | selection requires a managed config revision | import the config with `zc config load <path>` first |
 | `PROXY_TEST_FAILED` | failed to run connectivity test | retry; `zc status` and `zc log --no-follow` show daemon state |
 | `PROXY_LIST_ARGUMENT_INVALID` | unknown or unexpected argument for `proxy list` | use `zc proxy list [-c <config>] [--json]` |
 | `PROXY_SELECT_ARGUMENT_INVALID` | unknown or unexpected argument for `proxy select` | use `zc proxy select [-g <group>] [-p <proxy>] [-c <config>] [--json]` |

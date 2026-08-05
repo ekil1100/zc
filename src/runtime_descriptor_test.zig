@@ -30,12 +30,16 @@ test "RuntimeDescriptor publishes canonical tracked endpoint and exact identity"
     defer observed.deinit();
     try testing.expectEqual(@as(u32, 1234), observed.pid);
     try testing.expect(observed.nonce.eql(instance_nonce));
-    try testing.expectEqualStrings("127.0.0.1:29001", observed.endpoint);
+    try testing.expectEqualStrings("127.0.0.1:29001", observed.endpoint.?);
     try testing.expectEqualStrings("home", observed.identity.?.key);
     try testing.expect(observed.identity.?.revision.eql(revision));
     try testing.expectEqual(@as(u64, 7), observed.generation);
 
-    const descriptor_file = try tmp.dir.openFile(compat.io(), "daemon.json", .{});
+    const descriptor_file = try tmp.dir.openFile(
+        compat.io(),
+        runtime_descriptor.file_name,
+        .{},
+    );
     defer descriptor_file.close(compat.io());
     if (@import("builtin").os.tag != .windows) {
         const stat = try descriptor_file.stat(compat.io());
@@ -45,11 +49,55 @@ test "RuntimeDescriptor publishes canonical tracked endpoint and exact identity"
         const root_stat = try root_file.stat(compat.io());
         try testing.expectEqual(@as(std.posix.mode_t, 0o700), root_stat.permissions.toMode() & 0o777);
     }
-    const bytes = try tmp.dir.readFileAlloc(compat.io(), "daemon.json", allocator, .limited(64 * 1024));
+    const bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        runtime_descriptor.file_name,
+        allocator,
+        .limited(64 * 1024),
+    );
     defer allocator.free(bytes);
     try testing.expectEqualStrings(
-        "{\"schema_version\":1,\"pid\":1234,\"nonce\":\"11111111111111111111111111111111\",\"endpoint\":\"127.0.0.1:29001\",\"identity\":{\"key\":\"home\",\"revision\":\"00112233445566778899aabbccddeeff\"},\"generation\":7}\n",
+        "{\"schema_version\":1,\"pid\":1234,\"nonce\":\"11111111111111111111111111111111\",\"endpoint\":\"127.0.0.1:29001\",\"identity\":{\"key\":\"home\",\"revision\":\"00112233445566778899aabbccddeeff\"},\"generation\":7,\"ready\":true}\n",
         bytes,
+    );
+}
+
+test "RuntimeDescriptor tracks readiness when the controller is disabled" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = Store.init(allocator, tmp.dir);
+    const instance_nonce = try nonce("11111111111111111111111111111111");
+    _ = try store.publish(.missing, .{
+        .pid = 42,
+        .nonce = instance_nonce,
+        .ready = false,
+    });
+    {
+        var observed = (try store.observe()) orelse return error.TestExpectedEqual;
+        defer observed.deinit();
+        try testing.expect(observed.endpoint == null);
+        try testing.expect(!observed.ready);
+    }
+    try testing.expect((try store.publish(.{ .state = .{
+        .nonce = instance_nonce,
+        .generation = 0,
+        .ready = false,
+    } }, .{
+        .pid = 42,
+        .nonce = instance_nonce,
+        .ready = true,
+    })) == .committed);
+    var ready = (try store.observe()) orelse return error.TestExpectedEqual;
+    defer ready.deinit();
+    try testing.expect(ready.ready);
+    try testing.expectError(
+        error.RuntimeReadinessRegression,
+        store.publish(.{ .nonce = instance_nonce }, .{
+            .pid = 42,
+            .nonce = instance_nonce,
+            .ready = false,
+        }),
     );
 }
 
@@ -59,7 +107,10 @@ test "RuntimeDescriptor observation is side-effect-free and works without write 
     defer tmp.cleanup();
     const store = Store.init(allocator, tmp.dir);
     try testing.expect(try store.observe() == null);
-    try testing.expectError(error.FileNotFound, tmp.dir.access(compat.io(), "daemon.lock", .{}));
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), runtime_descriptor.lock_name, .{}),
+    );
     if (@import("builtin").os.tag == .windows) return;
 
     const instance_nonce = try nonce("11111111111111111111111111111111");
@@ -104,7 +155,68 @@ test "RuntimeDescriptor stale instance cannot replace a newer daemon" {
     var observed = (try store.observe()) orelse return error.TestExpectedEqual;
     defer observed.deinit();
     try testing.expectEqual(@as(u32, 2), observed.pid);
-    try testing.expectEqualStrings("127.0.0.1:2", observed.endpoint);
+    try testing.expectEqualStrings("127.0.0.1:2", observed.endpoint.?);
+}
+
+test "RuntimeDescriptor generation state prevents reordered updates" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = Store.init(allocator, tmp.dir);
+    const instance_nonce = try nonce("11111111111111111111111111111111");
+    const revision = try config_identity.Revision.parseHex(
+        "00112233445566778899aabbccddeeff",
+    );
+    _ = try store.publish(.missing, .{
+        .pid = 1,
+        .nonce = instance_nonce,
+        .endpoint = "127.0.0.1:1",
+        .identity = .{ .key = "home", .revision = revision },
+    });
+    try testing.expect((try store.publish(.{ .state = .{
+        .nonce = instance_nonce,
+        .generation = 0,
+    } }, .{
+        .pid = 1,
+        .nonce = instance_nonce,
+        .endpoint = "127.0.0.1:1",
+        .identity = .{ .key = "home", .revision = revision },
+        .generation = 1,
+    })) == .committed);
+    const reordered = try store.publish(.{ .state = .{
+        .nonce = instance_nonce,
+        .generation = 0,
+    } }, .{
+        .pid = 1,
+        .nonce = instance_nonce,
+        .endpoint = "127.0.0.1:1",
+        .identity = .{ .key = "home", .revision = revision },
+        .generation = 2,
+    });
+    try testing.expect(reordered == .conflict);
+    try testing.expect((try store.publish(.{ .state = .{
+        .nonce = instance_nonce,
+        .generation = 1,
+    } }, .{
+        .pid = 1,
+        .nonce = instance_nonce,
+        .endpoint = "127.0.0.1:1",
+        .identity = .{ .key = "home", .revision = revision },
+        .generation = 4,
+    })) == .committed);
+    try testing.expectError(
+        error.InvalidRuntimeGeneration,
+        store.publish(.{ .state = .{
+            .nonce = instance_nonce,
+            .generation = 4,
+        } }, .{
+            .pid = 1,
+            .nonce = instance_nonce,
+            .endpoint = "127.0.0.1:1",
+            .identity = .{ .key = "home", .revision = revision },
+            .generation = 3,
+        }),
+    );
 }
 
 test "RuntimeDescriptor stale shutdown cannot remove a replacement daemon" {
@@ -131,14 +243,19 @@ test "RuntimeDescriptor rejects noncanonical and symlinked descriptors" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(compat.io(), .{
-        .sub_path = "daemon.json",
+        .sub_path = runtime_descriptor.file_name,
         .data = "{ \"schema_version\": 1, \"pid\": 1, \"nonce\": \"11111111111111111111111111111111\", \"endpoint\": \"x\", \"identity\": null, \"generation\": 0 }\n",
     });
     const store = Store.init(allocator, tmp.dir);
     try testing.expectError(error.CorruptRuntimeDescriptor, store.observe());
-    try tmp.dir.deleteFile(compat.io(), "daemon.json");
+    try tmp.dir.deleteFile(compat.io(), runtime_descriptor.file_name);
     try tmp.dir.writeFile(compat.io(), .{ .sub_path = "target", .data = "{}\n" });
-    try tmp.dir.symLink(compat.io(), "target", "daemon.json", .{});
+    try tmp.dir.symLink(
+        compat.io(),
+        "target",
+        runtime_descriptor.file_name,
+        .{},
+    );
     try testing.expectError(error.CorruptRuntimeDescriptor, store.observe());
 }
 
@@ -153,7 +270,7 @@ test "RuntimeDescriptor distinguishes unmanaged runtime and same key different r
     _ = try store.publish(.missing, .{
         .pid = 1,
         .nonce = first_nonce,
-        .endpoint = "unix:///tmp/zc.sock",
+        .endpoint = "127.0.0.1:29001",
         .identity = null,
     });
     var unmanaged = (try store.observe()) orelse return error.TestExpectedEqual;
@@ -170,6 +287,26 @@ test "RuntimeDescriptor distinguishes unmanaged runtime and same key different r
     defer managed.deinit();
     try testing.expect(managed.identity.?.revision.eql(revision));
     try testing.expectEqual(@as(u64, 9), managed.generation);
+}
+
+test "RuntimeDescriptor bounds lock contention" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lock = try tmp.dir.createFile(compat.io(), runtime_descriptor.lock_name, .{
+        .read = true,
+        .lock = .exclusive,
+    });
+    defer lock.close(compat.io());
+    const store = Store.init(allocator, tmp.dir);
+    try testing.expectError(
+        error.RuntimeDescriptorBusy,
+        store.publish(.missing, .{
+            .pid = 1,
+            .nonce = try nonce("11111111111111111111111111111111"),
+            .endpoint = "127.0.0.1:29001",
+        }),
+    );
 }
 
 fn observeAllocationFixture(allocator: std.mem.Allocator, root: std.Io.Dir) !void {

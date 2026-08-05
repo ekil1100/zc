@@ -1,6 +1,8 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
+const controller_endpoint = @import("controller_endpoint.zig");
+const daemon = @import("daemon.zig");
 const cli_output = @import("cli/output.zig");
 const runtime_selection = @import("runtime_selection.zig");
 const runtime_descriptor = @import("runtime_descriptor.zig");
@@ -186,22 +188,25 @@ pub fn resolveSelectGroup(cfg: *config.Config, group_name: ?[]const u8) !*config
 
 /// 校验并应用选择：文本模式打印确认行（stdout），随后通知运行中的 daemon。
 /// 返回 applied —— 是否成功通知了运行中的 daemon（envelope data.applied）。
+pub fn validateSelection(
+    group: *const config.ProxyGroup,
+    proxy_name: []const u8,
+) !void {
+    for (group.proxies.items) |candidate| {
+        if (std.mem.eql(u8, candidate, proxy_name)) return;
+    }
+    return error.ProxyNotFound;
+}
+
 pub fn applySelection(
     allocator: std.mem.Allocator,
-    cfg: *config.Config,
     group: *const config.ProxyGroup,
     proxy_name: []const u8,
     identity: ?config_identity.ManagedIdentity,
+    generation: ?u64,
     out: *cli_output.Output,
 ) !bool {
-    var found = false;
-    for (group.proxies.items) |p| {
-        if (std.mem.eql(u8, p, proxy_name)) {
-            found = true;
-            break;
-        }
-    }
-    if (!found) return error.ProxyNotFound;
+    try validateSelection(group, proxy_name);
 
     if (out.mode == .text) {
         try out.print("{s}✓{s} Selected {s}{s}{s} in group {s}{s}{s}\n", .{
@@ -213,7 +218,14 @@ pub fn applySelection(
         try out.flush();
     }
 
-    return notifyDaemon(allocator, cfg, group.name, proxy_name, identity, out);
+    return notifyDaemon(
+        allocator,
+        group.name,
+        proxy_name,
+        identity,
+        generation,
+        out,
+    );
 }
 
 pub const InteractiveSelection = struct {
@@ -443,40 +455,84 @@ fn drawProxyList(
 /// data.applied）。诊断提示只在文本模式输出（stderr，带样式开关）。
 fn notifyDaemon(
     allocator: std.mem.Allocator,
-    cfg: *config.Config,
     group_name: []const u8,
     proxy_name: []const u8,
     identity: ?config_identity.ManagedIdentity,
+    generation: ?u64,
     out: *cli_output.Output,
 ) bool {
-    var default_store = runtime_descriptor.openDefault(allocator, false) catch null;
-    defer if (default_store) |*value| value.deinit();
-    var descriptor: ?runtime_descriptor.Descriptor = if (default_store) |value|
-        value.store().observe() catch null
-    else
-        null;
-    defer if (descriptor) |*value| value.deinit();
-    const ec = if (descriptor) |runtime| blk: {
-        const expected = identity orelse break :blk cfg.external_controller orelse return false;
-        const actual = runtime.identity orelse return false;
-        if (!std.mem.eql(u8, expected.key, actual.key) or !expected.revision.eql(actual.revision)) {
-            noteDim(out, "(running daemon uses a different config revision; selection saved for restart)", .{});
-            return false;
-        }
-        break :blk runtime.endpoint;
-    } else cfg.external_controller orelse {
-        noteDim(out, "(no external-controller, restart daemon to apply)", .{});
+    const expected_identity = identity orelse {
+        noteDim(out, "(unmanaged config; import it before applying runtime selection)", .{});
         return false;
     };
+    const expected_generation = generation orelse {
+        noteDim(out, "(legacy selection has no generation; restart to apply)", .{});
+        return false;
+    };
+    var default_store = runtime_descriptor.openDefault(allocator, false) catch {
+        noteDim(out, "(runtime directory is not trustworthy; selection saved only)", .{});
+        return false;
+    } orelse {
+        noteDim(out, "(no tracked daemon descriptor; selection saved for restart)", .{});
+        return false;
+    };
+    defer default_store.deinit();
+    var descriptor = default_store.store().observe() catch {
+        noteDim(out, "(daemon descriptor is invalid; selection saved only)", .{});
+        return false;
+    } orelse {
+        noteDim(out, "(no tracked daemon descriptor; selection saved for restart)", .{});
+        return false;
+    };
+    defer descriptor.deinit();
 
-    const colon = std.mem.lastIndexOf(u8, ec, ":") orelse return false;
-    const port = std.fmt.parseInt(u16, ec[colon + 1 ..], 10) catch return false;
-    const host = ec[0..colon];
+    const tracked_pid = daemon.readPid(allocator) catch return false;
+    if (tracked_pid == null or tracked_pid.? <= 0 or
+        descriptor.pid != @as(u32, @intCast(tracked_pid.?)) or
+        !(daemon.isRunning(allocator) catch false))
+    {
+        noteDim(out, "(daemon descriptor is stale; selection saved for restart)", .{});
+        return false;
+    }
+    const confirmed_pid = daemon.readPid(allocator) catch return false;
+    if (confirmed_pid == null or confirmed_pid.? != tracked_pid.?) {
+        noteDim(out, "(daemon identity changed; selection saved for restart)", .{});
+        return false;
+    }
+    const actual_identity = descriptor.identity orelse return false;
+    if (!std.mem.eql(u8, expected_identity.key, actual_identity.key) or
+        !expected_identity.revision.eql(actual_identity.revision))
+    {
+        noteDim(
+            out,
+            "(running daemon uses a different config revision; selection saved for restart)",
+            .{},
+        );
+        return false;
+    }
+    if (expected_generation <= descriptor.generation) {
+        noteDim(out, "(daemon generation is stale; restart to reconcile selection)", .{});
+        return false;
+    }
+    const ec = descriptor.endpoint orelse {
+        noteDim(out, "(daemon controller is disabled; selection saved for restart)", .{});
+        return false;
+    };
+    const endpoint = controller_endpoint.parse(ec) catch return false;
 
-    // PUT body 经 std.json 序列化（节点名真实转义，禁止手拼 JSON）。
+    var nonce_hex: [32]u8 = undefined;
+    var revision_hex: [32]u8 = undefined;
+    const instance_nonce = descriptor.nonce.formatHex(&nonce_hex);
+    const revision = expected_identity.revision.formatHex(&revision_hex);
     var body_writer: std.Io.Writer.Allocating = .init(allocator);
     defer body_writer.deinit();
-    std.json.Stringify.value(.{ .name = proxy_name }, .{ .whitespace = .minified }, &body_writer.writer) catch return false;
+    std.json.Stringify.value(.{
+        .name = proxy_name,
+        .instance_nonce = instance_nonce,
+        .identity_key = expected_identity.key,
+        .identity_revision = revision,
+        .generation = expected_generation,
+    }, .{ .whitespace = .minified }, &body_writer.writer) catch return false;
     const body = body_writer.written();
 
     // 组名进 URL path 必须百分号编码：含空格的组名否则会截断请求行，
@@ -489,7 +545,11 @@ fn notifyDaemon(
     const req = std.fmt.allocPrint(allocator, "PUT /proxies/{s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ encoded_group, ec, body.len, body }) catch return false;
     defer allocator.free(req);
 
-    const stream = compat.net.tcpConnectToHost(allocator, host, port) catch {
+    const stream = compat.net.tcpConnectToHost(
+        allocator,
+        controller_endpoint.loopback_host,
+        endpoint.port,
+    ) catch {
         noteDim(out, "(daemon not reachable at {s}, restart to apply)", .{ec});
         return false;
     };
@@ -780,13 +840,35 @@ test "applySelection validates membership and reports applied=false without cont
     var out = streams.output(.text);
 
     const group = try resolveSelectGroup(&cfg, "Proxy");
-    try testing.expectError(error.ProxyNotFound, applySelection(allocator, &cfg, group, "missing", null, &out));
+    try testing.expectError(
+        error.ProxyNotFound,
+        applySelection(allocator, group, "missing", null, null, &out),
+    );
 
-    const applied = try applySelection(allocator, &cfg, group, "Auto", null, &out);
+    const applied = try applySelection(
+        allocator,
+        group,
+        "Auto",
+        null,
+        null,
+        &out,
+    );
     try testing.expect(!applied);
-    // 确认行在 stdout，daemon 提示在 stderr。
-    try testing.expect(std.mem.indexOf(u8, streams.out_alloc.written(), "Selected Auto in group Proxy") != null);
-    try testing.expect(std.mem.indexOf(u8, streams.err_alloc.written(), "no external-controller") != null);
+    // Confirmation stays on stdout; daemon discovery diagnostics use stderr.
+    try testing.expect(
+        std.mem.indexOf(
+            u8,
+            streams.out_alloc.written(),
+            "Selected Auto in group Proxy",
+        ) != null,
+    );
+    try testing.expect(
+        std.mem.indexOf(
+            u8,
+            streams.err_alloc.written(),
+            "unmanaged config",
+        ) != null,
+    );
 }
 
 test "applySelection in json mode keeps stdout free for the envelope" {
@@ -799,7 +881,14 @@ test "applySelection in json mode keeps stdout free for the envelope" {
     var out = streams.output(.json);
 
     const group = try resolveSelectGroup(&cfg, "Proxy");
-    const applied = try applySelection(allocator, &cfg, group, "Auto", null, &out);
+    const applied = try applySelection(
+        allocator,
+        group,
+        "Auto",
+        null,
+        null,
+        &out,
+    );
     try testing.expect(!applied);
     try testing.expectEqualStrings("", streams.out_alloc.written());
     try testing.expectEqualStrings("", streams.err_alloc.written());

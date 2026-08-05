@@ -3,16 +3,20 @@ const compat = @import("compat.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const constants = @import("constants.zig");
+const controller_endpoint = @import("controller_endpoint.zig");
 const runtime_selection = @import("runtime_selection.zig");
+const runtime_descriptor = @import("runtime_descriptor.zig");
+const runtime_dir = @import("runtime_dir.zig");
+const socket_options = @import("socket_options.zig");
 const cli_output = @import("cli/output.zig");
-
-// PID 文件路径
-const PID_FILE = "/tmp/zc.pid";
-const LOCK_FILE = "/tmp/zc.lock";
-const LOG_FILE = "/tmp/zc.log";
-const startup_poll_interval_ms: u64 = 200;
-const startup_poll_attempts: usize = 10;
+const startup_poll_interval_ms: u64 = 25;
+const startup_lock_wait_ms: i64 = 80_000;
+const override_timeout_ms_default: i64 = 5_000;
+const startup_overhead_timeout_ms: i64 = 20_000;
 const command_probe_max_output_bytes: usize = 16 * 1024;
+const daemon_status_response_max_bytes: usize = 4 * 1024 * 1024 + 64 * 1024;
+const daemon_status_io_timeout_ms: i64 = 2_000;
+pub const daemon_log_max_bytes: u64 = 8 * 1024 * 1024;
 
 pub const ApplyMode = enum {
     auto,
@@ -41,6 +45,7 @@ const StatusSnapshot = struct {
     pid: ?i32 = null,
     uptime_seconds: ?i64 = null,
     active_config: ?[]const u8 = null,
+    runtime_state_available: ?bool = null,
     selected_proxies: []runtime_selection.SelectedProxy = &[_]runtime_selection.SelectedProxy{},
     pid_file: []const u8,
     lock_file: []const u8,
@@ -70,55 +75,50 @@ const RuntimeInspector = struct {
     pid_is_daemon: *const fn (std.mem.Allocator, i32) anyerror!bool,
 };
 
-/// 获取 PID 文件路径
+fn getRuntimeFilePath(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) ![]const u8 {
+    const directory = try runtime_dir.defaultPath(allocator);
+    defer allocator.free(directory);
+    return compat.fs.path.join(allocator, &.{ directory, name });
+}
+
 pub fn getPidFilePath(allocator: std.mem.Allocator) ![]const u8 {
-    return getRuntimeFilePath(allocator, "zc.pid", PID_FILE);
+    return getRuntimeFilePath(allocator, runtime_dir.pid_name);
 }
 
-/// 获取 lock 文件路径
 fn getLockFilePath(allocator: std.mem.Allocator) ![]const u8 {
-    return getRuntimeFilePath(allocator, "zc.lock", LOCK_FILE);
+    return getRuntimeFilePath(allocator, runtime_dir.lock_name);
 }
 
-fn getRuntimeFilePath(allocator: std.mem.Allocator, basename: []const u8, fallback: []const u8) ![]const u8 {
-    // 优先使用 XDG_RUNTIME_DIR，否则使用 /tmp
-    if (compat.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR")) |runtime_dir| {
-        const path = try compat.fs.path.join(allocator, &.{ runtime_dir, basename });
-        allocator.free(runtime_dir);
-        return path;
-    } else |_| {
-        return try allocator.dupe(u8, fallback);
-    }
-}
-
-/// 获取日志文件路径
 pub fn getLogFilePath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = compat.getEnvVarOwned(allocator, "HOME") catch {
-        return try allocator.dupe(u8, LOG_FILE);
-    };
-    defer allocator.free(home);
-
-    // 使用 ~/.local/share/zc/zc.log
-    const log_dir = try compat.fs.path.join(allocator, &.{ home, ".local/share/zc" });
-    defer allocator.free(log_dir);
-
-    // 创建目录
-    compat.fs.makeDirAbsolute(log_dir) catch |err| {
-        if (err != error.PathAlreadyExists) {
-            // 回退到 /tmp
-            return try allocator.dupe(u8, LOG_FILE);
-        }
-    };
-
-    return try compat.fs.path.join(allocator, &.{ log_dir, "zc.log" });
+    return getRuntimeFilePath(allocator, runtime_dir.log_name);
 }
 
-/// 读取 PID 文件
 pub fn readPid(allocator: std.mem.Allocator) !?i32 {
-    const pid_file = try getPidFilePath(allocator);
-    defer allocator.free(pid_file);
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse return null;
+    defer runtime.deinit();
+    return readPidInRuntime(runtime);
+}
 
-    return readPidAtPath(pid_file);
+fn readPidInRuntime(runtime: runtime_dir.RuntimeDir) !?i32 {
+    const file = runtime.openFile(runtime_dir.pid_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(compat.io());
+    const stat = try file.stat(compat.io());
+    if (stat.size == 0) return error.InvalidPidFile;
+    if (stat.size > 32) return error.InvalidPidFile;
+    var buffer: [32]u8 = undefined;
+    const count = try compat.fileReadAll(file, buffer[0..@intCast(stat.size)]);
+    if (count != stat.size) return error.InvalidPidFile;
+    const text = std.mem.trim(u8, buffer[0..count], " \t\n\r");
+    const pid = std.fmt.parseInt(i32, text, 10) catch
+        return error.InvalidPidFile;
+    if (pid <= 0) return error.InvalidPidFile;
+    return pid;
 }
 
 fn readPidAtPath(pid_file: []const u8) !?i32 {
@@ -133,15 +133,23 @@ fn readPidAtPath(pid_file: []const u8) !?i32 {
     if (n == 0) return null;
 
     const pid_str = std.mem.trim(u8, buf[0..n], " \t\n\r");
-    return std.fmt.parseInt(i32, pid_str, 10) catch null;
+    const pid = std.fmt.parseInt(i32, pid_str, 10) catch
+        return error.InvalidPidFile;
+    if (pid <= 0) return error.InvalidPidFile;
+    return pid;
 }
 
-/// 写入 PID 文件
-pub fn writePid(allocator: std.mem.Allocator, pid: i32) !void {
-    const pid_file = try getPidFilePath(allocator);
-    defer allocator.free(pid_file);
+fn writePidInRuntime(runtime: runtime_dir.RuntimeDir, pid: i32) !void {
+    var buffer: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, "{d}\n", .{pid});
+    try runtime.replaceFile(runtime_dir.pid_name, text);
+}
 
-    try writePidAtPath(pid_file, pid);
+pub fn writePid(allocator: std.mem.Allocator, pid: i32) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, true)) orelse
+        return error.InvalidRuntimeDirectory;
+    defer runtime.deinit();
+    return writePidInRuntime(runtime, pid);
 }
 
 fn writePidAtPath(pid_file: []const u8, pid: i32) !void {
@@ -153,15 +161,244 @@ fn writePidAtPath(pid_file: []const u8, pid: i32) !void {
     try compat.fileWriteAll(file, pid_str);
 }
 
-/// 删除 PID 文件
-pub fn removePidFile(allocator: std.mem.Allocator) void {
-    const pid_file = getPidFilePath(allocator) catch return;
-    defer allocator.free(pid_file);
-    removePidFileAtPath(pid_file);
+pub fn removeCurrentProcessPid(allocator: std.mem.Allocator) !bool {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse return false;
+    defer runtime.deinit();
+    const current = (try readPidInRuntime(runtime)) orelse return false;
+    if (current != std.c.getpid()) return false;
+    try runtime.deleteFile(runtime_dir.pid_name);
+    return true;
+}
+
+pub fn cleanupCurrentProcessRuntime(allocator: std.mem.Allocator) void {
+    const pid = std.c.getpid();
+    const nonce = descriptorNonceForPid(allocator, pid);
+    _ = removeCurrentProcessPid(allocator) catch false;
+    removeDescriptor(allocator, nonce);
+}
+
+pub const StartupFailure = enum {
+    generic,
+    port_in_use,
+    controller_port_in_use,
+    port_conflict,
+    invalid_bind_address,
+    invalid_controller,
+    listener_failed,
+    readiness,
+    runtime_publish,
+    lock_handoff,
+    capability,
+    override_not_found,
+    override_exec,
+    override_timeout,
+    override_output,
+    override_merge,
+};
+
+pub const StartupSignal = union(enum) {
+    ready,
+    failed: StartupFailure,
+};
+
+fn startupFailureError(failure: StartupFailure) anyerror {
+    return switch (failure) {
+        .generic => error.StartFailed,
+        .port_in_use => error.PortAlreadyInUse,
+        .controller_port_in_use => error.ControllerPortAlreadyInUse,
+        .port_conflict => error.PortConflict,
+        .invalid_bind_address => error.InvalidBindAddress,
+        .invalid_controller => error.InvalidExternalController,
+        .listener_failed => error.ListenerStartupFailed,
+        .readiness => error.StartupTimeout,
+        .runtime_publish => error.StartRuntimePublishFailed,
+        .lock_handoff => error.StartLockHandoffInvalid,
+        .capability => error.UnsupportedCapability,
+        .override_not_found => error.OverrideScriptNotFound,
+        .override_exec => error.OverrideScriptExecFailed,
+        .override_timeout => error.OverrideScriptTimeout,
+        .override_output => error.OverrideOutputInvalid,
+        .override_merge => error.OverrideMergeFailed,
+    };
+}
+
+fn nonceFileName(
+    prefix: []const u8,
+    nonce: runtime_descriptor.Nonce,
+    buffer: []u8,
+) []const u8 {
+    std.debug.assert(buffer.len == prefix.len + 32);
+    @memcpy(buffer[0..prefix.len], prefix);
+    const hex: *[32]u8 = buffer[prefix.len..][0..32];
+    _ = nonce.formatHex(hex);
+    return buffer;
+}
+
+fn startupSignalText(signal: StartupSignal) []const u8 {
+    return switch (signal) {
+        .ready => "ready\n",
+        .failed => |failure| switch (failure) {
+            .generic => "error:generic\n",
+            .port_in_use => "error:port_in_use\n",
+            .controller_port_in_use => "error:controller_port_in_use\n",
+            .port_conflict => "error:port_conflict\n",
+            .invalid_bind_address => "error:invalid_bind_address\n",
+            .invalid_controller => "error:invalid_controller\n",
+            .listener_failed => "error:listener_failed\n",
+            .readiness => "error:readiness\n",
+            .runtime_publish => "error:runtime_publish\n",
+            .lock_handoff => "error:lock_handoff\n",
+            .capability => "error:capability\n",
+            .override_not_found => "error:override_not_found\n",
+            .override_exec => "error:override_exec\n",
+            .override_timeout => "error:override_timeout\n",
+            .override_output => "error:override_output\n",
+            .override_merge => "error:override_merge\n",
+        },
+    };
+}
+
+pub fn publishStartupSignal(
+    allocator: std.mem.Allocator,
+    token: runtime_descriptor.Nonce,
+    signal: StartupSignal,
+) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return error.RuntimeDirectoryUnavailable;
+    defer runtime.deinit();
+    var name_buffer: [runtime_dir.startup_prefix.len + 32]u8 = undefined;
+    const name = nonceFileName(
+        runtime_dir.startup_prefix,
+        token,
+        &name_buffer,
+    );
+    try runtime.replaceFile(name, startupSignalText(signal));
+}
+
+fn observeStartupSignal(
+    runtime: runtime_dir.RuntimeDir,
+    token: runtime_descriptor.Nonce,
+) !?StartupSignal {
+    var name_buffer: [runtime_dir.startup_prefix.len + 32]u8 = undefined;
+    const name = nonceFileName(
+        runtime_dir.startup_prefix,
+        token,
+        &name_buffer,
+    );
+    const file = runtime.openFile(name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(compat.io());
+    var buffer: [64]u8 = undefined;
+    const count = try compat.fileReadAll(file, &buffer);
+    const text = buffer[0..count];
+    if (std.mem.eql(u8, text, "ready\n")) return .ready;
+    inline for (std.meta.fields(StartupFailure)) |field| {
+        const expected = "error:" ++ field.name ++ "\n";
+        if (std.mem.eql(u8, text, expected)) {
+            return .{ .failed = @enumFromInt(field.value) };
+        }
+    }
+    return error.InvalidStartupSignal;
+}
+
+fn removeStartupSignal(
+    runtime: runtime_dir.RuntimeDir,
+    token: runtime_descriptor.Nonce,
+) void {
+    var name_buffer: [runtime_dir.startup_prefix.len + 32]u8 = undefined;
+    const name = nonceFileName(
+        runtime_dir.startup_prefix,
+        token,
+        &name_buffer,
+    );
+    runtime.deleteFile(name) catch {};
+}
+
+fn stopRequestBytes(nonce: runtime_descriptor.Nonce, buffer: *[33]u8) []const u8 {
+    const hex: *[32]u8 = buffer[0..32];
+    _ = nonce.formatHex(hex);
+    buffer[32] = '\n';
+    return buffer;
+}
+
+fn stopRequestName(
+    nonce: runtime_descriptor.Nonce,
+    buffer: *[runtime_dir.stop_prefix.len + 32]u8,
+) []const u8 {
+    @memcpy(buffer[0..runtime_dir.stop_prefix.len], runtime_dir.stop_prefix);
+    const hex: *[32]u8 = buffer[runtime_dir.stop_prefix.len..];
+    _ = nonce.formatHex(hex);
+    return buffer;
+}
+
+fn publishStopRequest(
+    allocator: std.mem.Allocator,
+    nonce: runtime_descriptor.Nonce,
+) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return error.RuntimeDirectoryUnavailable;
+    defer runtime.deinit();
+    var name_buffer: [runtime_dir.stop_prefix.len + 32]u8 = undefined;
+    const name = stopRequestName(nonce, &name_buffer);
+    var content_buffer: [33]u8 = undefined;
+    try runtime.replaceFile(name, stopRequestBytes(nonce, &content_buffer));
+}
+
+pub fn consumeStopRequest(
+    allocator: std.mem.Allocator,
+    expected: runtime_descriptor.Nonce,
+) !bool {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse return false;
+    defer runtime.deinit();
+    var name_buffer: [runtime_dir.stop_prefix.len + 32]u8 = undefined;
+    const name = stopRequestName(expected, &name_buffer);
+    const file = runtime.openFile(name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close(compat.io());
+    const stat = try file.stat(compat.io());
+    if (stat.size != 33) return error.InvalidStopRequest;
+    var buffer: [33]u8 = undefined;
+    const count = try compat.fileReadAll(file, &buffer);
+    if (count != buffer.len or buffer[32] != '\n') {
+        return error.InvalidStopRequest;
+    }
+    const observed = runtime_descriptor.Nonce.parseHex(buffer[0..32]) catch
+        return error.InvalidStopRequest;
+    if (!observed.eql(expected)) return false;
+    try runtime.deleteFile(name);
+    return true;
 }
 
 fn removePidFileAtPath(pid_file: []const u8) void {
     compat.fs.deleteFileAbsolute(pid_file) catch {};
+}
+
+fn removePidIfMatchesInRuntime(
+    runtime: runtime_dir.RuntimeDir,
+    expected_pid: i32,
+) !bool {
+    var lock = acquireDaemonLockFileInRuntime(runtime) catch |err| switch (err) {
+        error.DaemonAlreadyRunning => return false,
+        else => return err,
+    };
+    defer lock.close(compat.io());
+    const current = (try readPidInRuntime(runtime)) orelse return false;
+    if (current != expected_pid) return false;
+    try runtime.deleteFile(runtime_dir.pid_name);
+    return true;
+}
+
+fn removePidIfMatches(
+    allocator: std.mem.Allocator,
+    expected_pid: i32,
+) !bool {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse return false;
+    defer runtime.deinit();
+    return removePidIfMatchesInRuntime(runtime, expected_pid);
 }
 
 fn isDaemonBinaryPath(argv0: []const u8) bool {
@@ -349,35 +586,146 @@ fn inspectRuntimeAtPathsWithInspector(
     };
 }
 
-fn inspectRuntimeAtPaths(allocator: std.mem.Allocator, pid_file: []const u8, lock_file: []const u8) !RuntimeState {
-    return inspectRuntimeAtPathsWithInspector(allocator, pid_file, lock_file, .{
+const DescriptorProcess = struct {
+    pid: i32,
+    ready: bool,
+};
+
+fn descriptorProcessInRuntime(
+    allocator: std.mem.Allocator,
+    runtime: runtime_dir.RuntimeDir,
+) !?DescriptorProcess {
+    const store = runtime_descriptor.Store.init(allocator, runtime.dir);
+    var descriptor = (try store.observe()) orelse return null;
+    defer descriptor.deinit();
+    if (descriptor.pid > std.math.maxInt(i32)) {
+        return error.RuntimeIdentityUncertain;
+    }
+    return .{
+        .pid = @intCast(descriptor.pid),
+        .ready = descriptor.ready,
+    };
+}
+
+fn inspectRuntimeWithInspector(
+    allocator: std.mem.Allocator,
+    inspector: RuntimeInspector,
+) !RuntimeState {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return .{};
+    defer runtime.deinit();
+    var stale_pid: ?i32 = null;
+    var candidate_pid: ?i32 = null;
+
+    if (try readPidInRuntime(runtime)) |pid| {
+        if (try inspector.pid_is_daemon(allocator, pid)) {
+            candidate_pid = pid;
+        } else {
+            stale_pid = pid;
+            _ = removePidIfMatchesInRuntime(runtime, pid) catch false;
+        }
+    }
+    const lock_held = try isDaemonLockHeldInRuntime(runtime);
+    const descriptor_process = try descriptorProcessInRuntime(
+        allocator,
+        runtime,
+    );
+    if (candidate_pid) |pid| {
+        const descriptor_matches = descriptor_process != null and
+            descriptor_process.?.pid == pid;
+        if (lock_held) {
+            if (descriptor_matches and descriptor_process.?.ready) {
+                return .{ .pid = pid, .lock_held = true };
+            }
+            return .{
+                .detail = if (descriptor_matches)
+                    "startup_in_progress"
+                else
+                    "lock_held_pid_untracked",
+                .lock_held = true,
+            };
+        }
+        if (descriptor_matches) return error.RuntimeLockIntegrityLost;
+        return error.RuntimeIdentityUncertain;
+    }
+    if (descriptor_process) |process| {
+        if (try inspector.pid_is_daemon(allocator, process.pid)) {
+            if (!lock_held) return error.RuntimeLockIntegrityLost;
+            if (process.ready) {
+                return .{ .pid = process.pid, .lock_held = true };
+            }
+            return .{
+                .detail = "startup_in_progress",
+                .lock_held = true,
+            };
+        }
+    }
+    if (lock_held) {
+        return .{
+            .detail = "startup_in_progress",
+            .lock_held = true,
+            .stale_pid = stale_pid,
+        };
+    }
+    return .{
+        .detail = if (stale_pid != null) "stale_pid_file" else null,
+        .stale_pid = stale_pid,
+    };
+}
+
+fn inspectRuntime(allocator: std.mem.Allocator) !RuntimeState {
+    return inspectRuntimeWithInspector(allocator, .{
         .pid_is_daemon = pidMatchesRunningDaemon,
     });
 }
 
-fn inspectRuntime(allocator: std.mem.Allocator) !RuntimeState {
-    const pid_file = try getPidFilePath(allocator);
-    defer allocator.free(pid_file);
-    const lock_file = try getLockFilePath(allocator);
-    defer allocator.free(lock_file);
-    return try inspectRuntimeAtPaths(allocator, pid_file, lock_file);
+fn rejectLiveTrackedPidAfterLockAcquire(
+    allocator: std.mem.Allocator,
+) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse return;
+    defer runtime.deinit();
+    const descriptor_process = try descriptorProcessInRuntime(
+        allocator,
+        runtime,
+    );
+    const pid = (try readPidInRuntime(runtime)) orelse
+        (if (descriptor_process) |process| process.pid else return);
+    if (try pidMatchesRunningDaemon(allocator, pid) and
+        descriptor_process != null and descriptor_process.?.pid == pid)
+    {
+        return error.RuntimeLockIntegrityLost;
+    }
 }
 
 fn readTrackedPid(allocator: std.mem.Allocator) !?i32 {
     return (try inspectRuntime(allocator)).pid;
 }
 
-fn waitForTrackedRunningPid(allocator: std.mem.Allocator) !?i32 {
-    var attempt: usize = 0;
-    while (attempt < startup_poll_attempts) : (attempt += 1) {
-        if (try readTrackedPid(allocator)) |pid| return pid;
+const LockWaitOutcome = union(enum) {
+    ready: i32,
+    unlocked,
+    timeout,
+};
+
+fn waitForReadyOrUnlocked(
+    allocator: std.mem.Allocator,
+    deadline: i64,
+) !LockWaitOutcome {
+    while (compat.monotonicMilliTimestamp() < deadline) {
+        const runtime = try inspectRuntime(allocator);
+        if (runtime.pid) |pid| return .{ .ready = pid };
+        if (!runtime.lock_held) return .unlocked;
         compat.sleepNs(startup_poll_interval_ms * std.time.ns_per_ms);
     }
-    return null;
+    return .timeout;
 }
 
 fn duplicateWithoutCloexec(file: compat.fs.File) !compat.fs.File {
-    const dup_fd = std.c.dup(file.handle);
+    const dup_fd = std.c.fcntl(
+        file.handle,
+        std.c.F.DUPFD,
+        @as(c_int, 3),
+    );
     if (dup_fd < 0) return error.Unexpected;
     file.close(compat.io());
     return .{ .handle = dup_fd, .flags = file.flags };
@@ -397,10 +745,151 @@ fn acquireDaemonLockFileAtPath(lock_file_path: []const u8) !compat.fs.File {
     return try duplicateWithoutCloexec(lock_file);
 }
 
+fn acquireDaemonLockFileInRuntime(
+    runtime: runtime_dir.RuntimeDir,
+) !compat.fs.File {
+    while (true) {
+        const lock_file = runtime.openFile(runtime_dir.lock_name, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                const created = runtime.createExclusive(runtime_dir.lock_name) catch |create_err| switch (create_err) {
+                    error.PathAlreadyExists => continue,
+                    else => return create_err,
+                };
+                created.close(compat.io());
+                continue;
+            },
+            error.WouldBlock => return error.DaemonAlreadyRunning,
+            error.SymLinkLoop, error.IsDir => return error.InvalidRuntimeLock,
+            else => return err,
+        };
+        errdefer lock_file.close(compat.io());
+        try lock_file.setPermissions(compat.io(), runtime_dir.ownerFilePermissions());
+        return duplicateWithoutCloexec(lock_file);
+    }
+}
+
 fn acquireDaemonLockFile(allocator: std.mem.Allocator) !compat.fs.File {
-    const lock_file_path = try getLockFilePath(allocator);
-    defer allocator.free(lock_file_path);
-    return try acquireDaemonLockFileAtPath(lock_file_path);
+    var runtime = (try runtime_dir.openDefault(allocator, true)) orelse
+        return error.InvalidRuntimeDirectory;
+    defer runtime.deinit();
+    return acquireDaemonLockFileInRuntime(runtime);
+}
+
+fn isDaemonLockHeldInRuntime(runtime: runtime_dir.RuntimeDir) !bool {
+    const lock_file = runtime.openFile(runtime_dir.lock_name, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        error.WouldBlock => return true,
+        error.SymLinkLoop, error.IsDir => return error.InvalidRuntimeLock,
+        else => return err,
+    };
+    lock_file.close(compat.io());
+    return false;
+}
+
+fn resetLogPathIfOversized(runtime: runtime_dir.RuntimeDir) !bool {
+    const file = runtime.openFile(runtime_dir.log_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    const size = (try file.stat(compat.io())).size;
+    file.close(compat.io());
+    if (size <= daemon_log_max_bytes) return false;
+    try runtime.replaceFile(runtime_dir.log_name, "");
+    return true;
+}
+
+pub fn rotateDaemonLogIfNeeded(allocator: std.mem.Allocator) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse return;
+    defer runtime.deinit();
+    const writer: std.Io.File = .{
+        .handle = std.c.STDERR_FILENO,
+        .flags = .{ .nonblocking = false },
+    };
+    const writer_stat = try writer.stat(compat.io());
+    const path_stat = runtime.dir.statFile(
+        compat.io(),
+        runtime_dir.log_name,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    const path_matches = if (path_stat) |stat|
+        stat.kind == .file and stat.inode == writer_stat.inode
+    else
+        false;
+    if (path_matches and writer_stat.size <= daemon_log_max_bytes) return;
+
+    var temporary_name_buffer: [64]u8 = undefined;
+    const temporary_name = try std.fmt.bufPrint(
+        &temporary_name_buffer,
+        "zc.log.rotate.{d}",
+        .{std.c.getpid()},
+    );
+    runtime.deleteFile(temporary_name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const replacement = try runtime.createExclusive(temporary_name);
+    defer replacement.close(compat.io());
+    var temporary_owned = true;
+    defer if (temporary_owned) runtime.deleteFile(temporary_name) catch {};
+    try replacement.setPermissions(
+        compat.io(),
+        runtime_dir.ownerFilePermissions(),
+    );
+    if (std.c.dup2(replacement.handle, std.c.STDOUT_FILENO) < 0 or
+        std.c.dup2(replacement.handle, std.c.STDERR_FILENO) < 0)
+    {
+        return error.LogRedirectFailed;
+    }
+    try runtime.dir.rename(
+        temporary_name,
+        runtime.dir,
+        runtime_dir.log_name,
+        compat.io(),
+    );
+    temporary_owned = false;
+    const parent = try runtime.dir.openFile(
+        compat.io(),
+        ".",
+        .{ .allow_directory = true },
+    );
+    defer parent.close(compat.io());
+    try parent.sync(compat.io());
+}
+
+fn openLogFileInRuntime(runtime: runtime_dir.RuntimeDir) !compat.fs.File {
+    _ = try resetLogPathIfOversized(runtime);
+    while (true) {
+        const file = runtime.openFile(runtime_dir.log_name, .{
+            .mode = .read_write,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                const created = runtime.createExclusive(runtime_dir.log_name) catch |create_err| switch (create_err) {
+                    error.PathAlreadyExists => continue,
+                    else => return create_err,
+                };
+                created.close(compat.io());
+                continue;
+            },
+            error.SymLinkLoop, error.IsDir => return error.InvalidRuntimeLog,
+            else => return err,
+        };
+        errdefer file.close(compat.io());
+        try file.setPermissions(compat.io(), runtime_dir.ownerFilePermissions());
+        const size = (try file.stat(compat.io())).size;
+        try compat.fileSeekTo(file, size);
+        return file;
+    }
 }
 
 fn isDaemonLockHeldAtPath(lock_file_path: []const u8) !bool {
@@ -419,8 +908,141 @@ pub fn isRunning(allocator: std.mem.Allocator) !bool {
 
 /// `zc start --foreground`（决策 D1）：不 fork，由调用方持有 daemon 锁直到
 /// 进程退出，防止与后台 daemon 双实例并存。
+pub fn protectDaemonLockFromExec(fd: std.posix.fd_t) !void {
+    if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC)) < 0) {
+        return error.DaemonLockCloexecFailed;
+    }
+}
+
+const FileIdentity = struct {
+    device: u64,
+    inode: u64,
+
+    fn eql(a: FileIdentity, b: FileIdentity) bool {
+        return a.device == b.device and a.inode == b.inode;
+    }
+};
+
+fn fileIdentity(fd: std.posix.fd_t) !FileIdentity {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stat = std.mem.zeroes(linux.Statx);
+        const result = linux.statx(
+            fd,
+            "",
+            linux.AT.EMPTY_PATH,
+            .{ .INO = true },
+            &stat,
+        );
+        if (linux.errno(result) != .SUCCESS or !stat.mask.INO) {
+            return error.FileIdentityUnavailable;
+        }
+        return .{
+            .device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
+            .inode = stat.ino,
+        };
+    }
+
+    var stat = std.mem.zeroes(std.posix.Stat);
+    if (std.posix.errno(std.posix.system.fstat(fd, &stat)) != .SUCCESS) {
+        return error.FileIdentityUnavailable;
+    }
+    return .{
+        .device = @intCast(stat.dev),
+        .inode = @intCast(stat.ino),
+    };
+}
+
+fn runtimeLockIdentity(runtime: runtime_dir.RuntimeDir) !FileIdentity {
+    const file = try runtime.dir.openFile(compat.io(), runtime_dir.lock_name, .{
+        .path_only = true,
+        .follow_symlinks = false,
+    });
+    defer file.close(compat.io());
+    if ((try file.stat(compat.io())).kind != .file) {
+        return error.InvalidInheritedDaemonLock;
+    }
+    return fileIdentity(file.handle);
+}
+
+pub fn validateInheritedDaemonLockIdentity(
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return error.InvalidRuntimeDirectory;
+    defer runtime.deinit();
+    const inherited: std.Io.File = .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+    const actual = try fileIdentity(fd);
+    const expected = try runtimeLockIdentity(runtime);
+    if ((try inherited.stat(compat.io())).kind != .file or
+        !actual.eql(expected))
+    {
+        return error.InvalidInheritedDaemonLock;
+    }
+}
+
+pub fn adoptInheritedDaemonLock(
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+) !void {
+    var runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+        return error.InvalidRuntimeDirectory;
+    defer runtime.deinit();
+    const inherited: std.Io.File = .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+    if ((try inherited.stat(compat.io())).kind != .file) {
+        return error.InvalidInheritedDaemonLock;
+    }
+    const actual = try fileIdentity(fd);
+    if (!actual.eql(try runtimeLockIdentity(runtime))) {
+        return error.InvalidInheritedDaemonLock;
+    }
+    if (!try inherited.tryLock(compat.io(), .exclusive)) {
+        return error.InvalidInheritedDaemonLock;
+    }
+    if (!actual.eql(try runtimeLockIdentity(runtime))) {
+        return error.InvalidInheritedDaemonLock;
+    }
+    try protectDaemonLockFromExec(fd);
+}
+
+pub fn publishStartupReservation(
+    allocator: std.mem.Allocator,
+    nonce: runtime_descriptor.Nonce,
+    pid: i32,
+) !void {
+    if (pid <= 0) return error.InvalidRuntimeDescriptor;
+    var default_store = (try runtime_descriptor.openDefault(
+        allocator,
+        true,
+    )) orelse return error.RuntimeDirectoryUnavailable;
+    defer default_store.deinit();
+    const outcome = try default_store.store().publish(.missing, .{
+        .pid = @intCast(pid),
+        .nonce = nonce,
+        .ready = false,
+    });
+    switch (outcome) {
+        .committed, .durability_uncertain => {},
+        .conflict => return error.RuntimeDescriptorConflict,
+    }
+}
+
+pub fn prepareForegroundRuntime(allocator: std.mem.Allocator) !void {
+    return clearStaleDescriptorBeforeStart(allocator);
+}
+
 pub fn acquireForegroundLock(allocator: std.mem.Allocator) !compat.fs.File {
-    return try acquireDaemonLockFile(allocator);
+    const lock = try acquireDaemonLockFile(allocator);
+    errdefer lock.close(compat.io());
+    try protectDaemonLockFromExec(lock.handle);
+    return lock;
 }
 
 fn getDaemonUptime(pid: ?i32) !?i64 {
@@ -444,12 +1066,22 @@ fn collectStatusSnapshot(allocator: std.mem.Allocator) !StatusSnapshot {
     errdefer allocator.free(lock_file);
     const log_file = try getLogFilePath(allocator);
     errdefer allocator.free(log_file);
-    const active_config = try config.resolveRuntimeConfigKey(allocator, null);
+    const runtime = try inspectRuntime(allocator);
+    if (runtime.detail != null and
+        std.mem.eql(u8, runtime.detail.?, "startup_in_progress"))
+    {
+        return error.RuntimeStartupInProgress;
+    }
+    const active_config: ?[]const u8 = if (runtime.pid == null and !runtime.lock_held)
+        try config.resolveRuntimeConfigKey(allocator, null)
+    else
+        null;
     errdefer if (active_config) |value| allocator.free(value);
-    const selected_proxies = try collectStatusSelectedProxies(allocator, active_config);
+    const selected_proxies = if (runtime.pid == null and !runtime.lock_held)
+        try collectStatusSelectedProxies(allocator, active_config)
+    else
+        try allocator.alloc(runtime_selection.SelectedProxy, 0);
     errdefer runtime_selection.deinitSelectedProxies(allocator, selected_proxies);
-
-    const runtime = try inspectRuntimeAtPaths(allocator, pid_file, lock_file);
     if (runtime.pid) |p| {
         return .{
             .state = "running",
@@ -511,6 +1143,16 @@ const DaemonStatus = struct {
 /// 解析 daemon GET /status 的 JSON body 为 DaemonStatus。纯函数（不起 socket），
 /// 便于测试。失败（非 JSON / 缺字段）返回 null，调用方回退到文件路径。
 fn parseDaemonStatusJson(allocator: std.mem.Allocator, body: []const u8) !?DaemonStatus {
+    var shape = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return null;
+    defer shape.deinit();
+    if (shape.value != .object or
+        shape.value.object.get("config_key") == null or
+        shape.value.object.get("selected_proxies") == null)
+    {
+        return null;
+    }
+
     const StatusProxy = struct {
         group: []const u8 = "",
         proxy: ?[]const u8 = null,
@@ -553,34 +1195,126 @@ fn parseDaemonStatusJson(allocator: std.mem.Allocator, body: []const u8) !?Daemo
     };
 }
 
-/// 经 IPC（external_controller）读取 daemon 实际运行时状态。daemon 不可达
-/// 或响应异常时返回 null，调用方回退到 meta.json 文件路径。
-fn fetchDaemonStatusOverIpc(allocator: std.mem.Allocator) !?DaemonStatus {
-    var cfg = config.loadDefaultQuiet(allocator) catch return null;
-    defer cfg.deinit();
-    const ec = cfg.external_controller orelse return null;
-    return try fetchDaemonStatusOverIpcEc(allocator, ec);
+/// 经 live runtime descriptor 读取 daemon 实际运行时状态。descriptor、PID
+/// 或响应不匹配时返回 null，调用方仅展示 durable fallback。
+fn fetchDaemonStatusOverIpc(
+    allocator: std.mem.Allocator,
+    expected_pid: i32,
+) !?DaemonStatus {
+    if (expected_pid <= 0) return null;
+    var default_store = (runtime_descriptor.openDefault(allocator, false) catch return null) orelse
+        return null;
+    defer default_store.deinit();
+    var descriptor = (default_store.store().observe() catch return null) orelse
+        return null;
+    defer descriptor.deinit();
+    if (!descriptor.ready or
+        descriptor.pid != @as(u32, @intCast(expected_pid))) return null;
+    const endpoint = descriptor.endpoint orelse return null;
+    var status = (try fetchDaemonStatusOverIpcEc(allocator, endpoint)) orelse
+        return null;
+    errdefer status.deinit(allocator);
+    if (!try runtimeInstanceMatches(allocator, expected_pid, descriptor.nonce)) {
+        status.deinit(allocator);
+        return null;
+    }
+    return status;
+}
+
+fn waitForStatusSocket(
+    fd: std.posix.fd_t,
+    events: i16,
+    deadline: i64,
+) !void {
+    while (true) {
+        const remaining = deadline - compat.monotonicMilliTimestamp();
+        if (remaining <= 0) return error.StatusRequestTimeout;
+        var descriptors = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = events,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(
+            &descriptors,
+            @intCast(@min(remaining, std.math.maxInt(i32))),
+        );
+        if (ready == 0) return error.StatusRequestTimeout;
+        const revents = descriptors[0].revents;
+        if (revents & std.posix.POLL.NVAL != 0 or
+            revents & std.posix.POLL.ERR != 0)
+        {
+            return error.StatusSocketFailure;
+        }
+        if (revents & events != 0 or revents & std.posix.POLL.HUP != 0) return;
+    }
+}
+
+fn writeStatusRequest(
+    fd: std.posix.fd_t,
+    request: []const u8,
+    deadline: i64,
+) !void {
+    var offset: usize = 0;
+    while (offset < request.len) {
+        try waitForStatusSocket(fd, std.posix.POLL.OUT, deadline);
+        const flags: u32 = if (comptime @hasDecl(std.posix.MSG, "NOSIGNAL"))
+            std.posix.MSG.NOSIGNAL
+        else
+            0;
+        const result = std.c.send(
+            fd,
+            request[offset..].ptr,
+            request.len - offset,
+            flags,
+        );
+        if (result < 0) switch (std.c.errno(result)) {
+            .INTR, .AGAIN => continue,
+            else => return error.StatusSocketFailure,
+        };
+        if (result == 0) return error.StatusSocketFailure;
+        offset += @intCast(result);
+    }
+}
+
+fn readStatusChunk(
+    fd: std.posix.fd_t,
+    buffer: []u8,
+    deadline: i64,
+) !usize {
+    while (true) {
+        try waitForStatusSocket(fd, std.posix.POLL.IN, deadline);
+        const result = std.c.recv(fd, buffer.ptr, buffer.len, 0);
+        if (result >= 0) return @intCast(result);
+        switch (std.c.errno(result)) {
+            .INTR, .AGAIN => continue,
+            else => return error.StatusSocketFailure,
+        }
+    }
 }
 
 fn fetchDaemonStatusOverIpcEc(allocator: std.mem.Allocator, ec: []const u8) !?DaemonStatus {
-    const colon = std.mem.lastIndexOf(u8, ec, ":") orelse return null;
-    const port = std.fmt.parseInt(u16, ec[colon + 1 ..], 10) catch return null;
-    const host = ec[0..colon];
-
-    const stream = compat.net.tcpConnectToHost(allocator, host, port) catch return null;
+    const deadline = compat.monotonicMilliTimestamp() + daemon_status_io_timeout_ms;
+    const endpoint = controller_endpoint.parse(ec) catch return null;
+    const stream = compat.net.tcpConnectToHost(
+        allocator,
+        controller_endpoint.loopback_host,
+        endpoint.port,
+    ) catch return null;
     defer stream.close();
+    socket_options.configureConnectedStream(stream) catch return null;
+    compat.setNonBlock(stream.handle) catch return null;
 
     const req = std.fmt.allocPrint(allocator, "GET /status HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ec}) catch return null;
     defer allocator.free(req);
-    stream.writeAll(req) catch return null;
+    writeStatusRequest(stream.handle, req, deadline) catch return null;
 
-    // daemon 返回的 JSON 可能较大（多节点），循环读到 EOF。
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = stream.read(&chunk) catch break;
+        const n = readStatusChunk(stream.handle, &chunk, deadline) catch return null;
         if (n == 0) break;
+        if (buf.items.len > daemon_status_response_max_bytes - n) return null;
         buf.appendSlice(allocator, chunk[0..n]) catch break;
     }
 
@@ -649,6 +1383,7 @@ fn emitStatus(allocator: std.mem.Allocator, out: *cli_output.Output, snapshot: *
             .pid = snapshot.pid,
             .uptime_seconds = snapshot.uptime_seconds,
             .active_config = snapshot.active_config,
+            .runtime_state_available = snapshot.runtime_state_available,
             .selected_proxies = snapshot.selected_proxies,
             .paths = .{
                 .pid_file = snapshot.pid_file,
@@ -673,6 +1408,9 @@ fn emitStatus(allocator: std.mem.Allocator, out: *cli_output.Output, snapshot: *
         try out.print("uptime_seconds: {d}\n", .{uptime_seconds});
     } else {
         try out.print("uptime_seconds: (unknown)\n", .{});
+    }
+    if (snapshot.runtime_state_available) |available| {
+        try out.print("runtime_state_available: {}\n", .{available});
     }
     if (snapshot.active_config) |active_config| {
         try out.print("active_config: {s}\n", .{active_config});
@@ -730,23 +1468,134 @@ pub fn printStartupInfo(allocator: std.mem.Allocator, config_path: ?[]const u8, 
     out.print("  rules:       {d}\n", .{cfg.rules.items.len}) catch return;
 }
 
+fn clearStaleDescriptorBeforeStart(allocator: std.mem.Allocator) !void {
+    var default_store = (try runtime_descriptor.openDefault(allocator, false)) orelse
+        return;
+    defer default_store.deinit();
+    const store = default_store.store();
+    var descriptor = (try store.observe()) orelse return;
+    defer descriptor.deinit();
+    var stop_name_buffer: [runtime_dir.stop_prefix.len + 32]u8 = undefined;
+    const stop_name = stopRequestName(descriptor.nonce, &stop_name_buffer);
+    default_store.runtime.deleteFile(stop_name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    switch (try store.remove(descriptor.nonce)) {
+        .removed, .absent => {},
+        .conflict => return error.ConcurrentRuntimeDescriptorUpdate,
+        .durability_uncertain => |err| return err,
+    }
+}
+
+fn descriptorMatchesInstance(
+    allocator: std.mem.Allocator,
+    pid: std.posix.pid_t,
+    nonce: runtime_descriptor.Nonce,
+) !bool {
+    if (pid <= 0) return false;
+    var default_store = (try runtime_descriptor.openDefault(allocator, false)) orelse
+        return false;
+    defer default_store.deinit();
+    var descriptor = (try default_store.store().observe()) orelse return false;
+    defer descriptor.deinit();
+    return descriptor.ready and
+        descriptor.pid == @as(u32, @intCast(pid)) and
+        descriptor.nonce.eql(nonce);
+}
+
+const ChildState = enum { running, exited, unavailable };
+
+fn childState(pid: std.posix.pid_t) ChildState {
+    while (true) {
+        var status: c_int = 0;
+        const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+        if (result == pid) return .exited;
+        if (result == 0) return .running;
+        if (std.c.errno(result) == .INTR) continue;
+        return .unavailable;
+    }
+}
+
+fn terminateAndReapChild(pid: std.posix.pid_t) void {
+    if (childState(pid) != .running) return;
+    std.posix.kill(pid, std.posix.SIG.TERM) catch return;
+    var attempt: u8 = 0;
+    while (attempt < 40) : (attempt += 1) {
+        if (childState(pid) != .running) return;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    if (childState(pid) != .running) return;
+    std.posix.kill(pid, std.posix.SIG.KILL) catch return;
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+}
+
+fn cleanupOwnedStartupChild(
+    allocator: std.mem.Allocator,
+    pid: i32,
+) void {
+    terminateAndReapChild(pid);
+    const nonce = descriptorNonceForPid(allocator, pid);
+    _ = removePidIfMatches(allocator, pid) catch false;
+    removeDescriptor(allocator, nonce);
+}
+
+fn normalizeStandardDescriptors() !void {
+    const dev_null = try std.Io.Dir.openFileAbsolute(compat.io(), "/dev/null", .{
+        .mode = .read_write,
+    });
+    var keep_open = dev_null.handle <= std.c.STDERR_FILENO;
+    defer if (!keep_open) dev_null.close(compat.io());
+    for ([_]std.posix.fd_t{
+        std.c.STDIN_FILENO,
+        std.c.STDOUT_FILENO,
+        std.c.STDERR_FILENO,
+    }) |target| {
+        if (std.c.fcntl(target, std.c.F.GETFD) >= 0) continue;
+        if (std.c.dup2(dev_null.handle, target) < 0) {
+            return error.StandardDescriptorSetupFailed;
+        }
+        if (dev_null.handle == target) keep_open = true;
+    }
+}
+
+fn forwardedOverrideTimeoutMs(extra_args: []const []const u8) i64 {
+    for (extra_args, 0..) |arg, index| {
+        if (!std.mem.eql(u8, arg, "--override-timeout-ms")) continue;
+        if (index + 1 >= extra_args.len) return override_timeout_ms_default;
+        return std.fmt.parseInt(i64, extra_args[index + 1], 10) catch
+            override_timeout_ms_default;
+    }
+    return override_timeout_ms_default;
+}
+
 /// 启动守护进程。只返回事实（LifecycleOutcome）或错误；envelope/文本由
 /// main.zig 经 cli/output.zig 恰好打印一次。
 pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, extra_args: []const []const u8) !LifecycleOutcome {
-    var lock_file = acquireDaemonLockFile(allocator) catch |err| switch (err) {
-        error.DaemonAlreadyRunning => {
-            const existing_pid = try waitForTrackedRunningPid(allocator);
-            return .{ .detail = "already_running", .pid = existing_pid };
-        },
-        else => return err,
-    };
-    errdefer lock_file.close(compat.io());
-
-    // 兼容旧版本 daemon：即使没有 lock，也不要在已有可追踪 pid 存活时再启动一个实例。
-    // 这里不能用 isRunning()，因为当前 start 进程自己已经拿到了 lock。
-    if (try readTrackedPid(allocator)) |existing_pid| {
-        return .{ .detail = "already_running", .pid = existing_pid };
+    const lock_wait_deadline = compat.monotonicMilliTimestamp() +
+        startup_lock_wait_ms;
+    var lock_file: compat.fs.File = undefined;
+    while (true) {
+        lock_file = acquireDaemonLockFile(allocator) catch |err| switch (err) {
+            error.DaemonAlreadyRunning => switch (try waitForReadyOrUnlocked(
+                allocator,
+                lock_wait_deadline,
+            )) {
+                .ready => |pid| return .{ .detail = "already_running", .pid = pid },
+                .unlocked => continue,
+                .timeout => return error.StartupTimeout,
+            },
+            else => return err,
+        };
+        break;
     }
+    var lock_open = true;
+    errdefer if (lock_open) lock_file.close(compat.io());
+
+    try rejectLiveTrackedPidAfterLockAcquire(allocator);
+    try clearStaleDescriptorBeforeStart(allocator);
+    const startup_token = runtime_descriptor.Nonce.generate();
 
     // Fork 子进程
     const fork_result = std.c.fork();
@@ -756,49 +1605,140 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, extra
     const pid: std.posix.pid_t = @intCast(fork_result);
 
     if (pid > 0) {
-        // 父进程：轮询最多 2s，每 200ms 检查子进程是否存活
-        var i: usize = 0;
-        while (i < startup_poll_attempts) : (i += 1) { // 10 × 200ms = 2s
-            compat.sleepNs(startup_poll_interval_ms * std.time.ns_per_ms);
-
-            // 检查子进程是否还活着
-            std.posix.kill(pid, @enumFromInt(0)) catch {
-                // 子进程已退出，启动失败
-                removePidFile(allocator);
+        var owns_child = true;
+        defer if (owns_child) cleanupOwnedStartupChild(allocator, pid);
+        var signal_runtime = (try runtime_dir.openDefault(allocator, false)) orelse
+            return error.InvalidRuntimeDirectory;
+        defer signal_runtime.deinit();
+        defer removeStartupSignal(signal_runtime, startup_token);
+        const startup_deadline = compat.monotonicMilliTimestamp() +
+            forwardedOverrideTimeoutMs(extra_args) + startup_overhead_timeout_ms;
+        while (compat.monotonicMilliTimestamp() < startup_deadline) {
+            if (try observeStartupSignal(signal_runtime, startup_token)) |signal| {
+                switch (signal) {
+                    .ready => {
+                        if (!(descriptorMatchesInstance(
+                            allocator,
+                            pid,
+                            startup_token,
+                        ) catch false) or
+                            childState(pid) != .running)
+                        {
+                            return error.StartFailed;
+                        }
+                        lock_file.close(compat.io());
+                        lock_open = false;
+                        owns_child = false;
+                        return .{ .pid = pid };
+                    },
+                    .failed => |failure| {
+                        lock_file.close(compat.io());
+                        lock_open = false;
+                        _ = removePidIfMatches(allocator, pid) catch false;
+                        return startupFailureError(failure);
+                    },
+                }
+            }
+            if (descriptorMatchesInstance(
+                allocator,
+                pid,
+                startup_token,
+            ) catch false) {
+                if (childState(pid) != .running) return error.StartFailed;
+                lock_file.close(compat.io());
+                lock_open = false;
+                owns_child = false;
+                return .{ .pid = pid };
+            }
+            if (childState(pid) != .running) {
+                if (try observeStartupSignal(signal_runtime, startup_token)) |signal| {
+                    switch (signal) {
+                        .failed => |failure| {
+                            lock_file.close(compat.io());
+                            lock_open = false;
+                            return startupFailureError(failure);
+                        },
+                        .ready => {},
+                    }
+                }
+                const nonce = descriptorNonceForPid(allocator, pid);
+                lock_file.close(compat.io());
+                lock_open = false;
+                _ = removePidIfMatches(allocator, pid) catch false;
+                removeDescriptor(allocator, nonce);
                 return error.StartFailed;
-            };
+            }
+            compat.sleepNs(startup_poll_interval_ms * std.time.ns_per_ms);
         }
 
-        // 子进程在 2s 后仍然存活，视为启动成功
-        try writePid(allocator, pid);
+        terminateAndReapChild(pid);
+        if (try observeStartupSignal(signal_runtime, startup_token)) |signal| {
+            switch (signal) {
+                .failed => |failure| {
+                    lock_file.close(compat.io());
+                    lock_open = false;
+                    return startupFailureError(failure);
+                },
+                .ready => {},
+            }
+        }
+        const nonce = descriptorNonceForPid(allocator, pid);
         lock_file.close(compat.io());
-        return .{ .pid = pid };
+        lock_open = false;
+        _ = removePidIfMatches(allocator, pid) catch false;
+        removeDescriptor(allocator, nonce);
+        return error.StartupTimeout;
     }
 
-    // 子进程：成为守护进程
-    // 创建新会话
-    _ = std.c.setsid();
+    // The fork child must never return into any caller's CLI rendering path.
+    execDaemonChild(
+        allocator,
+        config_path,
+        extra_args,
+        lock_file,
+        startup_token,
+    ) catch {
+        publishStartupSignal(
+            allocator,
+            startup_token,
+            .{ .failed = .generic },
+        ) catch {};
+        std.c._exit(cli_output.exit_failure);
+    };
+    unreachable;
+}
 
-    // 重定向标准输出/错误到日志文件
-    const log_path = try getLogFilePath(allocator);
-    defer allocator.free(log_path);
+fn execDaemonChild(
+    allocator: std.mem.Allocator,
+    config_path: ?[]const u8,
+    extra_args: []const []const u8,
+    lock_file: compat.fs.File,
+    startup_token: runtime_descriptor.Nonce,
+) !noreturn {
+    try normalizeStandardDescriptors();
+    if (std.c.setsid() < 0) return error.SessionSetupFailed;
 
-    const log_file = compat.fs.createFileAbsolute(log_path, .{ .truncate = false }) catch |err| {
+    // Redirect through the verified runtime directory; never follow log links.
+    var runtime = (try runtime_dir.openDefault(allocator, true)) orelse
+        return error.InvalidRuntimeDirectory;
+    defer runtime.deinit();
+    const log_file = openLogFileInRuntime(runtime) catch |err| {
         std.debug.print("Failed to open log file: {s}\n", .{@errorName(err)});
         return err;
     };
     const log_fd = log_file.handle;
 
-    // 重定向 stdout 和 stderr
-    _ = std.c.dup2(log_fd, std.c.STDOUT_FILENO);
-    _ = std.c.dup2(log_fd, std.c.STDERR_FILENO);
+    if (std.c.dup2(log_fd, std.c.STDOUT_FILENO) < 0 or
+        std.c.dup2(log_fd, std.c.STDERR_FILENO) < 0)
+    {
+        return error.LogRedirectFailed;
+    }
     compat.posixClose(log_fd);
 
-    // 关闭 stdin
-    const dev_null = compat.fs.openFileAbsolute("/dev/null", .{}) catch null;
-    if (dev_null) |file| {
-        _ = std.c.dup2(file.handle, std.c.STDIN_FILENO);
-        file.close(compat.io());
+    const dev_null = try compat.fs.openFileAbsolute("/dev/null", .{});
+    defer dev_null.close(compat.io());
+    if (std.c.dup2(dev_null.handle, std.c.STDIN_FILENO) < 0) {
+        return error.StandardDescriptorSetupFailed;
     }
 
     // 获取当前可执行文件路径
@@ -819,6 +1759,23 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, extra
 
     try argv_list.append(allocator, try allocator.dupe(u8, exe_path));
     try argv_list.append(allocator, try allocator.dupe(u8, "--daemon-run"));
+    try argv_list.append(
+        allocator,
+        try std.fmt.allocPrint(
+            allocator,
+            "--daemon-lock-fd={d}",
+            .{lock_file.handle},
+        ),
+    );
+    var startup_token_hex: [32]u8 = undefined;
+    try argv_list.append(
+        allocator,
+        try std.fmt.allocPrint(
+            allocator,
+            "--startup-token={s}",
+            .{startup_token.formatHex(&startup_token_hex)},
+        ),
+    );
 
     if (config_path) |path| {
         try argv_list.append(allocator, try allocator.dupe(u8, "-c"));
@@ -853,46 +1810,69 @@ pub fn startDaemon(allocator: std.mem.Allocator, config_path: ?[]const u8, extra
     return error.ExecFailed;
 }
 
+fn descriptorNonceForPid(
+    allocator: std.mem.Allocator,
+    pid: i32,
+) ?runtime_descriptor.Nonce {
+    if (pid <= 0) return null;
+    var default_store = (runtime_descriptor.openDefault(allocator, false) catch return null) orelse
+        return null;
+    defer default_store.deinit();
+    var descriptor = (default_store.store().observe() catch return null) orelse return null;
+    defer descriptor.deinit();
+    if (descriptor.pid != @as(u32, @intCast(pid))) return null;
+    return descriptor.nonce;
+}
+
+fn removeDescriptor(
+    allocator: std.mem.Allocator,
+    expected: ?runtime_descriptor.Nonce,
+) void {
+    const nonce = expected orelse return;
+    var default_store = (runtime_descriptor.openDefault(allocator, false) catch return) orelse
+        return;
+    defer default_store.deinit();
+    _ = default_store.store().remove(nonce) catch return;
+}
+
+fn runtimeInstanceMatches(
+    allocator: std.mem.Allocator,
+    pid: i32,
+    nonce: runtime_descriptor.Nonce,
+) !bool {
+    const state = try inspectRuntime(allocator);
+    if (state.pid == null or state.pid.? != pid) return false;
+    const observed = descriptorNonceForPid(allocator, pid) orelse return false;
+    return observed.eql(nonce);
+}
+
 /// 停止守护进程。只返回事实（LifecycleOutcome）或错误；envelope/文本由
 /// main.zig 经 cli/output.zig 恰好打印一次。
 pub fn stopDaemon(allocator: std.mem.Allocator) !LifecycleOutcome {
     const runtime = try inspectRuntime(allocator);
     const pid = runtime.pid orelse {
-        if (runtime.lock_held) {
-            return error.DaemonPidUntracked;
-        }
+        if (runtime.lock_held) return error.DaemonPidUntracked;
         return .{ .detail = "already_stopped" };
     };
+    const nonce = descriptorNonceForPid(allocator, pid) orelse
+        return error.DaemonPidUntracked;
+    if (!try runtimeInstanceMatches(allocator, pid, nonce)) {
+        return error.DaemonInstanceChanged;
+    }
+    try publishStopRequest(allocator, nonce);
 
-    // 发送 SIGTERM 信号
-    std.posix.kill(pid, std.posix.SIG.TERM) catch |err| {
-        if (err == error.ProcessNotFound) {
-            removePidFile(allocator);
-            return .{ .detail = "already_stopped" };
+    var attempt: u8 = 0;
+    while (attempt < 50) : (attempt += 1) {
+        compat.sleepNs(100 * std.time.ns_per_ms);
+        if (!try runtimeInstanceMatches(allocator, pid, nonce)) {
+            const current = try inspectRuntime(allocator);
+            if (current.lock_held) return error.DaemonInstanceChanged;
+            _ = try removePidIfMatches(allocator, pid);
+            removeDescriptor(allocator, nonce);
+            return .{ .pid = pid };
         }
-        return err;
-    };
-
-    // 等待优雅退出
-    var stopped = false;
-    var i: usize = 0;
-    while (i < 20) : (i += 1) { // 最多等待 2 秒
-        compat.sleepNs(100 * std.time.ns_per_ms);
-        _ = std.posix.kill(pid, @enumFromInt(0)) catch {
-            stopped = true;
-            break;
-        };
     }
-
-    if (!stopped) {
-        // 强制停止
-        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-        compat.sleepNs(100 * std.time.ns_per_ms);
-    }
-
-    // 删除 PID 文件
-    removePidFile(allocator);
-    return .{ .pid = pid };
+    return error.DaemonStopTimeout;
 }
 
 /// 静默重启：供 reloadOrRestart（config update / config override / zc reload）
@@ -927,7 +1907,8 @@ fn restartDaemonQuiet(allocator: std.mem.Allocator, config_path: ?[]const u8) !v
         }
     }
 
-    _ = try startDaemon(allocator, effective_config, extra_args);
+    const outcome = try startDaemon(allocator, effective_config, extra_args);
+    if (outcome.detail != null) return error.RestartContended;
     if ((try readTrackedPid(allocator)) == null) {
         return error.StartFailed;
     }
@@ -966,48 +1947,110 @@ pub fn getStatus(allocator: std.mem.Allocator, out: *cli_output.Output) !void {
     var snapshot = try collectStatusSnapshot(allocator);
     defer snapshot.deinit(allocator);
 
-    // daemon 在跑时，经 IPC 读其实际运行时状态（config_key + 内存 selections）
-    // 覆盖文件路径的 selections。避免 config_key 与 active_config 错位（配置
-    // 切换未重启 daemon）时 status 读 meta.json[用户指针] 误报 default。
-    if (snapshot.pid != null) {
-        if (try fetchDaemonStatusOverIpc(allocator)) |ds_val| {
+    // A running daemon is never projected from the current active profile.
+    // The matching descriptor supplies a bounded fallback identity; a successful
+    // IPC response then replaces both fields authoritatively, including null/empty.
+    if (snapshot.pid) |pid| {
+        snapshot.runtime_state_available = false;
+        if (snapshot.active_config) |old| allocator.free(old);
+        snapshot.active_config = null;
+        runtime_selection.deinitSelectedProxies(
+            allocator,
+            snapshot.selected_proxies,
+        );
+        snapshot.selected_proxies = try allocator.alloc(
+            runtime_selection.SelectedProxy,
+            0,
+        );
+
+        var default_store = (runtime_descriptor.openDefault(allocator, false) catch null);
+        defer if (default_store) |*value| value.deinit();
+        if (default_store) |value| {
+            var descriptor = (value.store().observe() catch null);
+            defer if (descriptor) |*observed| observed.deinit();
+            if (descriptor) |observed| {
+                if (observed.pid == @as(u32, @intCast(pid))) {
+                    if (observed.identity) |identity| {
+                        snapshot.active_config = try allocator.dupe(u8, identity.key);
+                    }
+                }
+            }
+        }
+
+        if (try fetchDaemonStatusOverIpc(allocator, pid)) |ds_val| {
+            snapshot.runtime_state_available = true;
             var ds = ds_val;
-            defer ds.deinit(allocator); // 转移后字段为空，no-op
-            if (ds.config_key) |_| {
-                if (snapshot.active_config) |old| allocator.free(old);
-                snapshot.active_config = ds.config_key;
-                ds.config_key = null;
-            }
-            if (ds.selected_proxies.len > 0) {
-                runtime_selection.deinitSelectedProxies(allocator, snapshot.selected_proxies);
-                snapshot.selected_proxies = ds.selected_proxies;
-                ds.selected_proxies = &.{};
-            }
+            defer ds.deinit(allocator);
+            if (snapshot.active_config) |old| allocator.free(old);
+            snapshot.active_config = ds.config_key;
+            ds.config_key = null;
+            runtime_selection.deinitSelectedProxies(
+                allocator,
+                snapshot.selected_proxies,
+            );
+            snapshot.selected_proxies = ds.selected_proxies;
+            ds.selected_proxies = &.{};
         }
     }
 
     try emitStatus(allocator, out, &snapshot);
 }
 
+fn openRuntimeForLog(
+    allocator: std.mem.Allocator,
+    follow: bool,
+) !?runtime_dir.RuntimeDir {
+    return runtime_dir.openDefault(allocator, false) catch |err| switch (err) {
+        error.InvalidRuntimeDirectory => if (follow) null else return err,
+        else => return err,
+    };
+}
+
 /// 查看日志（默认显示最后 50 行，持续刷新）。
 /// 日志行是主输出，永远走 stdout：JSON 模式下为 JSON Lines（每行一个
 /// {"line":"..."} 对象），文本模式下为时间戳行；横幅类提示是诊断，走 stderr。
 pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool, out: *cli_output.Output) !void {
-    const log_path = try getLogFilePath(allocator);
-    defer allocator.free(log_path);
-
-    const file = compat.fs.openFileAbsolute(log_path, .{}) catch |err| {
-        if (err == error.FileNotFound) {
+    var runtime: runtime_dir.RuntimeDir = while (true) {
+        if (try openRuntimeForLog(allocator, follow)) |value| break value;
+        if (!follow) {
             if (out.mode != .json) out.note("No log file found\n", .{}) catch {};
             return;
         }
-        return err;
+        compat.sleepNs(500 * std.time.ns_per_ms);
+    };
+    defer runtime.deinit();
+    var file: compat.fs.File = while (true) {
+        break runtime.openFile(runtime_dir.log_name, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (!follow) {
+                    if (out.mode != .json) {
+                        out.note("No log file found\n", .{}) catch {};
+                    }
+                    return;
+                }
+                compat.sleepNs(500 * std.time.ns_per_ms);
+                if (try openRuntimeForLog(allocator, true)) |opened| {
+                    var candidate = opened;
+                    var candidate_owned = true;
+                    defer if (candidate_owned) candidate.deinit();
+                    const candidate_stat = try candidate.dir.stat(compat.io());
+                    const current_stat = try runtime.dir.stat(compat.io());
+                    if (candidate_stat.inode != current_stat.inode) {
+                        runtime.deinit();
+                        runtime = candidate;
+                        candidate_owned = false;
+                    }
+                }
+                continue;
+            },
+            else => return err,
+        };
     };
     defer file.close(compat.io());
 
     // 首先显示最后 N 行
     const n = lines orelse 50;
-    try printLastNLines(allocator, file, n, out);
+    const initial_size = try printLastNLines(allocator, file, n, out);
 
     // 如果需要持续刷新
     if (follow) {
@@ -1015,29 +2058,130 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool, out: *
         var carry = std.ArrayList(u8).empty;
         defer carry.deinit(allocator);
 
-        // 获取当前文件位置
-        const stat = try file.stat(compat.io());
-        var last_pos = stat.size;
+        var last_pos = initial_size;
 
         while (true) {
             compat.sleepNs(500 * std.time.ns_per_ms); // 500ms 刷新一次
 
-            // 重新获取文件大小
-            const new_stat = try file.stat(compat.io());
-            const new_size = new_stat.size;
+            var current_runtime = (try openRuntimeForLog(
+                allocator,
+                true,
+            )) orelse {
+                const old_size = (try file.stat(compat.io())).size;
+                try emitLogRange(
+                    allocator,
+                    file,
+                    &last_pos,
+                    old_size,
+                    &carry,
+                    out,
+                );
+                continue;
+            };
+            var current_runtime_owned = true;
+            defer if (current_runtime_owned) current_runtime.deinit();
+            const current_dir_stat = try current_runtime.dir.stat(compat.io());
+            const open_dir_stat = try runtime.dir.stat(compat.io());
+            if (current_dir_stat.inode != open_dir_stat.inode) {
+                const replacement = current_runtime.openFile(
+                    runtime_dir.log_name,
+                    .{},
+                ) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        const old_size = (try file.stat(compat.io())).size;
+                        try emitLogRange(
+                            allocator,
+                            file,
+                            &last_pos,
+                            old_size,
+                            &carry,
+                            out,
+                        );
+                        continue;
+                    },
+                    else => return err,
+                };
+                const old_size = (try file.stat(compat.io())).size;
+                try emitLogRange(
+                    allocator,
+                    file,
+                    &last_pos,
+                    old_size,
+                    &carry,
+                    out,
+                );
+                file.close(compat.io());
+                runtime.deinit();
+                runtime = current_runtime;
+                current_runtime_owned = false;
+                file = replacement;
+                if (carry.items.len > 0) {
+                    emitLogLine(out, carry.items);
+                    carry.clearRetainingCapacity();
+                }
+                if (out.mode != .json) {
+                    out.note(
+                        "\n--- Runtime directory recreated, reopening log ---\n",
+                        .{},
+                    ) catch {};
+                }
+                last_pos = 0;
+            }
+
+            const path_stat = runtime.dir.statFile(
+                compat.io(),
+                runtime_dir.log_name,
+                .{ .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => {
+                    const old_size = (try file.stat(compat.io())).size;
+                    try emitLogRange(
+                        allocator,
+                        file,
+                        &last_pos,
+                        old_size,
+                        &carry,
+                        out,
+                    );
+                    continue;
+                },
+                else => return err,
+            };
+            const open_stat = try file.stat(compat.io());
+            if (path_stat.kind != .file) return error.InvalidRuntimeLog;
+            if (path_stat.inode != open_stat.inode) {
+                try emitLogRange(
+                    allocator,
+                    file,
+                    &last_pos,
+                    open_stat.size,
+                    &carry,
+                    out,
+                );
+                const replacement = try runtime.openFile(runtime_dir.log_name, .{});
+                file.close(compat.io());
+                file = replacement;
+                if (carry.items.len > 0) {
+                    emitLogLine(out, carry.items);
+                    carry.clearRetainingCapacity();
+                }
+                if (out.mode != .json) {
+                    out.note("\n--- Log file rotated, reopening ---\n", .{}) catch {};
+                }
+                last_pos = 0;
+            }
+
+            const new_size = (try file.stat(compat.io())).size;
 
             if (new_size > last_pos) {
-                // 有新内容，读取并输出
-                try compat.fileSeekTo(file, last_pos);
-
-                var buffer: [4096]u8 = undefined;
-                while (true) {
-                    const bytes_read = try compat.fileRead(file, &buffer);
-                    if (bytes_read == 0) break;
-                    try printTimestampedChunk(allocator, buffer[0..bytes_read], &carry, out);
-                }
-
-                last_pos = new_size;
+                try emitLogRange(
+                    allocator,
+                    file,
+                    &last_pos,
+                    new_size,
+                    &carry,
+                    out,
+                );
             } else if (new_size < last_pos) {
                 // 文件被截断或轮转，从头开始
                 if (carry.items.len > 0) {
@@ -1053,14 +2197,45 @@ pub fn viewLog(allocator: std.mem.Allocator, lines: ?usize, follow: bool, out: *
 }
 
 /// 打印文件最后 N 行
-fn printLastNLines(allocator: std.mem.Allocator, file: compat.fs.File, n: usize, out: *cli_output.Output) !void {
+fn emitLogRange(
+    allocator: std.mem.Allocator,
+    file: compat.fs.File,
+    position: *u64,
+    end: u64,
+    carry: *std.ArrayList(u8),
+    out: *cli_output.Output,
+) !void {
+    if (end <= position.*) return;
+    try compat.fileSeekTo(file, position.*);
+    var buffer: [4096]u8 = undefined;
+    while (position.* < end) {
+        const remaining: usize = @intCast(@min(
+            end - position.*,
+            buffer.len,
+        ));
+        const bytes_read = try compat.fileRead(file, buffer[0..remaining]);
+        if (bytes_read == 0) break;
+        try printTimestampedChunk(
+            allocator,
+            buffer[0..bytes_read],
+            carry,
+            out,
+        );
+        position.* += @intCast(bytes_read);
+    }
+}
+
+fn printLastNLines(
+    allocator: std.mem.Allocator,
+    file: compat.fs.File,
+    n: usize,
+    out: *cli_output.Output,
+) !u64 {
     const file_size = (try file.stat(compat.io())).size;
     const max_size = 1024 * 1024 * 10; // 10MB max
     const read_size = @min(file_size, max_size);
 
-    if (read_size == 0) {
-        return;
-    }
+    if (read_size == 0) return file_size;
 
     const content = try allocator.alloc(u8, read_size);
     defer allocator.free(content);
@@ -1069,6 +2244,7 @@ fn printLastNLines(allocator: std.mem.Allocator, file: compat.fs.File, n: usize,
     _ = try compat.fileReadAll(file, content);
 
     try printTimestampedSlice(allocator, tailLinesSlice(content, n), out);
+    return file_size;
 }
 
 /// 返回 content 中最后 n 行的切片。不足 n 行时返回整个 content（修复
@@ -1148,6 +2324,11 @@ test "daemon lock prevents duplicate acquisition and can be reacquired after clo
 
     var first_lock: ?compat.fs.File = try acquireDaemonLockFileAtPath(lock_path);
     defer if (first_lock) |file| file.close(compat.io());
+    try std.testing.expect(first_lock.?.handle >= 3);
+    try protectDaemonLockFromExec(first_lock.?.handle);
+    const fd_flags = std.c.fcntl(first_lock.?.handle, std.c.F.GETFD);
+    try std.testing.expect(fd_flags >= 0);
+    try std.testing.expect(fd_flags & std.posix.FD_CLOEXEC != 0);
 
     try std.testing.expectError(error.DaemonAlreadyRunning, acquireDaemonLockFileAtPath(lock_path));
 
@@ -1156,6 +2337,54 @@ test "daemon lock prevents duplicate acquisition and can be reacquired after clo
 
     var second_lock = try acquireDaemonLockFileAtPath(lock_path);
     defer second_lock.close(compat.io());
+}
+
+test "daemon log path resets after the hard size limit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.setDirPermissions(
+        tmp.dir,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const path = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(path);
+    var runtime = (try runtime_dir.openPath(allocator, path, false)).?;
+    defer runtime.deinit();
+    const log = try runtime.createExclusive(runtime_dir.log_name);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.ftruncate(log.handle, @intCast(daemon_log_max_bytes + 1)),
+    );
+    log.close(compat.io());
+    try std.testing.expect(try resetLogPathIfOversized(runtime));
+    const replacement = try runtime.openFile(runtime_dir.log_name, .{});
+    defer replacement.close(compat.io());
+    try std.testing.expectEqual(@as(u64, 0), (try replacement.stat(compat.io())).size);
+}
+
+test "pid cleanup compares under the daemon lock" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.setDirPermissions(
+        tmp.dir,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const path = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(path);
+    var runtime = (try runtime_dir.openPath(allocator, path, false)).?;
+    defer runtime.deinit();
+
+    try writePidInRuntime(runtime, 101);
+    try std.testing.expect(!try removePidIfMatchesInRuntime(runtime, 202));
+    try std.testing.expectEqual(@as(?i32, 101), try readPidInRuntime(runtime));
+
+    var held_lock = try acquireDaemonLockFileInRuntime(runtime);
+    try std.testing.expect(!try removePidIfMatchesInRuntime(runtime, 101));
+    held_lock.close(compat.io());
+    try std.testing.expect(try removePidIfMatchesInRuntime(runtime, 101));
+    try std.testing.expect(try readPidInRuntime(runtime) == null);
 }
 
 test "collectStatusSnapshot reports stopped state without pid file" {
@@ -1512,8 +2741,18 @@ test "parseDaemonStatusJson: null config_key and empty selections" {
     try std.testing.expectEqual(@as(usize, 0), ds.selected_proxies.len);
 }
 
-test "parseDaemonStatusJson: malformed JSON returns null" {
+test "parseDaemonStatusJson: malformed or incomplete JSON returns null" {
     const allocator = std.testing.allocator;
-    const ds = try parseDaemonStatusJson(allocator, "not json");
-    try std.testing.expect(ds == null);
+    try std.testing.expect(
+        (try parseDaemonStatusJson(allocator, "not json")) == null,
+    );
+    try std.testing.expect(
+        (try parseDaemonStatusJson(allocator, "{}")) == null,
+    );
+    try std.testing.expect(
+        (try parseDaemonStatusJson(
+            allocator,
+            "{\"config_key\":null}",
+        )) == null,
+    );
 }

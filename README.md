@@ -68,10 +68,12 @@ brew install ekil1100/tap/zc
 zc --version
 ```
 
-升级到 Tap 中的最新版本：
+升级到 Tap 中的最新版本时，先用旧二进制停止 daemon，避免跨版本 runtime 路径变化造成双实例：
 
 ```bash
+zc stop
 brew upgrade ekil1100/tap/zc
+zc start  # only if it was running before the upgrade
 ```
 
 该渠道目前发布的是 `v1.0.0-rc6`，不代表 `v1.0.0` GA gate 已关闭。
@@ -106,6 +108,7 @@ zc down --json
 emitted on stdout, so they pipe directly into `jq`; human diagnostics stay on
 stderr. Set `NO_COLOR=1` or pass `--no-color` to disable ANSI colors. In
 containers or under systemd, run the daemon with `zc start --foreground`.
+生命周期文件优先写入 owner-only (`0700`) 的规范化 `XDG_RUNTIME_DIR`；未设置时使用 `$HOME/.local/state/zc/runtime`。后台 `start` 先绑定代理与 controller listener，但在 exact desired 对账与 runtime descriptor 发布完成前保持 accept gate 关闭；开放接入后才报告成功。
 
 The same binary can be run without installing:
 
