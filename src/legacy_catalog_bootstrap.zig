@@ -355,7 +355,13 @@ fn prepareProfile(
     errdefer bundle.deinit();
     var offline = try bundle.loadOffline(allocator);
     defer offline.deinit();
-    if (!offline.validation.isValid()) return error.InvalidLegacyConfig;
+    // Legacy source revisions may need an explicit override or replacement
+    // before they can run on the current capability set. Preserve those
+    // inspectable sources during the authority cutover; only a persisted
+    // override claims to be runtime-ready and must therefore validate now.
+    if (frozen != null and !offline.validation.isValid()) {
+        return error.InvalidLegacyConfig;
+    }
     return .{
         .legacy = profile,
         .bundle = bundle,

@@ -747,6 +747,266 @@ test "integration: special pid files fail without blocking" {
     try expectErrorEnvelope(envelope.value, "status", "STATUS_FAILED");
 }
 
+test "integration: incompatible legacy config migrates for inspection but cannot start" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(
+        compat.io(),
+        "home/.config/zc/configs",
+    );
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "home/.config/zc/configs/legacy.yaml",
+        .data =
+        \\port: 7890
+        \\mixed-port: 7891
+        \\proxies:
+        \\  - name: legacy-obfs
+        \\    type: ss
+        \\    server: 127.0.0.1
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: test-password
+        \\    plugin: obfs
+        \\    udp: true
+        \\proxy-groups:
+        \\  - name: Proxy
+        \\    type: select
+        \\    proxies: [legacy-obfs]
+        \\rules:
+        \\  - MATCH,Proxy
+        \\
+        ,
+    });
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "home/.config/zc/meta.json",
+        .data = "{\"active\":null,\"configs\":{\"legacy\":{}}}\n",
+    });
+    const home = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home",
+        allocator,
+    );
+    defer allocator.free(home);
+
+    var listed = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "list", "--json" },
+    );
+    defer listed.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), listed.code);
+    var list_envelope = try parseEnvelope(allocator, listed.stdout);
+    defer list_envelope.deinit();
+    const list_data = list_envelope.value.object.get("data").?.object;
+    try std.testing.expect(
+        list_data.get("active") == null or
+            list_data.get("active").? == .null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        list_data.get("configs").?.array.items.len,
+    );
+
+    var unselected_start = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "start", "--port", "65123", "--json" },
+    );
+    defer unselected_start.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), unselected_start.code);
+    var unselected_envelope = try parseEnvelope(
+        allocator,
+        unselected_start.stdout,
+    );
+    defer unselected_envelope.deinit();
+    try expectErrorEnvelope(
+        unselected_envelope.value,
+        "start",
+        "START_CONFIG_NOT_SELECTED",
+    );
+
+    var unselected_restart = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "restart", "--port", "65123", "--json" },
+    );
+    defer unselected_restart.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), unselected_restart.code);
+    var restart_envelope = try parseEnvelope(
+        allocator,
+        unselected_restart.stdout,
+    );
+    defer restart_envelope.deinit();
+    try expectErrorEnvelope(
+        restart_envelope.value,
+        "restart",
+        "RESTART_CONFIG_NOT_SELECTED",
+    );
+
+    var selected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "use", "legacy", "--json" },
+    );
+    defer selected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), selected.code);
+
+    var unsupported_start = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "start", "--port", "65123", "--json" },
+    );
+    defer unsupported_start.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), unsupported_start.code);
+    var unsupported_envelope = try parseEnvelope(
+        allocator,
+        unsupported_start.stdout,
+    );
+    defer unsupported_envelope.deinit();
+    try expectErrorEnvelope(
+        unsupported_envelope.value,
+        "start",
+        "CONFIG_CAPABILITY_UNSUPPORTED",
+    );
+
+    var deleted = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "delete", "legacy", "--json" },
+    );
+    defer deleted.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), deleted.code);
+}
+
+test "integration: restart preserves running daemon after active profile deletion" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "source.yaml",
+        .data = "mixed-port: 7891\nrules:\n  - MATCH,DIRECT\n",
+    });
+    const home = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home",
+        allocator,
+    );
+    defer allocator.free(home);
+    const source_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "source.yaml",
+        allocator,
+    );
+    defer allocator.free(source_path);
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    defer stopIsolatedDaemon(allocator, &environment);
+
+    var loaded = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), loaded.code);
+    var load_envelope = try parseEnvelope(allocator, loaded.stdout);
+    defer load_envelope.deinit();
+    const key = load_envelope.value.object.get("data").?.object.get(
+        "name",
+    ).?.string;
+    const port = try reserveClosedPort();
+    var port_buffer: [16]u8 = undefined;
+    const port_text = try std.fmt.bufPrint(&port_buffer, "{d}", .{port});
+
+    var started = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "start", "--port", port_text, "--json" },
+    );
+    defer started.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), started.code);
+    var start_envelope = try parseEnvelope(allocator, started.stdout);
+    defer start_envelope.deinit();
+    const started_pid = start_envelope.value.object.get("data").?.object.get(
+        "pid",
+    ).?.integer;
+
+    var deleted = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "delete", key, "--json" },
+    );
+    defer deleted.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), deleted.code);
+
+    var restarted = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "restart", "--json" },
+    );
+    defer restarted.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), restarted.code);
+    var restart_envelope = try parseEnvelope(allocator, restarted.stdout);
+    defer restart_envelope.deinit();
+    try expectErrorEnvelope(
+        restart_envelope.value,
+        "restart",
+        "RESTART_CONFIG_NOT_SELECTED",
+    );
+
+    var status = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "status", "--json" },
+    );
+    defer status.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), status.code);
+    var status_envelope = try parseEnvelope(allocator, status.stdout);
+    defer status_envelope.deinit();
+    const status_data = status_envelope.value.object.get("data").?.object;
+    try std.testing.expectEqualStrings(
+        "running",
+        status_data.get("state").?.string,
+    );
+    try std.testing.expectEqual(started_pid, status_data.get("pid").?.integer);
+
+    const replacement_port = try reserveClosedPort();
+    var replacement_port_buffer: [16]u8 = undefined;
+    const replacement_port_text = try std.fmt.bufPrint(
+        &replacement_port_buffer,
+        "{d}",
+        .{replacement_port},
+    );
+    var recovered = try runCliWithHome(
+        allocator,
+        home,
+        &.{
+            "restart",
+            "-c",
+            source_path,
+            "--port",
+            replacement_port_text,
+            "--json",
+        },
+    );
+    defer recovered.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), recovered.code);
+    var recovered_envelope = try parseEnvelope(allocator, recovered.stdout);
+    defer recovered_envelope.deinit();
+    const recovered_pid = recovered_envelope.value.object.get(
+        "data",
+    ).?.object.get("pid").?.integer;
+    try std.testing.expect(recovered_pid != started_pid);
+}
+
 test "integration: corrupt metadata fails closed without replacement" {
     const allocator = std.testing.allocator;
     try ensureZcBinary(allocator);

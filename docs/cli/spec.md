@@ -62,6 +62,8 @@ group help on stdout, exit 0. Every subcommand accepts `help`, `--help`, or
 
 新托管配置名在剥除一个 `.yaml` 后必须为 1–250 字节的有效 UTF-8，且不能是 `.`、`..`，也不能包含控制字符、`/` 或 `\`。无效新名称返回 `CONFIG_NAME_INVALID`，并且不会发起网络或文件访问。旧版本已持久化的 251–255 字节 key 可继续读取和删除，避免升级时把 catalog 判坏；它们不再允许作为新 key，且兼容 mirror 可能报告 `mirror_out_of_sync:true`。bootstrap 通过共享 legacy cutover lock 冻结最终 snapshot 与 authority CAS；完成后，catalog v2 是 `load/list/download/update/use/delete/dump/override` 的唯一权威状态；`meta.json` 与 `configs/` 仅为派生兼容镜像，镜像损坏或不可写不会阻断健康 catalog 的读取。损坏 catalog、缺失 active identity 或缺失 immutable revision 均明确失败，不回退到内置 `DIRECT`。
 
+Legacy cutover 会保留可安全捕获、但使用当前 v1 不支持能力的原始配置，使其仍可通过 `config list/delete/update` 检视或替换；这不绕过运行时 capability gate。旧状态没有 active profile 时，`start`/`restart` 返回 `START_CONFIG_NOT_SELECTED` / `RESTART_CONFIG_NOT_SELECTED`，必须先执行 `zc config use <name>`。选中后若配置仍包含不支持的协议、插件、UDP 或独立 `port`/`socks-port`，启动继续以 `CONFIG_CAPABILITY_UNSUPPORTED` 在 bind/dial 前失败。
+
 Managed config JSON success data includes `durability_uncertain` and `mirror_out_of_sync`. A visible state commit whose parent-directory sync failed remains a success with `durability_uncertain:true`; callers must verify again before treating it as crash-durable. Mirror refresh failure is separately reported as `mirror_out_of_sync:true` and never changes catalog authority.
 
 ### proxy / profile

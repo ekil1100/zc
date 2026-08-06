@@ -274,6 +274,81 @@ test "LegacyCatalogBootstrap materializes before resolving replaced local depend
     try testing.expect((try bootstrap.ensure()) == .migrated);
 }
 
+test "LegacyCatalogBootstrap preserves semantic-invalid raw source for recovery" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "configs", .default_dir);
+    const source = "mixed-port: 0\nrules:\n  - MATCH,DIRECT\n";
+    try writeFile(tmp.dir, "configs/legacy.yaml", source);
+    try writeFile(
+        tmp.dir,
+        "meta.json",
+        "{\"active\":null,\"configs\":{\"legacy\":{}}}\n",
+    );
+
+    const bootstrap = LegacyCatalogBootstrap.init(allocator, tmp.dir);
+    try testing.expect((try bootstrap.ensure()) == .migrated);
+    const authority = state_authority.Authority.init(allocator, tmp.dir);
+    var inspection = try authority.inspect();
+    defer inspection.deinit();
+    const state = switch (inspection) {
+        .catalog_v2 => |*observed| observed.catalog.state,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(usize, 1), state.profiles.len);
+    var view = try revision_store.RevisionStore.init(
+        allocator,
+        tmp.dir,
+    ).openVerified("legacy", state.profiles[0].head);
+    defer view.deinit();
+    try testing.expectEqualStrings(source, view.sourceBytes());
+}
+
+test "LegacyCatalogBootstrap rejects invalid persisted override before commit" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "configs", .default_dir);
+    try writeFile(tmp.dir, "configs/home.yaml", "mixed-port: 7890\n");
+    try writeFile(tmp.dir, "override.sh", "#!/bin/sh\nprintf 'mixed-port: 0\\n'\n");
+    const script = try tmp.dir.openFile(
+        compat.io(),
+        "override.sh",
+        .{ .mode = .read_write },
+    );
+    try script.setPermissions(
+        compat.io(),
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    script.close(compat.io());
+    const script_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "override.sh",
+        allocator,
+    );
+    defer allocator.free(script_path);
+    const meta_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"active\":\"home\",\"configs\":{{\"home\":{{\"override_script\":\"{s}\"}}}}}}\n",
+        .{script_path},
+    );
+    defer allocator.free(meta_json);
+    try writeFile(tmp.dir, "meta.json", meta_json);
+
+    const bootstrap = LegacyCatalogBootstrap.init(allocator, tmp.dir);
+    try testing.expectError(error.InvalidLegacyConfig, bootstrap.ensure());
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "state-v2.json", .{}),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "profiles", .{}),
+    );
+}
+
 test "LegacyCatalogBootstrap override failure publishes no revision" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = testing.allocator;

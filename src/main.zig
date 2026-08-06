@@ -369,7 +369,7 @@ pub fn main(init: std.process.Init) !void {
                     .port_override = start_opts.port,
                 },
             ) catch |err| {
-                _ = daemon.removeCurrentProcessPid(allocator) catch false;
+                daemon.cleanupCurrentProcessRuntime(allocator);
                 if (isPortPreflightError(err)) {
                     printRuntimeCommandPreflightError(.start, json_output, err);
                 } else if (err == error.ListenerStartupTimeout) {
@@ -379,7 +379,9 @@ pub fn main(init: std.process.Init) !void {
                         "daemon listeners did not become ready within 10 seconds",
                         "check port ownership and retry",
                     );
-                } else if (!printOverrideRuntimeError(json_output, err)) {
+                } else if (!printOverrideRuntimeError(json_output, err) and
+                    !printRuntimeConfigSelectionError(.start, json_output, err))
+                {
                     printCliError(json_output, "START_FAILED", "failed to start proxy in foreground", "check config path and `zc log --no-follow`");
                 }
                 std.process.exit(cli_output.exit_failure);
@@ -450,7 +452,9 @@ pub fn main(init: std.process.Init) !void {
             ) catch |err| {
                 if (isPortPreflightError(err)) {
                     printRuntimeCommandPreflightError(.start, json_output, err);
-                } else if (!printOverrideRuntimeError(json_output, err)) {
+                } else if (!printOverrideRuntimeError(json_output, err) and
+                    !printRuntimeConfigSelectionError(.start, json_output, err))
+                {
                     printCliError(
                         json_output,
                         "START_PREFLIGHT_FAILED",
@@ -621,7 +625,9 @@ pub fn main(init: std.process.Init) !void {
             &override_opts,
             hasExplicitOverrideArguments(args),
         ) catch |err| {
-            if (!printOverrideRuntimeError(json_output, err)) {
+            if (!printOverrideRuntimeError(json_output, err) and
+                !printRuntimeConfigSelectionError(.restart, json_output, err))
+            {
                 switch (err) {
                     error.PortAlreadyInUse,
                     error.ControllerPortAlreadyInUse,
@@ -3802,6 +3808,28 @@ fn printRuntimeCommandPreflightError(command: RuntimeCommand, json_output: bool,
     printCliError(json_output, info.code, info.message, info.hint);
 }
 
+fn printRuntimeConfigSelectionError(
+    command: RuntimeCommand,
+    json_output: bool,
+    err: anyerror,
+) bool {
+    if (err != error.NoActiveManagedConfig) return false;
+    const info: CliErrorInfo = switch (command) {
+        .start => .{
+            .code = "START_CONFIG_NOT_SELECTED",
+            .message = "no active config is selected",
+            .hint = "run `zc config list`, then `zc config use <name>`",
+        },
+        .restart => .{
+            .code = "RESTART_CONFIG_NOT_SELECTED",
+            .message = "no active config is selected for restart",
+            .hint = "run `zc config list`, then `zc config use <name>`",
+        },
+    };
+    printCliError(json_output, info.code, info.message, info.hint);
+    return true;
+}
+
 fn deinitForwardArgs(
     allocator: std.mem.Allocator,
     args: *std.ArrayList([]const u8),
@@ -4017,6 +4045,27 @@ fn validateTrackedPreparedRuntime(
     return preparedListenerPorts(allocator, path);
 }
 
+fn validateTrackedManagedRevision(
+    allocator: std.mem.Allocator,
+    tracked: *const daemon.TrackedRuntime,
+) !void {
+    const prepared_path = tracked.invocation.config_path orelse
+        return error.DaemonInvocationUntracked;
+    var prepared = try daemon.readPreparedConfig(allocator, prepared_path);
+    defer prepared.deinit();
+    const identity = prepared.identity orelse return;
+    var root = try openDefaultCatalogRoot(allocator);
+    defer root.deinit();
+    var loaded = managed_config_loader.Loader.init(
+        allocator,
+        root.dir,
+    ).loadExact(identity) catch |err| switch (err) {
+        error.ManagedProfileNotFound => return error.NoActiveManagedConfig,
+        else => return err,
+    };
+    loaded.deinit();
+}
+
 fn runRestartCommand(
     allocator: std.mem.Allocator,
     start_opts: StartCommandOptions,
@@ -4032,6 +4081,12 @@ fn runRestartCommand(
         tracked = (try daemon.captureTrackedRuntime(allocator)) orelse
             return error.DaemonInvocationUntracked;
         if (tracked.?.invocation.foreground) return error.ForegroundDaemonSupervised;
+        // An explicit source is an independent recovery target and does not
+        // require the deleted managed identity to remain rollback-capable.
+        // Descriptor reuse and overrides of the tracked source still do.
+        if (start_opts.config_path == null) {
+            try validateTrackedManagedRevision(allocator, &tracked.?);
+        }
         old_ports = try validateTrackedPreparedRuntime(allocator, &tracked.?);
     }
 
