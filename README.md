@@ -72,7 +72,7 @@ zc --version
 
 默认目标是 `${XDG_BIN_HOME:-$HOME/.local/bin}/zc`。Linux 发布物是静态 musl ELF；
 macOS 发布物只依赖系统库。installer 会验证版本化 Release SHA-256，并在下载、校验或
-自检失败时保留旧二进制。固定版本和自定义目录使用 `ZC_VERSION`、`ZC_INSTALL_DIR`，
+自检失败时保留旧二进制；安装目标仍有进程运行时，即使新版本无法追踪其旧 runtime 状态，也拒绝覆盖。固定版本和自定义目录使用 `ZC_VERSION`、`ZC_INSTALL_DIR`，
 详见 [`docs/install/README.md`](docs/install/README.md)。
 
 ## Install with Homebrew (release candidate)

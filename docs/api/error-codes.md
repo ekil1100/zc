@@ -56,6 +56,7 @@
 | `START_PORT_REQUIRED` | missing value for `--port` | use `zc start --port <port>` |
 | `START_PORT_INVALID` | invalid `--port` value | use an integer between 1 and 65535 |
 | `START_CONFIG_PATH_REQUIRED` | missing value for `-c` | use `zc start -c <config>` |
+| `START_CONFIG_NOT_SELECTED` | no active config is selected | run `zc config list`, then `zc config use <name>` |
 | `START_PORT_IN_USE` | requested start port is already in use | retry with `zc start --port <free-port>` |
 | `START_CONTROLLER_PORT_IN_USE` | configured controller port is already in use | free the exact `external-controller` port or update the config |
 | `START_PORT_CONFLICT` | requested start port conflicts with another runtime listener | change the port or fix the conflicting runtime config |
@@ -71,6 +72,7 @@
 | `RESTART_ROLLBACK_FAILED` | new daemon failed and the previous invocation could not be restored | inspect status/logs and start the known-good config explicitly |
 | `RESTART_CONTENDED` | another daemon acquired the runtime during restart | inspect `zc status` before retrying |
 | `RESTART_READINESS_TIMEOUT` | daemon did not publish readiness before the startup deadline | check override duration, port ownership, and the daemon log |
+| `RESTART_CONFIG_NOT_SELECTED` | no active config is selected for restart | run `zc config list`, then `zc config use <name>` |
 | `RESTART_PORT_IN_USE` | restart target port is already in use | free the occupied port, then retry `zc restart` |
 | `RESTART_CONTROLLER_PORT_IN_USE` | restart controller port is already in use | free the exact `external-controller` port before retrying `zc restart` |
 | `RESTART_PORT_CONFLICT` | restart target port conflicts with another runtime listener | fix the conflicting runtime config before retrying `zc restart` |

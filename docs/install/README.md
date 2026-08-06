@@ -28,12 +28,15 @@ installer 先把 `latest` 解析为 immutable tag，再下载版本化归档及�
 checksum、摘要不匹配、归档异常或 `zc --version` 自检失败都会保留旧二进制并非零退出。
 最终替换使用目标目录内的临时文件、单安装器锁、旧二进制备份和原子 rename。installer
 在发布前后都会检查目标状态；若 daemon 在检查与 rename 之间启动，新二进制会检测到
-running 并原子恢复旧二进制。现有 `zc` 无法明确报告 stopped 时同样拒绝覆盖。先执行
-`zc stop` 并确认状态。异常断电可能遗留
+running 并原子恢复旧二进制。即使 `zc status` 报告 stopped，只要可见进程的 executable
+identity 仍指向安装目标（例如 runtime 路径迁移后遗留的旧 daemon），installer 也会拒绝
+替换；最终目标是 symlink 时同样拒绝。现有 `zc` 无法明确报告 stopped 或平台进程身份检查
+不可用时也拒绝覆盖。先执行 `zc stop` 并确认状态；若是
+无法追踪的旧实例，先核对 PID、命令路径和监听端口，再显式终止该实例。异常断电可能遗留
 `.zc.install.lock`；只有确认其 `owner` PID 已不存在且没有安装进程后才能手动删除。
 
 安装阶段需要系统已有的 POSIX `sh`、`curl`、`tar`、`awk`、`mktemp`，以及
-`sha256sum`、`shasum` 或 `openssl` 之一；安装后的 `zc` 不需要这些工具。
+`sha256sum`、`shasum` 或 `openssl` 之一。Linux 进程身份检查使用 `/proc` 与 `readlink`，macOS 使用系统 `lsof`；安装后的 `zc` 不需要这些工具。
 
 ## Homebrew Tap
 
@@ -67,7 +70,7 @@ The shortest local install flow is:
 just install
 ```
 
-This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`. `just install` binds lifecycle checks to the exact target `$HOME/.local/bin/zc`: it detects a running daemon with that old binary, verifies the tracked process was launched from that exact target path, stops it before replacement, verifies it stopped, then starts it with the new target binary. Success requires a changed PID and an executable device/inode matching the newly installed target, so `already_running` cannot accept a respawned old inode. If replacement or startup verification fails, an EXIT rollback restores the retained old binary and attempts to restart it. Automatic restart is limited to the default managed prepared invocation; foreground, explicit source, CLI port, and one-shot override invocations must be preserved manually through their supervisor. The lower-level `local-dev-install.sh` only replaces the binary and must not be used directly while a daemon is running.
+This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`. `just install` binds lifecycle checks to the exact target `$HOME/.local/bin/zc`: it detects a running daemon with that old binary, verifies the tracked process was launched from that exact target path, stops it before replacement, verifies it stopped, then starts it with the new target binary. Success requires a changed PID and an executable device/inode matching the newly installed target, so `already_running` cannot accept a respawned old inode. If replacement or startup verification fails, an EXIT rollback restores the retained old binary and attempts to restart it. Automatic restart is limited to the default managed prepared invocation; foreground, explicit source, CLI port, and one-shot override invocations must be preserved manually through their supervisor. The lower-level `local-dev-install.sh` only replaces the binary. It rejects symlink targets and any visible process whose executable identity is the exact logical or physical install target, including an untracked process executing an older unlinked inode. It scans both before and after publication and restores the retained target if final verification fails; it must not be used directly while a daemon is running.
 
 The underlying maintained install workflow is script-based:
 
