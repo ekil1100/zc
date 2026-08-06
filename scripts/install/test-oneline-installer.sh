@@ -2,6 +2,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+command -v cc >/dev/null 2>&1 || {
+    echo "TEST_RESULT=FAIL missing cc" >&2
+    exit 1
+}
 real_zc_bin="${1:-}"
 port_helper_bin="${2:-}"
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/zc-installer-e2e.XXXXXX")"
@@ -9,6 +13,7 @@ real_home=""
 real_runtime=""
 real_daemon_pid=""
 signal_installer_pid=""
+orphan_target_pid=""
 
 cleanup() {
     local exit_code=$?
@@ -29,6 +34,10 @@ cleanup() {
             kill -9 "$stop_process_id" >/dev/null 2>&1 || true
         fi
         wait "$stop_process_id" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$orphan_target_pid" ]; then
+        kill -9 "$orphan_target_pid" >/dev/null 2>&1 || true
+        wait "$orphan_target_pid" >/dev/null 2>&1 || true
     fi
     if [ -n "$signal_installer_pid" ]; then
         kill -9 "$signal_installer_pid" >/dev/null 2>&1 || true
@@ -259,6 +268,21 @@ test -d "$install_dir/zc"
 rmdir "$install_dir/zc"
 echo "INSTALLER_DIRECTORY_TARGET_FAIL_CLOSED=PASS"
 
+cat >"$work_root/symlink-target" <<'EOF'
+#!/bin/sh
+echo "zc symlink sentinel"
+EOF
+chmod 755 "$work_root/symlink-target"
+ln -s "$work_root/symlink-target" "$install_dir/zc"
+if run_installer >/dev/null 2>&1; then
+    echo "symbolic-link installation target was unexpectedly accepted" >&2
+    exit 1
+fi
+test -L "$install_dir/zc"
+test "$("$install_dir/zc")" = "zc symlink sentinel"
+rm "$install_dir/zc"
+echo "INSTALLER_SYMLINK_TARGET_FAIL_CLOSED=PASS"
+
 write_fixture_binary "${version#v}" running
 package_fixture
 cat >"$install_dir/zc" <<'EOF'
@@ -358,6 +382,56 @@ if run_installer >/dev/null 2>&1; then
 fi
 test "$("$install_dir/zc")" = "zc running sentinel"
 echo "INSTALLER_RUNNING_TARGET_FAIL_CLOSED=PASS"
+
+cat >"$work_root/orphan-target.c" <<'EOF'
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "status") == 0) {
+        puts("{\"ok\":true,\"data\":{\"state\":\"stopped\"}}");
+        return 0;
+    }
+    if (argc > 2 && strcmp(argv[1], "run") == 0) {
+        FILE *ready = fopen(argv[2], "w");
+        if (ready == NULL) return 2;
+        fclose(ready);
+        sleep(30);
+        return 0;
+    }
+    puts("zc orphan sentinel");
+    return 0;
+}
+EOF
+cc "$work_root/orphan-target.c" -o "$work_root/orphan-target"
+cp "$work_root/orphan-target" "$install_dir/zc"
+chmod 755 "$install_dir/zc"
+orphan_ready="$work_root/orphan-ready"
+"$install_dir/zc" run "$orphan_ready" &
+orphan_target_pid=$!
+orphan_attempt=0
+while [ "$orphan_attempt" -lt 100 ]; do
+    if [ -f "$orphan_ready" ]; then
+        break
+    fi
+    orphan_attempt=$((orphan_attempt + 1))
+    sleep 0.01
+done
+test -f "$orphan_ready"
+if run_installer >/dev/null 2>&1; then
+    echo "orphaned installation target was unexpectedly replaced" >&2
+    exit 1
+fi
+if ! kill -0 "$orphan_target_pid" >/dev/null 2>&1; then
+    echo "orphaned installation target was terminated" >&2
+    exit 1
+fi
+cmp "$work_root/orphan-target" "$install_dir/zc"
+kill "$orphan_target_pid" >/dev/null 2>&1 || true
+wait "$orphan_target_pid" >/dev/null 2>&1 || true
+orphan_target_pid=""
+echo "INSTALLER_ORPHAN_TARGET_FAIL_CLOSED=PASS"
 
 if [ -n "$real_zc_bin" ] && [ -n "$port_helper_bin" ]; then
     real_home="$work_root/real-home"

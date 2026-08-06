@@ -114,8 +114,14 @@ fi
 zc_validate_tag "$zc_tag"
 
 case "$(uname -s)" in
-    Linux) zc_os="linux" ;;
-    Darwin) zc_os="macos" ;;
+    Linux)
+        zc_os="linux"
+        command -v readlink >/dev/null 2>&1 || zc_fail "readlink is required on Linux"
+        ;;
+    Darwin)
+        zc_os="macos"
+        command -v lsof >/dev/null 2>&1 || zc_fail "lsof is required on macOS"
+        ;;
     *) zc_fail "unsupported operating system: $(uname -s)" ;;
 esac
 
@@ -184,6 +190,12 @@ fi
 
 mkdir -p "$zc_install_dir"
 zc_target="$zc_install_dir/zc"
+zc_install_dir_physical="$(CDPATH= cd -P "$zc_install_dir" && pwd -P)" \
+    || zc_fail "cannot resolve installation directory: $zc_install_dir"
+zc_target_physical="$zc_install_dir_physical/zc"
+if [ -L "$zc_target" ]; then
+    zc_fail "installation target must not be a symbolic link: $zc_target"
+fi
 if [ -d "$zc_target" ]; then
     zc_fail "installation target is a directory: $zc_target"
 fi
@@ -195,7 +207,60 @@ fi
 zc_lock_dir="$zc_lock_candidate"
 printf '%s\n' "$$" >"$zc_lock_dir/owner" || zc_fail "failed to record installer lock owner"
 
+zc_running_target_pids() {
+    if [ -r /proc/self/exe ]; then
+        command -v readlink >/dev/null 2>&1 || return 1
+        for zc_exe_link in /proc/[0-9]*/exe; do
+            if ! zc_executable="$(readlink "$zc_exe_link" 2>/dev/null)"; then
+                zc_proc_dir="${zc_exe_link%/exe}"
+                zc_comm="$(cat "$zc_proc_dir/comm" 2>/dev/null)" || continue
+                [ "$zc_comm" != "zc" ] || return 1
+                continue
+            fi
+            zc_executable="${zc_executable% (deleted)}"
+            if [ "$zc_executable" = "$zc_target" ] \
+                || [ "$zc_executable" = "$zc_target_physical" ]; then
+                zc_pid="${zc_exe_link#/proc/}"
+                printf '%s\n' "${zc_pid%%/*}"
+            fi
+        done
+        return 0
+    fi
+
+    command -v lsof >/dev/null 2>&1 || return 1
+    if ! zc_lsof_output="$(lsof -n -d txt -Fpn 2>/dev/null)"; then
+        return 1
+    fi
+    if ! zc_ps_output="$(ps -ww -axo pid=,comm= 2>/dev/null)"; then
+        return 1
+    fi
+    {
+        printf '%s\n' "$zc_ps_output" | awk \
+            -v logical="$zc_target" \
+            -v physical="$zc_target_physical" '
+                {
+                    pid = $1
+                    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "")
+                    if ($0 == logical || $0 == physical) print pid
+                }
+            '
+        printf '%s\n' "$zc_lsof_output" | awk \
+            -v logical="$zc_target" \
+            -v physical="$zc_target_physical" '
+                /^p/ { pid = substr($0, 2) }
+                /^n/ {
+                    path = substr($0, 2)
+                    sub(/ \(deleted\)$/, "", path)
+                    if (path == logical || path == physical) print pid
+                }
+            '
+    } | awk '!seen[$0]++'
+}
+
 zc_require_stopped_target() {
+    if [ -L "$zc_target" ]; then
+        zc_fail "installation target must not be a symbolic link: $zc_target"
+    fi
     if [ ! -e "$zc_target" ]; then
         return 0
     fi
@@ -207,12 +272,19 @@ zc_require_stopped_target() {
     fi
     zc_status_compact="$(printf '%s' "$zc_status" | tr -d '[:space:]')"
     case "$zc_status_compact" in
-        *'"state":"stopped"'*) return 0 ;;
+        *'"state":"stopped"'*) ;;
         *'"state":"running"'*)
             zc_fail "zc is running; stop it before replacing $zc_target"
             ;;
         *) zc_fail "existing zc returned an unknown status contract" ;;
     esac
+    if ! zc_target_pids="$(zc_running_target_pids)"; then
+        zc_fail "cannot inspect running processes before replacing $zc_target"
+    fi
+    if [ -n "$zc_target_pids" ]; then
+        zc_target_pids_one_line="$(printf '%s' "$zc_target_pids" | tr '\n' ' ')"
+        zc_fail "installation target is still running (pid: $zc_target_pids_one_line)"
+    fi
 }
 
 zc_restore_previous() {
@@ -231,6 +303,24 @@ zc_restore_previous() {
     zc_fail "$zc_restore_reason"
 }
 
+zc_verify_post_publish_processes() {
+    if ! zc_target_pids="$(zc_running_target_pids)"; then
+        if [ "$zc_had_target" -eq 1 ]; then
+            zc_restore_previous \
+                "could not inspect processes after publication; restored previous zc"
+        fi
+        zc_fail "could not inspect processes after publication"
+    fi
+    if [ -n "$zc_target_pids" ]; then
+        zc_target_pids_one_line="$(printf '%s' "$zc_target_pids" | tr '\n' ' ')"
+        if [ "$zc_had_target" -eq 1 ]; then
+            zc_restore_previous \
+                "zc started during installation (pid: $zc_target_pids_one_line); restored previous zc"
+        fi
+        zc_fail "zc started during installation (pid: $zc_target_pids_one_line)"
+    fi
+}
+
 zc_require_stopped_target
 zc_had_target=0
 if [ -e "$zc_target" ]; then
@@ -246,12 +336,17 @@ zc_actual_version="$("$zc_stage_path" --version 2>/dev/null || true)"
 [ "$zc_actual_version" = "$zc_expected_version" ] \
     || zc_fail "binary self-check failed: expected '$zc_expected_version'"
 zc_require_stopped_target
+if [ -L "$zc_target" ]; then
+    zc_fail "installation target became a symbolic link: $zc_target"
+fi
 if [ -d "$zc_target" ]; then
     zc_fail "installation target became a directory: $zc_target"
 fi
 zc_publish_in_progress=1
 mv -f "$zc_stage_path" "$zc_target"
 zc_stage_path=""
+
+zc_verify_post_publish_processes
 
 if [ "$zc_had_target" -eq 1 ]; then
     if ! zc_status="$("$zc_target" status --json 2>/dev/null)"; then
@@ -266,10 +361,12 @@ if [ "$zc_had_target" -eq 1 ]; then
                 "daemon started during installation; restored previous zc"
             ;;
     esac
+    zc_verify_post_publish_processes
     zc_publish_in_progress=0
     rm -f "$zc_backup_path"
     zc_backup_path=""
 else
+    zc_verify_post_publish_processes
     zc_publish_in_progress=0
 fi
 
