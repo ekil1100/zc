@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
+const config_validator = @import("config_validator.zig");
 const yaml = @import("util/yaml.zig");
 
 pub const timeout_ms_default: u32 = 5_000;
@@ -239,10 +240,24 @@ pub fn apply(
     }
 }
 
+const PatchConfigParseMode = enum {
+    runtime,
+    catalog_capture,
+};
+
 pub fn applyPatch(
     allocator: std.mem.Allocator,
     cfg: *config.Config,
     patch_text: []const u8,
+) !void {
+    return applyPatchImpl(allocator, cfg, patch_text, .runtime);
+}
+
+fn applyPatchImpl(
+    allocator: std.mem.Allocator,
+    cfg: *config.Config,
+    patch_text: []const u8,
+    parse_mode: PatchConfigParseMode,
 ) !void {
     const trimmed = std.mem.trim(u8, patch_text, " \t\r\n");
     if (trimmed.len == 0) return;
@@ -257,7 +272,12 @@ pub fn applyPatch(
     defer allocator.free(source);
     var replacement = try config.parseDocument(allocator, source);
     errdefer replacement.deinit();
-    applyMapOverride(allocator, &replacement, &root.map) catch |err| switch (err) {
+    applyMapOverride(
+        allocator,
+        &replacement,
+        &root.map,
+        parse_mode,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return Errors.OverrideMergeFailed,
     };
@@ -272,13 +292,35 @@ pub fn materializeSource(
     source: []const u8,
     patch_text: []const u8,
 ) ![]u8 {
+    var cfg = try config.parseCatalogDocument(allocator, source);
+    defer cfg.deinit();
     if (std.mem.trim(u8, patch_text, " \t\r\n").len == 0) {
+        try requireMaterializableCapabilities(allocator, &cfg);
         return allocator.dupe(u8, source);
     }
-    var cfg = try config.parseDocument(allocator, source);
-    defer cfg.deinit();
-    try applyPatch(allocator, &cfg, patch_text);
+    applyPatchImpl(
+        allocator,
+        &cfg,
+        patch_text,
+        .catalog_capture,
+    ) catch |err| switch (err) {
+        error.InvalidPluginOptions => return error.UnsupportedCapability,
+        else => return err,
+    };
+    try requireMaterializableCapabilities(allocator, &cfg);
     return dumpEffectiveConfigYaml(allocator, &cfg);
+}
+
+fn requireMaterializableCapabilities(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+) !void {
+    var validation = try config_validator.validateRuntimeCapabilities(
+        allocator,
+        cfg,
+    );
+    defer validation.deinit();
+    if (!validation.isValid()) return error.UnsupportedCapability;
 }
 
 fn executeOverrideScript(
@@ -595,6 +637,7 @@ fn applyMapOverride(
     allocator: std.mem.Allocator,
     cfg: *config.Config,
     m: *const std.StringHashMap(yaml.YamlValue),
+    parse_mode: PatchConfigParseMode,
 ) !void {
     var it = m.iterator();
     while (it.next()) |entry| {
@@ -656,25 +699,45 @@ fn applyMapOverride(
             continue;
         }
         if (std.mem.eql(u8, key, "proxies")) {
-            var tmp = try parseSingleFieldOverride(allocator, "proxies", value);
+            var tmp = try parseSingleFieldOverride(
+                allocator,
+                "proxies",
+                value,
+                parse_mode,
+            );
             defer releaseTempConfig(&tmp);
             moveProxies(cfg, &tmp);
             continue;
         }
         if (std.mem.eql(u8, key, "proxy-groups")) {
-            var tmp = try parseSingleFieldOverride(allocator, "proxy-groups", value);
+            var tmp = try parseSingleFieldOverride(
+                allocator,
+                "proxy-groups",
+                value,
+                parse_mode,
+            );
             defer releaseTempConfig(&tmp);
             moveProxyGroups(cfg, &tmp);
             continue;
         }
         if (std.mem.eql(u8, key, "rule-providers")) {
-            var tmp = try parseSingleFieldOverride(allocator, "rule-providers", value);
+            var tmp = try parseSingleFieldOverride(
+                allocator,
+                "rule-providers",
+                value,
+                parse_mode,
+            );
             defer releaseTempConfig(&tmp);
             moveRuleProviders(cfg, &tmp);
             continue;
         }
         if (std.mem.eql(u8, key, "rules")) {
-            var tmp = try parseSingleFieldOverride(allocator, "rules", value);
+            var tmp = try parseSingleFieldOverride(
+                allocator,
+                "rules",
+                value,
+                parse_mode,
+            );
             defer releaseTempConfig(&tmp);
             moveRules(cfg, &tmp);
             continue;
@@ -694,7 +757,12 @@ fn decodePort(value: yaml.YamlValue) !u16 {
     };
 }
 
-fn parseSingleFieldOverride(allocator: std.mem.Allocator, field: []const u8, value: yaml.YamlValue) !config.Config {
+fn parseSingleFieldOverride(
+    allocator: std.mem.Allocator,
+    field: []const u8,
+    value: yaml.YamlValue,
+    parse_mode: PatchConfigParseMode,
+) !config.Config {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
@@ -723,7 +791,10 @@ fn parseSingleFieldOverride(allocator: std.mem.Allocator, field: []const u8, val
         },
     }
 
-    return config.parseDocument(allocator, out.items) catch Errors.OverrideOutputInvalid;
+    return switch (parse_mode) {
+        .runtime => config.parseDocument(allocator, out.items),
+        .catalog_capture => config.parseCatalogDocument(allocator, out.items),
+    } catch Errors.OverrideOutputInvalid;
 }
 
 fn releaseTempConfig(tmp: *config.Config) void {
@@ -982,17 +1053,28 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
                 try writeYamlQuotedString(&out, allocator, value);
                 try out.append(allocator, '\n');
             }
-            if (proxy.obfs_mode != null or proxy.obfs_host != null) {
-                try out.appendSlice(allocator, "    plugin-opts:\n");
-                if (proxy.obfs_mode) |value| {
-                    try out.appendSlice(allocator, "      mode: ");
-                    try writeYamlQuotedString(&out, allocator, value);
-                    try out.append(allocator, '\n');
-                }
-                if (proxy.obfs_host) |value| {
-                    try out.appendSlice(allocator, "      host: ");
-                    try writeYamlQuotedString(&out, allocator, value);
-                    try out.append(allocator, '\n');
+            if (proxy.semantic_state == .malformed or
+                proxy.plugin_options_state == .malformed)
+            {
+                return error.InvalidPluginOptions;
+            }
+            if (proxy.plugin_options_state == .map or
+                proxy.obfs_mode != null or proxy.obfs_host != null)
+            {
+                if (proxy.obfs_mode == null and proxy.obfs_host == null) {
+                    try out.appendSlice(allocator, "    plugin-opts: {}\n");
+                } else {
+                    try out.appendSlice(allocator, "    plugin-opts:\n");
+                    if (proxy.obfs_mode) |value| {
+                        try out.appendSlice(allocator, "      mode: ");
+                        try writeYamlQuotedString(&out, allocator, value);
+                        try out.append(allocator, '\n');
+                    }
+                    if (proxy.obfs_host) |value| {
+                        try out.appendSlice(allocator, "      host: ");
+                        try writeYamlQuotedString(&out, allocator, value);
+                        try out.append(allocator, '\n');
+                    }
                 }
             }
         }
@@ -1222,17 +1304,28 @@ fn dumpConfigYamlWithOptions(
             try writeYamlQuotedString(&out, allocator, plugin);
             try out.append(allocator, '\n');
         }
-        if (proxy.obfs_mode != null or proxy.obfs_host != null) {
-            try out.appendSlice(allocator, "    plugin-opts:\n");
-            if (proxy.obfs_mode) |obfs_mode| {
-                try out.appendSlice(allocator, "      mode: ");
-                try writeYamlQuotedString(&out, allocator, obfs_mode);
-                try out.append(allocator, '\n');
-            }
-            if (proxy.obfs_host) |obfs_host| {
-                try out.appendSlice(allocator, "      host: ");
-                try writeYamlQuotedString(&out, allocator, obfs_host);
-                try out.append(allocator, '\n');
+        if (proxy.semantic_state == .malformed or
+            proxy.plugin_options_state == .malformed)
+        {
+            return error.InvalidPluginOptions;
+        }
+        if (proxy.plugin_options_state == .map or
+            proxy.obfs_mode != null or proxy.obfs_host != null)
+        {
+            if (proxy.obfs_mode == null and proxy.obfs_host == null) {
+                try out.appendSlice(allocator, "    plugin-opts: {}\n");
+            } else {
+                try out.appendSlice(allocator, "    plugin-opts:\n");
+                if (proxy.obfs_mode) |obfs_mode| {
+                    try out.appendSlice(allocator, "      mode: ");
+                    try writeYamlQuotedString(&out, allocator, obfs_mode);
+                    try out.append(allocator, '\n');
+                }
+                if (proxy.obfs_host) |obfs_host| {
+                    try out.appendSlice(allocator, "      host: ");
+                    try writeYamlQuotedString(&out, allocator, obfs_host);
+                    try out.append(allocator, '\n');
+                }
             }
         }
     }
@@ -1342,6 +1435,34 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
         if (proxy.password != null) {
             try js.objectField("password");
             try js.write("******");
+        }
+        if (proxy.cipher) |cipher| {
+            try js.objectField("cipher");
+            try js.write(cipher);
+        }
+        if (proxy.plugin) |plugin| {
+            try js.objectField("plugin");
+            try js.write(plugin);
+        }
+        if (proxy.semantic_state == .malformed or
+            proxy.plugin_options_state == .malformed)
+        {
+            return error.InvalidPluginOptions;
+        }
+        if (proxy.plugin_options_state == .map or
+            proxy.obfs_mode != null or proxy.obfs_host != null)
+        {
+            try js.objectField("plugin-opts");
+            try js.beginObject();
+            if (proxy.obfs_mode) |mode| {
+                try js.objectField("mode");
+                try js.write(mode);
+            }
+            if (proxy.obfs_host) |host| {
+                try js.objectField("host");
+                try js.write(host);
+            }
+            try js.endObject();
         }
         if (proxy.uuid != null) {
             try js.objectField("uuid");
@@ -1544,9 +1665,9 @@ test "runtime YAML snapshot preserves secrets and omits provider declarations" {
         \\    port: 443
         \\    password: proxy-secret
         \\    cipher: aes-128-gcm
-        \\    plugin: obfs
-        \\    plugin-opts:
-        \\      mode: tls
+        \\    plugin: obfs-local
+        \\    plugin_opts:
+        \\      mode: http
         \\      host: cdn.example.com
         \\  - name: websocket
         \\    type: trojan
@@ -1576,7 +1697,14 @@ test "runtime YAML snapshot preserves secrets and omits provider declarations" {
     defer restored.deinit();
     try std.testing.expectEqualStrings("controller-secret", restored.secret.?);
     try std.testing.expectEqualStrings("proxy-secret", restored.proxies.items[0].password.?);
-    try std.testing.expectEqualStrings("tls", restored.proxies.items[0].obfs_mode.?);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "plugin-opts:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "plugin_opts:") == null);
+    try std.testing.expectEqualStrings("obfs-local", restored.proxies.items[0].plugin.?);
+    try std.testing.expectEqual(
+        config.PluginOptionsState.map,
+        restored.proxies.items[0].plugin_options_state,
+    );
+    try std.testing.expectEqualStrings("http", restored.proxies.items[0].obfs_mode.?);
     try std.testing.expectEqualStrings(
         "cdn.example.com",
         restored.proxies.items[0].obfs_host.?,
@@ -1603,6 +1731,10 @@ test "dumpConfigJson emits parseable std.json with escaping and masked secrets" 
         \\    port: 8388
         \\    cipher: aes-128-gcm
         \\    password: topsecret
+        \\    plugin: obfs
+        \\    plugin_opts:
+        \\      mode: http
+        \\      host: cdn.example.com
         \\proxy-groups:
         \\  - name: Proxy
         \\    type: select
@@ -1624,6 +1756,15 @@ test "dumpConfigJson emits parseable std.json with escaping and masked secrets" 
     const proxy = parsed.value.object.get("proxies").?.array.items[0].object;
     try std.testing.expectEqualStrings("node \"HK\" 线路", proxy.get("name").?.string);
     try std.testing.expectEqualStrings("******", proxy.get("password").?.string);
+    try std.testing.expectEqualStrings("aes-128-gcm", proxy.get("cipher").?.string);
+    try std.testing.expectEqualStrings("obfs", proxy.get("plugin").?.string);
+    const plugin_options = proxy.get("plugin-opts").?.object;
+    try std.testing.expectEqualStrings("http", plugin_options.get("mode").?.string);
+    try std.testing.expectEqualStrings(
+        "cdn.example.com",
+        plugin_options.get("host").?.string,
+    );
+    try std.testing.expect(proxy.get("plugin_opts") == null);
     try std.testing.expectEqualStrings("MATCH,DIRECT", parsed.value.object.get("rules").?.array.items[0].string);
 }
 
@@ -1648,8 +1789,6 @@ test "override materialization preserves runtime secrets in owner-only effective
         \\    port: 443
         \\    password: "proxy-password"
         \\    sni: "sni.example.com"
-        \\    udp: true
-        \\    ws-opts: {}
         \\proxy-groups:
         \\  - name: "Proxy"
         \\    type: "select"
@@ -1673,8 +1812,6 @@ test "override materialization preserves runtime secrets in owner-only effective
     try std.testing.expectEqualStrings("global", parsed.mode);
     try std.testing.expectEqualStrings("controller-secret", parsed.secret.?);
     try std.testing.expectEqualStrings("proxy-password", parsed.proxies.items[0].password.?);
-    try std.testing.expect(parsed.proxies.items[0].udp);
-    try std.testing.expect(parsed.proxies.items[0].ws);
     try std.testing.expectEqualStrings("local rules", parsed.rule_providers.items[0].name);
     try std.testing.expectEqualStrings("assets/rules.yaml", parsed.rule_providers.items[0].path);
 }
@@ -1683,14 +1820,8 @@ test "override field parsing preserves nested empty collections" {
     const allocator = std.testing.allocator;
     const source = "mixed-port: 7890\n";
     const patch =
-        \\proxies:
-        \\  - name: node
-        \\    type: trojan
-        \\    server: example.com
-        \\    port: 443
-        \\    password: secret
-        \\    ws-opts:
-        \\      headers: {}
+        \\proxies: []
+        \\rule-providers: {}
         \\proxy-groups:
         \\  - name: Empty
         \\    type: select
@@ -1702,7 +1833,8 @@ test "override field parsing preserves nested empty collections" {
 
     var parsed = try config.parseDocument(allocator, effective);
     defer parsed.deinit();
-    try std.testing.expect(parsed.proxies.items[0].ws);
+    try std.testing.expectEqual(@as(usize, 0), parsed.proxies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.rule_providers.items.len);
     try std.testing.expectEqual(
         @as(usize, 0),
         parsed.proxy_groups.items[0].proxies.items.len,
@@ -1723,6 +1855,228 @@ test "override materialization keeps original bytes for an empty patch and is de
     const second = try materializeSource(allocator, source, "mixed-port: 9000\n");
     defer allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+}
+
+test "override materialization maps every runtime capability rejection for empty and nonempty patches" {
+    const allocator = std.testing.allocator;
+    const documents = [_][]const u8{
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: DIRECT
+        \\    type: direct
+        \\rules:
+        \\  - MATCH,DIRECT
+        ,
+        \\mixed-port: 7890
+        \\proxies: []
+        \\proxy-groups:
+        \\  - name: REJECT
+        \\    type: select
+        \\    proxies: [DIRECT]
+        \\rules:
+        \\  - MATCH,REJECT
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: disabled-http
+        \\    type: http
+        \\    server: example.com
+        \\    port: 8080
+        \\rules:
+        \\  - MATCH,disabled-http
+        ,
+        \\mixed-port: 7890
+        \\proxies: []
+        \\proxy-groups:
+        \\  - name: automatic
+        \\    type: url-test
+        \\    proxies: [DIRECT]
+        \\    url: https://example.com/ping
+        \\rules:
+        \\  - MATCH,automatic
+        ,
+        \\port: 7890
+        \\socks-port: 7891
+        \\mixed-port: 7892
+        \\rules:
+        \\  - MATCH,DIRECT
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: unsupported-obfs
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: obfs
+        \\    plugin-opts: { mode: tls, host: example.com }
+        \\rules:
+        \\  - MATCH,unsupported-obfs
+        ,
+    };
+    for (documents) |document| {
+        for ([_][]const u8{ "", "mode: global\n" }) |patch| {
+            try std.testing.expectError(
+                error.UnsupportedCapability,
+                materializeSource(allocator, document, patch),
+            );
+        }
+    }
+    try std.testing.expectError(
+        error.UnsupportedCapability,
+        materializeSource(
+            allocator,
+            "mixed-port: 7890\n",
+            \\proxies:
+            \\  - name: malformed-patch
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin-opts: "obfs=http"
+            ,
+        ),
+    );
+}
+
+test "override capability validation performs no provider network or asset IO" {
+    const allocator = std.testing.allocator;
+    const address = try compat.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try compat.net.listenReuseAddr(address);
+    defer listener.deinit();
+    const source = try std.fmt.allocPrint(
+        allocator,
+        \\mixed-port: 7890
+        \\rule-providers:
+        \\  missing-local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: definitely-absent.yaml
+        \\  remote:
+        \\    type: http
+        \\    behavior: domain
+        \\    path: remote.yaml
+        \\    url: http://127.0.0.1:{d}/rules
+        \\rules:
+        \\  - MATCH,DIRECT
+    ,
+        .{listener.listen_address.getPort()},
+    );
+    defer allocator.free(source);
+
+    const unchanged = try materializeSource(allocator, source, "");
+    defer allocator.free(unchanged);
+    const patched = try materializeSource(
+        allocator,
+        source,
+        "mode: global\n",
+    );
+    defer allocator.free(patched);
+
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = listener.fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try std.posix.poll(&descriptors, 0),
+    );
+}
+
+test "override materialization rejects plugin metadata on non-Shadowsocks proxies" {
+    const allocator = std.testing.allocator;
+    const documents = [_][]const u8{
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: direct-plugin
+        \\    type: direct
+        \\    plugin: obfs
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: reject-derived
+        \\    type: reject
+        \\    plugin-opts: { mode: http, host: example.com }
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: trojan-plugin
+        \\    type: trojan
+        \\    server: example.com
+        \\    port: 443
+        \\    password: secret
+        \\    plugin: obfs
+        \\    plugin_opts: { mode: http, host: example.com }
+        ,
+    };
+    for (documents) |document| {
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            materializeSource(allocator, document, ""),
+        );
+    }
+    try std.testing.expectError(
+        error.UnsupportedCapability,
+        materializeSource(allocator,
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: malformed
+            \\    type: trojan
+            \\    server: example.com
+            \\    port: 443
+            \\    password: secret
+            \\    plugin-opts: "obfs=http"
+        , ""),
+    );
+}
+
+test "override materialization rejects malformed and unsupported obfs semantics" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedCapability,
+        materializeSource(allocator,
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: malformed
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin-opts: "obfs=http"
+        , ""),
+    );
+    const unsupported =
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: unsupported
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: obfs
+        \\    plugin-opts: { mode: tls, host: example.com }
+    ;
+    try std.testing.expectError(
+        error.UnsupportedCapability,
+        materializeSource(allocator, unsupported, ""),
+    );
+    var captured = try config.parseCatalogDocument(allocator, unsupported);
+    defer captured.deinit();
+    try std.testing.expectEqual(
+        config.ProxySemanticState.malformed,
+        captured.proxies.items[0].semantic_state,
+    );
+    try std.testing.expectError(
+        error.InvalidPluginOptions,
+        dumpConfigYaml(allocator, &captured),
+    );
 }
 
 fn materializeAllocationFixture(allocator: std.mem.Allocator) !void {

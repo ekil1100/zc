@@ -67,6 +67,77 @@ pub fn monotonicMilliTimestamp() i64 {
     ));
 }
 
+const SystemPollOps = struct {
+    fn now(_: *@This()) i64 {
+        return monotonicMilliTimestamp();
+    }
+
+    fn poll(
+        _: *@This(),
+        descriptors: []std.posix.pollfd,
+        timeout_ms: i32,
+    ) !usize {
+        const result = std.c.poll(
+            descriptors.ptr,
+            @intCast(descriptors.len),
+            timeout_ms,
+        );
+        if (result >= 0) return @intCast(result);
+        return switch (std.c.errno(result)) {
+            .INTR => error.Interrupted,
+            .NOMEM => error.SystemResources,
+            else => error.PollFailed,
+        };
+    }
+};
+
+/// Polls until an absolute awake-clock millisecond deadline. Unlike
+/// `std.posix.poll`, an EINTR cannot restart the original relative timeout:
+/// every retry clears stale revents and derives a new bounded timeout from the
+/// same monotonic deadline.
+pub fn pollUntil(
+    descriptors: []std.posix.pollfd,
+    deadline_ms: i64,
+) !usize {
+    var ops = SystemPollOps{};
+    return pollUntilUsing(SystemPollOps, &ops, descriptors, deadline_ms);
+}
+
+/// Explicit absolute-deadline spelling used by bounded socket paths.
+pub fn pollAbsolute(
+    descriptors: []std.posix.pollfd,
+    deadline_ms: i64,
+) !usize {
+    return pollUntil(descriptors, deadline_ms);
+}
+
+fn pollUntilUsing(
+    comptime Ops: type,
+    ops: *Ops,
+    descriptors: []std.posix.pollfd,
+    deadline_ms: i64,
+) !usize {
+    while (true) {
+        const now_ms = ops.now();
+        if (now_ms >= deadline_ms) return 0;
+        const remaining_ms = std.math.sub(i64, deadline_ms, now_ms) catch
+            return 0;
+        const timeout_ms: i32 = @intCast(@min(
+            remaining_ms,
+            @as(i64, std.math.maxInt(i32)),
+        ));
+        for (descriptors) |*descriptor| descriptor.revents = 0;
+        const ready = ops.poll(descriptors, timeout_ms) catch |err| switch (err) {
+            error.Interrupted => continue,
+            else => |other| return other,
+        };
+        if (ready != 0) return ready;
+        // A timeout clamped to i32 may expire before the absolute deadline;
+        // clock granularity can also wake a millisecond early.
+        if (ops.now() >= deadline_ms) return 0;
+    }
+}
+
 pub fn randomBytes(buffer: []u8) void {
     io().random(buffer);
 }
@@ -91,6 +162,22 @@ pub fn posixWrite(fd: std.posix.fd_t, buffer: []const u8) !usize {
     return @intCast(rc);
 }
 
+/// Writes to a connected socket without allowing peer closure to terminate the
+/// process via SIGPIPE. Darwin sockets are configured with SO_NOSIGPIPE when
+/// created/accepted below; Linux and other supporting targets use MSG_NOSIGNAL.
+pub fn posixSocketWrite(fd: std.posix.fd_t, buffer: []const u8) !usize {
+    const flags: u32 = if (@hasDecl(std.c.MSG, "NOSIGNAL"))
+        @intCast(std.c.MSG.NOSIGNAL)
+    else
+        0;
+    while (true) {
+        const rc = std.c.send(fd, buffer.ptr, buffer.len, flags);
+        if (rc >= 0) return @intCast(rc);
+        if (std.c.errno(rc) == .INTR) continue;
+        return posixWriteError(rc);
+    }
+}
+
 fn posixReadError(rc: isize) anyerror {
     return switch (std.c.errno(rc)) {
         .CONNRESET => error.ConnectionResetByPeer,
@@ -109,6 +196,7 @@ fn posixWriteError(rc: isize) anyerror {
         .CONNRESET => error.ConnectionResetByPeer,
         .PIPE => error.BrokenPipe,
         .BADF => error.NotOpenForWriting,
+        .AGAIN => error.WouldBlock,
         else => error.InputOutput,
     };
 }
@@ -542,6 +630,22 @@ pub const fs = struct {
 pub const net = struct {
     const ionet = std.Io.net;
 
+    fn configureSocketWriteSafety(fd: std.posix.fd_t) !void {
+        if (comptime builtin.os.tag.isDarwin()) {
+            comptime if (!@hasDecl(std.c.SO, "NOSIGPIPE")) {
+                @compileError("Darwin socket writes require SO_NOSIGPIPE");
+            };
+            var enabled: c_int = 1;
+            if (std.c.setsockopt(
+                fd,
+                std.c.SOL.SOCKET,
+                std.c.SO.NOSIGPIPE,
+                &enabled,
+                @sizeOf(c_int),
+            ) != 0) return error.SocketSetupFailed;
+        }
+    }
+
     pub const Address = union(enum) {
         in: struct { sa: std.c.sockaddr.in },
         in6: struct { sa: std.c.sockaddr.in6 },
@@ -638,7 +742,7 @@ pub const net = struct {
         }
 
         pub fn write(stream: Stream, buffer: []const u8) !usize {
-            return posixWrite(stream.handle, buffer);
+            return posixSocketWrite(stream.handle, buffer);
         }
 
         pub fn writeAll(stream: Stream, buffer: []const u8) !void {
@@ -676,6 +780,8 @@ pub const net = struct {
 
         pub fn accept(server: *Server) !Connection {
             const accepted = try server.inner.accept(io());
+            errdefer accepted.close(io());
+            try configureSocketWriteSafety(accepted.socket.handle);
             return .{
                 .stream = Stream.fromIo(accepted),
                 .address = Address.fromIo(accepted.socket.address),
@@ -713,6 +819,10 @@ pub const net = struct {
                     else => return error.AcceptFailed,
                 };
                 setCloexec(cfd);
+                configureSocketWriteSafety(cfd) catch |err| {
+                    _ = std.c.close(cfd);
+                    return err;
+                };
                 return .{
                     .stream = Stream{ .handle = cfd },
                     .address = .{ .in = .{ .sa = sa } },
@@ -771,9 +881,271 @@ pub const net = struct {
         }
     };
 
+    const darwin_address_result_count_max: usize = 64;
+    const DarwinDnsServiceRef = ?*anyopaque;
+    const DarwinDnsFlags = u32;
+    const DarwinDnsProtocol = u32;
+    const DarwinDnsError = i32;
+    const darwin_dns_flags_more_coming: DarwinDnsFlags = 0x1;
+    const darwin_dns_flags_add: DarwinDnsFlags = 0x2;
+    const darwin_dns_protocol_ipv4: DarwinDnsProtocol = 0x01;
+    const darwin_dns_protocol_ipv6: DarwinDnsProtocol = 0x02;
+    const darwin_dns_error_no_error: DarwinDnsError = 0;
+    const darwin_dns_error_no_such_name: DarwinDnsError = -65538;
+    const darwin_dns_error_no_memory: DarwinDnsError = -65539;
+    const darwin_dns_error_timeout: DarwinDnsError = -65568;
+    const DarwinDnsGetAddrInfoReply = *const fn (
+        sd_ref: DarwinDnsServiceRef,
+        flags: DarwinDnsFlags,
+        interface_index: u32,
+        error_code: DarwinDnsError,
+        hostname: ?[*:0]const u8,
+        address: ?*const std.c.sockaddr,
+        ttl: u32,
+        context: ?*anyopaque,
+    ) callconv(.c) void;
+
+    // Exact C ABI and constants from Apple's dns_sd.h. These declarations are
+    // instantiated only for Darwin; libSystem already exports the symbols.
+    const DarwinDnsApi = if (builtin.os.tag.isDarwin()) struct {
+        extern fn DNSServiceGetAddrInfo(
+            sd_ref: *DarwinDnsServiceRef,
+            flags: DarwinDnsFlags,
+            interface_index: u32,
+            protocol: DarwinDnsProtocol,
+            hostname: [*:0]const u8,
+            callback: DarwinDnsGetAddrInfoReply,
+            context: ?*anyopaque,
+        ) callconv(.c) DarwinDnsError;
+        extern fn DNSServiceRefSockFD(
+            sd_ref: DarwinDnsServiceRef,
+        ) callconv(.c) c_int;
+        extern fn DNSServiceProcessResult(
+            sd_ref: DarwinDnsServiceRef,
+        ) callconv(.c) DarwinDnsError;
+        extern fn DNSServiceRefDeallocate(
+            sd_ref: DarwinDnsServiceRef,
+        ) callconv(.c) void;
+
+        fn start(
+            _: *@This(),
+            sd_ref: *DarwinDnsServiceRef,
+            hostname: [*:0]const u8,
+            callback: DarwinDnsGetAddrInfoReply,
+            context: ?*anyopaque,
+        ) !void {
+            const result = DNSServiceGetAddrInfo(
+                sd_ref,
+                0,
+                0,
+                darwin_dns_protocol_ipv4 | darwin_dns_protocol_ipv6,
+                hostname,
+                callback,
+                context,
+            );
+            if (result != darwin_dns_error_no_error) return mapDarwinDnsError(result);
+        }
+
+        fn socketFd(_: *@This(), sd_ref: DarwinDnsServiceRef) !std.posix.fd_t {
+            const fd = DNSServiceRefSockFD(sd_ref);
+            if (fd < 0) return error.AddressResolutionFailed;
+            return fd;
+        }
+
+        fn process(_: *@This(), sd_ref: DarwinDnsServiceRef) !void {
+            const result = DNSServiceProcessResult(sd_ref);
+            if (result != darwin_dns_error_no_error) return mapDarwinDnsError(result);
+        }
+
+        fn deallocate(_: *@This(), sd_ref: DarwinDnsServiceRef) void {
+            DNSServiceRefDeallocate(sd_ref);
+        }
+
+        fn wait(
+            _: *@This(),
+            descriptors: []std.posix.pollfd,
+            deadline_ms: i64,
+        ) !usize {
+            return pollUntil(descriptors, deadline_ms);
+        }
+    } else struct {};
+
+    const DarwinAddressContext = struct {
+        allocator: std.mem.Allocator,
+        port: u16,
+        addresses: std.ArrayList(Address) = .empty,
+        callback_error: ?anyerror = null,
+        batch_complete: bool = false,
+
+        fn deinit(self: *@This()) void {
+            self.addresses.deinit(self.allocator);
+        }
+    };
+
+    fn mapDarwinDnsError(code: DarwinDnsError) anyerror {
+        return switch (code) {
+            darwin_dns_error_no_error => unreachable,
+            darwin_dns_error_no_such_name => error.UnknownHostName,
+            darwin_dns_error_no_memory => error.OutOfMemory,
+            darwin_dns_error_timeout => error.AddressResolutionTimeout,
+            else => error.AddressResolutionFailed,
+        };
+    }
+
+    fn darwinAddressCallback(
+        _: DarwinDnsServiceRef,
+        flags: DarwinDnsFlags,
+        _: u32,
+        error_code: DarwinDnsError,
+        _: ?[*:0]const u8,
+        raw_address: ?*const std.c.sockaddr,
+        _: u32,
+        opaque_context: ?*anyopaque,
+    ) callconv(.c) void {
+        const context: *DarwinAddressContext = @ptrCast(@alignCast(
+            opaque_context orelse return,
+        ));
+        defer if (flags & darwin_dns_flags_more_coming == 0) {
+            context.batch_complete = true;
+        };
+        if (context.callback_error != null) return;
+        if (error_code != 0) {
+            context.callback_error = mapDarwinDnsError(error_code);
+            return;
+        }
+        // Ignore removal notifications; this bounded one-shot resolver ends
+        // after the first immediately available result batch.
+        if (flags & darwin_dns_flags_add == 0) return;
+        const address = raw_address orelse {
+            context.callback_error = error.AddressResolutionFailed;
+            return;
+        };
+        if (context.addresses.items.len >= darwin_address_result_count_max) {
+            context.callback_error = error.AddressResolutionResultLimitExceeded;
+            return;
+        }
+        const converted: Address = if (address.family == std.c.AF.INET) blk: {
+            const source: *const std.c.sockaddr.in = @ptrCast(@alignCast(address));
+            var value = source.*;
+            value.port = std.mem.nativeToBig(u16, context.port);
+            break :blk .{ .in = .{ .sa = value } };
+        } else if (address.family == std.c.AF.INET6) blk: {
+            const source: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(address));
+            var value = source.*;
+            value.port = std.mem.nativeToBig(u16, context.port);
+            break :blk .{ .in6 = .{ .sa = value } };
+        } else return;
+        context.addresses.append(context.allocator, converted) catch |err| {
+            context.callback_error = err;
+        };
+    }
+
+    fn getDarwinAddressListWithTimeoutUsing(
+        comptime Ops: type,
+        ops: *Ops,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        timeout_ms: u32,
+    ) !AddressList {
+        // Keep the test seam fail-closed too: DNSService accepts a C string and
+        // would otherwise silently truncate an embedded NUL or accept names
+        // that Zig's native resolver rejects.
+        _ = try ionet.HostName.init(host);
+        const deadline_ms = std.math.add(
+            i64,
+            monotonicMilliTimestamp(),
+            @intCast(timeout_ms),
+        ) catch std.math.maxInt(i64);
+        const hostname = try allocator.dupeZ(u8, host);
+        defer allocator.free(hostname);
+        if (monotonicMilliTimestamp() >= deadline_ms) {
+            return error.AddressResolutionTimeout;
+        }
+
+        var context = DarwinAddressContext{
+            .allocator = allocator,
+            .port = port,
+        };
+        defer context.deinit();
+        var sd_ref: DarwinDnsServiceRef = null;
+        try ops.start(&sd_ref, hostname, darwinAddressCallback, &context);
+        std.debug.assert(sd_ref != null);
+        defer ops.deallocate(sd_ref);
+        const fd = try ops.socketFd(sd_ref);
+
+        while (!context.batch_complete) {
+            var descriptors = [_]std.posix.pollfd{.{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = try ops.wait(&descriptors, deadline_ms);
+            if (ready == 0) return error.AddressResolutionTimeout;
+            const revents = descriptors[0].revents;
+            if (revents & std.posix.POLL.NVAL != 0) {
+                return error.AddressResolutionFailed;
+            }
+            if (revents & std.posix.POLL.IN == 0) {
+                if (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0) {
+                    return error.AddressResolutionFailed;
+                }
+                continue;
+            }
+            try ops.process(sd_ref);
+            if (context.callback_error) |err| return err;
+        }
+        if (context.callback_error) |err| return err;
+        if (context.addresses.items.len == 0) return error.UnknownHostName;
+        return .{
+            .addrs = try context.addresses.toOwnedSlice(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    fn singleAddressList(
+        allocator: std.mem.Allocator,
+        address: Address,
+    ) !AddressList {
+        const addresses = try allocator.alloc(Address, 1);
+        addresses[0] = address;
+        return .{ .addrs = addresses, .allocator = allocator };
+    }
+
+    const AddressListTimeoutEvent = union(enum) {
+        addresses: anyerror!AddressList,
+        deadline: anyerror!void,
+    };
+
+    const SystemAddressListResolver = struct {
+        deadline: std.Io.Clock.Timestamp,
+
+        fn init(timeout_ms: u32) SystemAddressListResolver {
+            return .{ .deadline = .fromNow(io(), .{
+                .raw = .fromMilliseconds(timeout_ms),
+                .clock = .awake,
+            }) };
+        }
+
+        fn resolve(
+            _: *@This(),
+            allocator: std.mem.Allocator,
+            host: []const u8,
+            port: u16,
+        ) !AddressList {
+            return getAddressList(allocator, host, port);
+        }
+
+        fn wait(self: *@This(), _: u32) !void {
+            try self.deadline.wait(io());
+        }
+    };
+
     pub fn tcpConnectToAddress(address: Address) !Stream {
         var inner_address = address.toIo();
         const stream = try inner_address.connect(io(), .{ .mode = .stream });
+        errdefer stream.close(io());
+        try configureSocketWriteSafety(stream.socket.handle);
         return Stream.fromIo(stream);
     }
 
@@ -781,15 +1153,113 @@ pub const net = struct {
         address: Address,
         timeout_ms: u32,
     ) !Stream {
-        var inner_address = address.toIo();
-        const stream = try inner_address.connect(io(), .{
-            .mode = .stream,
-            .timeout = .{ .duration = .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(timeout_ms),
-            } },
-        });
-        return Stream.fromIo(stream);
+        if (timeout_ms == 0) return error.Timeout;
+        const deadline_ms = std.math.add(
+            i64,
+            monotonicMilliTimestamp(),
+            @intCast(timeout_ms),
+        ) catch std.math.maxInt(i64);
+
+        const fd = switch (address) {
+            .in => std.c.socket(
+                std.c.AF.INET,
+                std.c.SOCK.STREAM,
+                std.c.IPPROTO.TCP,
+            ),
+            .in6 => std.c.socket(
+                std.c.AF.INET6,
+                std.c.SOCK.STREAM,
+                std.c.IPPROTO.TCP,
+            ),
+        };
+        if (fd < 0) return error.SocketSetupFailed;
+        errdefer _ = std.c.close(fd);
+        setCloexec(fd);
+        try configureSocketWriteSafety(fd);
+        try setNonBlock(fd);
+
+        const connect_result = switch (address) {
+            .in => |value| std.c.connect(
+                fd,
+                @ptrCast(&value.sa),
+                @sizeOf(std.c.sockaddr.in),
+            ),
+            .in6 => |value| std.c.connect(
+                fd,
+                @ptrCast(&value.sa),
+                @sizeOf(std.c.sockaddr.in6),
+            ),
+        };
+        if (connect_result < 0) switch (std.c.errno(connect_result)) {
+            .INPROGRESS, .ALREADY, .AGAIN, .INTR => {
+                while (true) {
+                    var descriptors = [_]std.posix.pollfd{.{
+                        .fd = fd,
+                        .events = std.posix.POLL.OUT,
+                        .revents = 0,
+                    }};
+                    const ready = try pollUntil(&descriptors, deadline_ms);
+                    if (ready == 0) return error.Timeout;
+                    const revents = descriptors[0].revents;
+                    if (revents & std.posix.POLL.NVAL != 0) {
+                        return error.InvalidSocket;
+                    }
+                    if (revents & (std.posix.POLL.OUT |
+                        std.posix.POLL.ERR |
+                        std.posix.POLL.HUP) == 0)
+                    {
+                        continue;
+                    }
+
+                    var socket_error: c_int = 0;
+                    var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+                    if (std.c.getsockopt(
+                        fd,
+                        std.c.SOL.SOCKET,
+                        std.c.SO.ERROR,
+                        &socket_error,
+                        &socket_error_len,
+                    ) != 0) return error.SocketSetupFailed;
+                    if (socket_error != 0) {
+                        return tcpConnectError(@enumFromInt(socket_error));
+                    }
+                    break;
+                }
+            },
+            .ISCONN => {},
+            else => |err| return tcpConnectError(err),
+        };
+
+        if (monotonicMilliTimestamp() >= deadline_ms) return error.Timeout;
+        try setBlocking(fd);
+        return .{ .handle = fd };
+    }
+
+    fn setBlocking(fd: std.posix.fd_t) !void {
+        const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.SetNonblockFailed;
+        const nonblock: c_int = @bitCast(@as(
+            u32,
+            @bitCast(std.posix.O{ .NONBLOCK = true }),
+        ));
+        if (std.c.fcntl(fd, std.posix.F.SETFL, flags & ~nonblock) < 0) {
+            return error.SetNonblockFailed;
+        }
+    }
+
+    fn tcpConnectError(err: std.c.E) anyerror {
+        return switch (err) {
+            .ADDRNOTAVAIL => error.AddressUnavailable,
+            .AFNOSUPPORT => error.AddressFamilyUnsupported,
+            .CONNREFUSED => error.ConnectionRefused,
+            .CONNRESET => error.ConnectionResetByPeer,
+            .HOSTUNREACH => error.HostUnreachable,
+            .NETUNREACH => error.NetworkUnreachable,
+            .TIMEDOUT => error.Timeout,
+            .ACCES, .PERM => error.AccessDenied,
+            .NOBUFS, .NOMEM => error.SystemResources,
+            else => error.ConnectFailed,
+        };
     }
 
     pub fn tcpConnectToHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !Stream {
@@ -798,6 +1268,8 @@ pub const net = struct {
         if (Address.parseIp6(host, port)) |address| return tcpConnectToAddress(address) else |_| {}
         const host_name = try ionet.HostName.init(host);
         const stream = try host_name.connect(io(), port, .{ .mode = .stream });
+        errdefer stream.close(io());
+        try configureSocketWriteSafety(stream.socket.handle);
         return Stream.fromIo(stream);
     }
 
@@ -826,6 +1298,138 @@ pub const net = struct {
         return .{
             .addrs = try list.toOwnedSlice(allocator),
             .allocator = allocator,
+        };
+    }
+
+    /// Resolves a host under one awake-clock timeout. Select owns both tasks;
+    /// cancel waits for the losing task and every queued AddressList is drained
+    /// and deinitialized before return, including a lookup/timeout completion
+    /// race. No detached resolver thread can outlive the caller.
+    pub fn getAddressListWithTimeout(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        timeout_ms: u32,
+    ) !AddressList {
+        if (timeout_ms == 0) return error.AddressResolutionTimeout;
+        // Numeric literals never enter either asynchronous resolver.
+        if (Address.parseIp4(host, port)) |address| {
+            return singleAddressList(allocator, address);
+        } else |_| {}
+        if (Address.parseIp6(host, port)) |address| {
+            return singleAddressList(allocator, address);
+        } else |_| {}
+
+        // Validate once, before selecting the OS resolver. In particular,
+        // Darwin's DNSService C-string API must reject exactly the same
+        // embedded-NUL, invalid-label, and overlong inputs as std's resolver.
+        _ = try ionet.HostName.init(host);
+
+        if (comptime builtin.os.tag.isDarwin()) {
+            var ops = DarwinDnsApi{};
+            return getDarwinAddressListWithTimeoutUsing(
+                DarwinDnsApi,
+                &ops,
+                allocator,
+                host,
+                port,
+                timeout_ms,
+            );
+        }
+
+        // std.Io.Threaded uses Zig's native cancellable DNS implementation on
+        // Linux, so Select cancellation remains bounded there.
+        var resolver = SystemAddressListResolver.init(timeout_ms);
+        return getAddressListWithTimeoutUsing(
+            SystemAddressListResolver,
+            &resolver,
+            allocator,
+            host,
+            port,
+            timeout_ms,
+        );
+    }
+
+    fn getAddressListWithTimeoutUsing(
+        comptime Resolver: type,
+        resolver: *Resolver,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        timeout_ms: u32,
+    ) !AddressList {
+        if (timeout_ms == 0) return error.AddressResolutionTimeout;
+
+        const Workers = struct {
+            fn resolve(
+                worker_resolver: *Resolver,
+                worker_allocator: std.mem.Allocator,
+                worker_host: []const u8,
+                worker_port: u16,
+            ) anyerror!AddressList {
+                return Resolver.resolve(
+                    worker_resolver,
+                    worker_allocator,
+                    worker_host,
+                    worker_port,
+                );
+            }
+
+            fn deadline(
+                worker_resolver: *Resolver,
+                worker_timeout_ms: u32,
+            ) anyerror!void {
+                return Resolver.wait(worker_resolver, worker_timeout_ms);
+            }
+        };
+
+        var event_buffer: [2]AddressListTimeoutEvent = undefined;
+        var select: std.Io.Select(AddressListTimeoutEvent) = .init(
+            io(),
+            &event_buffer,
+        );
+        select.async(
+            .addresses,
+            Workers.resolve,
+            .{ resolver, allocator, host, port },
+        );
+        select.async(.deadline, Workers.deadline, .{ resolver, timeout_ms });
+
+        const winner = select.await() catch |err| {
+            drainAddressListSelect(&select);
+            return err;
+        };
+        return switch (winner) {
+            .addresses => |result| addresses: {
+                const value = result catch |err| {
+                    drainAddressListSelect(&select);
+                    return err;
+                };
+                drainAddressListSelect(&select);
+                break :addresses value;
+            },
+            .deadline => |result| {
+                result catch |err| {
+                    drainAddressListSelect(&select);
+                    return err;
+                };
+                drainAddressListSelect(&select);
+                return error.AddressResolutionTimeout;
+            },
+        };
+    }
+
+    fn drainAddressListSelect(
+        select: *std.Io.Select(AddressListTimeoutEvent),
+    ) void {
+        while (select.cancel()) |event| switch (event) {
+            .addresses => |result| {
+                if (result) |value| {
+                    var addresses = value;
+                    addresses.deinit();
+                } else |_| {}
+            },
+            .deadline => {},
         };
     }
 };
@@ -912,6 +1516,385 @@ test "append mode survives external copytruncate" {
     );
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("after", bytes);
+}
+
+test "pollUntil recomputes the absolute deadline after repeated EINTR" {
+    const FakePollOps = struct {
+        now_ms: i64 = 1_000,
+        calls: usize = 0,
+        timeouts: [3]i32 = undefined,
+
+        fn now(self: *@This()) i64 {
+            return self.now_ms;
+        }
+
+        fn poll(
+            self: *@This(),
+            _: []std.posix.pollfd,
+            timeout_ms: i32,
+        ) !usize {
+            self.timeouts[self.calls] = timeout_ms;
+            self.calls += 1;
+            const elapsed: i64 = @min(@as(i64, timeout_ms), 40);
+            self.now_ms += elapsed;
+            if (self.calls < 3) return error.Interrupted;
+            return 0;
+        }
+    };
+
+    var ops = FakePollOps{};
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = -1,
+        .events = std.posix.POLL.IN,
+        .revents = std.posix.POLL.IN,
+    }};
+    const ready = try pollUntilUsing(
+        FakePollOps,
+        &ops,
+        &descriptors,
+        1_100,
+    );
+    try std.testing.expectEqual(@as(usize, 0), ready);
+    try std.testing.expectEqual(@as(usize, 3), ops.calls);
+    try std.testing.expectEqualSlices(
+        i32,
+        &.{ 100, 60, 20 },
+        &ops.timeouts,
+    );
+    try std.testing.expectEqual(@as(i64, 1_100), ops.now_ms);
+    try std.testing.expectEqual(@as(i16, 0), descriptors[0].revents);
+
+    const stable_timeout: anyerror!void = if (ready == 0)
+        error.TestSocketTimeout
+    else {};
+    try std.testing.expectError(error.TestSocketTimeout, stable_timeout);
+}
+
+test "getAddressListWithTimeout resolves a numeric address" {
+    var addresses = try net.getAddressListWithTimeout(
+        std.testing.allocator,
+        "127.0.0.1",
+        8388,
+        100,
+    );
+    defer addresses.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), addresses.addrs.len);
+    try std.testing.expectEqual(@as(u16, 8388), net.Address.getPort(addresses.addrs[0]));
+}
+
+test "getAddressListWithTimeout validates hostnames before the OS resolver" {
+    const InvalidDarwinOps = struct {
+        starts: usize = 0,
+
+        fn start(
+            self: *@This(),
+            _: *net.DarwinDnsServiceRef,
+            _: [*:0]const u8,
+            _: net.DarwinDnsGetAddrInfoReply,
+            _: ?*anyopaque,
+        ) !void {
+            self.starts += 1;
+            return error.TestUnexpectedResolverStart;
+        }
+
+        fn socketFd(_: *@This(), _: net.DarwinDnsServiceRef) !std.posix.fd_t {
+            return error.TestUnexpectedSocketFd;
+        }
+
+        fn wait(_: *@This(), _: []std.posix.pollfd, _: i64) !usize {
+            return error.TestUnexpectedWait;
+        }
+
+        fn process(_: *@This(), _: net.DarwinDnsServiceRef) !void {
+            return error.TestUnexpectedProcess;
+        }
+
+        fn deallocate(_: *@This(), _: net.DarwinDnsServiceRef) void {}
+    };
+
+    const invalid_names = [_]struct {
+        host: []const u8,
+        expected: anyerror,
+    }{
+        .{ .host = "nul\x00suffix.example", .expected = error.InvalidHostName },
+        .{ .host = "-invalid.example", .expected = error.InvalidHostName },
+        .{ .host = ("a" ** 64) ++ ".example", .expected = error.InvalidHostName },
+        .{ .host = ("a." ** 127) ++ "ab", .expected = error.NameTooLong },
+    };
+
+    for (invalid_names) |invalid| {
+        try std.testing.expectError(
+            invalid.expected,
+            net.getAddressListWithTimeout(
+                std.testing.allocator,
+                invalid.host,
+                53,
+                100,
+            ),
+        );
+
+        var ops = InvalidDarwinOps{};
+        try std.testing.expectError(
+            invalid.expected,
+            net.getDarwinAddressListWithTimeoutUsing(
+                InvalidDarwinOps,
+                &ops,
+                std.testing.allocator,
+                invalid.host,
+                53,
+                100,
+            ),
+        );
+        try std.testing.expectEqual(@as(usize, 0), ops.starts);
+    }
+}
+
+test "Darwin DNSService resolver returns bounded localhost addresses with the requested port" {
+    if (!builtin.os.tag.isDarwin()) return;
+    var addresses = try net.getAddressListWithTimeout(
+        std.testing.allocator,
+        "localhost",
+        4242,
+        2_000,
+    );
+    defer addresses.deinit();
+
+    try std.testing.expect(addresses.addrs.len > 0);
+    try std.testing.expect(
+        addresses.addrs.len <= net.darwin_address_result_count_max,
+    );
+    for (addresses.addrs) |address| {
+        try std.testing.expectEqual(@as(u16, 4242), address.getPort());
+    }
+}
+
+test "Darwin DNSService timeout seam deallocates the active query" {
+    if (!builtin.os.tag.isDarwin()) return;
+    const TimeoutOps = struct {
+        deallocated: bool = false,
+
+        fn start(
+            _: *@This(),
+            sd_ref: *net.DarwinDnsServiceRef,
+            _: [*:0]const u8,
+            _: net.DarwinDnsGetAddrInfoReply,
+            _: ?*anyopaque,
+        ) !void {
+            sd_ref.* = @ptrFromInt(1);
+        }
+
+        fn socketFd(_: *@This(), _: net.DarwinDnsServiceRef) !std.posix.fd_t {
+            return 42;
+        }
+
+        fn wait(
+            _: *@This(),
+            _: []std.posix.pollfd,
+            _: i64,
+        ) !usize {
+            return 0;
+        }
+
+        fn process(_: *@This(), _: net.DarwinDnsServiceRef) !void {
+            return error.TestUnexpectedProcess;
+        }
+
+        fn deallocate(self: *@This(), _: net.DarwinDnsServiceRef) void {
+            self.deallocated = true;
+        }
+    };
+
+    var ops = TimeoutOps{};
+    try std.testing.expectError(
+        error.AddressResolutionTimeout,
+        net.getDarwinAddressListWithTimeoutUsing(
+            TimeoutOps,
+            &ops,
+            std.testing.allocator,
+            "resolver-timeout.invalid",
+            53,
+            50,
+        ),
+    );
+    try std.testing.expect(ops.deallocated);
+}
+
+fn darwinResolverAllocationFixture(allocator: std.mem.Allocator) !void {
+    const CallbackOps = struct {
+        callback: net.DarwinDnsGetAddrInfoReply = undefined,
+        context: ?*anyopaque = null,
+        sd_ref: net.DarwinDnsServiceRef = @ptrFromInt(1),
+
+        fn start(
+            self: *@This(),
+            output_ref: *net.DarwinDnsServiceRef,
+            _: [*:0]const u8,
+            callback: net.DarwinDnsGetAddrInfoReply,
+            context: ?*anyopaque,
+        ) !void {
+            output_ref.* = self.sd_ref;
+            self.callback = callback;
+            self.context = context;
+        }
+
+        fn socketFd(_: *@This(), _: net.DarwinDnsServiceRef) !std.posix.fd_t {
+            return 42;
+        }
+
+        fn wait(
+            _: *@This(),
+            descriptors: []std.posix.pollfd,
+            _: i64,
+        ) !usize {
+            descriptors[0].revents = std.posix.POLL.IN;
+            return 1;
+        }
+
+        fn process(self: *@This(), _: net.DarwinDnsServiceRef) !void {
+            var address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).in.sa;
+            self.callback(
+                self.sd_ref,
+                0x2,
+                0,
+                0,
+                "localhost",
+                @ptrCast(&address),
+                60,
+                self.context,
+            );
+        }
+
+        fn deallocate(_: *@This(), _: net.DarwinDnsServiceRef) void {}
+    };
+
+    var ops = CallbackOps{};
+    var addresses = try net.getDarwinAddressListWithTimeoutUsing(
+        CallbackOps,
+        &ops,
+        allocator,
+        "localhost",
+        5353,
+        100,
+    );
+    defer addresses.deinit();
+    try std.testing.expectEqual(@as(usize, 1), addresses.addrs.len);
+    try std.testing.expectEqual(@as(u16, 5353), addresses.addrs[0].getPort());
+}
+
+test "Darwin DNSService callback allocation failures clean up" {
+    if (!builtin.os.tag.isDarwin()) return;
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        darwinResolverAllocationFixture,
+        .{},
+    );
+}
+
+test "getAddressListWithTimeout cancels and drains an allocating resolver" {
+    const SlowResolver = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        cancellation_observed: std.atomic.Value(bool) = .init(false),
+
+        fn resolve(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            port: u16,
+        ) !net.AddressList {
+            const addrs = try allocator.alloc(net.Address, 1);
+            errdefer allocator.free(addrs);
+            addrs[0] = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+            self.started.store(true, .release);
+            std.Io.sleep(io(), .fromSeconds(30), .awake) catch |err| switch (err) {
+                // Deliberately turn cancellation into an allocated success.
+                // Select.cancel must queue and drain this losing result.
+                error.Canceled => self.cancellation_observed.store(true, .release),
+            };
+            return .{ .addrs = addrs, .allocator = allocator };
+        }
+
+        fn wait(self: *@This(), _: u32) !void {
+            while (!self.started.load(.acquire)) {
+                try std.Io.sleep(io(), .fromMilliseconds(1), .awake);
+            }
+            try std.Io.sleep(io(), .fromMilliseconds(10), .awake);
+        }
+    };
+
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var resolver = SlowResolver{};
+    const started_ms = monotonicMilliTimestamp();
+    try std.testing.expectError(
+        error.AddressResolutionTimeout,
+        net.getAddressListWithTimeoutUsing(
+            SlowResolver,
+            &resolver,
+            tracking.allocator(),
+            "resolver-never-completes.invalid",
+            8388,
+            10,
+        ),
+    );
+    try std.testing.expect(monotonicMilliTimestamp() - started_ms < 2_000);
+    try std.testing.expect(resolver.started.load(.acquire));
+    try std.testing.expect(resolver.cancellation_observed.load(.acquire));
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    try std.testing.expectEqual(tracking.allocations, tracking.deallocations);
+}
+
+test "Darwin compat.net connect and accept paths set SO_NOSIGPIPE" {
+    if (!builtin.os.tag.isDarwin()) return;
+
+    const expectNoSigpipe = struct {
+        fn check(stream: net.Stream) !void {
+            var enabled: c_int = 0;
+            var len: std.c.socklen_t = @sizeOf(c_int);
+            if (std.c.getsockopt(
+                stream.handle,
+                std.c.SOL.SOCKET,
+                std.c.SO.NOSIGPIPE,
+                &enabled,
+                &len,
+            ) != 0) return error.SocketOptionReadFailed;
+            try std.testing.expectEqual(@as(c_int, 1), enabled);
+        }
+    }.check;
+
+    const address = try net.Address.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(.{});
+    defer server.deinit();
+    const client = try net.tcpConnectToAddress(server.listen_address);
+    defer client.close();
+    const accepted = try server.accept();
+    defer accepted.stream.close();
+    try expectNoSigpipe(client);
+    try expectNoSigpipe(accepted.stream);
+
+    var reuse_server = try net.listenReuseAddr(address);
+    defer reuse_server.deinit();
+    const timed_client = try net.tcpConnectToAddressWithTimeout(
+        reuse_server.listen_address,
+        1_000,
+    );
+    defer timed_client.close();
+    const reuse_accepted = try reuse_server.accept();
+    defer reuse_accepted.stream.close();
+    try expectNoSigpipe(timed_client);
+    try expectNoSigpipe(reuse_accepted.stream);
+
+    var host_server = try net.listenReuseAddr(address);
+    defer host_server.deinit();
+    const host_client = try net.tcpConnectToHost(
+        std.testing.allocator,
+        "localhost",
+        host_server.listen_address.getPort(),
+    );
+    defer host_client.close();
+    const host_accepted = try host_server.accept();
+    defer host_accepted.stream.close();
+    try expectNoSigpipe(host_client);
+    try expectNoSigpipe(host_accepted.stream);
 }
 
 // ---------------------------------------------------------------------------

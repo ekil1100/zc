@@ -244,7 +244,7 @@ pub const DnsClient = struct {
         var written: usize = 0;
         while (written < buf.len) {
             try setSocketTimeout(sock, std.posix.SO.SNDTIMEO, deadline_ms);
-            written += try compat.posixWrite(sock, buf[written..]);
+            written += try compat.posixSocketWrite(sock, buf[written..]);
         }
     }
 

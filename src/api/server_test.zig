@@ -399,12 +399,12 @@ test "buildStatusJson returns daemon config_key and runtime selections" {
     try gp.proxies.append(allocator, try allocator.dupe(u8, "B"));
     try cfg.proxy_groups.append(allocator, gp);
 
-    var mgr = try manager_mod.OutboundManager.initWithKey(allocator, &cfg, "runtimkey");
+    const mgr = try manager_mod.OutboundManager.initWithKey(allocator, &cfg, "runtimkey");
     defer mgr.deinit();
     // Apply the already-authorized runtime value without touching legacy metadata.
     try testing.expect(try mgr.applyPersistedSelection("Proxy", "B"));
 
-    const json = try server.ApiServer.buildStatusJson(allocator, &mgr, &cfg);
+    const json = try server.ApiServer.buildStatusJson(allocator, mgr, &cfg);
     defer allocator.free(json);
 
     // config_key reflects daemon's actual loaded key (not the user pointer).

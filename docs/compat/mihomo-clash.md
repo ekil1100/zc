@@ -37,13 +37,42 @@ Known gaps:
 - `dns:` is not wired as a full runtime DNS config;
 - `redir-port` / `tproxy-port` are not active runtime listeners;
 - `proxy-providers` are not supported;
-- managed revisions use captured local `rule-providers`; remote providers that remain unresolved at exact-load time fail before listener startup rather than falling back to cwd/source paths. Remote provider bodies are limited to 16 MiB and replace an existing cache only after strict parse/validation plus atomic publication;
+- managed revisions use captured local `rule-providers`; every referenced local provider is expanded from captured bytes, while a referenced remote provider that remains as `RULE-SET` is rejected before **any** managed revision publication (including inactive publication) and again at the exact persisted activation/runtime gate. An unused remote declaration with no `RULE-SET` reference may remain deferred. Managed loading never falls back to cwd/source paths. Capture accepts at most 4096 local-provider assets and 16 MiB per asset, matching the provider count/source limits. Each remote provider body is likewise limited to 16 MiB and all cached/downloaded provider sources in one sync pass share a fixed 64 MiB raw-byte budget. Under proxy-compatible HTTPS fallback, std HTTP and curl consume one shared remaining window: failed/HTTP-400 std response bytes reduce curl's cap and are included in successful download accounting. A candidate replaces an existing cache only after strict parse/validation, shared-budget reservation, and atomic publication. Only ordinary network/status failure may fall back to a strictly validated cached source; allocation, YAML, invalid-candidate, and resource-limit errors propagate unchanged;
 - `external-controller` is restricted to an explicit `127.0.0.1:<port>` endpoint；端口冲突时启动失败，不自动漂移或静默关闭控制面；
 - TUN/fake-ip/enhanced-mode are not supported;
 - both legacy and managed YAML parsing reject nesting deeper than 128 levels;
 - managed/offline configs without `MATCH` receive an implicit terminal `MATCH,REJECT`; duplicate or non-terminal `MATCH` entries are rejected. A legacy config with no `rules` field retains its historical `MATCH,DIRECT`; any present, well-formed ruleset without `MATCH` receives `MATCH,REJECT`, while malformed rule values are rejected;
 - rules use declaration-order first-match semantics across rule types. Domain matching is ASCII case-insensitive and ignores a final root dot. Domain targets reaching `IP-CIDR`, `IP-CIDR6`, or `GEOIP` use the system resolver and a bounded 256-entry process cache;
 - the mixed listener admits at most 128 concurrent connection workers. Initial HTTP/SOCKS negotiation has one 5-second monotonic deadline; excess or stalled handshakes are closed without terminating the daemon.
+
+## Config resource limits
+
+Every parser and runtime entry point uses one fixed, public resource contract:
+
+- at most **262144 decoded YAML collection entries globally**: every block/flow mapping entry and sequence item counts, including nested and unknown extension data;
+- at most **4096 rule-provider declarations**;
+- at most **262144 normalized entries in each rule-provider**, and at most **262144 normalized entries / 64 MiB normalized entry bytes across all providers**; legacy/raw line providers without a YAML `payload:` wrapper use the same shared budget;
+- at most **64 MiB aggregate raw rule-provider source bytes** across cached files and download bodies in each synchronization or authoritative load pass, independently of normalized bytes, so comments/low-normalization documents cannot amplify work; each individual provider source remains bounded to 16 MiB;
+- after `RULE-SET` resolution, at most **262144 rules / 64 MiB owned payload+target bytes**. Every repeated provider reference is charged again; classical entries conservatively charge their full normalized entry length as the payload bound;
+- at most **4096 proxy nodes**;
+- at most **1024 proxy groups** in total, including groups declared in the compatibility `proxies:` mixed array;
+- at most **5120 raw entries** in that mixed `proxies:` array (the checked sum of the two limits, including subscription information banners that zc later ignores);
+- at most **5122 members per proxy group** (all possible proxy/group identities plus the `DIRECT` and `REJECT` literals);
+- at most **1024 persisted selections** per profile.
+
+Complete config sources have one public **16 MiB** bound. `config.load`, managed document loading, catalog capture, and replacement snapshots probe one byte past that bound: exactly 16 MiB is accepted, while 16 MiB + 1 returns a size error. A long source is never treated as a valid truncated YAML prefix, including when meaningful fields occur after the first MiB.
+
+The exact maxima are accepted. A raw provider accepts exactly 262144 normalized entries when it is the only provider; the next normalized entry returns `RuleProviderAggregateEntryCountLimitExceeded` before cloning or list growth. Multiple providers consume shared normalized and raw-source budgets, and downloaded single-provider candidates retain the same fixed per-provider bounds. Sync passes the currently remaining raw budget (capped by the 16 MiB single-source bound) to the HTTP body writer; zero remaining bytes means no request is issued. A completed body is charged, while a transport failure with unreported partial bytes conservatively charges its advertised cap before cached fallback. Candidate reservations commit only after atomic visibility. Runtime loading then performs an independent shared-budget pass to detect post-sync file changes. A YAML-wrapped payload also consumes its surrounding mapping/sequence entries from the global document budget and can therefore reach `YamlCollectionEntryLimitExceeded` first. YAML allocation, collection-budget, and nesting errors never fall back to the line parser; only an ordinary syntax-compatibility failure may try the bounded legacy parser. Plain legacy lines and raw classical rules remain compatible.
+
+Expansion first builds a bounded borrowed-key provider-name hash index and rejects duplicate names. It then uses hash lookup to precompute final count and conservative owned bytes with checked arithmetic. Remote providers retained by managed local-only preparation keep their unresolved `RULE-SET` as one rule. Only after the complete plan is within bounds does zc reserve the output once and clone/expand rules. Complexity is `O(providers + rules + expanded)`, rather than a provider scan per rule. Repeated references, several providers, and target-byte multiplication all consume the final budget.
+
+Resource excess returns one of `ConfigTooLarge`, `YamlCollectionEntryLimitExceeded`, the proxy/group errors, `RuleProviderCountLimitExceeded`, `RuleProviderAggregateEntryCountLimitExceeded`, `RuleProviderAggregateBytesLimitExceeded`, `RuleProviderAggregateSourceBytesLimitExceeded`, `ExpandedRuleCountLimitExceeded`, or `ExpandedRuleBytesLimitExceeded` before revision publication, listener creation, output reservation, or dial. `requireConfigResourceLimits` applies the same checked contract to manually constructed providers, existing entries, and rules. At the CLI seam, `config load`, `config download`, and `config update` map those typed resource errors to `CONFIG_LOAD_LIMIT_EXCEEDED`, `CONFIG_DOWNLOAD_LIMIT_EXCEEDED`, and `CONFIG_UPDATE_LIMIT_EXCEEDED`; the 16 MiB source bound keeps separate `*_TOO_LARGE` codes. Catalog and legacy admission leave authoritative `state-v2.json` and the immutable revision tree unchanged on rejection. Reduce/filter YAML, provider entries, repeated references, or long targets and retry. There is no limit switch, truncation, compatibility fallback for resource errors, or partial publication.
+
+`OutboundManager.init`/`initWithKey` return an **owned pointer to a public opaque handle**; callers must invoke `deinit` exactly once and cannot construct a manager value with a struct literal. Its public persisted-selection transaction and selection-barrier owners are likewise allocated opaque pointers: `commit`/`deinit` consumes a transaction, and `deinit` consumes a barrier, exactly once. Copying one of those pointers does not create another owner, and the former shallow-copyable value API is intentionally incompatible. The private implementation borrows the admitted `Config`: the value and all nested storage must remain alive, immutable, and address-stable until handle deinit. Runtime config mutation is outside the interface and is not a supported recovery mechanism.
+
+Validation retains at most **256 errors and warnings combined**, with at most **512 rendered bytes per entry**. Oversized details use a bounded omission message; additional entries set `diagnostics_truncated` without allocating. Invalid status remains exact even when an error is omitted. Text validation and doctor output report that additional details were omitted.
+
+`PersistedSelectionCountLimitExceeded` belongs to catalog/selection mutation, not to config YAML. The mutation seam enforces at most 1024 desired selections per profile. The config CLI retains a defensive catch for that typed error, but the normal load/download/update source path cannot construct it. A pre-existing `state-v2.json` with more than 1024 selections is corrupt catalog state and fails closed; it is not downgraded to a user-correctable source limit and receives no backward-compatibility exception.
 
 ## Proxy support
 
@@ -53,13 +82,32 @@ Runtime outbound support currently includes:
 | --- | --- | --- |
 | `direct` | supported | Direct TCP connect. |
 | `reject` | supported | Fails connection intentionally. |
-| `ss` | partially supported | AEAD ciphers: `aes-128-gcm`, `aes-256-gcm`, `chacha20-poly1305`, `chacha20-ietf-poly1305`. Plugins/transports are rejected before bind/dial. |
+| `ss` | supported subset | AEAD TCP ciphers: `aes-128-gcm`, `aes-256-gcm`, `chacha20-poly1305`, `chacha20-ietf-poly1305`; plain or the exact built-in simple-obfs HTTP shape documented below. UDP remains unsupported. |
 | `vmess` | unsupported | v1.0 capability gate hard rejects it；现有代码未通过标准 wire/互操作验证。 |
 | `trojan` | supported subset | TLS + CONNECT（TCP）；支持 `password`/`server`/`port`/`sni`/`skip-cert-verify`。`udp:true` 与其他 transport 被拒绝；`skip-cert-verify:true` 产生安全告警。已知限制（M1/M5）见下文。 |
 | `vless` | unsupported | v1.0 capability gate hard rejects it；响应 framing 与 transport 尚未通过互操作门禁。 |
 | `anytls` | unsupported | v1.0 capability gate hard rejects it；保留实现和设计文档不构成支持声明，生命周期与资源上界门禁尚未关闭。 |
 | `http` | unsupported | Outbound connect 未实现；配置准入阶段拒绝。 |
 | `socks5` | unsupported | Outbound connect 未实现；配置准入阶段拒绝。 |
+
+### Shadowsocks simple-obfs HTTP boundary
+
+The only enabled Shadowsocks plugin transport is:
+
+```yaml
+plugin: obfs # or obfs-local
+plugin-opts: # plugin_opts map is accepted and canonicalized to this spelling
+  mode: http
+  host: cdn.example.com
+```
+
+`mode` and `host` must both be explicit. `host` is 1..255 bytes and may not contain CR, LF, or NUL. Managed config rejects malformed/non-map options and conflicting aliases; dump/override output uses the canonical `plugin-opts` map. SIP003 scalar option strings are intentionally not accepted in this release.
+
+simple-obfs `tls`, unknown modes, plugins other than `obfs`/`obfs-local`, missing options/host, and derived plugin fields without the matching plugin declaration fail closed in validator/doctor. Validator, catalog capture, complete manager admission, and the selected-proxy gate all consume one allocation-free runtime capability classifier; it also owns standalone `port`/`socks-port`, reserved declarations, disabled proxy/group types, non-SS plugin metadata, SS cipher/UDP/TLS/WebSocket, and Trojan UDP/WebSocket decisions. `OutboundManager.initWithKey` completes that full gate before its first manager allocation, then builds borrowed-key proxy and group hash indexes with complete failure cleanup. TCP/UDP admission is independent of configured proxy/group counts: each resolved group layer and the final proxy use fixed hash lookups, while literal `DIRECT`/`REJECT` performs no config-table lookup. The selected concrete proxy still receives one focused classifier gate before private-target bypass or dial. zc never launches an external plugin and never downgrades such a node to plain Shadowsocks. `udp: true` is still rejected; simple-obfs support is TCP/HTTP only.
+
+Catalog recovery uses a separate strict-YAML raw-capture path: duplicate keys still fail, but explicitly marked malformed or unsupported Shadowsocks simple-obfs metadata can be retained byte-for-byte as an inactive recovery revision. `config download` uses the same bounded recovery rule: a malformed first download without `-d` succeeds but remains inactive, so only the first later **runtime-ready** managed config auto-activates. The exemption applies only to the marked SS plugin-semantic finding: SS UDP/TLS/cipher/WebSocket findings and Trojan/other proxy findings remain errors. It also does not bypass offline validation of reserved names, proxy/group types, basic fields, rules/references, or providers; non-Shadowsocks plugin metadata is rejected. A retained revision can be listed, inspected, updated, or deleted, but `config download -d`, an active replacement update, and `config use` return `CONFIG_CAPABILITY_UNSUPPORTED` rather than changing the active identity. It cannot run or produce a frozen override until its effective config validates; after repairing an inactive revision through `config update`, activate it explicitly with `config use`. Runtime `config.load` and `parseDocument` remain strict.
+
+User-declared proxy names `DIRECT` and `REJECT` are reserved and rejected before outbound allocation or dial. The same exact tokens remain valid as built-in literals in rules and proxy-group member lists.
 
 ### Trojan 已知限制
 
@@ -82,15 +130,9 @@ Runtime outbound support currently includes:
 
 ## Proxy groups
 
-Parsed group types:
+The compatibility parser recognizes `select`, `url-test`, `fallback`, `load-balance`, and `relay`, but **zc v1.0 runtime supports only `select`**. `url-test`, `fallback`, `load-balance`, and `relay` return `UnsupportedProxyGroupType` during the allocation-free manager initialization gate. Public selection/control-plane operations may repeat that bounded complete validation; TCP/UDP connection paths rely on the opaque handle's admitted immutable borrow and the prebuilt group index, so admission cost depends on resolution depth rather than configured group count. Runtime mutation of a borrowed group is unsupported.
 
-- `select`
-- `url-test`
-- `fallback`
-- `load-balance`
-- `relay`
-
-运行时选择优先使用持久化的用户选择；没有持久化选择时，select 组使用第一个组成员作为默认节点。`zc status` 和 `zc test` 会显示同一套节点信息，JSON 字段为 `selected_proxies`；`zc test --json` 还会通过 `daemon_state` 报告本机 daemon 状态。不要在没有场景测试证明前假设完整 mihomo 策略一致性。
+运行时选择优先使用持久化的用户选择；没有持久化选择时，合法的 `select` 组使用第一个组成员作为默认节点。TCP 与 UDP 共用同一个嵌套组解析器：每个实际组层级只做一次预建 hash-index 查询，并允许最多 **1024 个唯一组层级**。`DIRECT` 与 `REJECT` 是立即终止解析的合法 select 成员；非组名称继续交给最终 proxy index，因此未知名称仍返回 `ProxyNotFound`。重复层级返回明确的 `ProxyGroupResolutionCycle`；若在唯一层级上界后仍可命中另一组，防御性地返回 `ProxyGroupResolutionLimit`，不会静默截断、误报 `ProxyNotFound` 或无限循环。`zc status` 和 `zc test` 会显示同一套节点信息，JSON 字段为 `selected_proxies`；`zc test --json` 还会通过 `daemon_state` 报告本机 daemon 状态。不要在没有场景测试证明前假设完整 mihomo 策略一致性。
 
 ## Rules
 

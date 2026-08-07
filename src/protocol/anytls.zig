@@ -1061,14 +1061,25 @@ const TlsFrameSource = struct {
                     .events = std.posix.POLL.IN,
                     .revents = 0,
                 }};
-                const ready = std.posix.poll(&fds, self.recv_poll_timeout_ms) catch return error.EndOfStream;
+                const before_poll_ms = compat.monotonicMilliTimestamp();
+                const heartbeat_deadline_ms = std.math.add(
+                    i64,
+                    before_poll_ms,
+                    self.recv_poll_timeout_ms,
+                ) catch std.math.maxInt(i64);
+                const poll_deadline_ms = if (session.handshake_deadline_ms > 0)
+                    @min(heartbeat_deadline_ms, session.handshake_deadline_ms)
+                else
+                    heartbeat_deadline_ms;
+                const ready = compat.pollUntil(&fds, poll_deadline_ms) catch
+                    return error.EndOfStream;
                 if (ready == 0) {
                     // Handshake deadline: if the server hasn't sent a valid
                     // protocol frame (server_settings / syn_ack) within the
                     // deadline, tear down the session so the relay doesn't hang.
-                    const now_ms = std.Io.Timestamp.now(compat.io(), .awake).toMilliseconds();
+                    const now_ms = compat.monotonicMilliTimestamp();
                     if (session.handshake_deadline_ms > 0 and
-                        now_ms > session.handshake_deadline_ms)
+                        now_ms >= session.handshake_deadline_ms)
                     {
                         // Shut down the socket to unblock the main thread which
                         // may be holding tls_mutex while blocked in send() inside
@@ -2547,13 +2558,16 @@ test "C2: multi-sid demux isolation (frames land only in their own stream)" {
     const s2 = try testRegisterStream(session, 2);
     const s3 = try testRegisterStream(session, 3);
 
-    var src = ScriptedSource{ .allocator = allocator, .frames = &.{
-        .{ .command = .psh, .stream_id = 1, .body = "one" },
-        .{ .command = .psh, .stream_id = 2, .body = "twotwo" },
-        .{ .command = .psh, .stream_id = 3, .body = "three!" },
-        .{ .command = .psh, .stream_id = 1, .body = "-1again" },
-        .{ .command = .psh, .stream_id = 99, .body = "orphan-dropped" }, // no such stream
-    } };
+    var src = ScriptedSource{
+        .allocator = allocator,
+        .frames = &.{
+            .{ .command = .psh, .stream_id = 1, .body = "one" },
+            .{ .command = .psh, .stream_id = 2, .body = "twotwo" },
+            .{ .command = .psh, .stream_id = 3, .body = "three!" },
+            .{ .command = .psh, .stream_id = 1, .body = "-1again" },
+            .{ .command = .psh, .stream_id = 99, .body = "orphan-dropped" }, // no such stream
+        },
+    };
     session.recvLoop(src.source());
 
     var buf: [32]u8 = undefined;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const meta = @import("meta.zig");
+const runtime_descriptor = @import("runtime_descriptor.zig");
 
 pub const SelectionSource = enum {
     persisted,
@@ -103,6 +104,62 @@ pub const SelectionEntry = struct {
     proxy: []const u8,
     source: SelectionSource,
 };
+
+pub const DescriptorSelectionCompletion = enum {
+    applied,
+    conflict,
+};
+
+fn requireOwnedOpaquePointer(comptime Transaction: type) void {
+    switch (@typeInfo(Transaction)) {
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"opaque" => {},
+            else => @compileError(
+                "selection transaction must be a direct owned opaque pointer",
+            ),
+        },
+        else => @compileError(
+            "selection transaction value API is intentionally unsupported",
+        ),
+    }
+}
+
+/// Publishes a descriptor generation and consumes the owned opaque transaction
+/// pointer exactly once on every path. The transaction and descriptor
+/// generations must match before any store I/O. Descriptor-visible outcomes
+/// apply infallibly; errors and conflicts discard the plan without changing
+/// manager state. Callers must not defer deinit after passing ownership here.
+pub fn publishPreparedSelectionTransaction(
+    transaction: anytype,
+    store: runtime_descriptor.Store,
+    expected: runtime_descriptor.Expected,
+    next: runtime_descriptor.DescriptorInput,
+) !DescriptorSelectionCompletion {
+    comptime requireOwnedOpaquePointer(@TypeOf(transaction));
+    errdefer transaction.deinit();
+    if (transaction.preparedGeneration() != next.generation) {
+        return error.SelectionGenerationMismatch;
+    }
+    const outcome = try store.publish(expected, next);
+    return completeSelectionDescriptorPublish(transaction, outcome);
+}
+
+pub fn completeSelectionDescriptorPublish(
+    transaction: anytype,
+    outcome: runtime_descriptor.PublishOutcome,
+) DescriptorSelectionCompletion {
+    comptime requireOwnedOpaquePointer(@TypeOf(transaction));
+    return switch (outcome) {
+        .committed, .durability_uncertain => result: {
+            transaction.commit();
+            break :result .applied;
+        },
+        .conflict => result: {
+            transaction.deinit();
+            break :result .conflict;
+        },
+    };
+}
 
 pub fn freeSelectionEntries(allocator: std.mem.Allocator, entries: []SelectionEntry) void {
     for (entries) |e| {

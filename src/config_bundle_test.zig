@@ -146,6 +146,118 @@ test "ConfigBundle memory capture rejects ambient local asset lookup" {
     ));
 }
 
+test "ConfigBundle catalog capture preserves malformed simple-obfs metadata" {
+    const documents = [_][]const u8{
+        "proxies:\n  - { name: scalar, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs, plugin-opts: 'obfs=http' }\n",
+        "proxies:\n  - { name: unknown-key, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs, plugin-opts: { mode: http, host: example.com, extra: value } }\n",
+        "proxies:\n  - { name: unknown-type, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs, plugin-opts: { mode: 7, host: example.com } }\n",
+        "proxies:\n  - { name: aliases, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs, plugin-opts: { mode: http, host: example.com }, plugin_opts: { mode: http, host: example.com } }\n",
+        "proxies:\n  - { name: plugin-type, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: [obfs], plugin-opts: { mode: http, host: example.com } }\n",
+        "proxies:\n  - { name: unsupported-plugin, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: v2ray-plugin }\n",
+        "proxies:\n  - { name: unsupported-mode, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs-local, plugin-opts: { mode: tls, host: example.com } }\n",
+    };
+
+    for (documents) |document| {
+        var bundle = try ConfigBundle.captureCatalogMemory(
+            testing.allocator,
+            document,
+            null,
+            .{},
+        );
+        defer bundle.deinit();
+        try testing.expectEqual(
+            bundle_mod.SemanticState.malformed,
+            bundle.semanticState(),
+        );
+        try testing.expectEqualStrings(document, bundle.sourceBytes());
+
+        var inspected = try config_mod.parseCatalogDocument(
+            testing.allocator,
+            bundle.sourceBytes(),
+        );
+        defer inspected.deinit();
+        try testing.expectEqual(
+            config_mod.ProxySemanticState.malformed,
+            inspected.proxies.items[0].semantic_state,
+        );
+
+        if (bundle.loadOffline(testing.allocator)) |loaded_value| {
+            var loaded = loaded_value;
+            defer loaded.deinit();
+            try testing.expect(!loaded.validation.isValid());
+        } else |err| {
+            try testing.expect(err != error.OutOfMemory);
+        }
+    }
+}
+
+test "ConfigBundle catalog offline load retains only plugin validation failures" {
+    const allocator = testing.allocator;
+    const source =
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: recoverable
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: obfs
+        \\    plugin-opts: "obfs=http"
+        \\rules:
+        \\  - MATCH,recoverable
+    ;
+    var bundle = try ConfigBundle.captureCatalogMemory(
+        allocator,
+        source,
+        null,
+        .{},
+    );
+    defer bundle.deinit();
+    var loaded = try bundle.loadCatalogOffline(allocator);
+    defer loaded.deinit();
+    try testing.expect(loaded.validation.isValid());
+    try testing.expectEqual(
+        config_mod.ProxySemanticState.malformed,
+        loaded.config.proxies.items[0].semantic_state,
+    );
+
+    const assets = [_]bundle_mod.MemoryAsset{.{
+        .logical_path = "rules.yaml",
+        .canonical_relative_target = "rules.yaml",
+        .bytes = "payload:\n  - garbage:address/64\n",
+    }};
+    var invalid_provider = try ConfigBundle.reconstructCatalogMemory(
+        allocator,
+        source ++
+            "\nrule-providers:\n" ++
+            "  bad:\n" ++
+            "    type: file\n" ++
+            "    behavior: ipcidr\n" ++
+            "    path: rules.yaml\n",
+        null,
+        &assets,
+        .{},
+    );
+    defer invalid_provider.deinit();
+    try testing.expectError(
+        error.InvalidRuleProviderEntry,
+        invalid_provider.loadCatalogOffline(allocator),
+    );
+}
+
+test "ConfigBundle catalog capture stays strict about duplicate YAML keys" {
+    try testing.expectError(
+        error.DuplicateKey,
+        ConfigBundle.captureCatalogMemory(
+            testing.allocator,
+            "proxies:\n  - name: duplicate\n    type: ss\n    server: example.com\n    port: 8388\n    cipher: aes-128-gcm\n    password: secret\n    plugin: obfs\n    plugin: obfs-local\n",
+            null,
+            .{},
+        ),
+    );
+}
+
 test "ConfigBundle reconstructs exact local assets from immutable memory records" {
     const assets = [_]bundle_mod.MemoryAsset{.{
         .logical_path = "rules.yaml",
@@ -164,6 +276,20 @@ test "ConfigBundle reconstructs exact local assets from immutable memory records
     var loaded = try bundle.loadOffline(testing.allocator);
     defer loaded.deinit();
     try testing.expectEqualStrings("example.com", loaded.config.rules.items[0].payload);
+
+    try testing.expectError(
+        error.RuleProviderFileTooLarge,
+        ConfigBundle.reconstructMemory(
+            testing.allocator,
+            "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: rules.yaml\n",
+            null,
+            &assets,
+            .{
+                .max_asset_bytes = assets[0].bytes.len - 1,
+                .max_aggregate_bytes = 1024,
+            },
+        ),
+    );
 }
 
 test "ConfigBundle reconstructed effective source cannot request an unavailable asset" {
@@ -531,7 +657,7 @@ test "ConfigBundle checks asset count before opening local paths" {
     }));
 }
 
-test "ConfigBundle enforces the default 1024 distinct asset boundary before opening files" {
+test "ConfigBundle enforces the default 4096 distinct provider asset boundary before opening files" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -558,7 +684,10 @@ test "ConfigBundle enforces the default 1024 distinct asset boundary before open
         "  overflow:\n    type: file\n    behavior: domain\n    path: overflow.yaml\n",
     );
     try writeFile(tmp.dir, "config.yaml", source.items);
-    try testing.expectError(error.TooManyAssets, ConfigBundle.capture(allocator, path, .{}));
+    try testing.expectError(
+        error.RuleProviderCountLimitExceeded,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
 }
 
 test "ConfigBundle enforces per-asset and aggregate limits without truncation" {
@@ -586,7 +715,7 @@ test "ConfigBundle enforces per-asset and aggregate limits without truncation" {
     });
     exact.deinit();
 
-    try testing.expectError(error.AssetTooLarge, ConfigBundle.capture(allocator, path, .{
+    try testing.expectError(error.RuleProviderFileTooLarge, ConfigBundle.capture(allocator, path, .{
         .max_source_bytes = 1024,
         .max_asset_bytes = rules.len - 1,
         .max_aggregate_bytes = 1024,
@@ -634,7 +763,10 @@ test "ConfigBundle enforces real default source and asset byte boundaries" {
     var asset_exact = try ConfigBundle.capture(allocator, path, .{});
     asset_exact.deinit();
     try writeFile(tmp.dir, "rules.yaml", asset_storage);
-    try testing.expectError(error.AssetTooLarge, ConfigBundle.capture(allocator, path, .{}));
+    try testing.expectError(
+        error.RuleProviderFileTooLarge,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
 }
 
 test "ConfigBundle materialized source is authoritative while original bytes stay preserved" {
@@ -1088,8 +1220,8 @@ test "ConfigBundle refuses callers that try to widen managed capture limits" {
 }
 
 test "ConfigBundle default capture limits remain the managed contract" {
-    try testing.expectEqual(@as(usize, 16 * 1024 * 1024), CaptureLimits.defaults.max_source_bytes);
-    try testing.expectEqual(@as(usize, 8 * 1024 * 1024), CaptureLimits.defaults.max_asset_bytes);
+    try testing.expectEqual(config_mod.config_source_bytes_max, CaptureLimits.defaults.max_source_bytes);
+    try testing.expectEqual(config_mod.config_source_bytes_max, CaptureLimits.defaults.max_asset_bytes);
     try testing.expectEqual(@as(usize, 64 * 1024 * 1024), CaptureLimits.defaults.max_aggregate_bytes);
-    try testing.expectEqual(@as(usize, 1024), CaptureLimits.defaults.max_assets);
+    try testing.expectEqual(config_mod.rule_provider_count_max, CaptureLimits.defaults.max_assets);
 }

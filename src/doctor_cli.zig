@@ -29,6 +29,7 @@ pub const DoctorData = struct {
     proxy_reachable: bool = false,
     config_errors: []const []const u8 = &.{},
     config_warnings: []const []const u8 = &.{},
+    config_diagnostics_truncated: bool = false,
     migration_hints: []const []const u8 = &.{},
     daemon_uptime_seconds: ?i64 = null,
 
@@ -123,6 +124,7 @@ pub fn emitDoctorResult(allocator: std.mem.Allocator, data: *const DoctorData, o
         .proxy_reachable = data.proxy_reachable,
         .config_errors = data.config_errors,
         .config_warnings = data.config_warnings,
+        .config_diagnostics_truncated = data.config_diagnostics_truncated,
         .migration_hints = data.migration_hints,
         .daemon_uptime_seconds = data.daemon_uptime_seconds,
         .checks = checks[0..],
@@ -213,6 +215,7 @@ fn populateConfigData(
     defer vr.deinit();
 
     data.config_ok = vr.isValid();
+    data.config_diagnostics_truncated = vr.diagnostics_truncated;
 
     if (vr.errors.items.len > 0) {
         const errs = try allocator.alloc([]const u8, vr.errors.items.len);
@@ -280,7 +283,12 @@ fn tcpConnectIp4WithTimeout(host: []const u8, port: u16, timeout_ms: i32) bool {
             .revents = 0,
         },
     };
-    const ready = std.posix.poll(&poll_fds, timeout_ms) catch return false;
+    const deadline_ms = std.math.add(
+        i64,
+        compat.monotonicMilliTimestamp(),
+        timeout_ms,
+    ) catch std.math.maxInt(i64);
+    const ready = compat.pollUntil(&poll_fds, deadline_ms) catch return false;
     if (ready == 0) return false;
     if ((poll_fds[0].revents & (std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP)) == 0) return false;
 
@@ -400,7 +408,14 @@ pub fn formatDoctorReport(allocator: std.mem.Allocator, data: *const DoctorData)
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    try out.print(allocator, "Config: {s}\n", .{if (data.config_ok) "OK" else "FAILED"});
+    try out.print(allocator, "Config: {s}", .{if (data.config_ok) "OK" else "FAILED"});
+    if (data.config_diagnostics_truncated) {
+        try out.appendSlice(
+            allocator,
+            " (additional validation details omitted)",
+        );
+    }
+    try out.append(allocator, '\n');
     try out.print(allocator, "Daemon: {s}\n", .{if (data.daemon_running) "running" else "stopped"});
     if (data.daemon_pid) |pid| {
         try out.print(allocator, "PID: {d}\n", .{pid});
@@ -508,6 +523,7 @@ test "emitDoctorResult json success: one envelope, escaped strings, proxy_reacha
         .daemon_pid = null,
         .ports = undefined,
         .port_count = 1,
+        .config_diagnostics_truncated = true,
     };
     data.ports[0] = .{ .label = "mixed", .port = 7890, .listening = false };
 
@@ -531,6 +547,9 @@ test "emitDoctorResult json success: one envelope, escaped strings, proxy_reacha
     try std.testing.expectEqualStrings("/tmp/we\"ird\npath.yaml", json_data.get("config_path").?.string);
     try std.testing.expect(json_data.get("proxy_reachable") != null);
     try std.testing.expect(json_data.get("network_ok") != null);
+    try std.testing.expect(
+        json_data.get("config_diagnostics_truncated").?.bool,
+    );
     try std.testing.expectEqual(@as(usize, 2), json_data.get("checks").?.array.items.len);
     try std.testing.expectEqualStrings("", err_alloc.written());
 }
@@ -580,6 +599,7 @@ test "emitDoctorResult text failure: frozen-label report on stdout, error block 
         .daemon_pid = null,
         .ports = undefined,
         .port_count = 1,
+        .config_diagnostics_truncated = true,
     };
     data.ports[0] = .{ .label = "mixed", .port = 7890, .listening = false };
 
@@ -595,6 +615,9 @@ test "emitDoctorResult text failure: frozen-label report on stdout, error block 
     try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Config: FAILED") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Daemon: stopped") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_text, "Connection:") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, stdout_text, "validation details omitted") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "CHECKS_FAILED") != null);
 }
 

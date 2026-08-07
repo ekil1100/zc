@@ -3,20 +3,50 @@ const compat = @import("../../compat.zig");
 const net = compat.net;
 const aead = @import("../../crypto/aead.zig");
 const socket_options = @import("../../socket_options.zig");
+const simple_obfs_http = @import("simple_obfs_http.zig");
 pub const Address = aead.Address;
 pub const connect_retry_attempts: usize = 3;
+pub const upstream_connect_timeout_ms: u32 = 10_000;
 const retry_backoff_ms = [_]u64{ 200, 500, 1000 };
+
+const UpstreamConnectDeadline = struct {
+    expires_ms: i64,
+
+    fn initAt(now_ms: i64, timeout_ms: u32) UpstreamConnectDeadline {
+        return .{
+            .expires_ms = std.math.add(
+                i64,
+                now_ms,
+                @intCast(timeout_ms),
+            ) catch std.math.maxInt(i64),
+        };
+    }
+
+    fn expiredAt(self: UpstreamConnectDeadline, now_ms: i64) bool {
+        return now_ms >= self.expires_ms;
+    }
+
+    fn remainingMsAt(
+        self: UpstreamConnectDeadline,
+        now_ms: i64,
+    ) !u32 {
+        if (self.expiredAt(now_ms)) {
+            return error.UpstreamConnectDeadlineExceeded;
+        }
+        const remaining_ms = self.expires_ms - now_ms;
+        return @intCast(@min(
+            remaining_ms,
+            @as(i64, std.math.maxInt(u32)),
+        ));
+    }
+};
 
 /// Scratch size for a single upstream socket read. One read pulls up to this
 /// many ciphertext bytes into the reassembly buffer; large enough to usually
 /// capture a whole 0x3FFF-payload AEAD frame (~16 KB + tags) in one syscall.
 const socket_read_chunk: usize = 32 * 1024;
-
-/// Shadowsocks Obfs configuration
-pub const ObfsConfig = struct {
-    mode: []const u8, // "http" or "tls"
-    host: []const u8,
-};
+const default_socket_timeout_ms: u32 = 15_000;
+const blocking_poll_timeout_ms: i32 = 15_000;
 
 /// Shadowsocks 出站连接（AEAD 加密版）
 pub const ShadowsocksClient = struct {
@@ -26,16 +56,13 @@ pub const ShadowsocksClient = struct {
     password: []const u8,
     cipher_type: aead.CipherType,
 
-    // Obfs plugin
-    obfs: ?ObfsConfig = null,
+    // Built-in simple-obfs HTTP transport. External plugins remain disabled.
+    obfs: ?simple_obfs_http.Client = null,
 
     // Session state
     stream: ?net.Stream = null,
     enc_ctx: ?aead.AeadStream = null, // encrypt (client salt derived)
     dec_ctx: ?aead.AeadStream = null, // decrypt (server salt derived)
-
-    // Obfs: need to strip HTTP response headers on first read
-    obfs_first_response: bool = true,
 
     // Leftover data after stripping HTTP headers / server salt
     read_leftover: ?[]u8 = null,
@@ -45,31 +72,35 @@ pub const ShadowsocksClient = struct {
 
     pub fn init(allocator: std.mem.Allocator, server: []const u8, port: u16, password: []const u8, cipher: []const u8) !ShadowsocksClient {
         const cipher_type = aead.parseCipherType(cipher) orelse return error.UnsupportedCipher;
+        const owned_server = try allocator.dupe(u8, server);
+        errdefer allocator.free(owned_server);
+        const owned_password = try allocator.dupe(u8, password);
         return ShadowsocksClient{
             .allocator = allocator,
-            .server = try allocator.dupe(u8, server),
+            .server = owned_server,
             .port = port,
-            .password = try allocator.dupe(u8, password),
+            .password = owned_password,
             .cipher_type = cipher_type,
         };
     }
 
-    pub fn initWithObfs(allocator: std.mem.Allocator, server: []const u8, port: u16, password: []const u8, cipher: []const u8, obfs_mode: []const u8, obfs_host: []const u8) !ShadowsocksClient {
+    pub fn initWithObfs(
+        allocator: std.mem.Allocator,
+        server: []const u8,
+        port: u16,
+        password: []const u8,
+        cipher: []const u8,
+        http_config: simple_obfs_http.Config,
+    ) !ShadowsocksClient {
         var client = try init(allocator, server, port, password, cipher);
-        client.obfs = ObfsConfig{
-            .mode = try allocator.dupe(u8, obfs_mode),
-            .host = try allocator.dupe(u8, obfs_host),
-        };
+        errdefer client.deinit();
+        client.obfs = try simple_obfs_http.Client.init(http_config);
         return client;
     }
 
     pub fn deinit(self: *ShadowsocksClient) void {
         self.allocator.free(self.server);
         self.allocator.free(self.password);
-        if (self.obfs) |o| {
-            self.allocator.free(o.mode);
-            self.allocator.free(o.host);
-        }
         if (self.read_leftover) |lo| self.allocator.free(lo);
         if (self.read_payload_leftover) |lo| self.allocator.free(lo);
         if (self.stream) |s| s.close();
@@ -79,11 +110,28 @@ pub const ShadowsocksClient = struct {
     pub fn connect(self: *ShadowsocksClient, target: Address) !net.Stream {
         std.debug.print("[SS] Connecting to {s}:{d} via SS\n", .{ self.server, self.port });
 
+        // DNS, every retry backoff, and every TCP connect share this one
+        // monotonic deadline. No phase or retry can reopen the time budget.
+        var upstream_ops = SystemUpstreamOps{};
+        const upstream_deadline = UpstreamConnectDeadline.initAt(
+            upstream_ops.now(),
+            upstream_connect_timeout_ms,
+        );
+
         // 1. DNS resolve (with retry/backoff)
-        const upstream_addr = try self.resolveUpstreamAddressWithRetry();
+        const upstream_addr = try self.resolveUpstreamAddressWithRetryUsing(
+            upstream_deadline,
+            SystemUpstreamOps,
+            &upstream_ops,
+        );
 
         // 2. TCP connect (with retry/backoff)
-        var stream = try self.connectUpstreamWithRetry(upstream_addr);
+        var stream = try self.connectUpstreamWithRetryUsing(
+            upstream_addr,
+            upstream_deadline,
+            SystemUpstreamOps,
+            &upstream_ops,
+        );
         // Close the freshly-opened socket if any handshake step below fails;
         // ownership transfers to self.stream only on the success path.
         var handshake_ok = false;
@@ -111,17 +159,10 @@ pub const ShadowsocksClient = struct {
         var enc_buf: [300]u8 = undefined;
         const enc_len = try self.enc_ctx.?.encryptChunk(addr_buf[0..addr_len], &enc_buf);
 
-        // 7. Send data (with or without obfs wrapping)
-        if (self.obfs) |obfs_cfg| {
-            if (std.mem.eql(u8, obfs_cfg.mode, "http")) {
-                // simple-obfs HTTP: combine HTTP headers + salt + encrypted data
-                try self.sendWithHttpObfs(&stream, obfs_cfg.host, salt, enc_buf[0..enc_len]);
-                self.obfs_first_response = true;
-            } else {
-                return error.UnsupportedObfsMode;
-            }
+        // 7. Send data (with or without the one-shot HTTP obfs header).
+        if (self.obfs != null) {
+            try self.sendInitialPayload(&stream, salt, enc_buf[0..enc_len]);
         } else {
-            // No obfs: send salt + encrypted data directly
             try stream.writeAll(salt);
             try stream.writeAll(enc_buf[0..enc_len]);
         }
@@ -141,23 +182,54 @@ pub const ShadowsocksClient = struct {
         return retry_backoff_ms[attempt_index];
     }
 
-    fn resolveUpstreamAddressWithRetry(self: *ShadowsocksClient) !net.Address {
+    fn resolveUpstreamAddressWithRetryUsing(
+        self: *ShadowsocksClient,
+        deadline: UpstreamConnectDeadline,
+        comptime Ops: type,
+        ops: *Ops,
+    ) !net.Address {
         var last_err: anyerror = error.UpstreamDnsResolveFailed;
 
         var attempt: usize = 0;
         while (attempt < connect_retry_attempts) : (attempt += 1) {
-            var addr_list = net.getAddressList(self.allocator, self.server, self.port) catch |err| {
+            const remaining_ms = deadline.remainingMsAt(ops.now()) catch
+                return error.UpstreamConnectDeadlineExceeded;
+            var addr_list = ops.resolve(
+                self.allocator,
+                self.server,
+                self.port,
+                remaining_ms,
+            ) catch |err| {
+                if (err == error.AddressResolutionTimeout or
+                    deadline.expiredAt(ops.now()))
+                {
+                    return error.UpstreamConnectDeadlineExceeded;
+                }
                 last_err = err;
                 std.debug.print("[SS] Upstream DNS resolve failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
-                sleepBeforeRetry(attempt, connect_retry_attempts);
+                try sleepBeforeRetryWithinDeadline(
+                    deadline,
+                    attempt,
+                    connect_retry_attempts,
+                    Ops,
+                    ops,
+                );
                 continue;
             };
             defer addr_list.deinit();
 
+            _ = deadline.remainingMsAt(ops.now()) catch
+                return error.UpstreamConnectDeadlineExceeded;
             if (addr_list.addrs.len == 0) {
                 last_err = error.HostNotFound;
                 std.debug.print("[SS] Upstream DNS resolve returned no address: server={s}:{d} attempt={d}/{d}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts });
-                sleepBeforeRetry(attempt, connect_retry_attempts);
+                try sleepBeforeRetryWithinDeadline(
+                    deadline,
+                    attempt,
+                    connect_retry_attempts,
+                    Ops,
+                    ops,
+                );
                 continue;
             }
             if (attempt > 0) {
@@ -170,31 +242,53 @@ pub const ShadowsocksClient = struct {
         return error.UpstreamDnsResolveFailed;
     }
 
-    fn connectUpstreamWithRetry(self: *ShadowsocksClient, addr: net.Address) !net.Stream {
+    fn connectUpstreamWithRetryUsing(
+        self: *ShadowsocksClient,
+        addr: net.Address,
+        deadline: UpstreamConnectDeadline,
+        comptime Ops: type,
+        ops: *Ops,
+    ) !net.Stream {
         var last_err: anyerror = error.UpstreamTcpConnectFailed;
 
         var attempt: usize = 0;
         while (attempt < connect_retry_attempts) : (attempt += 1) {
-            var stream = net.tcpConnectToAddress(addr) catch |err| {
+            const remaining_ms = deadline.remainingMsAt(ops.now()) catch
+                return error.UpstreamConnectDeadlineExceeded;
+            var stream = ops.connect(addr, remaining_ms) catch |err| {
+                if (deadline.expiredAt(ops.now())) {
+                    return error.UpstreamConnectDeadlineExceeded;
+                }
                 last_err = err;
                 std.debug.print("[SS] Upstream TCP connect failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
-                sleepBeforeRetry(attempt, connect_retry_attempts);
+                try sleepBeforeRetryWithinDeadline(
+                    deadline,
+                    attempt,
+                    connect_retry_attempts,
+                    Ops,
+                    ops,
+                );
                 continue;
             };
 
-            socket_options.configureConnectedStream(stream) catch |err| {
+            _ = deadline.remainingMsAt(ops.now()) catch {
                 stream.close();
-                last_err = err;
-                std.debug.print("[SS] Upstream socket sigpipe setup failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
-                sleepBeforeRetry(attempt, connect_retry_attempts);
-                continue;
+                return error.UpstreamConnectDeadlineExceeded;
             };
-
-            setSocketTimeouts(stream.handle, 15_000) catch |err| {
+            ops.configure(self, stream) catch |err| {
                 stream.close();
+                if (deadline.expiredAt(ops.now())) {
+                    return error.UpstreamConnectDeadlineExceeded;
+                }
                 last_err = err;
-                std.debug.print("[SS] Upstream socket timeout setup failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
-                sleepBeforeRetry(attempt, connect_retry_attempts);
+                std.debug.print("[SS] Upstream socket setup failed: server={s}:{d} attempt={d}/{d} err={}\n", .{ self.server, self.port, attempt + 1, connect_retry_attempts, err });
+                try sleepBeforeRetryWithinDeadline(
+                    deadline,
+                    attempt,
+                    connect_retry_attempts,
+                    Ops,
+                    ops,
+                );
                 continue;
             };
 
@@ -217,31 +311,23 @@ pub const ShadowsocksClient = struct {
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
     }
 
-    /// Send initial SS data wrapped in HTTP obfs request
-    fn sendWithHttpObfs(self: *ShadowsocksClient, stream: *net.Stream, host: []const u8, salt: []const u8, enc_data: []const u8) !void {
-        // Build HTTP GET request headers
-        const header = try std.fmt.allocPrint(self.allocator, "GET / HTTP/1.1\r\n" ++
-            "Host: {s}\r\n" ++
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n" ++
-            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n" ++
-            "Accept-Language: en-US,en;q=0.8\r\n" ++
-            "Accept-Encoding: gzip, deflate\r\n" ++
-            "DNT: 1\r\n" ++
-            "Connection: keep-alive\r\n" ++
-            "\r\n", .{host});
-        defer self.allocator.free(header);
-
-        // Combine: HTTP headers + salt + encrypted data → one TCP write
-        const total_len = header.len + salt.len + enc_data.len;
-        const packet = try self.allocator.alloc(u8, total_len);
-        defer self.allocator.free(packet);
-
-        @memcpy(packet[0..header.len], header);
-        @memcpy(packet[header.len .. header.len + salt.len], salt);
-        @memcpy(packet[header.len + salt.len ..], enc_data);
-
-        std.debug.print("[SS] Sending obfs HTTP ({} hdr + {} salt + {} enc = {} total)\n", .{ header.len, salt.len, enc_data.len, total_len });
-        try stream.writeAll(packet);
+    /// Send the first Shadowsocks payload as salt || encrypted target.
+    fn sendInitialPayload(
+        self: *ShadowsocksClient,
+        stream: *net.Stream,
+        salt: []const u8,
+        encrypted_target: []const u8,
+    ) !void {
+        var payload: [32 + 300]u8 = undefined;
+        const payload_len = std.math.add(
+            usize,
+            salt.len,
+            encrypted_target.len,
+        ) catch return error.LengthOverflow;
+        if (payload_len > payload.len) return error.InitialPayloadTooLarge;
+        @memcpy(payload[0..salt.len], salt);
+        @memcpy(payload[salt.len..payload_len], encrypted_target);
+        try self.obfs.?.write(stream, payload[0..payload_len]);
     }
 
     /// 加密并发送数据 (subsequent data after handshake - no obfs wrapping)
@@ -258,7 +344,11 @@ pub const ShadowsocksClient = struct {
 
             var enc_buf: [max_chunk + 50]u8 = undefined;
             const enc_len = try ctx.encryptChunk(chunk, &enc_buf);
-            try stream.writeAll(enc_buf[0..enc_len]);
+            if (self.obfs) |*http_obfs| {
+                try http_obfs.write(&stream, enc_buf[0..enc_len]);
+            } else {
+                try stream.writeAll(enc_buf[0..enc_len]);
+            }
 
             offset += chunk_len;
         }
@@ -266,26 +356,27 @@ pub const ShadowsocksClient = struct {
 
     /// 接收并解密数据
     pub fn read(self: *ShadowsocksClient, buf: []u8) !usize {
-        // First, drain any leftover decrypted payload from a previous oversized chunk
-        if (self.read_payload_leftover) |leftover| {
-            const copy_len = @min(leftover.len, buf.len);
-            @memcpy(buf[0..copy_len], leftover[0..copy_len]);
-            if (copy_len < leftover.len) {
-                const remaining = try self.allocator.dupe(u8, leftover[copy_len..]);
-                self.allocator.free(leftover);
-                self.read_payload_leftover = remaining;
-            } else {
-                self.allocator.free(leftover);
-                self.read_payload_leftover = null;
-            }
-            return copy_len;
-        }
+        if (try self.takePayloadLeftover(buf)) |count| return count;
+        var stream = self.stream orelse return error.NotConnected;
+        return self.readFromStream(&stream, buf) catch |err| {
+            if (err == error.NeedMoreData) return error.WouldBlock;
+            return err;
+        };
+    }
 
-        const stream = self.stream orelse return error.NotConnected;
+    fn readFromStream(
+        self: *ShadowsocksClient,
+        stream: anytype,
+        buf: []u8,
+    ) !usize {
+        if (try self.takePayloadLeftover(buf)) |count| return count;
 
-        // Lazy init: on first read, strip obfs headers + read server salt → init dec_ctx
+        // Lazy init: strip the optional obfs header and consume the server salt.
+        // Carry the read accounting into frame assembly so one top-level read()
+        // never performs a second transport read after init already consumed one.
+        var did_socket_read = false;
         if (self.dec_ctx == null) {
-            try self.initDecryptContext(stream);
+            did_socket_read = try self.initDecryptContext(stream);
         }
 
         var ctx = &self.dec_ctx.?;
@@ -293,36 +384,117 @@ pub const ShadowsocksClient = struct {
 
         // Assemble AEAD frames from buffered ciphertext, doing AT MOST ONE socket
         // read per call. If a complete frame is not yet buffered after that read,
-        // return error.WouldBlock so the single-threaded poll relay can service
-        // the other direction instead of blocking here waiting for the rest of a
-        // frame that straddles TCP segments — that head-of-line block was the
-        // SSE/large-download stall. Partial frame bytes survive in read_leftover
-        // until the next readable event re-enters this function.
+        // return internal NeedMoreData; public read maps it to WouldBlock so the
+        // single-threaded poll relay can service the other direction instead of
+        // frame that straddles TCP segments. Partial bytes remain in read_leftover.
         //
-        // A zero-length AEAD chunk is a valid authenticated chunk carrying no
-        // data; returning 0 would be misread as EOF by the relay, so we consume
-        // and verify its tag, then continue to the next chunk.
-        var did_socket_read = false;
+        // A zero-length AEAD chunk is valid authenticated data. Consume it and
+        // continue rather than returning 0, which the relay would treat as EOF.
         while (true) {
             if (try self.takeBufferedFrame(ctx, tag_len, buf)) |n| {
-                if (n == 0) continue; // empty chunk consumed; not EOF
+                if (n == 0) continue;
                 return n;
             }
 
-            // No complete frame buffered. Read once, then retry assembly; if it
-            // is still incomplete, yield to the poll loop rather than blocking.
-            if (did_socket_read) return error.WouldBlock;
+            if (did_socket_read) return error.NeedMoreData;
 
             var scratch: [socket_read_chunk]u8 = undefined;
             const got = stream.read(&scratch) catch |err| {
-                // SO_RCVTIMEO surfaces as WouldBlock: no data right now. Any
-                // bytes already buffered stay put; yield to the poll loop.
                 if (err == error.WouldBlock) return error.WouldBlock;
                 return err;
             };
-            if (got == 0) return error.ConnectionClosed; // upstream EOF
+            if (got == 0) return error.ConnectionClosed;
             try self.appendLeftover(scratch[0..got]);
             did_socket_read = true;
+        }
+    }
+
+    fn takePayloadLeftover(
+        self: *ShadowsocksClient,
+        buf: []u8,
+    ) !?usize {
+        const leftover = self.read_payload_leftover orelse return null;
+        const copy_len = @min(leftover.len, buf.len);
+        @memcpy(buf[0..copy_len], leftover[0..copy_len]);
+        if (copy_len < leftover.len) {
+            const remaining = try self.allocator.dupe(u8, leftover[copy_len..]);
+            self.allocator.free(leftover);
+            self.read_payload_leftover = remaining;
+        } else {
+            self.allocator.free(leftover);
+            self.read_payload_leftover = null;
+        }
+        return copy_len;
+    }
+
+    /// Blocking facade for the HTTPS-forward reader. Synthetic WouldBlock from
+    /// split salts/frames is resumed after polling the socket; an armed obfs
+    /// response deadline bounds both the poll and the overall header wait.
+    pub fn readBlocking(self: *ShadowsocksClient, buf: []u8) !usize {
+        if (try self.takePayloadLeftover(buf)) |count| return count;
+        var stream = self.stream orelse return error.NotConnected;
+        while (true) {
+            const before_poll_ms = compat.monotonicMilliTimestamp();
+            try self.checkResponseDeadlineAt(before_poll_ms);
+
+            if (!self.hasPendingRead()) {
+                var poll_fds = [_]std.posix.pollfd{.{
+                    .fd = stream.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const timeout_ms = self.responseDeadlineRemainingMsAt(
+                    before_poll_ms,
+                ) orelse blocking_poll_timeout_ms;
+                const poll_deadline_ms = std.math.add(
+                    i64,
+                    before_poll_ms,
+                    timeout_ms,
+                ) catch std.math.maxInt(i64);
+                const ready = try compat.pollUntil(
+                    &poll_fds,
+                    poll_deadline_ms,
+                );
+                try self.checkResponseDeadlineAt(
+                    compat.monotonicMilliTimestamp(),
+                );
+                if (ready == 0) return error.WouldBlock;
+
+                const revents = poll_fds[0].revents;
+                if ((revents & std.posix.POLL.IN) == 0) {
+                    if ((revents & std.posix.POLL.NVAL) != 0) {
+                        return error.InvalidDescriptor;
+                    }
+                    if ((revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
+                        return error.ConnectionClosed;
+                    }
+                    return error.WouldBlock;
+                }
+            }
+
+            return self.readFromStream(&stream, buf) catch |err| {
+                if (err == error.NeedMoreData) continue;
+                return err;
+            };
+        }
+    }
+
+    pub fn responseDeadlineRemainingMsAt(
+        self: *const ShadowsocksClient,
+        now_ms: i64,
+    ) ?i32 {
+        if (self.obfs) |*http_obfs| {
+            return http_obfs.responseDeadlineRemainingMsAt(now_ms);
+        }
+        return null;
+    }
+
+    pub fn checkResponseDeadlineAt(
+        self: *const ShadowsocksClient,
+        now_ms: i64,
+    ) !void {
+        if (self.obfs) |*http_obfs| {
+            try http_obfs.checkResponseDeadlineAt(now_ms);
         }
     }
 
@@ -371,9 +543,12 @@ pub const ShadowsocksClient = struct {
     /// Append freshly-read ciphertext to the reassembly buffer.
     fn appendLeftover(self: *ShadowsocksClient, data: []const u8) !void {
         if (self.read_leftover) |old| {
-            const combined = try self.allocator.alloc(u8, old.len + data.len);
+            const combined_len = std.math.add(usize, old.len, data.len) catch {
+                return error.LengthOverflow;
+            };
+            const combined = try self.allocator.alloc(u8, combined_len);
             @memcpy(combined[0..old.len], old);
-            @memcpy(combined[old.len..], data);
+            @memcpy(combined[old.len..combined_len], data);
             self.allocator.free(old);
             self.read_leftover = combined;
         } else {
@@ -396,6 +571,13 @@ pub const ShadowsocksClient = struct {
 
     pub fn hasPendingRead(self: *const ShadowsocksClient) bool {
         if (self.read_payload_leftover != null) return true;
+        if (self.obfs) |*http_obfs| {
+            if (http_obfs.hasPendingRead()) return true;
+        }
+        if (self.dec_ctx == null) {
+            const leftover = self.read_leftover orelse return false;
+            return leftover.len >= self.cipher_type.saltLen();
+        }
         return self.hasBufferedEncryptedChunk();
     }
 
@@ -411,69 +593,246 @@ pub const ShadowsocksClient = struct {
         return leftover.len >= len_hdr_len + @as(usize, payload_len) + tag_len;
     }
 
-    /// Initialize decryption context: strip obfs HTTP response + read server salt
-    fn initDecryptContext(self: *ShadowsocksClient, stream: net.Stream) !void {
+    /// Initialize decryption context from persistent raw transport bytes.
+    /// Returns true when this call consumed one transport read operation.
+    fn initDecryptContext(
+        self: *ShadowsocksClient,
+        stream: anytype,
+    ) !bool {
         const salt_len = self.cipher_type.saltLen();
-
-        if (self.obfs != null and self.obfs_first_response) {
-            self.obfs_first_response = false;
-
-            // Read server's HTTP response, find \r\n\r\n, strip headers
-            var response_buf: [4096]u8 = undefined;
-            var total_read: usize = 0;
-
-            while (total_read < response_buf.len) {
-                const n = try stream.read(response_buf[total_read..]);
-                if (n == 0) return error.ConnectionClosed;
-                total_read += n;
-
-                if (std.mem.indexOf(u8, response_buf[0..total_read], "\r\n\r\n")) |header_end| {
-                    const data_start = header_end + 4;
-                    const remaining = response_buf[data_start..total_read];
-
-                    std.debug.print("[SS] Stripped obfs response ({} hdr bytes), {} data bytes remaining\n", .{ data_start, remaining.len });
-
-                    // remaining = server_salt + (possibly) encrypted chunks
-                    if (remaining.len >= salt_len) {
-                        self.dec_ctx = try aead.AeadStream.init(self.cipher_type, self.password, remaining[0..salt_len]);
-                        // Save any leftover after salt
-                        if (remaining.len > salt_len) {
-                            self.read_leftover = try self.allocator.dupe(u8, remaining[salt_len..]);
-                        }
-                    } else {
-                        // Partial salt in remaining, need more data
-                        var salt_full: [32]u8 = undefined;
-                        @memcpy(salt_full[0..remaining.len], remaining);
-                        var got = remaining.len;
-                        while (got < salt_len) {
-                            const rn = try stream.read(salt_full[got..salt_len]);
-                            if (rn == 0) return error.ConnectionClosed;
-                            got += rn;
-                        }
-                        self.dec_ctx = try aead.AeadStream.init(self.cipher_type, self.password, salt_full[0..salt_len]);
-                    }
-                    return;
-                }
-            }
-            return error.ObfsResponseTooLarge;
-        } else {
-            // No obfs: read server salt directly from stream
-            var salt_buf: [32]u8 = undefined;
-            var got: usize = 0;
-            while (got < salt_len) {
-                const n = try stream.read(salt_buf[got..salt_len]);
-                if (n == 0) return error.ConnectionClosed;
-                got += n;
-            }
-            std.debug.print("[SS] Read server salt ({} bytes)\n", .{salt_len});
-            self.dec_ctx = try aead.AeadStream.init(self.cipher_type, self.password, salt_buf[0..salt_len]);
+        const buffered_len = if (self.read_leftover) |leftover| leftover.len else 0;
+        var did_transport_read = false;
+        if (buffered_len < salt_len) {
+            var scratch: [socket_read_chunk]u8 = undefined;
+            const read_count = if (self.obfs) |*http_obfs|
+                try http_obfs.read(stream, &scratch)
+            else
+                try stream.read(&scratch);
+            did_transport_read = true;
+            if (read_count == 0) return error.ConnectionClosed;
+            try self.appendLeftover(scratch[0..read_count]);
         }
+
+        const leftover = self.read_leftover orelse return error.NeedMoreData;
+        if (leftover.len < salt_len) return error.NeedMoreData;
+
+        const context = try aead.AeadStream.init(
+            self.cipher_type,
+            self.password,
+            leftover[0..salt_len],
+        );
+        try self.consumeLeftoverFront(salt_len);
+        self.dec_ctx = context;
+        std.debug.print("[SS] Read server salt ({} bytes)\n", .{salt_len});
+        return did_transport_read;
     }
 };
 
-fn sleepBeforeRetry(attempt_index: usize, max_attempts: usize) void {
+const SystemUpstreamOps = struct {
+    fn now(_: *@This()) i64 {
+        return compat.monotonicMilliTimestamp();
+    }
+
+    fn resolve(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        timeout_ms: u32,
+    ) !net.AddressList {
+        return net.getAddressListWithTimeout(
+            allocator,
+            host,
+            port,
+            timeout_ms,
+        );
+    }
+
+    fn connect(
+        _: *@This(),
+        address: net.Address,
+        timeout_ms: u32,
+    ) !net.Stream {
+        return net.tcpConnectToAddressWithTimeout(address, timeout_ms);
+    }
+
+    fn configure(
+        _: *@This(),
+        client: *ShadowsocksClient,
+        stream: net.Stream,
+    ) !void {
+        try socket_options.configureConnectedStream(stream);
+        const timeout_ms: u32 = if (client.obfs) |*http_obfs|
+            @intCast(http_obfs.responseTimeoutMs())
+        else
+            default_socket_timeout_ms;
+        try ShadowsocksClient.setSocketTimeouts(stream.handle, timeout_ms);
+    }
+
+    fn sleep(_: *@This(), delay_ms: u32) !void {
+        try std.Io.sleep(
+            compat.io(),
+            .fromMilliseconds(delay_ms),
+            .awake,
+        );
+    }
+};
+
+fn sleepBeforeRetryWithinDeadline(
+    deadline: UpstreamConnectDeadline,
+    attempt_index: usize,
+    max_attempts: usize,
+    comptime Ops: type,
+    ops: *Ops,
+) !void {
     if (attempt_index + 1 >= max_attempts) return;
-    compat.sleepNs(ShadowsocksClient.retryBackoffMs(attempt_index) * std.time.ns_per_ms);
+
+    const remaining_ms = deadline.remainingMsAt(ops.now()) catch
+        return error.UpstreamConnectDeadlineExceeded;
+    const requested_ms: u32 = @intCast(@min(
+        ShadowsocksClient.retryBackoffMs(attempt_index),
+        @as(u64, std.math.maxInt(u32)),
+    ));
+    const delay_ms = @min(requested_ms, remaining_ms);
+    ops.sleep(delay_ms) catch |err| {
+        if (deadline.expiredAt(ops.now())) {
+            return error.UpstreamConnectDeadlineExceeded;
+        }
+        return err;
+    };
+    _ = deadline.remainingMsAt(ops.now()) catch
+        return error.UpstreamConnectDeadlineExceeded;
+}
+
+test "DNS retry backoff cannot extend the absolute upstream deadline" {
+    const DnsFailureOps = struct {
+        now_ms: i64 = 1_000,
+        resolve_calls: usize = 0,
+        resolve_timeouts: [connect_retry_attempts]u32 = @splat(0),
+        sleep_calls: usize = 0,
+        sleeps_ms: [connect_retry_attempts]u32 = @splat(0),
+
+        fn now(self: *@This()) i64 {
+            return self.now_ms;
+        }
+
+        fn resolve(
+            self: *@This(),
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: u16,
+            timeout_ms: u32,
+        ) !net.AddressList {
+            self.resolve_timeouts[self.resolve_calls] = timeout_ms;
+            self.resolve_calls += 1;
+            return error.InjectedDnsFailure;
+        }
+
+        fn sleep(self: *@This(), delay_ms: u32) !void {
+            self.sleeps_ms[self.sleep_calls] = delay_ms;
+            self.sleep_calls += 1;
+            self.now_ms += delay_ms;
+        }
+    };
+
+    var client = try ShadowsocksClient.init(
+        std.testing.allocator,
+        "upstream.invalid",
+        8388,
+        "password",
+        "aes-128-gcm",
+    );
+    defer client.deinit();
+    var ops = DnsFailureOps{};
+    const deadline = UpstreamConnectDeadline.initAt(ops.now(), 250);
+
+    try std.testing.expectError(
+        error.UpstreamConnectDeadlineExceeded,
+        client.resolveUpstreamAddressWithRetryUsing(
+            deadline,
+            DnsFailureOps,
+            &ops,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), ops.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 2), ops.sleep_calls);
+    try std.testing.expectEqual(@as(u32, 250), ops.resolve_timeouts[0]);
+    try std.testing.expectEqual(@as(u32, 50), ops.resolve_timeouts[1]);
+    try std.testing.expectEqual(@as(u32, 200), ops.sleeps_ms[0]);
+    try std.testing.expectEqual(@as(u32, 50), ops.sleeps_ms[1]);
+    try std.testing.expectEqual(deadline.expires_ms, ops.now());
+}
+
+test "TCP retries receive only remaining absolute-deadline time" {
+    const ConnectTimeoutOps = struct {
+        now_ms: i64 = 2_000,
+        connect_calls: usize = 0,
+        connect_timeouts: [connect_retry_attempts]u32 = @splat(0),
+        sleep_calls: usize = 0,
+
+        fn now(self: *@This()) i64 {
+            return self.now_ms;
+        }
+
+        fn connect(
+            self: *@This(),
+            _: net.Address,
+            timeout_ms: u32,
+        ) !net.Stream {
+            self.connect_timeouts[self.connect_calls] = timeout_ms;
+            self.connect_calls += 1;
+            if (self.connect_calls == 1) {
+                self.now_ms += 20;
+                return error.InjectedConnectFailure;
+            }
+
+            // Model an OS connector which never completes before its supplied
+            // timeout. Advancing exactly that amount must surface the shared,
+            // typed absolute deadline rather than start another retry window.
+            self.now_ms += timeout_ms;
+            return error.InjectedConnectTimeout;
+        }
+
+        fn configure(
+            _: *@This(),
+            _: *ShadowsocksClient,
+            _: net.Stream,
+        ) !void {
+            return error.UnexpectedConfigure;
+        }
+
+        fn sleep(self: *@This(), delay_ms: u32) !void {
+            self.sleep_calls += 1;
+            self.now_ms += delay_ms;
+        }
+    };
+
+    var client = try ShadowsocksClient.init(
+        std.testing.allocator,
+        "127.0.0.1",
+        8388,
+        "password",
+        "aes-128-gcm",
+    );
+    defer client.deinit();
+    var ops = ConnectTimeoutOps{};
+    const deadline = UpstreamConnectDeadline.initAt(ops.now(), 260);
+    const address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 8388);
+
+    try std.testing.expectError(
+        error.UpstreamConnectDeadlineExceeded,
+        client.connectUpstreamWithRetryUsing(
+            address,
+            deadline,
+            ConnectTimeoutOps,
+            &ops,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), ops.connect_calls);
+    try std.testing.expectEqual(@as(usize, 1), ops.sleep_calls);
+    try std.testing.expectEqual(@as(u32, 260), ops.connect_timeouts[0]);
+    try std.testing.expectEqual(@as(u32, 40), ops.connect_timeouts[1]);
+    try std.testing.expectEqual(deadline.expires_ms, ops.now());
 }
 
 test "Shadowsocks client init" {
@@ -620,7 +979,7 @@ test "write splits 0x4000 bytes at the Shadowsocks AEAD limit" {
 
 fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     var off: usize = 0;
-    while (off < data.len) off += try compat.posixWrite(fd, data[off..]);
+    while (off < data.len) off += try compat.posixSocketWrite(fd, data[off..]);
 }
 
 fn readToEndFd(fd: std.posix.fd_t, data: []u8) !usize {
@@ -713,4 +1072,141 @@ test "read drains multiple frames buffered from one socket read" {
     try std.testing.expect(client.hasPendingRead());
     const n2 = try client.read(&out);
     try std.testing.expectEqualStrings("world", out[0..n2]);
+}
+
+test "HTTP obfs integration sends salt and encrypted target as the first body" {
+    const allocator = std.testing.allocator;
+    var client = try ShadowsocksClient.initWithObfs(
+        allocator,
+        "127.0.0.1",
+        8388,
+        "password",
+        "aes-128-gcm",
+        simple_obfs_http.Config{
+            .host = "www.example.com",
+            .server_port = 8388,
+        },
+    );
+    defer client.deinit();
+
+    const fds = try makeSocketPair();
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var stream = net.Stream{ .handle = fds[0] };
+
+    const salt = "0123456789abcdef";
+    const encrypted_target = "encrypted-target";
+    try client.sendInitialPayload(&stream, salt, encrypted_target);
+
+    var wire: [simple_obfs_http.request_header_max + salt.len + encrypted_target.len]u8 = undefined;
+    var wire_len: usize = 0;
+    while (true) {
+        wire_len += try compat.posixRead(fds[1], wire[wire_len..]);
+        if (std.mem.indexOf(u8, wire[0..wire_len], "\r\n\r\n")) |header_end| {
+            const payload_start = header_end + 4;
+            if (wire_len == payload_start + salt.len + encrypted_target.len) break;
+        }
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "Content-Length: 32\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, wire[0..wire_len], salt ++ encrypted_target));
+}
+
+test "HTTP obfs integration resumes a split response without losing SS bytes" {
+    const allocator = std.testing.allocator;
+    var client = try ShadowsocksClient.initWithObfs(
+        allocator,
+        "127.0.0.1",
+        8388,
+        "password",
+        "aes-128-gcm",
+        simple_obfs_http.Config{
+            .host = "www.example.com",
+            .server_port = 8388,
+        },
+    );
+    defer client.deinit();
+
+    const fds = try makeSocketPair();
+    defer _ = std.c.close(fds[1]);
+    client.stream = net.Stream{ .handle = fds[0] };
+    try ShadowsocksClient.setSocketTimeouts(fds[0], 100);
+
+    const server_salt = [_]u8{0} ** 16;
+    var server_encrypt = try aead.AeadStream.init(
+        .aes_128_gcm,
+        "password",
+        &server_salt,
+    );
+    var frame: [64]u8 = undefined;
+    const frame_len = try server_encrypt.encryptChunk("hello", &frame);
+    const response = "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "\r\n";
+
+    // The first call consumes an incomplete header and must retain it on WouldBlock.
+    try writeAllFd(fds[1], response[0..17]);
+    var output: [32]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, client.read(&output));
+
+    var remainder: [response.len - 17 + server_salt.len + frame.len]u8 = undefined;
+    var remainder_len: usize = 0;
+    @memcpy(remainder[remainder_len .. remainder_len + response.len - 17], response[17..]);
+    remainder_len += response.len - 17;
+    @memcpy(remainder[remainder_len .. remainder_len + server_salt.len], &server_salt);
+    remainder_len += server_salt.len;
+    @memcpy(remainder[remainder_len .. remainder_len + frame_len], frame[0..frame_len]);
+    remainder_len += frame_len;
+    try writeAllFd(fds[1], remainder[0..remainder_len]);
+
+    const count = try client.read(&output);
+    try std.testing.expectEqualStrings("hello", output[0..count]);
+}
+
+const OneReadStream = struct {
+    input: []const u8,
+    reads: usize = 0,
+
+    pub fn read(self: *OneReadStream, output: []u8) !usize {
+        self.reads += 1;
+        if (self.reads > 1) return error.UnexpectedSecondRead;
+        const count = @min(output.len, self.input.len);
+        @memcpy(output[0..count], self.input[0..count]);
+        return count;
+    }
+};
+
+test "HTTP obfs read does not read twice after init consumed a partial frame" {
+    const allocator = std.testing.allocator;
+    var client = try ShadowsocksClient.initWithObfs(
+        allocator,
+        "127.0.0.1",
+        8388,
+        "password",
+        "aes-128-gcm",
+        simple_obfs_http.Config{
+            .host = "www.example.com",
+            .server_port = 8388,
+        },
+    );
+    defer client.deinit();
+
+    const salt = [_]u8{0} ** 16;
+    var encrypt = try aead.AeadStream.init(.aes_128_gcm, "password", &salt);
+    var frame: [64]u8 = undefined;
+    _ = try encrypt.encryptChunk("hello", &frame);
+    const response = "HTTP/1.1 101 Switching Protocols\r\n\r\n";
+    var wire: [response.len + salt.len + 10]u8 = undefined;
+    @memcpy(wire[0..response.len], response);
+    @memcpy(wire[response.len .. response.len + salt.len], &salt);
+    @memcpy(wire[response.len + salt.len ..], frame[0..10]);
+
+    var stream = OneReadStream{ .input = &wire };
+    var output: [32]u8 = undefined;
+    try std.testing.expectError(
+        error.NeedMoreData,
+        client.readFromStream(&stream, &output),
+    );
+    try std.testing.expectEqual(@as(usize, 1), stream.reads);
 }

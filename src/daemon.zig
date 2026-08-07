@@ -28,7 +28,17 @@ const prepared_name_bytes: usize = prepared_config_prefix.len +
 const prepared_header_prefix = "# zc-prepared-v1 ";
 const prepared_source_prefix = "# zc-prepared-source-v1 ";
 const prepared_port_prefix = "# zc-prepared-port-v1 ";
-const prepared_config_max_bytes: usize = 16 * 1024 * 1024;
+const prepared_payload_max_bytes: usize = config.config_source_bytes_max;
+const prepared_identity_encoded_max_bytes: usize =
+    config_catalog.max_key_bytes * 2 + 1 + 32;
+const prepared_source_encoded_max_bytes: usize = 4096 * 2;
+const prepared_port_encoded_max_bytes: usize = "65535".len;
+const prepared_metadata_max_bytes: usize =
+    prepared_header_prefix.len + prepared_identity_encoded_max_bytes + 1 +
+    prepared_source_prefix.len + prepared_source_encoded_max_bytes + 1 +
+    prepared_port_prefix.len + prepared_port_encoded_max_bytes + 1;
+const prepared_envelope_max_bytes: usize =
+    prepared_payload_max_bytes + prepared_metadata_max_bytes;
 const daemon_status_response_max_bytes: usize = 4 * 1024 * 1024 + 64 * 1024;
 const daemon_status_io_timeout_ms: i64 = 2_000;
 pub const daemon_log_max_bytes: u64 = 8 * 1024 * 1024;
@@ -714,6 +724,9 @@ pub fn publishPreparedConfig(
     source_path: ?[]const u8,
     port_override: ?u16,
 ) !PreparedConfig {
+    if (bytes.len > prepared_payload_max_bytes) {
+        return error.PreparedConfigTooLarge;
+    }
     const identity_bytes: usize = if (identity) |value|
         std.math.mul(usize, value.key.len, 2) catch
             return error.PreparedConfigTooLarge
@@ -766,7 +779,9 @@ pub fn publishPreparedConfig(
     ) catch return error.PreparedConfigTooLarge;
     const envelope_bytes = std.math.add(usize, header_bytes, bytes.len) catch
         return error.PreparedConfigTooLarge;
-    if (envelope_bytes > prepared_config_max_bytes) {
+    if (header_bytes > prepared_metadata_max_bytes or
+        envelope_bytes > prepared_envelope_max_bytes)
+    {
         return error.PreparedConfigTooLarge;
     }
     const envelope = try allocator.alloc(u8, envelope_bytes);
@@ -932,11 +947,14 @@ pub fn readPreparedConfig(
     {
         return error.InvalidPreparedConfig;
     }
-    const storage = try compat.fileReadToEndAlloc(
+    const storage = compat.fileReadBoundedAlloc(
         file,
         allocator,
-        prepared_config_max_bytes,
-    );
+        prepared_envelope_max_bytes,
+    ) catch |err| switch (err) {
+        error.FileTooLarge => return error.InvalidPreparedConfig,
+        else => |other| return other,
+    };
     errdefer {
         @memset(storage, 0);
         allocator.free(storage);
@@ -1791,17 +1809,12 @@ fn waitForStatusSocket(
     deadline: i64,
 ) !void {
     while (true) {
-        const remaining = deadline - compat.monotonicMilliTimestamp();
-        if (remaining <= 0) return error.StatusRequestTimeout;
         var descriptors = [_]std.posix.pollfd{.{
             .fd = fd,
             .events = events,
             .revents = 0,
         }};
-        const ready = try std.posix.poll(
-            &descriptors,
-            @intCast(@min(remaining, std.math.maxInt(i32))),
-        );
+        const ready = try compat.pollUntil(&descriptors, deadline);
         if (ready == 0) return error.StatusRequestTimeout;
         const revents = descriptors[0].revents;
         if (revents & std.posix.POLL.NVAL != 0 or
@@ -3290,6 +3303,76 @@ test "prepared config roundtrip preserves exact managed identity" {
     try std.testing.expectError(
         error.InvalidPreparedConfig,
         readPreparedConfig(allocator, published.path),
+    );
+}
+
+test "prepared config payload limit excludes bounded authentication metadata" {
+    const allocator = std.testing.allocator;
+    const exact_payload = try allocator.alloc(
+        u8,
+        config.config_source_bytes_max,
+    );
+    defer allocator.free(exact_payload);
+    @memset(exact_payload, '#');
+    const max_key = try allocator.alloc(u8, config_catalog.max_key_bytes);
+    defer allocator.free(max_key);
+    @memset(max_key, 'a');
+    const max_source_path = try allocator.alloc(u8, 4096);
+    defer allocator.free(max_source_path);
+    @memset(max_source_path, 'a');
+    max_source_path[0] = '/';
+
+    const identity: runtime_descriptor.Identity = .{
+        .key = max_key,
+        .revision = try config_identity.Revision.parseHex(
+            "00112233445566778899aabbccddeeff",
+        ),
+    };
+    var published = try publishPreparedConfig(
+        allocator,
+        exact_payload,
+        identity,
+        max_source_path,
+        65535,
+    );
+    defer published.deinit();
+    var content = try readPreparedConfig(allocator, published.path);
+    try std.testing.expectEqual(exact_payload.len, content.yaml.len);
+    try std.testing.expectEqualSlices(u8, exact_payload, content.yaml);
+    content.deinit();
+
+    const prepared_file = try published.runtime.openFile(
+        published.name,
+        .{ .mode = .read_write },
+    );
+    defer prepared_file.close(compat.io());
+    const prepared_stat = try prepared_file.stat(compat.io());
+    try std.testing.expectEqual(
+        @as(u64, prepared_envelope_max_bytes),
+        prepared_stat.size,
+    );
+    try compat.fileSeekTo(prepared_file, prepared_stat.size);
+    try compat.fileWriteAll(prepared_file, "x");
+    try std.testing.expectError(
+        error.InvalidPreparedConfig,
+        readPreparedConfig(allocator, published.path),
+    );
+
+    const oversized_payload = try allocator.alloc(
+        u8,
+        config.config_source_bytes_max + 1,
+    );
+    defer allocator.free(oversized_payload);
+    @memset(oversized_payload, '#');
+    try std.testing.expectError(
+        error.PreparedConfigTooLarge,
+        publishPreparedConfig(
+            allocator,
+            oversized_payload,
+            identity,
+            max_source_path,
+            65535,
+        ),
     );
 }
 

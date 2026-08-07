@@ -14,8 +14,10 @@ test "include zc test modules" {
     _ = @import("config_catalog_test.zig");
     _ = @import("config_import_test.zig");
     _ = @import("controller_endpoint.zig");
+    _ = @import("e2e_obfs_oracle.zig");
     _ = @import("config.zig");
     _ = @import("config_validator.zig");
+    _ = @import("shadowsocks_capability.zig");
     _ = @import("daemon.zig");
     _ = @import("doctor_cli.zig");
     _ = @import("geoip.zig");
@@ -31,6 +33,7 @@ test "include zc test modules" {
     _ = @import("perf_runner.zig");
     _ = @import("perf_stats.zig");
     _ = @import("runtime_selection.zig");
+    _ = @import("runtime_capability.zig");
     _ = @import("runtime_dir.zig");
     _ = @import("runtime_descriptor_test.zig");
     _ = @import("selection_state_test.zig");
@@ -57,6 +60,7 @@ test "include zc test modules" {
     _ = @import("proxy/outbound/proxy_type_test.zig");
     _ = @import("proxy/outbound/shadowsocks.zig");
     _ = @import("proxy/outbound/shadowsocks_test.zig");
+    _ = @import("proxy/outbound/simple_obfs_http_test.zig");
     _ = @import("proxy/proxy_test.zig");
     _ = @import("proxy/smart_group_test.zig");
     _ = @import("proxy/socks5.zig");

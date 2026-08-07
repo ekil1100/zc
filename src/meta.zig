@@ -152,6 +152,13 @@ fn saveInDirectory(
     meta: *const MetaData,
     config_dir: []const u8,
 ) !SaveOutcome {
+    var bounded_iterator = meta.configs.iterator();
+    while (bounded_iterator.next()) |entry| {
+        try config_mod.requirePersistedSelectionLimit(
+            entry.value_ptr.selections.count(),
+        );
+    }
+
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
@@ -345,18 +352,35 @@ pub fn parseUrlParams(allocator: std.mem.Allocator, url: []const u8) !std.String
 }
 
 /// 从 meta 中设置某个配置的 selection
-pub fn setSelection(allocator: std.mem.Allocator, meta: *MetaData, config_key: []const u8, group_name: []const u8, proxy_name: []const u8) !void {
+pub fn setSelection(
+    allocator: std.mem.Allocator,
+    meta: *MetaData,
+    config_key: []const u8,
+    group_name: []const u8,
+    proxy_name: []const u8,
+) !void {
     const entry = meta.configs.getPtr(config_key) orelse return;
-
-    // 如果已存在，先释放旧值
-    if (entry.selections.fetchRemove(group_name)) |removed| {
-        allocator.free(removed.key);
-        allocator.free(removed.value);
+    if (entry.selections.getPtr(group_name)) |value| {
+        const replacement = try allocator.dupe(u8, proxy_name);
+        const previous = value.*;
+        value.* = replacement;
+        allocator.free(previous);
+        return;
     }
 
-    const gn = try allocator.dupe(u8, group_name);
-    const pn = try allocator.dupe(u8, proxy_name);
-    try entry.selections.put(gn, pn);
+    const selection_count = std.math.add(
+        usize,
+        entry.selections.count(),
+        1,
+    ) catch return error.PersistedSelectionCountLimitExceeded;
+    try config_mod.requirePersistedSelectionLimit(selection_count);
+    try entry.selections.ensureUnusedCapacity(1);
+
+    const group_owned = try allocator.dupe(u8, group_name);
+    errdefer allocator.free(group_owned);
+    const proxy_owned = try allocator.dupe(u8, proxy_name);
+    errdefer allocator.free(proxy_owned);
+    entry.selections.putAssumeCapacity(group_owned, proxy_owned);
 }
 
 /// 获取当前活跃配置的 selections
@@ -452,6 +476,9 @@ fn parseMetaJson(allocator: std.mem.Allocator, content: []const u8, meta: *MetaD
 
         if (obj.get("selections")) |selections_val| {
             if (selections_val != .object) return error.InvalidMetaJson;
+            try config_mod.requirePersistedSelectionLimit(
+                selections_val.object.count(),
+            );
             var sit = selections_val.object.iterator();
             while (sit.next()) |se| {
                 if (se.value_ptr.* != .string) return error.InvalidMetaJson;
@@ -928,6 +955,86 @@ test "meta json round trip" {
     const cm2 = meta2.configs.get("V1StGXR8").?;
     try std.testing.expectEqualStrings("https://example.com/sub?target=clash", cm2.url.?);
     try std.testing.expectEqualStrings("Flower_SS.yaml", cm2.filename.?);
+}
+
+fn putAllocationTestConfig(
+    allocator: std.mem.Allocator,
+    metadata: *MetaData,
+) !void {
+    const config_key = try allocator.dupe(u8, "profile");
+    errdefer allocator.free(config_key);
+    var config_meta = ConfigMeta.init(allocator);
+    errdefer config_meta.deinit(allocator);
+    try metadata.configs.put(config_key, config_meta);
+}
+
+fn setSelectionNewAllocationFixture(allocator: std.mem.Allocator) !void {
+    var metadata = MetaData.init(allocator);
+    defer metadata.deinit();
+    try putAllocationTestConfig(allocator, &metadata);
+
+    setSelection(
+        allocator,
+        &metadata,
+        "profile",
+        "Policy",
+        "DIRECT",
+    ) catch |err| {
+        try std.testing.expectEqual(
+            @as(u32, 0),
+            metadata.configs.getPtr("profile").?.selections.count(),
+        );
+        return err;
+    };
+    const selections = &metadata.configs.getPtr("profile").?.selections;
+    try std.testing.expectEqual(@as(u32, 1), selections.count());
+    try std.testing.expectEqualStrings("DIRECT", selections.get("Policy").?);
+}
+
+fn setSelectionReplacementAllocationFixture(
+    allocator: std.mem.Allocator,
+) !void {
+    var metadata = MetaData.init(allocator);
+    defer metadata.deinit();
+    try putAllocationTestConfig(allocator, &metadata);
+    const selections = &metadata.configs.getPtr("profile").?.selections;
+    {
+        const group = try allocator.dupe(u8, "Policy");
+        errdefer allocator.free(group);
+        const proxy = try allocator.dupe(u8, "REJECT");
+        errdefer allocator.free(proxy);
+        try selections.put(group, proxy);
+    }
+
+    setSelection(
+        allocator,
+        &metadata,
+        "profile",
+        "Policy",
+        "DIRECT",
+    ) catch |err| {
+        try std.testing.expectEqual(@as(u32, 1), selections.count());
+        try std.testing.expectEqualStrings(
+            "REJECT",
+            selections.get("Policy").?,
+        );
+        return err;
+    };
+    try std.testing.expectEqual(@as(u32, 1), selections.count());
+    try std.testing.expectEqualStrings("DIRECT", selections.get("Policy").?);
+}
+
+test "setSelection is strongly exception safe for every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        setSelectionNewAllocationFixture,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        setSelectionReplacementAllocationFixture,
+        .{},
+    );
 }
 
 test "parseMetaJson decodes unicode escape sequences" {

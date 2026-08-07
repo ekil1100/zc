@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
+const catalog_runtime_gate = @import("catalog_runtime_gate.zig");
 const config_identity = @import("config_identity.zig");
 const config_catalog = @import("config_catalog.zig");
 const revision_store = @import("revision_store.zig");
@@ -132,14 +133,32 @@ pub const ProfileDesired = union(enum) {
     replace: []const config_catalog.Selection,
 };
 
+pub const CatalogPutPreflight = struct {
+    key: []const u8,
+    expected: ExpectedHead,
+    desired: ProfileDesired,
+    activate: bool = false,
+};
+
+pub const CatalogPutIntent = struct {
+    creates_active_identity: bool,
+};
+
+pub const CatalogPutPreflightOutcome = union(enum) {
+    accepted: CatalogPutIntent,
+    conflict: struct { actual: StateToken },
+};
+
+pub const CatalogPutChange = struct {
+    key: []const u8,
+    expected: ExpectedHead,
+    head: Revision,
+    desired: ProfileDesired,
+    activate: bool = false,
+};
+
 pub const CatalogMutation = union(enum) {
-    put_profile: struct {
-        key: []const u8,
-        expected: ExpectedHead,
-        head: Revision,
-        desired: ProfileDesired,
-        activate: bool = false,
-    },
+    put_profile: CatalogPutChange,
     set_active: struct { key: ?[]const u8 },
     delete_profile: struct {
         key: []const u8,
@@ -230,6 +249,26 @@ pub const Authority = struct {
             return self.authority.inspectUnlocked();
         }
 
+        /// Performs every deterministic catalog-side check that can precede
+        /// immutable publication while retaining the authority lock.
+        pub fn preflightCatalogPut(
+            self: Guard,
+            expected: StateToken,
+            request: CatalogPutPreflight,
+        ) !CatalogPutPreflightOutcome {
+            return self.authority.preflightCatalogPutUnlocked(expected, request);
+        }
+
+        /// Commits through the same authoritative final gate used by the
+        /// ordinary mutation API without recursively acquiring the lock.
+        pub fn mutateCatalog(
+            self: Guard,
+            expected: StateToken,
+            mutation: CatalogMutation,
+        ) !CatalogMutationOutcome {
+            return self.authority.mutateCatalogUnlocked(expected, mutation);
+        }
+
         pub fn deinit(self: *Guard) void {
             self.lock.close(compat.io());
             self.* = undefined;
@@ -264,6 +303,19 @@ pub const Authority = struct {
             },
             .missing => {},
         }
+        if (seed.active) |active| {
+            const index = findCatalogProfile(seed.profiles, active.key) orelse
+                return error.InvalidCatalog;
+            if (!seed.profiles[index].head.eql(active.revision)) {
+                return error.InvalidCatalog;
+            }
+            try catalog_runtime_gate.ensureIdentityRuntimeReady(
+                self.allocator,
+                self.dir,
+                active.key,
+                active.revision,
+            );
+        }
 
         const sequence = std.math.add(u64, actual.sequence, 1) catch
             return error.SequenceOverflow;
@@ -294,7 +346,64 @@ pub const Authority = struct {
     ) !CatalogMutationOutcome {
         const lock = try self.acquireLock();
         defer lock.close(compat.io());
+        return self.mutateCatalogUnlocked(expected, mutation);
+    }
 
+    fn preflightCatalogPutUnlocked(
+        self: Authority,
+        expected: StateToken,
+        request: CatalogPutPreflight,
+    ) !CatalogPutPreflightOutcome {
+        var current = try self.inspectUnlocked();
+        defer current.deinit();
+        const actual = current.token();
+        if (!actual.eql(expected)) return .{ .conflict = .{ .actual = actual } };
+        const state = switch (current) {
+            .catalog_v2 => |*observed| observed.catalog.state,
+            .missing, .legacy_v1 => return error.Schema2CatalogRequired,
+        };
+        // Preserve RevisionStore's direct Service error for an empty key while
+        // moving that deterministic rejection ahead of publication.
+        if (request.key.len == 0) return error.InvalidKey;
+        const next_sequence = std.math.add(u64, state.sequence, 1) catch
+            return error.SequenceOverflow;
+        const creates_active_identity = putCreatesActiveIdentity(
+            state,
+            request.key,
+            request.activate,
+        );
+
+        // The revision encoding is fixed-width, so a placeholder can validate
+        // the complete prospective catalog (including desired selections and
+        // the persisted size bound) before the immutable identity exists.
+        const placeholder: Revision = .{ .bytes = @splat(0) };
+        var edit = try applyCatalogPut(
+            self.allocator,
+            self.dir,
+            state,
+            .{
+                .key = request.key,
+                .expected = request.expected,
+                .head = placeholder,
+                .desired = request.desired,
+                .activate = request.activate,
+            },
+            false,
+        );
+        defer edit.deinit(self.allocator);
+        edit.state.sequence = next_sequence;
+        const bytes = try config_catalog.encodeCanonical(self.allocator, edit.state);
+        self.allocator.free(bytes);
+        return .{ .accepted = .{
+            .creates_active_identity = creates_active_identity,
+        } };
+    }
+
+    fn mutateCatalogUnlocked(
+        self: Authority,
+        expected: StateToken,
+        mutation: CatalogMutation,
+    ) !CatalogMutationOutcome {
         var current = try self.inspectUnlocked();
         defer current.deinit();
         const actual = current.token();
@@ -305,8 +414,26 @@ pub const Authority = struct {
         };
         const next_sequence = std.math.add(u64, state.sequence, 1) catch
             return error.SequenceOverflow;
+        const creates_active_identity = switch (mutation) {
+            .put_profile => |change| putCreatesActiveIdentity(
+                state,
+                change.key,
+                change.activate,
+            ),
+            .set_active => |change| change.key != null,
+            .delete_profile, .set_desired => false,
+        };
         var edit = try applyCatalogMutation(self.allocator, self.dir, state, mutation);
         defer edit.deinit(self.allocator);
+        if (creates_active_identity) {
+            const active = edit.state.active orelse return error.InvalidCatalog;
+            try catalog_runtime_gate.ensureIdentityRuntimeReady(
+                self.allocator,
+                self.dir,
+                active.key,
+                active.revision,
+            );
+        }
         edit.state.sequence = next_sequence;
         const bytes = try config_catalog.encodeCanonical(self.allocator, edit.state);
         defer self.allocator.free(bytes);
@@ -543,6 +670,68 @@ const CatalogEdit = struct {
     }
 };
 
+fn putCreatesActiveIdentity(
+    state: config_catalog.State,
+    key: []const u8,
+    activate: bool,
+) bool {
+    if (activate) return true;
+    const active = state.active orelse return false;
+    return std.mem.eql(u8, active.key, key);
+}
+
+fn applyCatalogPut(
+    allocator: std.mem.Allocator,
+    root: std.Io.Dir,
+    current: config_catalog.State,
+    change: CatalogPutChange,
+    verify_revision: bool,
+) !CatalogEdit {
+    if (!config_catalog.isManagedKey(change.key)) return error.InvalidCatalog;
+    const index = findCatalogProfile(current.profiles, change.key);
+    const actual = if (index) |value| current.profiles[value].head else null;
+    const matches = switch (change.expected) {
+        .missing => actual == null,
+        .revision => |expected| actual != null and actual.?.eql(expected),
+    };
+    if (!matches) return error.ProfileIdentityConflict;
+    if (verify_revision) {
+        var verified = try revision_store.RevisionStore.init(
+            allocator,
+            root,
+        ).openVerified(change.key, change.head);
+        defer verified.deinit();
+    }
+    const previous_desired: config_catalog.Desired = if (index) |value|
+        current.profiles[value].desired
+    else
+        .{};
+    const desired = try updateProfileDesired(previous_desired, index != null, change.desired);
+    const next: config_catalog.Profile = .{
+        .key = change.key,
+        .storage_id = config_identity.StorageId.derive(change.key),
+        .head = change.head,
+        .desired = desired,
+    };
+    const new_len = if (index == null) current.profiles.len + 1 else current.profiles.len;
+    const profiles = try allocator.alloc(config_catalog.Profile, new_len);
+    errdefer allocator.free(profiles);
+    @memcpy(profiles[0..current.profiles.len], current.profiles);
+    if (index) |value| profiles[value] = next else profiles[current.profiles.len] = next;
+    var active = current.active;
+    if (change.activate) {
+        active = .{ .key = next.key, .revision = next.head };
+    } else if (active) |value| {
+        if (std.mem.eql(u8, value.key, next.key)) {
+            active = .{ .key = next.key, .revision = next.head };
+        }
+    }
+    return .{
+        .state = .{ .sequence = current.sequence, .active = active, .profiles = profiles },
+        .profiles = profiles,
+    };
+}
+
 fn applyCatalogMutation(
     allocator: std.mem.Allocator,
     root: std.Io.Dir,
@@ -551,46 +740,13 @@ fn applyCatalogMutation(
 ) !CatalogEdit {
     const store = revision_store.RevisionStore.init(allocator, root);
     return switch (mutation) {
-        .put_profile => |change| blk: {
-            if (!config_catalog.isManagedKey(change.key)) return error.InvalidCatalog;
-            const index = findCatalogProfile(current.profiles, change.key);
-            const actual = if (index) |value| current.profiles[value].head else null;
-            const matches = switch (change.expected) {
-                .missing => actual == null,
-                .revision => |expected| actual != null and actual.?.eql(expected),
-            };
-            if (!matches) return error.ProfileIdentityConflict;
-            var verified = try store.openVerified(change.key, change.head);
-            defer verified.deinit();
-            const previous_desired: config_catalog.Desired = if (index) |value|
-                current.profiles[value].desired
-            else
-                .{};
-            const desired = try updateProfileDesired(previous_desired, index != null, change.desired);
-            const next: config_catalog.Profile = .{
-                .key = change.key,
-                .storage_id = config_identity.StorageId.derive(change.key),
-                .head = change.head,
-                .desired = desired,
-            };
-            const new_len = if (index == null) current.profiles.len + 1 else current.profiles.len;
-            const profiles = try allocator.alloc(config_catalog.Profile, new_len);
-            errdefer allocator.free(profiles);
-            @memcpy(profiles[0..current.profiles.len], current.profiles);
-            if (index) |value| profiles[value] = next else profiles[current.profiles.len] = next;
-            var active = current.active;
-            if (change.activate) {
-                active = .{ .key = next.key, .revision = next.head };
-            } else if (active) |value| {
-                if (std.mem.eql(u8, value.key, next.key)) {
-                    active = .{ .key = next.key, .revision = next.head };
-                }
-            }
-            break :blk .{
-                .state = .{ .sequence = current.sequence, .active = active, .profiles = profiles },
-                .profiles = profiles,
-            };
-        },
+        .put_profile => |change| applyCatalogPut(
+            allocator,
+            root,
+            current,
+            change,
+            true,
+        ),
         .set_active => |change| blk: {
             const profiles = try allocator.dupe(config_catalog.Profile, current.profiles);
             errdefer allocator.free(profiles);
@@ -1182,7 +1338,19 @@ test "StateAuthority bootstraps one exact catalog and rejects legacy mutations a
     defer initial.deinit();
     try std.testing.expect(initial == .missing);
 
-    const revision = try Revision.parseHex("00112233445566778899aabbccddeeff");
+    const config_bundle = @import("config_bundle.zig");
+    var bundle = try config_bundle.ConfigBundle.captureMemory(
+        std.testing.allocator,
+        "mixed-port: 7890\n",
+        null,
+        .{},
+    );
+    defer bundle.deinit();
+    const published = try revision_store.RevisionStore.init(
+        std.testing.allocator,
+        tmp.dir,
+    ).publishMigration("home", &bundle, .{});
+    const revision = published.revision;
     const profiles = [_]config_catalog.Profile{.{
         .key = "home",
         .storage_id = config_identity.StorageId.derive("home"),

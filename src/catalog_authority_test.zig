@@ -28,6 +28,36 @@ fn publish(
     return revision_store.RevisionStore.init(allocator, root).publishMigration(key, &bundle, .{});
 }
 
+fn publishCatalogRaw(
+    allocator: std.mem.Allocator,
+    root: std.Io.Dir,
+    key: []const u8,
+) !revision_store.PublishedRevision {
+    var bundle = try config_bundle.ConfigBundle.captureCatalogMemory(
+        allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: recovery
+        \\    type: trojan
+        \\    server: example.com
+        \\    port: 443
+        \\    password: secret
+        \\    plugin-opts: "obfs=http"
+    ,
+        null,
+        .{},
+    );
+    defer bundle.deinit();
+    try testing.expectEqual(
+        config_bundle.SemanticState.malformed,
+        bundle.semanticState(),
+    );
+    return revision_store.RevisionStore.init(
+        allocator,
+        root,
+    ).publishMigration(key, &bundle, .{});
+}
+
 fn bootstrapEmpty(authority: state_authority.Authority) !state_authority.StateToken {
     var missing = try authority.inspect();
     defer missing.deinit();
@@ -154,6 +184,133 @@ test "StateAuthority typed catalog mutation rejects stale token and unverified h
         .conflict => |conflict| try testing.expect(!conflict.actual.eql(token)),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "StateAuthority direct set_active rejects malformed revision after inactive put" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const authority = state_authority.Authority.init(allocator, tmp.dir);
+    var token = try bootstrapEmpty(authority);
+    const raw = try publishCatalogRaw(allocator, tmp.dir, "recovery");
+
+    token = try committedToken(try authority.mutateCatalog(token, .{
+        .put_profile = .{
+            .key = "recovery",
+            .expected = .missing,
+            .head = raw.revision,
+            .desired = .clear,
+        },
+    }));
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        authority.mutateCatalog(token, .{
+            .set_active = .{ .key = "recovery" },
+        }),
+    );
+
+    var observed = try authority.inspect();
+    defer observed.deinit();
+    try testing.expect(observed.token().eql(token));
+    switch (observed) {
+        .catalog_v2 => |*catalog| {
+            try testing.expect(catalog.catalog.state.active == null);
+            try testing.expectEqual(
+                @as(usize, 1),
+                catalog.catalog.state.profiles.len,
+            );
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "StateAuthority direct active put_profile rejects malformed replacement" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "source.yaml", "mixed-port: 7890\n");
+    const source_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "source.yaml",
+        allocator,
+    );
+    defer allocator.free(source_path);
+    const ready = try publish(
+        allocator,
+        tmp.dir,
+        "home",
+        source_path,
+        null,
+    );
+    const authority = state_authority.Authority.init(allocator, tmp.dir);
+    var token = try bootstrapEmpty(authority);
+    token = try committedToken(try authority.mutateCatalog(token, .{
+        .put_profile = .{
+            .key = "home",
+            .expected = .missing,
+            .head = ready.revision,
+            .desired = .clear,
+            .activate = true,
+        },
+    }));
+    const raw = try publishCatalogRaw(allocator, tmp.dir, "home");
+
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        authority.mutateCatalog(token, .{ .put_profile = .{
+            .key = "home",
+            .expected = .{ .revision = ready.revision },
+            .head = raw.revision,
+            .desired = .clear,
+        } }),
+    );
+    var observed = try authority.inspect();
+    defer observed.deinit();
+    try testing.expect(observed.token().eql(token));
+    switch (observed) {
+        .catalog_v2 => |*catalog| {
+            try testing.expect(
+                catalog.catalog.state.active.?.revision.eql(ready.revision),
+            );
+            try testing.expect(
+                catalog.catalog.state.profiles[0].head.eql(ready.revision),
+            );
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "StateAuthority direct active bootstrap rejects malformed revision" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const raw = try publishCatalogRaw(allocator, tmp.dir, "recovery");
+    const profile: config_catalog.Profile = .{
+        .key = "recovery",
+        .storage_id = config_identity.StorageId.derive("recovery"),
+        .head = raw.revision,
+        .desired = .{},
+    };
+    const active: config_catalog.ActiveIdentity = .{
+        .key = profile.key,
+        .revision = profile.head,
+    };
+    const authority = state_authority.Authority.init(allocator, tmp.dir);
+    var missing = try authority.inspect();
+    const token = missing.token();
+    missing.deinit();
+
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        authority.bootstrapCatalog(token, .{
+            .active = active,
+            .profiles = &.{profile},
+        }),
+    );
+    var observed = try authority.inspect();
+    defer observed.deinit();
+    try testing.expect(observed.token().eql(token));
+    try testing.expect(observed == .missing);
 }
 
 fn catalogMutationAllocationFixture(allocator: std.mem.Allocator, root: std.Io.Dir) !void {

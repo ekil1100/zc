@@ -5,10 +5,12 @@ const config_mod = @import("config.zig");
 const config_validator = @import("config_validator.zig");
 
 pub const CaptureLimits = struct {
-    max_source_bytes: usize = 16 * 1024 * 1024,
-    max_asset_bytes: usize = 8 * 1024 * 1024,
+    max_source_bytes: usize = config_mod.config_source_bytes_max,
+    // Every captured asset is a local rule-provider source, so capture and
+    // runtime preparation share one per-provider byte contract.
+    max_asset_bytes: usize = config_mod.config_source_bytes_max,
     max_aggregate_bytes: usize = 64 * 1024 * 1024,
-    max_assets: usize = 1024,
+    max_assets: usize = config_mod.rule_provider_count_max,
 
     pub const defaults: CaptureLimits = .{};
 
@@ -26,6 +28,16 @@ pub const CaptureLimits = struct {
 pub const ContentIdentity = struct {
     size: usize,
     sha256: [32]u8,
+};
+
+pub const SemanticState = enum {
+    runtime_ready,
+    malformed,
+};
+
+const CaptureMode = enum {
+    runtime,
+    catalog_raw,
 };
 
 pub const LocalAsset = struct {
@@ -91,13 +103,43 @@ pub const ConfigBundle = struct {
     assets: []CapturedAsset,
     remote_providers: []RemoteProvider,
     manifest_data: Manifest,
+    semantic_state: SemanticState,
 
     pub fn capture(
         allocator: std.mem.Allocator,
         source_path: []const u8,
         limits: CaptureLimits,
     ) !ConfigBundle {
-        return captureImpl(allocator, std.Io.Dir.cwd(), source_path, false, null, limits, null);
+        return captureImpl(
+            allocator,
+            std.Io.Dir.cwd(),
+            source_path,
+            false,
+            null,
+            limits,
+            .runtime,
+            null,
+        );
+    }
+
+    /// Captures a strict YAML document for immutable catalog recovery. Only
+    /// malformed simple-obfs semantics are retained; all other parsing and
+    /// filesystem containment rules are identical to runtime capture.
+    pub fn captureCatalog(
+        allocator: std.mem.Allocator,
+        source_path: []const u8,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        return captureImpl(
+            allocator,
+            std.Io.Dir.cwd(),
+            source_path,
+            false,
+            null,
+            limits,
+            .catalog_raw,
+            null,
+        );
     }
 
     /// Captures dependencies from a caller-provided, already-materialized config.
@@ -115,6 +157,7 @@ pub const ConfigBundle = struct {
             false,
             materialized_source,
             limits,
+            .runtime,
             null,
         );
     }
@@ -128,7 +171,33 @@ pub const ConfigBundle = struct {
         materialized_source: ?[]const u8,
         limits: CaptureLimits,
     ) !ConfigBundle {
-        return reconstructMemory(allocator, source_bytes, materialized_source, &.{}, limits);
+        return reconstructMemoryImpl(
+            allocator,
+            source_bytes,
+            materialized_source,
+            &.{},
+            limits,
+            .runtime,
+        );
+    }
+
+    /// Captures untrusted source bytes for an inspectable catalog revision.
+    /// The source remains immutable even when its simple-obfs metadata cannot
+    /// become a runtime config.
+    pub fn captureCatalogMemory(
+        allocator: std.mem.Allocator,
+        source_bytes: []const u8,
+        materialized_source: ?[]const u8,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        return reconstructMemoryImpl(
+            allocator,
+            source_bytes,
+            materialized_source,
+            &.{},
+            limits,
+            .catalog_raw,
+        );
     }
 
     /// Rebuilds a bundle exclusively from already-verified immutable records.
@@ -140,6 +209,41 @@ pub const ConfigBundle = struct {
         materialized_source: ?[]const u8,
         available_assets: []const MemoryAsset,
         limits: CaptureLimits,
+    ) !ConfigBundle {
+        return reconstructMemoryImpl(
+            allocator,
+            source_bytes,
+            materialized_source,
+            available_assets,
+            limits,
+            .runtime,
+        );
+    }
+
+    pub fn reconstructCatalogMemory(
+        allocator: std.mem.Allocator,
+        source_bytes: []const u8,
+        materialized_source: ?[]const u8,
+        available_assets: []const MemoryAsset,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        return reconstructMemoryImpl(
+            allocator,
+            source_bytes,
+            materialized_source,
+            available_assets,
+            limits,
+            .catalog_raw,
+        );
+    }
+
+    fn reconstructMemoryImpl(
+        allocator: std.mem.Allocator,
+        source_bytes: []const u8,
+        materialized_source: ?[]const u8,
+        available_assets: []const MemoryAsset,
+        limits: CaptureLimits,
+        capture_mode: CaptureMode,
     ) !ConfigBundle {
         try limits.validate();
         if (source_bytes.len > limits.max_source_bytes) return error.SourceTooLarge;
@@ -153,8 +257,13 @@ pub const ConfigBundle = struct {
         }
         var aggregate = try addToAggregate(0, source.len, limits.max_aggregate_bytes);
         if (materialized) |bytes| aggregate = try addToAggregate(aggregate, bytes.len, limits.max_aggregate_bytes);
-        var parsed = try config_mod.parseDocument(allocator, materialized orelse source);
+        var parsed = try parseCapturedDocument(
+            allocator,
+            materialized orelse source,
+            capture_mode,
+        );
         defer parsed.deinit();
+        const semantic_state = capturedSemanticState(&parsed);
         var local_paths = std.ArrayList([]const u8).empty;
         defer local_paths.deinit(allocator);
         var seen_local = std.StringHashMap(void).init(allocator);
@@ -184,7 +293,9 @@ pub const ConfigBundle = struct {
                 matched = candidate;
             }
             const input = matched orelse return error.AssetNotDeclared;
-            if (input.bytes.len > limits.max_asset_bytes) return error.AssetTooLarge;
+            if (input.bytes.len > limits.max_asset_bytes) {
+                return error.RuleProviderFileTooLarge;
+            }
             aggregate = try addToAggregate(aggregate, input.bytes.len, limits.max_aggregate_bytes);
             const logical_copy = try allocator.dupe(u8, input.logical_path);
             errdefer allocator.free(logical_copy);
@@ -234,6 +345,7 @@ pub const ConfigBundle = struct {
                 .local_assets = local_manifest,
                 .remote_providers = remotes,
             },
+            .semantic_state = semantic_state,
         };
     }
 
@@ -246,7 +358,34 @@ pub const ConfigBundle = struct {
         source_path: []const u8,
         limits: CaptureLimits,
     ) !ConfigBundle {
-        return captureImpl(allocator, source_dir, source_path, true, null, limits, null);
+        return captureImpl(
+            allocator,
+            source_dir,
+            source_path,
+            true,
+            null,
+            limits,
+            .runtime,
+            null,
+        );
+    }
+
+    pub fn captureCatalogFromDir(
+        allocator: std.mem.Allocator,
+        source_dir: std.Io.Dir,
+        source_path: []const u8,
+        limits: CaptureLimits,
+    ) !ConfigBundle {
+        return captureImpl(
+            allocator,
+            source_dir,
+            source_path,
+            true,
+            null,
+            limits,
+            .catalog_raw,
+            null,
+        );
     }
 
     pub fn readSourceFromDir(
@@ -310,6 +449,7 @@ pub const ConfigBundle = struct {
             true,
             materialized_source,
             limits,
+            .runtime,
             null,
         );
     }
@@ -321,6 +461,7 @@ pub const ConfigBundle = struct {
         bind_source_dir_root: bool,
         materialized_source: ?[]const u8,
         limits: CaptureLimits,
+        capture_mode: CaptureMode,
         hook: ?CaptureHook,
     ) !ConfigBundle {
         try limits.validate();
@@ -385,8 +526,13 @@ pub const ConfigBundle = struct {
         }
 
         const effective_source = materialized orelse source;
-        var parsed = try config_mod.parseDocument(allocator, effective_source);
+        var parsed = try parseCapturedDocument(
+            allocator,
+            effective_source,
+            capture_mode,
+        );
         defer parsed.deinit();
+        const semantic_state = capturedSemanticState(&parsed);
 
         var local_paths = std.ArrayList([]const u8).empty;
         defer local_paths.deinit(allocator);
@@ -427,7 +573,7 @@ pub const ConfigBundle = struct {
             }
 
             var bytes = readCapturedFile(allocator, &asset_capture, limits.max_asset_bytes) catch |err| switch (err) {
-                error.FileTooLarge => return error.AssetTooLarge,
+                error.FileTooLarge => return error.RuleProviderFileTooLarge,
                 else => return err,
             };
             errdefer allocator.free(bytes);
@@ -522,6 +668,7 @@ pub const ConfigBundle = struct {
             .assets = owned_assets,
             .remote_providers = remotes,
             .manifest_data = manifest_data,
+            .semantic_state = semantic_state,
         };
         source = &.{};
         materialized = null;
@@ -559,12 +706,36 @@ pub const ConfigBundle = struct {
         return &self.manifest_data;
     }
 
+    pub fn semanticState(self: *const ConfigBundle) SemanticState {
+        return self.semantic_state;
+    }
+
     /// Reconstructs and validates a runtime-ready local view using bundle bytes only.
     pub fn loadOffline(self: *const ConfigBundle, allocator: std.mem.Allocator) !OfflineLoad {
         var config = try config_mod.parseDocument(allocator, self.effectiveSourceBytes());
         errdefer config.deinit();
         try config_mod.prepareRuleProvidersOffline(allocator, &config, self);
         var validation = try config_validator.validate(allocator, &config);
+        errdefer validation.deinit();
+        return .{ .config = config, .validation = validation };
+    }
+
+    /// Reconstructs an offline catalog view while retaining only explicitly
+    /// marked plugin capability failures as inactive recovery data.
+    pub fn loadCatalogOffline(
+        self: *const ConfigBundle,
+        allocator: std.mem.Allocator,
+    ) !OfflineLoad {
+        var config = try config_mod.parseCatalogDocument(
+            allocator,
+            self.effectiveSourceBytes(),
+        );
+        errdefer config.deinit();
+        try config_mod.prepareRuleProvidersOffline(allocator, &config, self);
+        var validation = try config_validator.validateCatalogCapture(
+            allocator,
+            &config,
+        );
         errdefer validation.deinit();
         return .{ .config = config, .validation = validation };
     }
@@ -584,6 +755,24 @@ pub const ConfigBundle = struct {
         return error.AssetNotDeclared;
     }
 };
+
+fn parseCapturedDocument(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    capture_mode: CaptureMode,
+) !config_mod.Config {
+    return switch (capture_mode) {
+        .runtime => config_mod.parseDocument(allocator, source),
+        .catalog_raw => config_mod.parseCatalogDocument(allocator, source),
+    };
+}
+
+fn capturedSemanticState(config: *const config_mod.Config) SemanticState {
+    for (config.proxies.items) |proxy| {
+        if (proxy.semantic_state == .malformed) return .malformed;
+    }
+    return .runtime_ready;
+}
 
 fn deinitAsset(allocator: std.mem.Allocator, asset: *CapturedAsset) void {
     allocator.free(asset.record.logical_path);
@@ -802,6 +991,7 @@ test "capture rejects same-content asset replacement before final revalidation" 
         false,
         null,
         .{},
+        .runtime,
         .{ .context = &context, .run = Context.replace },
     ));
 }

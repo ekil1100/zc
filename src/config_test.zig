@@ -1,23 +1,33 @@
 const std = @import("std");
 const testing = std.testing;
-const Config = @import("config.zig").Config;
+const compat = @import("compat.zig");
+const config_mod = @import("config.zig");
+const Config = config_mod.Config;
 const Proxy = @import("config.zig").Proxy;
 const ProxyType = @import("config.zig").ProxyType;
 const Rule = @import("config.zig").Rule;
 const RuleType = @import("config.zig").RuleType;
-const parseConfig = @import("config.zig").parse;
-const parseConfigDocument = @import("config.zig").parseDocument;
-const fetchConfig = @import("config.zig").fetchConfig;
-const DownloadResult = @import("config.zig").DownloadResult;
+const parseConfig = config_mod.parse;
+const parseConfigDocument = config_mod.parseDocument;
+const parseCatalogConfigDocument = config_mod.parseCatalogDocument;
+const fetchConfig = config_mod.fetchConfig;
+const loadConfig = config_mod.load;
+const loadConfigDocument = config_mod.loadDocument;
+const loadBuiltinDefault = config_mod.loadBuiltinDefault;
+const DownloadResult = config_mod.DownloadResult;
+const validateConfig = @import("config_validator.zig").validate;
+const OutboundManager = @import("proxy/outbound/manager.zig").OutboundManager;
 
 // Verify DownloadResult struct exists and has correct fields
 test "DownloadResult struct exists with correct fields" {
     const result = DownloadResult{
         .status = std.http.Status.ok,
         .body = "test",
+        .total_source_bytes_consumed = 4,
     };
     try testing.expectEqual(std.http.Status.ok, result.status);
     try testing.expectEqualStrings("test", result.body);
+    try testing.expectEqual(@as(usize, 4), result.total_source_bytes_consumed);
 }
 
 // Test: fetchConfig function exists and is exported
@@ -28,6 +38,20 @@ test "fetchConfig function is exported" {
 }
 
 // Original tests from before
+
+test "built-in fallback is a valid manager configuration without user proxies" {
+    const allocator = testing.allocator;
+    var config = try loadBuiltinDefault(allocator);
+    defer config.deinit();
+
+    try testing.expectEqual(@as(usize, 0), config.proxies.items.len);
+    var validation = try validateConfig(allocator, &config);
+    defer validation.deinit();
+    try testing.expect(validation.isValid());
+
+    const manager = try OutboundManager.init(allocator, &config);
+    manager.deinit();
+}
 
 test "ProxyType enum variants" {
     const types = [_]ProxyType{
@@ -434,4 +458,328 @@ test "parseProxyGroup rejects out-of-range tolerance" {
         \\    tolerance: 70000
     ;
     try testing.expectError(error.InvalidGroupTolerance, parseConfig(allocator, yaml));
+}
+
+const ConfigParser = *const fn (std.mem.Allocator, []const u8) anyerror!Config;
+
+const config_resource_parsers = [_]ConfigParser{
+    parseConfig,
+    parseConfigDocument,
+    parseCatalogConfigDocument,
+};
+
+fn appendRepeatedConfigEntry(
+    allocator: std.mem.Allocator,
+    document: *std.ArrayList(u8),
+    entry: []const u8,
+    count: usize,
+) !void {
+    for (0..count) |_| try document.appendSlice(allocator, entry);
+}
+
+fn makeMixedProxyResourceDocument(
+    allocator: std.mem.Allocator,
+    proxy_count: usize,
+    group_count: usize,
+) ![]u8 {
+    var document = std.ArrayList(u8).empty;
+    errdefer document.deinit(allocator);
+    try document.appendSlice(allocator, "proxies:\n");
+    try appendRepeatedConfigEntry(
+        allocator,
+        &document,
+        "  - { name: node, type: direct }\n",
+        proxy_count,
+    );
+    try appendRepeatedConfigEntry(
+        allocator,
+        &document,
+        "  - { name: group, type: select, proxies: [DIRECT] }\n",
+        group_count,
+    );
+    return document.toOwnedSlice(allocator);
+}
+
+fn makeDedicatedGroupResourceDocument(
+    allocator: std.mem.Allocator,
+    group_count: usize,
+) ![]u8 {
+    var document = std.ArrayList(u8).empty;
+    errdefer document.deinit(allocator);
+    try document.appendSlice(allocator, "proxy-groups:\n");
+    try appendRepeatedConfigEntry(
+        allocator,
+        &document,
+        "  - { name: group, type: select, proxies: [DIRECT] }\n",
+        group_count,
+    );
+    return document.toOwnedSlice(allocator);
+}
+
+fn makeSubscriptionBannerResourceDocument(
+    allocator: std.mem.Allocator,
+    entry_count: usize,
+) ![]u8 {
+    var document = std.ArrayList(u8).empty;
+    errdefer document.deinit(allocator);
+    try document.appendSlice(allocator, "proxies:\n");
+    try appendRepeatedConfigEntry(
+        allocator,
+        &document,
+        "  - { name: \"Traffic: quota\", type: direct }\n",
+        entry_count,
+    );
+    return document.toOwnedSlice(allocator);
+}
+
+fn makeGroupMemberResourceDocument(
+    allocator: std.mem.Allocator,
+    member_count: usize,
+) ![]u8 {
+    var document = std.ArrayList(u8).empty;
+    errdefer document.deinit(allocator);
+    try document.appendSlice(
+        allocator,
+        "proxy-groups:\n  - name: bounded\n    type: select\n" ++
+            "    proxies:\n",
+    );
+    try appendRepeatedConfigEntry(
+        allocator,
+        &document,
+        "      - DIRECT\n",
+        member_count,
+    );
+    return document.toOwnedSlice(allocator);
+}
+
+fn expectConfigParserError(expected: anyerror, result: anyerror!Config) !void {
+    if (result) |value| {
+        var config = value;
+        config.deinit();
+        return error.TestExpectedError;
+    } else |actual| {
+        try testing.expectEqual(expected, actual);
+    }
+}
+
+test "config resource limits accept documented maxima in every parser" {
+    const allocator = testing.allocator;
+    const document = try makeMixedProxyResourceDocument(allocator, 4096, 1024);
+    defer allocator.free(document);
+
+    for (config_resource_parsers) |parser| {
+        var config = try parser(allocator, document);
+        defer config.deinit();
+        try testing.expectEqual(@as(usize, 4096), config.proxies.items.len);
+        try testing.expectEqual(@as(usize, 1024), config.proxy_groups.items.len);
+    }
+}
+
+test "config resource limits reject documented maxima plus one in every parser" {
+    const allocator = testing.allocator;
+    const proxy_overflow = try makeMixedProxyResourceDocument(allocator, 4097, 0);
+    defer allocator.free(proxy_overflow);
+    const group_overflow = try makeDedicatedGroupResourceDocument(allocator, 1025);
+    defer allocator.free(group_overflow);
+    const mixed_entry_overflow = try makeSubscriptionBannerResourceDocument(allocator, 5121);
+    defer allocator.free(mixed_entry_overflow);
+
+    for (config_resource_parsers) |parser| {
+        try expectConfigParserError(
+            error.ProxyCountLimitExceeded,
+            parser(allocator, proxy_overflow),
+        );
+        try expectConfigParserError(
+            error.ProxyGroupCountLimitExceeded,
+            parser(allocator, group_overflow),
+        );
+        try expectConfigParserError(
+            error.ProxyEntryCountLimitExceeded,
+            parser(allocator, mixed_entry_overflow),
+        );
+    }
+}
+
+test "proxy group member limit accepts max and rejects max plus one in every parser" {
+    const allocator = testing.allocator;
+    const maximum = try makeGroupMemberResourceDocument(
+        allocator,
+        config_mod.proxy_group_member_count_max,
+    );
+    defer allocator.free(maximum);
+    const overflow = try makeGroupMemberResourceDocument(
+        allocator,
+        config_mod.proxy_group_member_count_max + 1,
+    );
+    defer allocator.free(overflow);
+
+    for (config_resource_parsers) |parser| {
+        var parsed = try parser(allocator, maximum);
+        defer parsed.deinit();
+        try testing.expectEqual(
+            config_mod.proxy_group_member_count_max,
+            parsed.proxy_groups.items[0].proxies.items.len,
+        );
+        try expectConfigParserError(
+            error.ProxyGroupMemberCountLimitExceeded,
+            parser(allocator, overflow),
+        );
+    }
+}
+
+test "public config parser bounds compact unknown YAML arrays before OOM" {
+    const allocator = testing.allocator;
+    try testing.expectEqual(
+        @as(usize, 262_144),
+        config_mod.yaml_collection_entry_count_max,
+    );
+
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(allocator);
+    try source.appendSlice(allocator, "unknown: [");
+    for (0..config_mod.yaml_collection_entry_count_max) |index| {
+        if (index != 0) try source.append(allocator, ',');
+        try source.append(allocator, '0');
+    }
+    try source.appendSlice(allocator, "]\n");
+    try testing.expect(source.items.len < 1024 * 1024);
+
+    const parse_memory_ceiling = 18 * 1024 * 1024;
+    const parse_memory = try allocator.alloc(u8, parse_memory_ceiling);
+    defer allocator.free(parse_memory);
+    var fixed = std.heap.FixedBufferAllocator.init(parse_memory);
+    try testing.expectError(
+        error.YamlCollectionEntryLimitExceeded,
+        parseConfigDocument(fixed.allocator(), source.items),
+    );
+}
+
+const ConfigFileLoader = *const fn (
+    std.mem.Allocator,
+    []const u8,
+) anyerror!Config;
+
+const config_file_loaders = [_]ConfigFileLoader{
+    loadConfig,
+    loadConfigDocument,
+};
+
+fn writePaddedConfigFile(
+    directory: std.Io.Dir,
+    name: []const u8,
+    size: usize,
+    tail: []const u8,
+) !void {
+    try testing.expect(size >= tail.len);
+    const file = try directory.createFile(compat.io(), name, .{});
+    defer file.close(compat.io());
+
+    var comment: [4096]u8 = @splat('x');
+    comment[0] = '#';
+    comment[comment.len - 1] = '\n';
+    var padding_bytes_remaining = size - tail.len;
+    while (padding_bytes_remaining > 0) {
+        const write_size = @min(comment.len, padding_bytes_remaining);
+        if (write_size == 1) {
+            try compat.fileWriteAll(file, "\n");
+        } else {
+            comment[write_size - 1] = '\n';
+            try compat.fileWriteAll(file, comment[0..write_size]);
+            comment[write_size - 1] = 'x';
+        }
+        padding_bytes_remaining -= write_size;
+    }
+    try compat.fileWriteAll(file, tail);
+}
+
+fn expectConfigFileLoaderError(
+    expected: anyerror,
+    loader: ConfigFileLoader,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    if (loader(allocator, path)) |value| {
+        var config = value;
+        config.deinit();
+        return error.TestExpectedError;
+    } else |actual| {
+        try testing.expectEqual(expected, actual);
+    }
+}
+
+test "file loaders retain observable config after the first MiB" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const size = 1024 * 1024 + 4096;
+    try writePaddedConfigFile(
+        tmp.dir,
+        "large-valid.yaml",
+        size,
+        "mixed-port: 4321\n",
+    );
+    const path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "large-valid.yaml",
+        allocator,
+    );
+    defer allocator.free(path);
+
+    for (config_file_loaders) |loader| {
+        var loaded = try loader(allocator, path);
+        defer loaded.deinit();
+        try testing.expectEqual(@as(u16, 4321), loaded.mixed_port);
+    }
+}
+
+test "file loaders accept exactly the public config source bound" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePaddedConfigFile(
+        tmp.dir,
+        "exact.yaml",
+        config_mod.config_source_bytes_max,
+        "mixed-port: 4322\n",
+    );
+    const path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "exact.yaml",
+        allocator,
+    );
+    defer allocator.free(path);
+
+    for (config_file_loaders) |loader| {
+        var loaded = try loader(allocator, path);
+        defer loaded.deinit();
+        try testing.expectEqual(@as(u16, 4322), loaded.mixed_port);
+    }
+}
+
+test "file loaders reject one byte beyond the public config source bound" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile(compat.io(), "oversized.yaml", .{});
+    try compat.fileSeekTo(file, config_mod.config_source_bytes_max);
+    try compat.fileWriteAll(file, "x");
+    file.close(compat.io());
+    const path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "oversized.yaml",
+        allocator,
+    );
+    defer allocator.free(path);
+
+    for (config_file_loaders) |loader| {
+        try expectConfigFileLoaderError(
+            error.ConfigTooLarge,
+            loader,
+            allocator,
+            path,
+        );
+    }
 }

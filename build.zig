@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const pkg = @import("build.zig.zon");
     const options = b.addOptions();
     options.addOption([]const u8, "version", pkg.version);
+    options.addOption(bool, "api_owner_spawn_fault", false);
 
     // Create module for the executable
     const exe_mod = b.createModule(.{
@@ -70,6 +71,78 @@ pub fn build(b: *std.Build) void {
     const authority_process_step = b.step("test-authority-process", "Run StateAuthority cross-process tests");
     authority_process_step.dependOn(&authority_process_cmd.step);
 
+    // Compile and execute the startup barrier fault fixture as a real
+    // ReleaseFast child process. This keeps the late startup acquire contract
+    // covered under the optimization mode where detached-thread UAFs matter.
+    const startup_barrier_process_mod = b.createModule(.{
+        .root_source_file = b.path("src/state_authority_process_test.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .ReleaseFast,
+    });
+    startup_barrier_process_mod.link_libc = true;
+    const startup_barrier_process_exe = b.addExecutable(.{
+        .name = "zc-startup-barrier-process-test",
+        .root_module = startup_barrier_process_mod,
+    });
+    const startup_barrier_process_cmd = b.addRunArtifact(
+        startup_barrier_process_exe,
+    );
+    startup_barrier_process_cmd.addArg("selection-barrier-fault");
+    const startup_barrier_process_step = b.step(
+        "test-startup-barrier-process",
+        "Run ReleaseFast startup barrier fault-injection process test",
+    );
+    startup_barrier_process_step.dependOn(&startup_barrier_process_cmd.step);
+
+    const socket_write_process_cmd = b.addRunArtifact(
+        startup_barrier_process_exe,
+    );
+    socket_write_process_cmd.addArg("socket-write-after-rst");
+    const socket_write_process_step = b.step(
+        "test-socket-write-process",
+        "Run ReleaseFast write-after-RST SIGPIPE regression",
+    );
+    socket_write_process_step.dependOn(&socket_write_process_cmd.step);
+
+    // A compile-time-only fault binary exercises the exact post-proxy API
+    // spawn failure path as a real ReleaseFast daemon child. The driver gives
+    // it isolated HOME/runtime roots and verifies startup-signal/artifact cleanup.
+    const api_owner_fault_options = b.addOptions();
+    api_owner_fault_options.addOption([]const u8, "version", pkg.version);
+    api_owner_fault_options.addOption(bool, "api_owner_spawn_fault", true);
+    const api_owner_fault_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .ReleaseFast,
+    });
+    api_owner_fault_mod.link_libc = true;
+    api_owner_fault_mod.addOptions("build_options", api_owner_fault_options);
+    const api_owner_fault_exe = b.addExecutable(.{
+        .name = "zc-api-owner-spawn-fault",
+        .root_module = api_owner_fault_mod,
+    });
+    const api_owner_process_cmd = b.addRunArtifact(
+        startup_barrier_process_exe,
+    );
+    api_owner_process_cmd.addArg("api-owner-startup-fault");
+    api_owner_process_cmd.addArtifactArg(api_owner_fault_exe);
+    api_owner_process_cmd.addArg(
+        b.pathFromRoot(".zig-cache/api-owner-process-test"),
+    );
+    api_owner_process_cmd.setEnvironmentVariable(
+        "HOME",
+        b.pathFromRoot(".zig-cache/api-owner-process-test/home"),
+    );
+    api_owner_process_cmd.setEnvironmentVariable(
+        "XDG_RUNTIME_DIR",
+        b.pathFromRoot(".zig-cache/api-owner-process-test/run"),
+    );
+    const api_owner_process_step = b.step(
+        "test-api-owner-process",
+        "Run ReleaseFast API owner startup-failure process test",
+    );
+    api_owner_process_step.dependOn(&api_owner_process_cmd.step);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_runner.zig"),
         .target = target,
@@ -106,6 +179,34 @@ pub fn build(b: *std.Build) void {
     run_exe_unit_tests.step.dependOn(&secure_test_runtime.step);
     run_exe_unit_tests.setEnvironmentVariable("HOME", b.pathFromRoot(".zig-cache/zc-test-home"));
     run_exe_unit_tests.setEnvironmentVariable("XDG_RUNTIME_DIR", b.pathFromRoot(".zig-cache/zc-test-run"));
+
+    // The independent oracle is also a real unit-test root. Keeping this
+    // host-native test artifact separate from the E2E executable makes its
+    // embedded seams visible in the build graph without installing it.
+    const e2e_obfs_oracle_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/e2e_obfs_oracle.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = optimize,
+    });
+    e2e_obfs_oracle_test_mod.link_libc = true;
+    const e2e_obfs_oracle_unit_tests = b.addTest(.{
+        .name = "zc-e2e-obfs-oracle-test",
+        .root_module = e2e_obfs_oracle_test_mod,
+        .filters = test_filters,
+    });
+    const run_e2e_obfs_oracle_unit_tests = b.addRunArtifact(
+        e2e_obfs_oracle_unit_tests,
+    );
+    run_e2e_obfs_oracle_unit_tests.step.dependOn(&secure_test_runtime.step);
+    run_e2e_obfs_oracle_unit_tests.setEnvironmentVariable(
+        "HOME",
+        b.pathFromRoot(".zig-cache/zc-test-home"),
+    );
+    run_e2e_obfs_oracle_unit_tests.setEnvironmentVariable(
+        "XDG_RUNTIME_DIR",
+        b.pathFromRoot(".zig-cache/zc-test-run"),
+    );
+
     const config_flow_cmd = b.addSystemCommand(&.{
         "bash",
         b.pathFromRoot("scripts/test-config-load-selection.sh"),
@@ -114,7 +215,11 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit, process, and CLI flow tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&run_e2e_obfs_oracle_unit_tests.step);
     test_step.dependOn(&authority_process_cmd.step);
+    test_step.dependOn(&startup_barrier_process_cmd.step);
+    test_step.dependOn(&socket_write_process_cmd.step);
+    test_step.dependOn(&api_owner_process_cmd.step);
     test_step.dependOn(&config_flow_cmd.step);
 
     const e2e_zc_mod = b.createModule(.{
@@ -138,6 +243,16 @@ pub fn build(b: *std.Build) void {
         .name = "zc-e2e-origin",
         .root_module = e2e_origin_mod,
     });
+    const e2e_obfs_oracle_mod = b.createModule(.{
+        .root_source_file = b.path("src/e2e_obfs_oracle.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .ReleaseSafe,
+    });
+    e2e_obfs_oracle_mod.link_libc = true;
+    const e2e_obfs_oracle = b.addExecutable(.{
+        .name = "zc-e2e-obfs-oracle",
+        .root_module = e2e_obfs_oracle_mod,
+    });
     const e2e_fixture_root = b.pathFromRoot(".zig-cache/e2e-fixtures");
     const fetch_e2e_fixtures = b.addSystemCommand(&.{
         "bash",
@@ -150,6 +265,7 @@ pub fn build(b: *std.Build) void {
     });
     run_core_e2e.addArtifactArg(e2e_zc);
     run_core_e2e.addArtifactArg(e2e_origin);
+    run_core_e2e.addArtifactArg(e2e_obfs_oracle);
     run_core_e2e.addArgs(&.{
         e2e_fixture_root,
         b.pathFromRoot("testdata/e2e"),
@@ -162,6 +278,7 @@ pub fn build(b: *std.Build) void {
     run_installer_e2e.addArtifactArg(e2e_zc);
     run_installer_e2e.addArtifactArg(e2e_origin);
     const e2e_step = b.step("e2e", "Run installer and real network end-to-end tests");
+    e2e_step.dependOn(&run_e2e_obfs_oracle_unit_tests.step);
     e2e_step.dependOn(&run_installer_e2e.step);
     e2e_step.dependOn(&run_core_e2e.step);
 
@@ -171,6 +288,7 @@ pub fn build(b: *std.Build) void {
     });
     run_release_core_e2e.addArtifactArg(exe);
     run_release_core_e2e.addArtifactArg(e2e_origin);
+    run_release_core_e2e.addArtifactArg(e2e_obfs_oracle);
     run_release_core_e2e.addArgs(&.{
         e2e_fixture_root,
         b.pathFromRoot("testdata/e2e"),
@@ -186,6 +304,7 @@ pub fn build(b: *std.Build) void {
         "e2e-release",
         "Run E2E against the configured release artifact",
     );
+    release_e2e_step.dependOn(&run_e2e_obfs_oracle_unit_tests.step);
     release_e2e_step.dependOn(&run_release_installer_e2e.step);
     release_e2e_step.dependOn(&run_release_core_e2e.step);
 

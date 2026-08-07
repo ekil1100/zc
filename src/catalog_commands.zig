@@ -62,6 +62,17 @@ pub const Subscription = struct {
     }
 };
 
+pub const Source = struct {
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    revision: config_identity.Revision,
+
+    pub fn deinit(self: *Source) void {
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
 pub const OverrideChange = struct {
     key: []const u8,
     script: override_materialization.Script,
@@ -179,6 +190,28 @@ pub const Commands = struct {
         };
     }
 
+    pub fn source(self: Commands, key: []const u8) !Source {
+        const authority = state_authority.Authority.init(self.allocator, self.root);
+        var inspection = try authority.inspect();
+        defer inspection.deinit();
+        const state = switch (inspection) {
+            .catalog_v2 => |*observed| observed.catalog.state,
+            .missing, .legacy_v1 => return error.Schema2CatalogRequired,
+        };
+        const profile = findProfile(state.profiles, key) orelse
+            return error.ManagedProfileNotFound;
+        var view = try revision_store.RevisionStore.init(
+            self.allocator,
+            self.root,
+        ).openVerified(profile.key, profile.head);
+        defer view.deinit();
+        return .{
+            .allocator = self.allocator,
+            .bytes = try self.allocator.dupe(u8, view.sourceBytes()),
+            .revision = profile.head,
+        };
+    }
+
     pub fn activeOverride(self: Commands) !ActiveOverride {
         const authority = state_authority.Authority.init(self.allocator, self.root);
         var inspection = try authority.inspect();
@@ -232,14 +265,17 @@ pub const Commands = struct {
         var loaded: ?config_bundle.OfflineLoad = null;
         defer if (loaded) |*value| value.deinit();
         if (input.mode == .create) {
-            bundle = try config_bundle.ConfigBundle.captureMemory(
+            bundle = try config_bundle.ConfigBundle.captureCatalogMemory(
                 self.allocator,
                 input.source_bytes,
                 null,
                 .{},
             );
-            loaded = try bundle.?.loadOffline(self.allocator);
+            loaded = try bundle.?.loadCatalogOffline(self.allocator);
             if (!loaded.?.validation.isValid()) return error.InvalidConfig;
+            if (bundle.?.semanticState() == .malformed and input.activate) {
+                return error.ProfileNotRuntimeReady;
+            }
         }
 
         var original_head: ?config_identity.Revision = null;
@@ -260,6 +296,8 @@ pub const Commands = struct {
                     inspection.deinit();
                     return error.ManagedProfileAlreadyExists;
                 }
+                const should_activate = bundle.?.semanticState() == .runtime_ready and
+                    (input.activate or state.active == null);
                 inspection.deinit();
                 switch (try catalog_service.Service.init(self.allocator, self.root).publish(token, .{
                     .key = input.key,
@@ -267,7 +305,7 @@ pub const Commands = struct {
                     .bundle = &bundle.?,
                     .metadata = input.metadata,
                     .desired = .clear,
-                    .activate = input.activate or state.active == null,
+                    .activate = should_activate,
                 })) {
                     .applied => |receipt| return receipt,
                     .conflict => continue,
@@ -426,7 +464,7 @@ pub const Commands = struct {
                         return err;
                     };
                     defer self.allocator.free(available);
-                    break :blk config_bundle.ConfigBundle.reconstructMemory(
+                    break :blk config_bundle.ConfigBundle.reconstructCatalogMemory(
                         self.allocator,
                         input.source_bytes,
                         null,
@@ -438,7 +476,7 @@ pub const Commands = struct {
                         return err;
                     };
                 };
-                loaded = bundle.?.loadOffline(self.allocator) catch |err| {
+                loaded = bundle.?.loadCatalogOffline(self.allocator) catch |err| {
                     view.deinit();
                     inspection.deinit();
                     return err;
@@ -448,6 +486,41 @@ pub const Commands = struct {
                 view.deinit();
                 inspection.deinit();
                 return error.InvalidConfig;
+            }
+            if (bundle.?.semanticState() == .malformed and
+                (input.activate or isActiveProfile(state, profile)))
+            {
+                view.deinit();
+                inspection.deinit();
+                return error.ProfileNotRuntimeReady;
+            }
+            if (bundle.?.semanticState() == .malformed) {
+                const metadata: revision_store.MetadataInput = .{
+                    .url = view.metadata.url,
+                    .filename = view.metadata.filename,
+                    .params = view.metadata.params,
+                };
+                const raw_outcome = catalog_service.Service.init(
+                    self.allocator,
+                    self.root,
+                ).publish(token, .{
+                    .key = input.key,
+                    .expected = .{ .revision = profile.head },
+                    .bundle = &bundle.?,
+                    .metadata = metadata,
+                    .desired = .clear,
+                    .activate = input.activate,
+                }) catch |err| {
+                    view.deinit();
+                    inspection.deinit();
+                    return err;
+                };
+                view.deinit();
+                inspection.deinit();
+                switch (raw_outcome) {
+                    .applied => |receipt| return receipt,
+                    .conflict => continue,
+                }
             }
             const filtered = filterSelections(
                 self.allocator,
@@ -627,15 +700,22 @@ pub const Commands = struct {
             const authority = state_authority.Authority.init(self.allocator, self.root);
             var inspection = try authority.inspect();
             const token = inspection.token();
-            const exists = switch (inspection) {
-                .catalog_v2 => |*observed| findProfile(observed.catalog.state.profiles, key) != null,
+            switch (inspection) {
+                .catalog_v2 => |*observed| {
+                    _ = findProfile(
+                        observed.catalog.state.profiles,
+                        key,
+                    ) orelse {
+                        inspection.deinit();
+                        return error.ManagedProfileNotFound;
+                    };
+                },
                 .missing, .legacy_v1 => {
                     inspection.deinit();
                     return error.Schema2CatalogRequired;
                 },
-            };
+            }
             inspection.deinit();
-            if (!exists) return error.ManagedProfileNotFound;
             switch (try catalog_service.Service.init(self.allocator, self.root).mutate(
                 token,
                 .{ .set_active = .{ .key = key } },
@@ -738,6 +818,15 @@ fn filterSelections(
         if (valid) try filtered.append(allocator, selection);
     }
     return filtered.toOwnedSlice(allocator);
+}
+
+fn isActiveProfile(
+    state: config_catalog.State,
+    profile: *const config_catalog.Profile,
+) bool {
+    const active = state.active orelse return false;
+    return std.mem.eql(u8, active.key, profile.key) and
+        active.revision.eql(profile.head);
 }
 
 fn findProfile(profiles: []const config_catalog.Profile, key: []const u8) ?*const config_catalog.Profile {

@@ -6,8 +6,8 @@ const config_identity = @import("config_identity.zig");
 
 const max_manifest_bytes = 1024 * 1024;
 const max_identity_bytes = 64 * 1024;
-const max_source_bytes = 16 * 1024 * 1024;
-const max_object_bytes = 8 * 1024 * 1024;
+const max_source_bytes = config_bundle.CaptureLimits.defaults.max_source_bytes;
+const max_object_bytes = config_bundle.CaptureLimits.defaults.max_asset_bytes;
 const max_override_script_bytes = 1024 * 1024;
 const max_override_patch_bytes = 1024 * 1024;
 
@@ -202,6 +202,19 @@ const DiskManifest = struct {
     remote_providers: []const DiskRemote,
 };
 
+const PreparedMigration = struct {
+    allocator: std.mem.Allocator,
+    published: PublishedRevision,
+    identity_bytes: []u8,
+    manifest_bytes: []u8,
+
+    fn deinit(self: *PreparedMigration) void {
+        self.allocator.free(self.identity_bytes);
+        self.allocator.free(self.manifest_bytes);
+        self.* = undefined;
+    }
+};
+
 pub const RevisionStore = struct {
     allocator: std.mem.Allocator,
     root: std.Io.Dir,
@@ -210,41 +223,105 @@ pub const RevisionStore = struct {
         return .{ .allocator = allocator, .root = root };
     }
 
+    fn prepareMigration(
+        self: RevisionStore,
+        key: []const u8,
+        bundle: *const config_bundle.ConfigBundle,
+        metadata: MetadataInput,
+    ) !PreparedMigration {
+        if (key.len == 0) return error.InvalidKey;
+        const sorted_params = try sortedParamIndexes(
+            self.allocator,
+            metadata.params,
+        );
+        defer self.allocator.free(sorted_params);
+        try validateDistinctParams(metadata.params, sorted_params);
+        try validateOverrideInput(bundle, metadata.override);
+
+        const storage_id = config_identity.StorageId.derive(key).bytes;
+        const content_digest = computeBundleContentDigest(
+            key,
+            bundle,
+            metadata,
+            sorted_params,
+        );
+        const revision = computeMigrationRevision(key, content_digest);
+        const published = makePublished(storage_id, revision);
+        const identity_bytes = try encodeIdentity(
+            self.allocator,
+            key,
+            published.storageIdHex(),
+        );
+        errdefer self.allocator.free(identity_bytes);
+        if (identity_bytes.len > max_identity_bytes) {
+            return error.IdentityTooLarge;
+        }
+        const manifest_bytes = try encodeManifest(
+            self.allocator,
+            key,
+            &published,
+            content_digest,
+            bundle,
+            metadata,
+            sorted_params,
+        );
+        errdefer self.allocator.free(manifest_bytes);
+        if (manifest_bytes.len > max_manifest_bytes) {
+            return error.ManifestTooLarge;
+        }
+        return .{
+            .allocator = self.allocator,
+            .published = published,
+            .identity_bytes = identity_bytes,
+            .manifest_bytes = manifest_bytes,
+        };
+    }
+
+    /// Performs every deterministic migration validation and encoding step
+    /// without mutating the revision tree. Batch callers can preflight all
+    /// inputs before allowing the first immutable publication.
+    pub fn preflightMigration(
+        self: RevisionStore,
+        key: []const u8,
+        bundle: *const config_bundle.ConfigBundle,
+        metadata: MetadataInput,
+    ) !PublishedRevision {
+        var prepared = try self.prepareMigration(key, bundle, metadata);
+        defer prepared.deinit();
+        return prepared.published;
+    }
+
     pub fn publishMigration(
         self: RevisionStore,
         key: []const u8,
         bundle: *const config_bundle.ConfigBundle,
         metadata: MetadataInput,
     ) !PublishedRevision {
-        if (key.len == 0) return error.InvalidKey;
+        var prepared = try self.prepareMigration(key, bundle, metadata);
+        defer prepared.deinit();
+        const published = prepared.published;
         try compat.setDirPermissions(self.root, ownerDirPermissions());
-        const sorted_params = try sortedParamIndexes(self.allocator, metadata.params);
-        defer self.allocator.free(sorted_params);
-        try validateDistinctParams(metadata.params, sorted_params);
-        try validateOverrideInput(bundle, metadata.override);
-
-        const storage_id = config_identity.StorageId.derive(key).bytes;
-        const content_digest = computeBundleContentDigest(key, bundle, metadata, sorted_params);
-        const revision = computeMigrationRevision(key, content_digest);
-        const published = makePublished(storage_id, revision);
-        const identity_bytes = try encodeIdentity(self.allocator, key, published.storageIdHex());
-        defer self.allocator.free(identity_bytes);
-        if (identity_bytes.len > max_identity_bytes) return error.IdentityTooLarge;
 
         const profiles_dir = try openOrCreateDir(self.root, "profiles");
         defer profiles_dir.close(compat.io());
         const profile_dir = try openOrCreateDir(profiles_dir, published.storageIdHex());
         defer profile_dir.close(compat.io());
-        try ensureIdentity(self.allocator, profile_dir, key, published.storageIdHex(), identity_bytes);
+        try ensureIdentity(
+            self.allocator,
+            profile_dir,
+            key,
+            published.storageIdHex(),
+            prepared.identity_bytes,
+        );
 
         const revisions_dir = try openOrCreateDir(profile_dir, "revisions");
         defer revisions_dir.close(compat.io());
         var revision_buffer: [32]u8 = undefined;
-        const revision_text = revision.formatHex(&revision_buffer);
+        const revision_text = published.revision.formatHex(&revision_buffer);
 
         if (openExistingDir(revisions_dir, revision_text)) |existing| {
             existing.close(compat.io());
-            var verified = try self.openVerified(key, revision);
+            var verified = try self.openVerified(key, published.revision);
             verified.deinit();
             try syncDir(revisions_dir);
             return published;
@@ -281,25 +358,18 @@ pub const RevisionStore = struct {
         }
         try syncDir(objects);
 
-        const manifest_bytes = try encodeManifest(
-            self.allocator,
-            key,
-            &published,
-            content_digest,
-            bundle,
-            metadata,
-            sorted_params,
+        try writeSyncedFile(
+            staging,
+            "manifest.json",
+            prepared.manifest_bytes,
         );
-        defer self.allocator.free(manifest_bytes);
-        if (manifest_bytes.len > max_manifest_bytes) return error.ManifestTooLarge;
-        try writeSyncedFile(staging, "manifest.json", manifest_bytes);
         try syncDir(staging);
 
         const publish_lock = try acquirePublishLock(revisions_dir);
         defer publish_lock.close(compat.io());
         if (openExistingDir(revisions_dir, revision_text)) |existing| {
             existing.close(compat.io());
-            var verified = try self.openVerified(key, revision);
+            var verified = try self.openVerified(key, published.revision);
             verified.deinit();
             try syncDir(revisions_dir);
             return published;
@@ -319,20 +389,20 @@ pub const RevisionStore = struct {
         revision: config_identity.Revision,
     ) !RevisionView {
         if (key.len == 0) return error.InvalidKey;
-        try compat.setDirPermissions(self.root, ownerDirPermissions());
+        verifyPrivateDirectory(self.root) catch |err| return mapCorrupt(err);
         const storage_id = config_identity.StorageId.derive(key).bytes;
         var storage_hex: [64]u8 = std.fmt.bytesToHex(storage_id, .lower);
         var revision_hex: [32]u8 = undefined;
         const revision_text = revision.formatHex(&revision_hex);
 
-        const profiles_dir = openExistingDir(self.root, "profiles") catch |err| return mapCorrupt(err);
+        const profiles_dir = openVerifiedDir(self.root, "profiles") catch |err| return mapCorrupt(err);
         defer profiles_dir.close(compat.io());
-        const profile_dir = openExistingDir(profiles_dir, &storage_hex) catch |err| return mapCorrupt(err);
+        const profile_dir = openVerifiedDir(profiles_dir, &storage_hex) catch |err| return mapCorrupt(err);
         defer profile_dir.close(compat.io());
         verifyIdentity(self.allocator, profile_dir, key, &storage_hex) catch |err| return mapCorrupt(err);
-        const revisions_dir = openExistingDir(profile_dir, "revisions") catch |err| return mapCorrupt(err);
+        const revisions_dir = openVerifiedDir(profile_dir, "revisions") catch |err| return mapCorrupt(err);
         defer revisions_dir.close(compat.io());
-        const revision_dir = openExistingDir(revisions_dir, revision_text) catch |err| return mapCorrupt(err);
+        const revision_dir = openVerifiedDir(revisions_dir, revision_text) catch |err| return mapCorrupt(err);
         defer revision_dir.close(compat.io());
         const manifest_bytes = readRegularBounded(self.allocator, revision_dir, "manifest.json", max_manifest_bytes) catch |err|
             return mapCorrupt(err);
@@ -404,7 +474,7 @@ pub const RevisionStore = struct {
         errdefer owned_metadata.deinit();
         try validateSortedParams(owned_metadata.params);
 
-        const objects_dir = openExistingDir(revision_dir, "objects") catch |err| return mapCorrupt(err);
+        const objects_dir = openVerifiedDir(revision_dir, "objects") catch |err| return mapCorrupt(err);
         defer objects_dir.close(compat.io());
         const assets = try self.allocator.alloc(ViewAsset, manifest.local_assets.len);
         var assets_initialized: usize = 0;
@@ -947,6 +1017,27 @@ fn openExistingDir(parent: std.Io.Dir, name: []const u8) !std.Io.Dir {
     return dir;
 }
 
+fn openVerifiedDir(parent: std.Io.Dir, name: []const u8) !std.Io.Dir {
+    if (!isSingleComponent(name)) return error.InvalidStoragePath;
+    const dir = try parent.openDir(compat.io(), name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer dir.close(compat.io());
+    try verifyPrivateDirectory(dir);
+    return dir;
+}
+
+fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
+    const stat = try dir.stat(compat.io());
+    if (stat.kind != .directory) return error.InvalidStoragePath;
+    if (builtin.os.tag != .windows and
+        stat.permissions.toMode() & 0o077 != 0)
+    {
+        return error.UnsafeRevisionPermissions;
+    }
+}
+
 fn openOrCreateDir(parent: std.Io.Dir, name: []const u8) !std.Io.Dir {
     if (openExistingDir(parent, name)) |dir| {
         try syncDir(parent);
@@ -1040,7 +1131,11 @@ fn openStrictRegular(dir: std.Io.Dir, path: []const u8) !std.Io.File {
     errdefer file.close(compat.io());
     const stat = try file.stat(compat.io());
     if (stat.kind != .file) return error.InvalidRevisionFile;
-    try file.setPermissions(compat.io(), ownerFilePermissions());
+    if (builtin.os.tag != .windows and
+        stat.permissions.toMode() & 0o077 != 0)
+    {
+        return error.UnsafeRevisionPermissions;
+    }
     return file;
 }
 

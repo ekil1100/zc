@@ -100,7 +100,9 @@
 | `CONFIG_LOAD_PATH_REQUIRED` | missing `<path>` for config load | use `zc config load <path>` |
 | `CONFIG_LOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `config load` | use `zc config load <path>` |
 | `CONFIG_LOAD_INVALID` | local config is invalid | fix the config and retry |
-| `CONFIG_CAPABILITY_UNSUPPORTED` | config uses a capability not supported in zc v1.0 | run `zc doctor -c <config>` and use direct/reject/ss/trojan |
+| `CONFIG_LOAD_TOO_LARGE` | local config exceeds the 16 MiB limit | reduce the complete config source to 16 MiB or less and retry |
+| `CONFIG_LOAD_LIMIT_EXCEEDED` | config exceeds a fixed YAML/proxy/rule-provider/expanded-rule resource limit | remove unused collections, providers, provider entries, repeated references, or long targets and retry |
+| `CONFIG_CAPABILITY_UNSUPPORTED` | config revision cannot be activated because it uses an unsupported runtime capability | follow the command-specific recovery hint described below |
 | `CONFIG_LOAD_FAILED` | failed to load local config | check the path, local dependencies, and file permissions |
 | `CONFIG_ALREADY_EXISTS` | a config with this name already exists | rename the file or delete the existing config first |
 | `CONFIG_NAME_INVALID` | invalid config name | use 1-250 bytes of UTF-8 without control characters, `/` or `\` |
@@ -110,13 +112,15 @@
 | `CONFIG_DOWNLOAD_NAME_REQUIRED` | missing value for `-n` | use `zc config download <url> -n <name>` |
 | `CONFIG_DOWNLOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `config download` | use `zc config download <url> [-n <name>] [-d]` |
 | `CONFIG_DOWNLOAD_TOO_LARGE` | downloaded config exceeds the 16 MiB limit | reduce the config size and retry |
+| `CONFIG_DOWNLOAD_LIMIT_EXCEEDED` | config exceeds a fixed YAML/proxy/rule-provider/expanded-rule resource limit | remove unused collections, providers, provider entries, repeated references, or long targets and retry |
 | `CONFIG_DOWNLOAD_TIMEOUT` | config download exceeded the 30 second deadline | check the server or network and retry |
 | `CONFIG_DOWNLOAD_FAILED` | failed to download config | check the url/network and retry |
 | `CONFIG_UPDATE_APPLY_INVALID` | invalid `--apply` value | use `--apply auto\|hot\|restart` |
 | `CONFIG_UPDATE_ARGUMENT_INVALID` | unknown or unexpected argument for `config update` | use `zc config update [name] [--apply auto\|hot\|restart]` |
 | `CONFIG_UPDATE_NAME_REQUIRED` | no config name given and no active config | use `zc config update <name>`, or `zc config use <name>` first |
 | `CONFIG_UPDATE_NO_SUBSCRIPTION` | no subscription url recorded for this config | use `zc config download <url>` to (re)create it |
-| `CONFIG_UPDATE_TOO_LARGE` | updated config exceeds the 16 MiB limit | reduce the config size and retry |
+| `CONFIG_UPDATE_TOO_LARGE` | updated source or its persisted-override materialization exceeds the 16 MiB limit | reduce the config size and retry |
+| `CONFIG_UPDATE_LIMIT_EXCEEDED` | config exceeds a fixed YAML/proxy/rule-provider/expanded-rule resource limit | remove unused collections, providers, provider entries, repeated references, or long targets and retry |
 | `CONFIG_UPDATE_TIMEOUT` | config update exceeded the 30 second deadline | check the server or network and retry |
 | `CONFIG_UPDATE_CONFLICT` | config changed while its update was downloading | retry against the new profile revision |
 | `CONFIG_UPDATE_FAILED` | failed to update config | check subscription url/network and retry |
@@ -133,6 +137,43 @@
 | `CONFIG_OVERRIDE_FAILED` | failed to update persisted config override | check config state and retry |
 | `CONFIG_OVERRIDE_APPLY_FAILED` | override persisted but failed to apply running daemon | check logs and run `zc restart` |
 | `CONFIG_SUBCOMMAND_UNKNOWN` | unknown config subcommand | use `zc config --help` to list config subcommands |
+
+YAML source 的 `CONFIG_{LOAD,DOWNLOAD,UPDATE}_LIMIT_EXCEEDED` 覆盖底层
+`YamlCollectionEntryLimitExceeded`、proxy/group limits，以及
+`RuleProviderCountLimitExceeded`、`RuleProviderFileTooLarge`、
+`RuleProviderAggregateEntryCountLimitExceeded`、`RuleProviderAggregateBytesLimitExceeded`、
+`RuleProviderAggregateSourceBytesLimitExceeded`、
+`ExpandedRuleCountLimitExceeded` 与 `ExpandedRuleBytesLimitExceeded`。固定
+provider/rule 合同为 4096 providers、所有 providers 合计 262144 normalized
+entries / 64 MiB normalized bytes、每次同步或权威加载合计 64 MiB raw provider
+source bytes、展开后 262144 rules / 64 MiB owned payload+target bytes；每个
+provider 自身也最多 262144 entries，且单个 source 最多 16 MiB。managed capture
+最多保留 4096 个 local-provider assets；单 asset 的默认与 custom-tightened capture
+上界都稳定发射 `RuleProviderFileTooLarge`，由 load/download/update 映射到各自的
+`*_LIMIT_EXCEEDED`。aggregate raw limit 同样属于 `*_LIMIT_EXCEEDED`；完整 config
+自身的 16 MiB source limit 仍使用独立 `*_TOO_LARGE`。超限在 provider
+entry clone、expanded output reserve、revision publication、listener 和 dial 之前
+拒绝；前后 authoritative `state-v2.json` 与 immutable revision tree 不变，因此
+token/sequence/head/active/desired 均不变。64 MiB bundle/source aggregate 与
+revision manifest 的独立 1 MiB 编码上界均未因单 asset 放宽而改变。
+
+`PersistedSelectionCountLimitExceeded` 不是 config YAML source 字段。1024
+persisted-selection 上界在 catalog/selection mutation seam 执行；CLI
+config handler 保留该 error 的防御映射，但 `load/download/update` 的合法 YAML
+路径不会构造它。已有 `state-v2.json` 若含 1025 项或更多 selection，按损坏
+catalog fail closed，不降级为普通用户 limit，亦不提供旧状态兼容豁免。
+
+`config download -d`、active `config update` 或 `config use` 试图激活一个
+保留的非 runtime-ready revision 时统一返回 `CONFIG_CAPABILITY_UNSUPPORTED`，
+但 recovery hint 按可执行命令区分：download 提示先去掉 `-d` 保留 inactive
+revision，再运行 `zc config dump -c <name> --no-override` 检视其 retained raw
+source 并修复 subscription source；active update 只提示修复 subscription source
+后重试；use 同样提示用 `config dump` 检视已存在 name 的 raw source。三种拒绝
+均保持 authoritative state 逐字节不变。
+
+`CONFIG_UPDATE_TOO_LARGE` 同时覆盖下载 body/source 上界与 persisted override
+重新 materialize 后的 effective source 上界。后一种情况即使下载 source 本身小于
+16 MiB 也会在 publish 前失败；authoritative `state-v2.json` 逐字节不变。
 
 ### D. proxy / profile 家族
 

@@ -1,6 +1,6 @@
 # proxy selection 可靠性与本地 config import 实施计划
 
-> 状态：In Progress（durable `proxy select` 与 `config load <path>` 已接生产路径；其余 writer cutover 未完成）
+> 状态：In Progress（Batch 4/5 与 managed writer cutover 已完成；P0-6 的 fault/crash、ReleaseFast 与 smoke 关闭门禁仍按主 roadmap 推进）
 > 2026-07-15 用户最终命名覆盖原计划：公开命令为 `zc config load <path>`，导入成功后设为 active；下文尚存的 `config import` 是早期设计记录。
 > 制定日期：2026-07-14
 > 基线提交：`70f8c30`
@@ -30,19 +30,19 @@
 | Batch 2 — strict managed parser / offline provider | Done | `d4e2d84` |
 | Batch 2 — ConfigBundle shadow capture / resolver | Done | `65337fc` |
 | Batch 3 — exact catalog / immutable revisions / legacy migration | Done (shadow) | `052610f`–`01646d1` |
-| Batch 4 — managed loader / tracked runtime identity | In Progress | shadow seams `041578b`–`ee690e7`；待生产接线 |
-| Batch 5 — managed writers through Authority | In Progress | durable selection/load production path complete；其余 writer adapters 待切换 |
+| Batch 4 — managed loader / tracked runtime identity | Done | shadow seams `041578b`–`ee690e7`，production lifecycle 已完成接线 |
+| Batch 5 — managed writers through Authority | Done | `list/load/download/update/use/delete/dump/override` 均经 catalog-v2 authority |
 
-Durable selection、daemon startup restore、exact runtime descriptor 与 local config load 已接入生产路径；其余 legacy writer 尚未统一切换。当前真实 measurement 保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
+Durable selection、daemon startup restore、exact runtime descriptor、local config load 与全部 managed writer 已接入生产路径。下列 measurement 是实施期间的历史基线，保存在忽略目录 `.zig-cache/perf/`，不覆盖 tracked placeholder report：
 
 - `70f8c30` + harness：`legacy_bounded_read` median `28,852 ns/op`，p95 `32,493 ns/op`；
 - `b940f5d`：legacy median `30,795 ns/op`，strict median `30,577 ns/op`；
 - `b940f5d` authority commit median：1 profile `154,275 ns/op`、100 profiles `187,162 ns/op`、1000 profiles `535,435 ns/op`；
 - connection admission、flow RSS、config import 仍明确 omitted，不构造假值。
 
-### 2.2 当前验证
+### 2.2 历史验证与实施前事实
 
-2026-07-15 本机验证：
+以下内容记录 2026-07-15 的实施基线，不代表当前产品状态：
 
 ```bash
 zig version
@@ -65,7 +65,7 @@ zig build -Doptimize=ReleaseFast --summary all
 - 没有 CLI → daemon → manager → durable state → restart 的完整选择回归。
 - TCP 代理组最终解析为内建 `DIRECT` / `REJECT` 时存在数据面缺口。
 - 当前没有 `config import`；`config dump -c`、`start -c` 和 `config download` 不能替代本地托管导入。
-- 当前配置主文件读取上限为 1 MiB；本地 rule-provider 文件上限为 8 MiB。
+- 当时配置主文件读取上限为 1 MiB，本地 rule-provider 文件上限为 8 MiB。
 
 ## 3. 冻结的产品契约
 
@@ -191,7 +191,7 @@ zc config import <path> \
 - JSON 成功与失败都返回结构化 findings；文本 warning 写 stderr。
 - 任意失败都不能留下可见 head、active 或 metadata 半成品。
 
-工程安全上限在实施前通过 fixture 校准，初始建议为：本地主 YAML 16 MiB、单个本地 rule-provider 延续 8 MiB、单 bundle 聚合 64 MiB、最多 1024 个本地依赖。若主流 fixture 证明不足，必须在 RED 测试前更新本计划，而不是实现中静默放宽。
+工程安全上限经 fixture 与统一 provider 合同校准为：本地主 YAML 16 MiB、单个本地 rule-provider 16 MiB、单 bundle 聚合 64 MiB、最多 4096 个本地 provider 依赖。若主流 fixture 证明不足，必须在 RED 测试前更新本计划，而不是实现中静默放宽。
 
 ## 4. 深模块与 seam
 
@@ -433,7 +433,7 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 
 - `d4e2d84` 新增 managed-only 完整文档 parser、离线 provider parser/validator，并保持 legacy parser 行为隔离；
 - `65337fc` 新增 descriptor-based `ConfigBundle`、immutable resolver、materialized source seam、deterministic manifest 与 shadow parity；
-- 自动化覆盖 16 MiB / 8 MiB / 64 MiB / 1024 边界、source/dependency symlink、containment、FIFO/目录/设备、stat identity mutation、source tree 删除后 load、remote hit-count 0、CRLF/flow/BOM/escape/depth 与 OOM 路径；
+- 自动化覆盖 16 MiB config/provider / 64 MiB aggregate / 4096 provider 边界、source/dependency symlink、containment、FIFO/目录/设备、stat identity mutation、source tree 删除后 load、remote hit-count 0、CRLF/flow/BOM/escape/depth 与 OOM 路径；
 - `zig build test --summary all` 为 573/574（1 skip），ReleaseFast 4/4；
 - control-plane ReleaseFast 1000-iteration measurement 中 legacy bounded read median `29,850 ns/op`、strict bounded read median `30,963 ns/op`；`config_import` 仍明确 omitted，待真实 publish path 建立后补测；
 - persisted override 的**执行**与 revision 持久关联属于 Batch 3 revision builder；本批只接收并冻结一次性 materialized 输出，runtime 多次 load 不重执行。
@@ -544,6 +544,12 @@ revision 已发布但 authority 未引用时只是可回收 orphan，不得造�
 - immutable `RevisionView` records 可无 filesystem fallback 重建新 bundle；override set/replace/clear 均创建 revision，update 对 frozen script 只执行一次并保留 script/invocation/patch/effective-source provenance：`cdf7497`、`62d8a1e`、single-execution 证据 `f2eb2b4`；
 - stale token、unpublished/corrupt head、identity/generation conflict、invalid desired、OOM、mirror collision 与所有 replace fault boundary 均 fail closed；
 - 尚未接现有 `list/use/download/update/delete/override` writer；在全部 writer 同批切换前不得让生产路径 bootstrap schema 2，避免 legacy writer 与 authority split-brain。
+
+当前完成证据（2026-08-07）：
+
+- `list/load/download/update/use/delete/dump/override` 已统一接入 catalog-v2 authority；legacy files 仅作为派生兼容镜像，不再构成 writer authority；
+- Batch 4/5 的 production lifecycle、exact identity 与 managed writer 接线均已完成；
+- 整体 P0-6 仍以 `.agents/zc-v1.0-roadmap.md` 中尚未关闭的 fault/crash、ReleaseFast 与 smoke 门禁为准。
 
 门禁：
 

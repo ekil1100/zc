@@ -962,7 +962,10 @@ fn makeControlPair() !RelayTestPair {
     return .{ .control = accepted.stream, .peer = client };
 }
 
-fn makeEmptyManager(allocator: std.mem.Allocator, cfg: *const @import("../config.zig").Config) !OutboundManager {
+fn makeEmptyManager(
+    allocator: std.mem.Allocator,
+    cfg: *const @import("../config.zig").Config,
+) !*OutboundManager {
     return OutboundManager.init(allocator, cfg);
 }
 
@@ -983,7 +986,7 @@ test "D6: udpRelay returns on control-TCP EOF (no datagram, no upstream)" {
     };
     defer cfg.deinit();
 
-    var mgr = try OutboundManager.init(allocator, &cfg);
+    const mgr = try OutboundManager.init(allocator, &cfg);
     defer mgr.deinit();
     var engine = try Engine.init(allocator, &cfg.rules);
     defer engine.deinit();
@@ -1009,7 +1012,7 @@ test "D6: udpRelay returns on control-TCP EOF (no datagram, no upstream)" {
         }
     };
     var done = std.atomic.Value(bool).init(false);
-    const th = try std.Thread.spawn(.{}, T.run, .{ conn, &engine, &mgr, ufd, &done });
+    const th = try std.Thread.spawn(.{}, T.run, .{ conn, &engine, mgr, ufd, &done });
 
     // Close the client side -> the accepted control stream sees EOF.
     pair.peer.close();
@@ -1017,7 +1020,7 @@ test "D6: udpRelay returns on control-TCP EOF (no datagram, no upstream)" {
     try testing.expect(done.load(.acquire));
 }
 
-test "D6: first datagram to a no-udp proxy -> REP=0x07 then relay returns" {
+test "D6: first datagram to DIRECT -> REP=0x07 then relay returns" {
     const allocator = testing.allocator;
     const Config = @import("../config.zig").Config;
     const ProxyGroup = @import("../config.zig").ProxyGroup;
@@ -1034,22 +1037,14 @@ test "D6: first datagram to a no-udp proxy -> REP=0x07 then relay returns" {
         .rules = std.ArrayList(Rule).empty,
     };
     defer cfg.deinit();
-    // An anytls proxy WITHOUT udp:true. A FINAL rule routes everything to it.
-    try cfg.proxies.append(allocator, .{
-        .name = try allocator.dupe(u8, "atls"),
-        .proxy_type = .anytls,
-        .server = try allocator.dupe(u8, "203.0.113.10"),
-        .port = 443,
-        .password = try allocator.dupe(u8, "password"),
-    });
     try cfg.rules.append(allocator, .{
         .rule_type = .final,
         .payload = try allocator.dupe(u8, ""),
-        .target = try allocator.dupe(u8, "atls"),
+        .target = try allocator.dupe(u8, "DIRECT"),
     });
-
-    var mgr = try OutboundManager.init(allocator, &cfg);
+    const mgr = try OutboundManager.init(allocator, &cfg);
     defer mgr.deinit();
+
     var engine = try Engine.init(allocator, &cfg.rules);
     defer engine.deinit();
 
@@ -1072,7 +1067,7 @@ test "D6: first datagram to a no-udp proxy -> REP=0x07 then relay returns" {
             udpRelay(c, e, m, fd) catch {};
         }
     };
-    const th = try std.Thread.spawn(.{}, T.run, .{ conn, &engine, &mgr, ufd });
+    const th = try std.Thread.spawn(.{}, T.run, .{ conn, &engine, mgr, ufd });
 
     // Send one SOCKS5-UDP datagram to the bound socket from a client UDP socket.
     const cfd = try compat.udpSocket4();
@@ -1088,8 +1083,8 @@ test "D6: first datagram to a no-udp proxy -> REP=0x07 then relay returns" {
     const dgram = [_]u8{ 0, 0, 0, 0x01, 8, 8, 8, 8, 0x00, 0x35, 'Q' };
     _ = try compat.posixSendTo(cfd, &dgram, 0, @ptrCast(&dst), @sizeOf(std.c.sockaddr.in));
 
-    // The relay should select "atls" (no udp:true) -> connectUdp fails ->
-    // REP=0x07 written to the control conn -> relay returns. Read the REP back.
+    // DIRECT has no v1 UDP path, so connectUdp fails and the relay writes
+    // REP=0x07 to the control connection before returning.
     var rep: [10]u8 = undefined;
     const n = try pair.peer.read(&rep);
     try testing.expectEqual(@as(usize, 10), n);

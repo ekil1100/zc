@@ -236,7 +236,7 @@ fn relaySocks5(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             };
             if (n == 0) return;
             var w: usize = 0;
-            while (w < n) w += try compat.posixWrite(client_stream.handle, buf[w..n]);
+            while (w < n) w += try compat.posixSocketWrite(client_stream.handle, buf[w..n]);
         }
 
         _ = try std.posix.poll(&poll_fds, -1);
@@ -256,7 +256,7 @@ fn relaySocks5(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             if (n == 0) break;
             var written: usize = 0;
             while (written < n) {
-                written += try compat.posixWrite(client_stream.handle, buf[written..n]);
+                written += try compat.posixSocketWrite(client_stream.handle, buf[written..n]);
             }
         }
 

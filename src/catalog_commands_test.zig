@@ -4,12 +4,70 @@ const compat = @import("compat.zig");
 const catalog_commands = @import("catalog_commands.zig");
 const catalog_service = @import("catalog_service.zig");
 const config_bundle = @import("config_bundle.zig");
+const revision_store = @import("revision_store.zig");
 const state_authority = @import("state_authority.zig");
 
 fn writeFile(dir: std.Io.Dir, path: []const u8, bytes: []const u8) !void {
     const file = try dir.createFile(compat.io(), path, .{});
     defer file.close(compat.io());
     try file.writeStreamingAll(compat.io(), bytes);
+}
+
+const TreeSnapshot = struct {
+    allocator: std.mem.Allocator,
+    entries: [][]u8,
+
+    fn deinit(self: *TreeSnapshot) void {
+        for (self.entries) |entry| self.allocator.free(entry);
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+fn snapshotTree(
+    allocator: std.mem.Allocator,
+    root: std.Io.Dir,
+    path: []const u8,
+) !TreeSnapshot {
+    const dir = try root.openDir(compat.io(), path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer dir.close(compat.io());
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    var entries = std.ArrayList([]u8).empty;
+    errdefer {
+        for (entries.items) |entry| allocator.free(entry);
+        entries.deinit(allocator);
+    }
+    while (try walker.next(compat.io())) |entry| {
+        const record = try std.fmt.allocPrint(
+            allocator,
+            "{s}:{s}",
+            .{ @tagName(entry.kind), entry.path },
+        );
+        entries.append(allocator, record) catch |err| {
+            allocator.free(record);
+            return err;
+        };
+    }
+    std.mem.sort([]u8, entries.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return .{
+        .allocator = allocator,
+        .entries = try entries.toOwnedSlice(allocator),
+    };
+}
+
+fn expectTreeEqual(expected: TreeSnapshot, actual: TreeSnapshot) !void {
+    try testing.expectEqual(expected.entries.len, actual.entries.len);
+    for (expected.entries, actual.entries) |expected_entry, actual_entry| {
+        try testing.expectEqualStrings(expected_entry, actual_entry);
+    }
 }
 
 fn bootstrapEmpty(allocator: std.mem.Allocator, root: std.Io.Dir) !state_authority.StateToken {
@@ -225,6 +283,22 @@ fn clearingOverridePatch(
     return allocator.dupe(u8, "mixed-port: 9000\nrule-providers: {}\nrules:\n  - MATCH,DIRECT\n");
 }
 
+fn materializationExpansionSource(allocator: std.mem.Allocator) ![]u8 {
+    const max_source_bytes = @import("override_materialization.zig")
+        .max_effective_source_bytes;
+    const prefix = "mixed-port: 7890\nsecret: '";
+    const suffix = "'\nrules:\n  - MATCH,DIRECT\n";
+    const escaped_bytes = max_source_bytes / 2 + 4096;
+    const source = try allocator.alloc(
+        u8,
+        prefix.len + escaped_bytes + suffix.len,
+    );
+    @memcpy(source[0..prefix.len], prefix);
+    @memset(source[prefix.len .. prefix.len + escaped_bytes], '\\');
+    @memcpy(source[prefix.len + escaped_bytes ..], suffix);
+    return source;
+}
+
 test "CatalogCommands sets and clears a frozen override as exact revisions" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -295,6 +369,58 @@ test "CatalogCommands sets and clears a frozen override as exact revisions" {
     try testing.expect(try commands.clearOverride(.{ .key = "home" }) == null);
 }
 
+test "CatalogCommands update rejects persisted override materialization above 16 MiB" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try bootstrapEmpty(allocator, tmp.dir);
+    const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+    _ = try commands.publishDownloaded(.{
+        .key = "home",
+        .source_bytes = "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n",
+        .mode = .create,
+    });
+    var runner_context: u8 = 0;
+    _ = try commands.setOverride(.{
+        .key = "home",
+        .script = .{ .name = "override.sh", .bytes = "#!/bin/sh\n" },
+        .invocation = .{ .command = "config.override" },
+        .runner = .{ .context = &runner_context, .run = fixedOverridePatch },
+    });
+    try testing.expectEqual(@as(u8, 1), runner_context);
+    const before = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(before);
+    const expanded = try materializationExpansionSource(allocator);
+    defer allocator.free(expanded);
+
+    try testing.expectError(
+        error.MaterializedSourceTooLarge,
+        commands.publishDownloaded(.{
+            .key = "home",
+            .source_bytes = expanded,
+            .mode = .update,
+            .override_runner = .{
+                .context = &runner_context,
+                .run = fixedOverridePatch,
+            },
+        }),
+    );
+    try testing.expectEqual(@as(u8, 2), runner_context);
+    const after = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
 test "CatalogCommands update blocks instead of dropping frozen override provenance" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -348,6 +474,552 @@ test "CatalogCommands update blocks instead of dropping frozen override provenan
     try testing.expect(view.override != null);
     try testing.expectEqualStrings(updated_source, view.sourceBytes());
     try testing.expect(std.mem.indexOf(u8, view.effectiveSourceBytes(), "mixed-port: 9000") != null);
+}
+
+test "CatalogCommands rejects deferred remote RULE-SET for exact activation and every active publication path" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const remote_source =
+        \\mixed-port: 7890
+        \\rule-providers:
+        \\  deferred:
+        \\    type: http
+        \\    behavior: domain
+        \\    url: https://example.invalid/rules.yaml
+        \\    path: deferred.yaml
+        \\rules:
+        \\  - RULE-SET,deferred,DIRECT
+        \\  - MATCH,DIRECT
+    ;
+    var token = try bootstrapEmpty(allocator, tmp.dir);
+    var historical_bundle = try config_bundle.ConfigBundle.captureMemory(
+        allocator,
+        remote_source,
+        null,
+        .{},
+    );
+    defer historical_bundle.deinit();
+    const historical = try revision_store.RevisionStore.init(
+        allocator,
+        tmp.dir,
+    ).publishMigration("historical", &historical_bundle, .{});
+    token = switch (try state_authority.Authority.init(
+        allocator,
+        tmp.dir,
+    ).mutateCatalog(token, .{ .put_profile = .{
+        .key = "historical",
+        .expected = .missing,
+        .head = historical.revision,
+        .desired = .clear,
+    } })) {
+        .committed => |receipt| receipt.token,
+        .durability_uncertain => |uncertain| uncertain.receipt.token,
+        .conflict => return error.TestExpectedEqual,
+    };
+
+    const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+    const inactive_state = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(inactive_state);
+    var inactive_tree = try snapshotTree(allocator, tmp.dir, "profiles");
+    defer inactive_tree.deinit();
+
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        commands.activate("historical"),
+    );
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        commands.publishDownloaded(.{
+            .key = "automatic",
+            .source_bytes = remote_source,
+            .mode = .create,
+        }),
+    );
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        commands.publishDownloaded(.{
+            .key = "explicit",
+            .source_bytes = remote_source,
+            .mode = .create,
+            .activate = true,
+        }),
+    );
+    const rejected_state = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(rejected_state);
+    try testing.expectEqualStrings(inactive_state, rejected_state);
+    var rejected_tree = try snapshotTree(allocator, tmp.dir, "profiles");
+    defer rejected_tree.deinit();
+    try expectTreeEqual(inactive_tree, rejected_tree);
+
+    const ready = try commands.publishDownloaded(.{
+        .key = "home",
+        .source_bytes = "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n",
+        .mode = .create,
+    });
+    const active_state = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(active_state);
+    var active_tree = try snapshotTree(allocator, tmp.dir, "profiles");
+    defer active_tree.deinit();
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        commands.publishDownloaded(.{
+            .key = "home",
+            .source_bytes = remote_source,
+            .mode = .update,
+            .expected_revision = ready.revision,
+        }),
+    );
+    const update_state = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(update_state);
+    try testing.expectEqualStrings(active_state, update_state);
+    var update_tree = try snapshotTree(allocator, tmp.dir, "profiles");
+    defer update_tree.deinit();
+    try expectTreeEqual(active_tree, update_tree);
+    var listing = try commands.list();
+    defer listing.deinit();
+    var found_home = false;
+    for (listing.entries) |entry| {
+        if (!std.mem.eql(u8, entry.key, "home")) continue;
+        found_home = true;
+        try testing.expect(entry.revision.eql(ready.revision));
+        try testing.expect(entry.active);
+    }
+    try testing.expect(found_home);
+}
+
+test "CatalogCommands preserves malformed downloaded obfs as inactive raw" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try bootstrapEmpty(allocator, tmp.dir);
+    const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+    const source =
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: recoverable
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: obfs
+        \\    plugin-opts: "obfs=http;obfs-host=example.com"
+        \\rules:
+        \\  - MATCH,recoverable
+    ;
+    const published = try commands.publishDownloaded(.{
+        .key = "recovery",
+        .source_bytes = source,
+        .mode = .create,
+    });
+
+    var listing = try commands.list();
+    defer listing.deinit();
+    try testing.expectEqual(@as(usize, 1), listing.entries.len);
+    try testing.expect(listing.active == null);
+    var view = try @import("revision_store.zig").RevisionStore.init(
+        allocator,
+        tmp.dir,
+    ).openVerified("recovery", published.revision);
+    defer view.deinit();
+    try testing.expectEqualStrings(source, view.sourceBytes());
+    var inspected_source = try commands.source("recovery");
+    defer inspected_source.deinit();
+    try testing.expectEqualStrings(source, inspected_source.bytes);
+    try testing.expect(inspected_source.revision.eql(published.revision));
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        commands.activate("recovery"),
+    );
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        commands.publishDownloaded(.{
+            .key = "explicit-active",
+            .source_bytes = source,
+            .mode = .create,
+            .activate = true,
+        }),
+    );
+    const state_before_activation = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(state_before_activation);
+    var tree_before_activation = try snapshotTree(allocator, tmp.dir, "profiles");
+    defer tree_before_activation.deinit();
+    try testing.expectError(
+        error.ProfileNotRuntimeReady,
+        commands.publishDownloaded(.{
+            .key = "recovery",
+            .source_bytes = source ++ "\n# requested activation\n",
+            .mode = .update,
+            .expected_revision = published.revision,
+            .activate = true,
+        }),
+    );
+    const state_after_activation = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(state_after_activation);
+    try testing.expectEqualStrings(
+        state_before_activation,
+        state_after_activation,
+    );
+    var tree_after_activation = try snapshotTree(allocator, tmp.dir, "profiles");
+    defer tree_after_activation.deinit();
+    try expectTreeEqual(tree_before_activation, tree_after_activation);
+
+    const refreshed_source = source ++ "\n# refreshed malformed body\n";
+    const refreshed = try commands.publishDownloaded(.{
+        .key = "recovery",
+        .source_bytes = refreshed_source,
+        .mode = .update,
+        .expected_revision = published.revision,
+    });
+    try testing.expect(!refreshed.revision.eql(published.revision));
+    var refreshed_view = try @import("revision_store.zig").RevisionStore.init(
+        allocator,
+        tmp.dir,
+    ).openVerified("recovery", refreshed.revision);
+    defer refreshed_view.deinit();
+    try testing.expectEqualStrings(refreshed_source, refreshed_view.sourceBytes());
+
+    try testing.expectError(
+        error.InvalidConfig,
+        commands.publishDownloaded(.{
+            .key = "recovery",
+            .source_bytes = source ++ "\nmode: unsupported\n",
+            .mode = .update,
+            .expected_revision = refreshed.revision,
+        }),
+    );
+    var unchanged = try commands.list();
+    defer unchanged.deinit();
+    try testing.expect(unchanged.entries[0].revision.eql(refreshed.revision));
+    _ = try commands.delete("recovery");
+}
+
+test "CatalogCommands rejects malformed active updates before revision publication" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try bootstrapEmpty(allocator, tmp.dir);
+    const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+    const created = try commands.publishDownloaded(.{
+        .key = "home",
+        .source_bytes = "mixed-port: 7890\n",
+        .mode = .create,
+    });
+    const malformed_bodies = [_][]const u8{
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: recoverable
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: first-secret
+        \\    plugin: obfs
+        \\    plugin-opts: "obfs=http"
+        \\rules:
+        \\  - MATCH,recoverable
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: recoverable
+        \\    type: ss
+        \\    server: other.example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: second-secret
+        \\    plugin: obfs
+        \\    plugin-opts: "obfs=http"
+        \\rules:
+        \\  - MATCH,recoverable
+        ,
+    };
+    const state_before = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(state_before);
+    var tree_before = try snapshotTree(allocator, tmp.dir, "profiles");
+    defer tree_before.deinit();
+
+    for (malformed_bodies) |malformed| {
+        try testing.expectError(
+            error.ProfileNotRuntimeReady,
+            commands.publishDownloaded(.{
+                .key = "home",
+                .source_bytes = malformed,
+                .mode = .update,
+                .expected_revision = created.revision,
+            }),
+        );
+        const state_after = try tmp.dir.readFileAlloc(
+            compat.io(),
+            "state-v2.json",
+            allocator,
+            .limited(1024 * 1024),
+        );
+        defer allocator.free(state_after);
+        try testing.expectEqualStrings(state_before, state_after);
+        var tree_after = try snapshotTree(allocator, tmp.dir, "profiles");
+        defer tree_after.deinit();
+        try expectTreeEqual(tree_before, tree_after);
+    }
+
+    var listing = try commands.list();
+    defer listing.deinit();
+    try testing.expectEqualStrings("home", listing.active.?);
+    try testing.expect(listing.entries[0].revision.eql(created.revision));
+}
+
+test "CatalogCommands rejects malformed-plugin captures with unrelated invalid semantics" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try bootstrapEmpty(allocator, tmp.dir);
+    const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+    const cases = [_]struct {
+        key: []const u8,
+        source: []const u8,
+    }{
+        .{
+            .key = "reserved-proxy",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: DIRECT
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin-opts: "obfs=http"
+            \\rules:
+            \\  - MATCH,DIRECT
+            ,
+        },
+        .{
+            .key = "reserved-group",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: recoverable
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin-opts: "obfs=http"
+            \\proxy-groups:
+            \\  - name: REJECT
+            \\    type: select
+            \\    proxies: [recoverable]
+            \\rules:
+            \\  - MATCH,REJECT
+            ,
+        },
+        .{
+            .key = "unsupported-proxy",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: recoverable
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin-opts: "obfs=http"
+            \\  - name: disabled
+            \\    type: http
+            \\    server: example.com
+            \\    port: 8080
+            \\rules:
+            \\  - MATCH,recoverable
+            ,
+        },
+        .{
+            .key = "unsupported-group",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: recoverable
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin-opts: "obfs=http"
+            \\proxy-groups:
+            \\  - name: automatic
+            \\    type: url-test
+            \\    proxies: [recoverable]
+            \\    url: https://example.com/ping
+            \\rules:
+            \\  - MATCH,automatic
+            ,
+        },
+        .{
+            .key = "invalid-reference",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: recoverable
+            \\    type: ss
+            \\    server: example.com
+            \\    port: 8388
+            \\    cipher: aes-128-gcm
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin-opts: "obfs=http"
+            \\rules:
+            \\  - MATCH,undefined-target
+            ,
+        },
+    };
+
+    for (cases) |case| {
+        try testing.expectError(
+            error.InvalidConfig,
+            commands.publishDownloaded(.{
+                .key = case.key,
+                .source_bytes = case.source,
+                .mode = .create,
+            }),
+        );
+    }
+    var listing = try commands.list();
+    defer listing.deinit();
+    try testing.expectEqual(@as(usize, 0), listing.entries.len);
+}
+
+test "CatalogCommands rejects non-Shadowsocks plugin metadata from raw capture" {
+    const allocator = testing.allocator;
+    const cases = [_]struct {
+        key: []const u8,
+        source: []const u8,
+    }{
+        .{
+            .key = "direct-plugin",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: direct-node
+            \\    type: direct
+            \\    plugin: obfs
+            \\rules:
+            \\  - MATCH,direct-node
+            ,
+        },
+        .{
+            .key = "reject-derived",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: reject-node
+            \\    type: reject
+            \\    plugin-opts: { mode: http, host: example.com }
+            \\rules:
+            \\  - MATCH,reject-node
+            ,
+        },
+        .{
+            .key = "trojan-underscore",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: trojan-node
+            \\    type: trojan
+            \\    server: example.com
+            \\    port: 443
+            \\    password: secret
+            \\    plugin: obfs
+            \\    plugin_opts: { mode: http, host: example.com }
+            \\rules:
+            \\  - MATCH,trojan-node
+            ,
+        },
+        .{
+            .key = "trojan-malformed",
+            .source =
+            \\mixed-port: 7890
+            \\proxies:
+            \\  - name: malformed-node
+            \\    type: trojan
+            \\    server: example.com
+            \\    port: 443
+            \\    password: secret
+            \\    plugin-opts: "obfs=http"
+            \\rules:
+            \\  - MATCH,malformed-node
+            ,
+        },
+    };
+
+    for (cases) |case| {
+        var bundle = try config_bundle.ConfigBundle.captureCatalogMemory(
+            allocator,
+            case.source,
+            null,
+            .{},
+        );
+        defer bundle.deinit();
+        try testing.expectEqual(
+            config_bundle.SemanticState.malformed,
+            bundle.semanticState(),
+        );
+
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        _ = try bootstrapEmpty(allocator, tmp.dir);
+        const commands = catalog_commands.Commands.init(allocator, tmp.dir);
+        try testing.expectError(
+            error.InvalidConfig,
+            commands.publishDownloaded(.{
+                .key = case.key,
+                .source_bytes = case.source,
+                .mode = .create,
+            }),
+        );
+        var listing = try commands.list();
+        defer listing.deinit();
+        try testing.expectEqual(@as(usize, 0), listing.entries.len);
+    }
 }
 
 test "CatalogCommands downloaded writer rejects invalid and ambient local configs" {

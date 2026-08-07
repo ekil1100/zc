@@ -8,6 +8,7 @@ const Engine = @import("../rule/engine.zig").Engine;
 const OutboundManager = outbound.OutboundManager;
 const aead = @import("../crypto/aead.zig");
 const ss = @import("outbound/shadowsocks.zig");
+const simple_obfs_http = @import("outbound/simple_obfs_http.zig");
 const socket_options = @import("../socket_options.zig");
 const udp_uot = @import("udp_uot.zig");
 
@@ -65,6 +66,14 @@ const ConnectionLimiter = struct {
 // the old 30s timeout that broke long-lived tunnels/WebSockets.
 const relay_poll_timeout_ms: i32 = 30 * 1000;
 const relay_idle_reap_ms: i64 = 15 * 60 * 1000;
+
+fn boundedRelayPollTimeout(deadline_remaining_ms: ?i32) i32 {
+    const remaining_ms = deadline_remaining_ms orelse {
+        return relay_poll_timeout_ms;
+    };
+    std.debug.assert(remaining_ms >= 0);
+    return @min(relay_poll_timeout_ms, remaining_ms);
+}
 const accept_retry_backoff_ms: u64 = 200;
 
 /// 混合端口（HTTP + SOCKS5）
@@ -188,17 +197,12 @@ fn readBeforeDeadline(
     deadline_ms: i64,
 ) !usize {
     while (true) {
-        const remaining = deadline_ms - compat.monotonicMilliTimestamp();
-        if (remaining <= 0) return error.HandshakeTimeout;
         var descriptors = [_]std.posix.pollfd{.{
             .fd = stream.handle,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        const ready = try std.posix.poll(
-            &descriptors,
-            @intCast(@min(remaining, std.math.maxInt(i32))),
-        );
+        const ready = try compat.pollUntil(&descriptors, deadline_ms);
         if (ready == 0) return error.HandshakeTimeout;
         const events = descriptors[0].revents;
         if (events & std.posix.POLL.NVAL != 0 or
@@ -446,10 +450,10 @@ const HttpsForwardStream = struct {
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *UpstreamReader = @alignCast(@fieldParentPtr("interface", io_r));
             var buf: [4096]u8 = undefined;
-            // readBlocking (not read) so a multiplexed anytls stream waits on its
-            // notifier instead of returning WouldBlock into this no-poll pump
-            // (§14). For non-anytls streams readBlocking IS a plain read, so the
-            // behavior is unchanged.
+            // readBlocking (not read) keeps synthetic WouldBlock inside the
+            // transport: AnyTLS waits on its notifier and Shadowsocks polls
+            // across split salts/frames. The no-poll TLS pump sees one blocking
+            // byte stream and maps only terminal failures to ReadFailed.
             const n = self.parent.inner.readBlocking(&buf) catch return error.ReadFailed;
             if (n == 0) return error.EndOfStream;
             return try w.write(buf[0..n]);
@@ -1082,7 +1086,19 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             },
         };
 
-        _ = try std.posix.poll(&poll_fds, relay_poll_timeout_ms);
+        const before_poll_ms = compat.monotonicMilliTimestamp();
+        const poll_timeout_ms = boundedRelayPollTimeout(
+            target_stream.responseDeadlineRemainingMsAt(before_poll_ms),
+        );
+        const poll_deadline_ms = std.math.add(
+            i64,
+            before_poll_ms,
+            poll_timeout_ms,
+        ) catch std.math.maxInt(i64);
+        _ = try compat.pollUntil(&poll_fds, poll_deadline_ms);
+        try target_stream.checkResponseDeadlineAt(
+            compat.monotonicMilliTimestamp(),
+        );
 
         if (client_read_open and (poll_fds[0].revents & std.posix.POLL.IN != 0)) {
             const n = compat.posixRead(client_stream.handle, &buf) catch |err| {
@@ -1112,12 +1128,10 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         }
 
         if (target_read_open and (poll_fds[1].revents & std.posix.POLL.IN != 0)) {
-            // Accepted blocking-path limitation (M5): for the blocking trojan/ss
-            // target path, poll() above only guarantees ciphertext readiness, so this
-            // poll-ready read() can still block until the in-flight TLS record finishes
-            // arriving (a record may span several TCP segments), briefly stalling the
-            // client->target direction. Documented at trojan.zig:readTlsApplicationData;
-            // a non-blocking rewrite is performance-gated per AGENTS.md.
+            // Accepted blocking-path limitation (M5): for Trojan, poll() only
+            // guarantees ciphertext readiness, so this read can still wait for
+            // the rest of an in-flight TLS record. Shadowsocks instead yields
+            // WouldBlock after one transport read when an AEAD frame is partial.
             const n = target_stream.read(&buf) catch |err| {
                 // A buffered protocol (e.g. shadowsocks) returns WouldBlock when
                 // only part of a frame is in yet. Don't tear down — go back to
@@ -1274,7 +1288,7 @@ fn writeClientChunk(
 ) !bool {
     var written: usize = 0;
     while (written < data.len) {
-        written += compat.posixWrite(client_stream.handle, data[written..]) catch |err| {
+        written += compat.posixSocketWrite(client_stream.handle, data[written..]) catch |err| {
             if (clientWriteClosedBy(err)) {
                 relayLog("client write closed: {}", .{err});
                 closeClientReadSide(client_read_open, target_stream, target_write_shutdown);
@@ -1616,7 +1630,7 @@ test "handleConnection should preserve CONNECT payload buffered after headers" {
     };
     defer cfg.deinit();
 
-    var manager = try outbound.OutboundManager.init(allocator, &cfg);
+    const manager = try outbound.OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
     var engine = try Engine.init(allocator, &cfg.rules);
@@ -1659,7 +1673,7 @@ test "handleConnection should preserve CONNECT payload buffered after headers" {
         fn run(alloc: std.mem.Allocator, conn: net.Server.Connection, eng: *Engine, mgr: *OutboundManager) void {
             handleConnection(alloc, conn, eng, mgr) catch {};
         }
-    }.run, .{ allocator, mixed_conn, &engine, &manager });
+    }.run, .{ allocator, mixed_conn, &engine, manager });
     defer relay_thread.join();
 
     try mixed_client.writeAll(req);
@@ -1685,7 +1699,7 @@ test "handleConnection should wait for full CONNECT headers before tunneling" {
     };
     defer cfg.deinit();
 
-    var manager = try outbound.OutboundManager.init(allocator, &cfg);
+    const manager = try outbound.OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
     var engine = try Engine.init(allocator, &cfg.rules);
@@ -1729,7 +1743,7 @@ test "handleConnection should wait for full CONNECT headers before tunneling" {
         fn run(alloc: std.mem.Allocator, conn: net.Server.Connection, eng: *Engine, mgr: *OutboundManager) void {
             handleConnection(alloc, conn, eng, mgr) catch {};
         }
-    }.run, .{ allocator, mixed_conn, &engine, &manager });
+    }.run, .{ allocator, mixed_conn, &engine, manager });
     defer relay_thread.join();
 
     try mixed_client.writeAll(part1);
@@ -1879,7 +1893,7 @@ test "handleConnection should close client stream after successful HTTP relay" {
     };
     defer cfg.deinit();
 
-    var manager = try outbound.OutboundManager.init(allocator, &cfg);
+    const manager = try outbound.OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
     var engine = try Engine.init(allocator, &cfg.rules);
@@ -1917,7 +1931,7 @@ test "handleConnection should close client stream after successful HTTP relay" {
     try mixed_client.writeAll(req);
     try compat.shutdownWrite(mixed_client.handle);
     try setReadTimeoutMs(mixed_client.handle, 100);
-    try handleConnection(allocator, mixed_conn, &engine, &manager);
+    try handleConnection(allocator, mixed_conn, &engine, manager);
 
     var resp_buf: [1024]u8 = undefined;
     _ = mixed_client.read(&resp_buf) catch 0;
@@ -1950,7 +1964,7 @@ fn setResetOnClose(fd: std.posix.fd_t) !void {
 fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
-        written += try compat.posixWrite(fd, data[written..]);
+        written += try compat.posixSocketWrite(fd, data[written..]);
     }
 }
 
@@ -1977,4 +1991,81 @@ fn relayLog(comptime format: []const u8, args: anytype) void {
     std.debug.print("[{d}] [Relay] ", .{ts});
     std.debug.print(format, args);
     std.debug.print("\n", .{});
+}
+
+test "relay poll timeout is bounded by an obfs response deadline" {
+    try std.testing.expectEqual(
+        relay_poll_timeout_ms,
+        boundedRelayPollTimeout(null),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 10_000),
+        boundedRelayPollTimeout(10_000),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 1),
+        boundedRelayPollTimeout(1),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        boundedRelayPollTimeout(0),
+    );
+}
+
+test "relay enforces an armed simple-obfs deadline on a silent socket" {
+    const allocator = std.testing.allocator;
+    const client_pair = try makeTcpStreamPair();
+    defer client_pair.left.close();
+    defer client_pair.right.close();
+    const target_pair = try makeTcpStreamPair();
+    defer target_pair.right.close();
+
+    var target_fd_owned = true;
+    errdefer if (target_fd_owned) target_pair.left.close();
+    const client = try allocator.create(ss.ShadowsocksClient);
+    var client_initialized = false;
+    var client_transferred = false;
+    errdefer if (!client_transferred) {
+        if (client_initialized) client.deinit();
+        allocator.destroy(client);
+    };
+    client.* = try ss.ShadowsocksClient.initWithObfs(
+        allocator,
+        "127.0.0.1",
+        8388,
+        "password",
+        "aes-128-gcm",
+        .{
+            .host = "www.example.com",
+            .server_port = 8388,
+            .response_timeout_ms = 50,
+        },
+    );
+    client_initialized = true;
+    client.stream = target_pair.left;
+    target_fd_owned = false;
+    var target_stream = ProxyStream.initShadowsocks(
+        allocator,
+        target_pair.left,
+        client,
+    );
+    client_transferred = true;
+    defer target_stream.close();
+
+    var request_stream = client.stream.?;
+    try client.obfs.?.write(&request_stream, "first-payload");
+    const remaining_ms = target_stream.responseDeadlineRemainingMsAt(
+        compat.monotonicMilliTimestamp(),
+    ) orelse return error.TestExpectedArmedDeadline;
+    try std.testing.expect(remaining_ms > 0);
+    try std.testing.expect(remaining_ms <= 50);
+
+    const started_ms = compat.monotonicMilliTimestamp();
+    try std.testing.expectError(
+        error.ObfsResponseTimeout,
+        relay(client_pair.left, &target_stream),
+    );
+    const elapsed_ms = compat.monotonicMilliTimestamp() - started_ms;
+    try std.testing.expect(elapsed_ms >= 0);
+    try std.testing.expect(elapsed_ms <= 1_000);
 }

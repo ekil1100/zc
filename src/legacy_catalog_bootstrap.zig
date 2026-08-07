@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
+const catalog_runtime_gate = @import("catalog_runtime_gate.zig");
 const config_bundle = @import("config_bundle.zig");
 const config_catalog = @import("config_catalog.zig");
 const config_identity = @import("config_identity.zig");
@@ -83,8 +84,30 @@ const CapturedProfile = struct {
     legacy: *const LegacyProfile,
     bundle: config_bundle.ConfigBundle,
     materialization: ?override_materialization.Materialization,
+    runtime_ready: bool,
     published: revision_store.PublishedRevision,
 };
+
+fn migrationMetadata(
+    profile: *const CapturedProfile,
+) revision_store.MetadataInput {
+    return .{
+        .url = profile.legacy.url,
+        .filename = profile.legacy.filename,
+        .params = profile.legacy.params,
+        .override = if (profile.materialization) |*frozen| .{
+            .script_name = frozen.script.name,
+            .script_bytes = frozen.script.bytes,
+            .command = frozen.invocation.command,
+            .config_path = frozen.invocation.config_path,
+            .timeout_ms = frozen.invocation.timeout_ms,
+            // Legacy metadata never persisted override args. In particular,
+            // subscription params are not override args.
+            .args = &.{},
+            .patch_bytes = frozen.patch_bytes,
+        } else null,
+    };
+}
 
 pub const LegacyCatalogBootstrap = struct {
     allocator: std.mem.Allocator,
@@ -141,27 +164,18 @@ pub const LegacyCatalogBootstrap = struct {
             captured_count += 1;
         }
 
+        // Preflight every deterministic identity, metadata, override, and
+        // manifest encoding before either the repeat witness or the first
+        // immutable write. Later publication consumes the same captured inputs.
         for (captured) |*profile| {
-            profile.published = try store.publishMigration(
+            profile.published = store.preflightMigration(
                 profile.legacy.key,
                 &profile.bundle,
-                .{
-                    .url = profile.legacy.url,
-                    .filename = profile.legacy.filename,
-                    .params = profile.legacy.params,
-                    .override = if (profile.materialization) |*frozen| .{
-                        .script_name = frozen.script.name,
-                        .script_bytes = frozen.script.bytes,
-                        .command = frozen.invocation.command,
-                        .config_path = frozen.invocation.config_path,
-                        .timeout_ms = frozen.invocation.timeout_ms,
-                        // Legacy metadata never persisted override args. In
-                        // particular, subscription params are not args.
-                        .args = &.{},
-                        .patch_bytes = frozen.patch_bytes,
-                    } else null,
-                },
-            );
+                migrationMetadata(profile),
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidLegacyMetadata,
+            };
         }
 
         var second = captureLegacySnapshot(self.allocator, self.root) catch |err| switch (err) {
@@ -201,7 +215,7 @@ pub const LegacyCatalogBootstrap = struct {
                     error.OutOfMemory => return err,
                     else => return .{ .blocked = .legacy_changed },
                 };
-            } else config_bundle.ConfigBundle.captureFromDir(
+            } else config_bundle.ConfigBundle.captureCatalogFromDir(
                 self.allocator,
                 second_configs,
                 repeated_profile.source_name,
@@ -211,6 +225,13 @@ pub const LegacyCatalogBootstrap = struct {
                 else => return .{ .blocked = .legacy_changed },
             };
             defer repeated.deinit();
+            catalog_runtime_gate.ensureBundleCatalogAdmissible(
+                self.allocator,
+                &repeated,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return .{ .blocked = .legacy_changed },
+            };
             if (!bundlesEqual(&profile.bundle, &repeated)) {
                 return .{ .blocked = .legacy_changed };
             }
@@ -230,13 +251,34 @@ pub const LegacyCatalogBootstrap = struct {
             };
         }
         const active: ?config_catalog.ActiveIdentity = if (legacy.active) |active_key| blk: {
-            for (profiles) |profile| {
-                if (std.mem.eql(u8, profile.key, active_key)) {
-                    break :blk .{ .key = profile.key, .revision = profile.head };
-                }
+            for (profiles, captured) |profile, source| {
+                if (!std.mem.eql(u8, profile.key, active_key)) continue;
+                if (!source.runtime_ready) break :blk null;
+                break :blk .{ .key = profile.key, .revision = profile.head };
             }
             return error.LegacyActiveMissing;
         } else null;
+
+        // The cooperative legacy lock and repeat witness now protect every
+        // logical rejection and allocation above before publication. From
+        // here, only bounded storage/durability failures can interrupt the
+        // immutable writes.
+        for (captured) |*profile| {
+            const published = try store.publishMigration(
+                profile.legacy.key,
+                &profile.bundle,
+                migrationMetadata(profile),
+            );
+            if (!published.revision.eql(profile.published.revision) or
+                !std.mem.eql(
+                    u8,
+                    &published.storage_id,
+                    &profile.published.storage_id,
+                ))
+            {
+                return error.MigrationIdentityChanged;
+            }
+        }
 
         // The derived mirror replaces the legacy configs directory after the
         // catalog commit; release snapshot handles before that rename.
@@ -345,7 +387,7 @@ fn prepareProfile(
             return error.SourceChanged;
         }
     } else {
-        bundle = try config_bundle.ConfigBundle.captureFromDir(
+        bundle = try config_bundle.ConfigBundle.captureCatalogFromDir(
             allocator,
             configs_dir,
             profile.source_name,
@@ -353,19 +395,35 @@ fn prepareProfile(
         );
     }
     errdefer bundle.deinit();
-    var offline = try bundle.loadOffline(allocator);
-    defer offline.deinit();
-    // Legacy source revisions may need an explicit override or replacement
-    // before they can run on the current capability set. Preserve those
-    // inspectable sources during the authority cutover; only a persisted
-    // override claims to be runtime-ready and must therefore validate now.
-    if (frozen != null and !offline.validation.isValid()) {
-        return error.InvalidLegacyConfig;
-    }
+
+    // Legacy cutover must enforce the same unpublished-bundle boundary as
+    // CatalogService before any immutable revision is written. The sole
+    // catalog-only exception remains a marked malformed Shadowsocks plugin;
+    // every other invalid or deferred capability rejects the whole cutover.
+    catalog_runtime_gate.ensureBundleCatalogAdmissible(
+        allocator,
+        &bundle,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidLegacyConfig,
+    };
+    const runtime_ready = if (bundle.semanticState() == .malformed)
+        false
+    else ready: {
+        catalog_runtime_gate.ensureBundleRuntimeReady(
+            allocator,
+            &bundle,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidLegacyConfig,
+        };
+        break :ready true;
+    };
     return .{
         .legacy = profile,
         .bundle = bundle,
         .materialization = frozen,
+        .runtime_ready = runtime_ready,
         .published = undefined,
     };
 }
@@ -634,6 +692,8 @@ fn parseParams(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const re
 fn parseSelections(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const config_catalog.Selection {
     const actual = value orelse return allocator.alloc(config_catalog.Selection, 0);
     if (actual != .object) return error.InvalidLegacyMetadata;
+    config_catalog.requirePersistedSelectionLimit(actual.object.count()) catch
+        return error.InvalidLegacyMetadata;
     const selections = try allocator.alloc(config_catalog.Selection, actual.object.count());
     var iterator = actual.object.iterator();
     var index: usize = 0;

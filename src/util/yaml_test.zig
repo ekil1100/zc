@@ -352,3 +352,57 @@ test "YAML parse nested map" {
     try testing.expect(server == .map);
     try testing.expectEqualStrings("localhost", server.map.get("host").?.string);
 }
+
+fn appendCollectionEntryBudgetFixture(
+    allocator: std.mem.Allocator,
+    source: *std.ArrayList(u8),
+) !void {
+    try testing.expect(yaml.collection_entry_count_max >= 4);
+    try source.appendSlice(allocator, "unknown:\n  - {nested: [0]}\n");
+    for (0..yaml.collection_entry_count_max - 4) |_| {
+        try source.appendSlice(allocator, "  - 0\n");
+    }
+}
+
+test "YAML collection entry budget accepts exact max and rejects before allocation" {
+    const allocator = testing.allocator;
+    try testing.expectEqual(@as(usize, 262_144), yaml.collection_entry_count_max);
+
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(allocator);
+    try appendCollectionEntryBudgetFixture(allocator, &source);
+    const exact_len = source.items.len;
+
+    var exact_failing = testing.FailingAllocator.init(allocator, .{});
+    var exact = try yaml.parseDocument(
+        exact_failing.allocator(),
+        source.items[0..exact_len],
+    );
+    exact.deinit(exact_failing.allocator());
+    try testing.expectEqual(exact_failing.allocated_bytes, exact_failing.freed_bytes);
+    const allocations_at_limit = exact_failing.alloc_index;
+
+    try source.appendSlice(allocator, "overflow: allocated-if-budget-is-late\n");
+
+    var overflow_failing = testing.FailingAllocator.init(allocator, .{
+        .fail_index = allocations_at_limit,
+    });
+    try testing.expectError(
+        error.YamlCollectionEntryLimitExceeded,
+        yaml.parseDocument(overflow_failing.allocator(), source.items),
+    );
+    try testing.expect(!overflow_failing.has_induced_failure);
+    try testing.expectEqual(
+        overflow_failing.allocated_bytes,
+        overflow_failing.freed_bytes,
+    );
+
+    const fixed_ceiling_bytes = 18 * 1024 * 1024;
+    const fixed_memory = try allocator.alloc(u8, fixed_ceiling_bytes);
+    defer allocator.free(fixed_memory);
+    var fixed = std.heap.FixedBufferAllocator.init(fixed_memory);
+    try testing.expectError(
+        error.YamlCollectionEntryLimitExceeded,
+        yaml.parse(fixed.allocator(), source.items),
+    );
+}

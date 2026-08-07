@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-08-02
+> 最近更新：2026-08-06
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -11,7 +11,7 @@
 
 当前代码**仍不应直接 GA tag**。本轮 cleanup 已完成 Zig 0.16.0 工具链对齐、TUI de-scope、旧根目录 roadmap/tasks 移除和主要文档重整；剩余阻塞项集中在：
 
-1. **配置准入与已验证运行能力不一致**：`http` / `socks5` 未实现；VMess/VLESS wire/transport 未通过标准互操作；AnyTLS 生命周期与资源上界仍有安全阻断项。v1.0 已冻结为 fail-closed：仅允许 `direct` / `reject` / 经验证的 Shadowsocks AEAD / Trojan TCP，其他类型在 bind/dial 前拒绝。
+1. **配置准入与已验证运行能力必须持续一致**：`http` / `socks5` 未实现；VMess/VLESS wire/transport 未通过标准互操作；AnyTLS 生命周期与资源上界仍有安全阻断项。2026-08-06 已通过独立真实 socket 门禁开放 Shadowsocks simple-obfs HTTP 的精确 capability；经典 AEAD UDP 尚未实现，`udp:true` 继续 fail closed。
 2. ~~**CLI `test --json` 不生效**~~（已解决：全 CLI 输出契约对齐落地，`test --json` 走统一 envelope + `CHECKS_FAILED` 语义，见 `docs/cli/spec.md`）。
 3. **API v1 冻结为有界 minimal REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；连接数、header/body/response 大小和读写期限均有固定上界。当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
@@ -19,7 +19,7 @@
 6. **minimal controller 端点已冻结**：v1 只接受显式 `127.0.0.1:<port>`，必须绑定精确配置端口；冲突时启动失败，不自动漂移或静默关闭控制面。
 7. **生命周期路径已按用户隔离并具备 instance-bound restart rollback**：pid/lock/log/runtime descriptor 统一位于经 owner/mode/no-follow 校验的 `XDG_RUNTIME_DIR`；未设置时使用规范化 `$HOME/.local/state/zc/runtime`。后台启动只消费 parent 发布的 owner-only HMAC snapshot；restart 在 stop 前完成 preparation，并以 PID/nonce 恢复 exact old snapshot。
 
-因此，v1.0 roadmap 现在应聚焦：**落地统一 capability gate，关闭所有未经互操作与生命周期验证的协议；完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import；修复安全审计阻断项后，再做最终 smoke gate 和 GA tag 判断。**
+因此，v1.0 roadmap 现在应聚焦：**保持统一 capability gate；simple-obfs HTTP transport 与精确 enable 已关闭门禁，下一项 Shadowsocks 扩展只剩独立的 AEAD UDP 工作且当前不得开放；完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import；修复安全审计阻断项后，再做最终 smoke gate 和 GA tag 判断。**
 
 ---
 
@@ -211,7 +211,7 @@ bash scripts/run-full-validation.sh
 
 - `direct`
 - `reject`
-- Shadowsocks AEAD：`aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`
+- Shadowsocks AEAD：`aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`，支持 plain TCP 或 `obfs|obfs-local` + 显式 HTTP mode/合法 host 的内置 simple-obfs HTTP
 - Trojan TCP/TLS
 
 以下类型在 v1.0 必须由 validator/doctor/runtime 一致地提前拒绝：
@@ -224,7 +224,7 @@ bash scripts/run-full-validation.sh
 
 协议细节限制：
 
-- Shadowsocks：`src/crypto/aead.zig` 实际只解析 `aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`。validator 中列出的 CFB / rc4-md5 / none 等并非真实可用。
+- Shadowsocks：`src/crypto/aead.zig` 实际只解析 `aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`。simple-obfs 仅开放 HTTP；TLS、通用外部 plugin 与 UDP 明确拒绝。validator 中列出的 CFB / rc4-md5 / none 等并非真实可用。
 - VMess：当前 client 是最小 TCP 握手实现；`tls` / `ws-opts` 等配置字段未传入 VMess client。
 - VLESS：文件注释明确是“最小可用版本，仅 TCP”；`tls` / ws / reality / grpc 等主流变体未实现。
 - Trojan：实现 TLS + CONNECT；没有看到 Trojan WS / gRPC 等传输变体。
@@ -319,7 +319,7 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 - 默认 mixed inbound 可启动、停止、重启、查看状态。
 - 不发布 TUI；v1.0 只承诺 CLI + minimal API + daemon runtime。
 - `zc start --port <port>` 非生产端口开发入口稳定。
-- DIRECT / REJECT / Shadowsocks AEAD / Trojan TCP/TLS 的边界清晰；其他协议在 bind/dial 前 fail closed。
+- DIRECT / REJECT / Shadowsocks AEAD TCP（plain 或经验证的 simple-obfs HTTP）与 Trojan TCP/TLS 的边界清晰；Shadowsocks UDP 和其他协议在 bind/dial 前 fail closed。
 - 规则：DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / IP-CIDR / IP-CIDR6 / RULE-SET / MATCH 稳定可用。
 - 配置解析失败、端口冲突、provider 下载失败有可操作错误。
 - `doctor --json` 可作为最小诊断包。
@@ -365,19 +365,29 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 
 - workflow 中不再出现 `0.15.2`。
 
-### P0-2：统一 v1 capability gate — Decision locked, implementation in progress
+### P0-2：统一 v1 capability gate — simple-obfs HTTP enabled, UDP pending
 
-冻结决策：v1.0 只允许 `direct`、`reject`、四种已验证 Shadowsocks AEAD cipher 与 Trojan TCP/TLS。HTTP、SOCKS5、VMess、VLESS、AnyTLS 以及未接线 transport 必须在 bind/dial 前 hard reject；协议代码保留不构成支持声明。
+2026-08-06 按严格顺序完成前两阶段，第三阶段未开始且未开放：
 
-重新启用某一协议的必要条件：固定协议版本的独立外部 oracle、正负 wire vectors、真实互操作、连接生命周期、资源上界和 ReleaseFast 回归全部通过，并在单独 capability-enable commit 中更新 validator、doctor、migrator 与文档。
+1. ~~完成内置 simple-obfs HTTP 流式 transport~~（done）；
+2. ~~通过独立互操作后，仅开放 `plugin: obfs|obfs-local` + 显式 `mode: http` + 合法 host~~（done）；
+3. 完成经典 Shadowsocks AEAD UDP 与 SOCKS5 UDP ASSOCIATE（pending；`udp:true` 仍拒绝）。
+
+`mode: tls`、通用 SIP003 外部插件、AEAD-2022、UDP fragmentation、HTTP/SOCKS5/VMess/VLESS/AnyTLS outbound 仍不在本次范围，必须在 bind/dial 前 hard reject。协议代码保留不构成支持声明。
+
+HTTP capability 的公开测试 seam 使用真实 ReleaseSafe zc 和真实 socket：配置经过 `zc start/test/doctor` preflight，TCP 分别通过 mixed HTTP/SOCKS5 到 test-only 独立 obfs oracle，再转发固定 `shadowsocks-rust v1.24.0` 与 origin。oracle 不导入生产 config/SS/obfs 模块，独立校验 GET/Host/Upgrade/Connection/Key/Content-Length，并覆盖分片响应 header 与 same-write tail。TLS/unknown/missing/CRLF/UDP 负例在 bind/dial 前失败且 oracle counter 不增长。UDP 还没有正向 oracle seam，不得从 HTTP E2E 推导 UDP 支持。
+
+重新启用能力的必要条件：固定协议版本的独立外部 oracle、正负 wire vectors、真实互操作、连接生命周期、资源上界和 ReleaseSafe/ReleaseFast 回归全部通过，并在独立 capability-enable 变更中更新 validator、doctor/runtime 与文档；只有 migrator 已有统一 capability rule 时才同步该 rule，当前旧 migrator 不为此扩散重写。研究依据见 `docs/research/shadowsocks-simple-obfs-udp.md`。
 
 验收标准：
 
-- `zc test` / `doctor` / config validation 使用同一 capability 结论，提前拒绝 unsupported outbound。
-- runtime manager 保留第二道 fail-closed 防线，不得因绕过 validator 而建立连接。
-- Shadowsocks validator 只接受 runtime 实际实现的四种 AEAD cipher。
-- README、compat matrix、migrator 和错误码与代码一致。
-- 新增回归测试逐类覆盖 HTTP、SOCKS5、VMess、VLESS、AnyTLS 与 unsupported cipher。
+- simple-obfs HTTP 首次请求与首次响应 header 支持任意 TCP 切分，8 KiB 上限，header 后同 read 的 Shadowsocks bytes 不丢失；后续 bytes 为 raw stream；host 拒绝空值、CR/LF/NUL 和超过 255 bytes。
+- capability 仅接受 `obfs` / `obfs-local`、显式 `mode: http` 与合法 host；`tls`、未知 mode/plugin 不得回退为裸 Shadowsocks。
+- **后续 UDP 阶段**：Shadowsocks UDP 必须使用独立 datagram AEAD wire：每包 CSPRNG salt、HKDF-SHA1 `ss-subkey`、零 nonce、认证失败丢弃，不复用 TCP chunk framing；完成前 `udp:true` 一律拒绝。
+- **后续 UDP 阶段**：SOCKS5 UDP ASSOCIATE 必须绑定 TCP control connection 与客户端 IP/首个 UDP port；control close 即清理；FRAG!=0 丢弃；association 数量、idle 时间、队列和每包 65507-byte wire size 均有硬上界。
+- simple-obfs 只包装 TCP；当前没有 Shadowsocks UDP runtime path，不得 DIRECT 回退或以 HTTP E2E 作为 UDP 支持证据。
+- `zc test` / `doctor` / config validation 使用同一 capability 结论；runtime manager 保留第二道 fail-closed 防线。
+- README、compat matrix、错误码与代码一致；当前 E2E 覆盖四个 plain Shadowsocks 配置名、两个 obfs HTTP alias、独立 wire attestation 与 bind/dial 前负例。错误 tag、FRAG、截短/超限数据报和 UDP 关闭清理属于后续 UDP 阶段，当前不得写成已覆盖。
 
 ### P0-3：修正 CLI JSON 契约：`zc test --json`
 
@@ -696,7 +706,7 @@ git push origin v1.0.0
 
 按风险排序：
 
-1. ~~**实现已冻结的 capability gate**~~：validator / doctor / runtime / migrator / README 已一致拒绝 HTTP、SOCKS5、VMess、VLESS、AnyTLS 与 unsupported Shadowsocks cipher。
+1. **保持精确 capability gate**：simple-obfs HTTP 已由 validator/doctor 与 manager 双重开放；TLS/unknown/missing/CRLF/UDP 仍 fail closed。下一项协议工作是独立实现并验证 Shadowsocks UDP，不得扩散到 TLS/plugin launcher。
 2. **完成 P0-6 最终门禁**：managed writer cutover 已完成；下一步补齐 fault/crash 回归、复跑 ReleaseFast 跨目标与 selection/config smoke。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
@@ -715,7 +725,8 @@ git push origin v1.0.0
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0，`v1.0.0-rc6` 三平台 CD 与 Homebrew Tap 发布已通过
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
-- ✅ v1 capability gate 已在 validator/doctor/runtime/migrator 与兼容性文档统一落地
+- ✅ v1 capability gate 已在 validator/doctor/runtime 与兼容性文档统一落地；2026-08-06 精确开放 simple-obfs HTTP，TLS/generic plugin/UDP 仍拒绝
+- ✅ simple-obfs HTTP 已通过真实 zc + mixed HTTP/SOCKS5 + 独立 oracle + shadowsocks-rust v1.24.0 + origin 的 socket 互操作，覆盖分片 header、same-write tail 与零 dial 负例
 - ✅ `proxy select` durable/runtime identity、daemon startup restore、tracked controller discovery 与完整 managed config 命令族已进入 production path；legacy mirror 不再是 writer authority
 - ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档

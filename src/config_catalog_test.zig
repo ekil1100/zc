@@ -134,6 +134,95 @@ test "ConfigCatalog enforces its persisted byte limit" {
     try testing.expectError(error.CatalogTooLarge, catalog.decodeCanonical(testing.allocator, bytes));
 }
 
+fn makeSelectionLimitFixture(
+    allocator: std.mem.Allocator,
+    selection_count: usize,
+) !struct {
+    names: [][24]u8,
+    selections: []catalog.Selection,
+} {
+    const names = try allocator.alloc([24]u8, selection_count);
+    errdefer allocator.free(names);
+    const selections = try allocator.alloc(catalog.Selection, selection_count);
+    errdefer allocator.free(selections);
+    for (names, selections, 0..) |*name_buffer, *selection, index| {
+        const name = try std.fmt.bufPrint(name_buffer, "group-{d}", .{index});
+        selection.* = .{ .group = name, .proxy = "DIRECT" };
+    }
+    return .{ .names = names, .selections = selections };
+}
+
+test "ConfigCatalog persisted selection limit accepts max and rejects max plus one fail first" {
+    const allocator = testing.allocator;
+    const maximum = try makeSelectionLimitFixture(
+        allocator,
+        catalog.persisted_selection_count_max,
+    );
+    defer allocator.free(maximum.selections);
+    defer allocator.free(maximum.names);
+    const maximum_profiles = [_]catalog.Profile{.{
+        .key = "home",
+        .storage_id = identity.StorageId.derive("home"),
+        .head = revision_a,
+        .desired = .{ .selections = maximum.selections },
+    }};
+    const encoded = try catalog.encodeCanonical(allocator, .{
+        .profiles = &maximum_profiles,
+    });
+    defer allocator.free(encoded);
+
+    const overflow = try makeSelectionLimitFixture(
+        allocator,
+        catalog.persisted_selection_count_max + 1,
+    );
+    defer allocator.free(overflow.selections);
+    defer allocator.free(overflow.names);
+    const overflow_profiles = [_]catalog.Profile{.{
+        .key = "home",
+        .storage_id = identity.StorageId.derive("home"),
+        .head = revision_a,
+        .desired = .{ .selections = overflow.selections },
+    }};
+    var failing = testing.FailingAllocator.init(allocator, .{
+        .fail_index = 0,
+    });
+    try testing.expectError(
+        error.PersistedSelectionCountLimitExceeded,
+        catalog.encodeCanonical(failing.allocator(), .{
+            .profiles = &overflow_profiles,
+        }),
+    );
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "ConfigCatalog treats an on-disk persisted selection excess as corruption" {
+    const allocator = testing.allocator;
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(allocator);
+    try bytes.appendSlice(
+        allocator,
+        "{\"schema_version\":2,\"sequence\":1,\"active\":null,\"profiles\":[" ++
+            "{\"key\":\"home\",\"storage_id\":" ++
+            "\"dc3fb855b586386498f9ec0db774a3d31da4003977fcbcd9a697fb7455a6645b\"," ++
+            "\"head\":\"11111111111111111111111111111111\"," ++
+            "\"desired\":{\"generation\":1,\"selections\":[",
+    );
+    for (0..catalog.persisted_selection_count_max + 1) |index| {
+        if (index > 0) try bytes.append(allocator, ',');
+        try bytes.appendSlice(
+            allocator,
+            "{\"group\":\"Proxy\",\"proxy\":\"DIRECT\"}",
+        );
+    }
+    try bytes.appendSlice(allocator, "]}}]}\n");
+
+    try testing.expectError(
+        error.CorruptCatalog,
+        catalog.decodeCanonical(allocator, bytes.items),
+    );
+}
+
 fn encodeAllocationFixture(allocator: std.mem.Allocator) !void {
     const profiles = [_]catalog.Profile{.{
         .key = "home",

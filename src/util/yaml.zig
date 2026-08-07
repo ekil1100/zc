@@ -173,9 +173,31 @@ fn isFlowMappingIndicator(source: []const u8, position: usize) bool {
 
 const max_nesting_depth: usize = 128;
 
+/// Maximum number of decoded mapping entries and sequence items in one YAML
+/// document. All block and flow collections share this single budget.
+pub const collection_entry_count_max: usize = 262_144;
+
+const CollectionEntryBudget = struct {
+    limit: usize,
+    consumed: usize = 0,
+
+    fn consume(self: *CollectionEntryBudget) !void {
+        if (self.consumed >= self.limit) {
+            return error.YamlCollectionEntryLimitExceeded;
+        }
+        self.consumed = std.math.add(
+            usize,
+            self.consumed,
+            1,
+        ) catch return error.YamlCollectionEntryLimitExceeded;
+        std.debug.assert(self.consumed <= self.limit);
+    }
+};
+
 const Parser = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
+    entry_budget: *CollectionEntryBudget,
     pos: usize = 0,
     strict: bool = false,
     depth: usize = 0,
@@ -433,6 +455,8 @@ const Parser = struct {
                     (self.source[self.pos] == ' ' or self.source[self.pos] == '\t')) self.pos += 1;
             }
 
+            // Charge the mapping entry before allocating its key or value.
+            try self.entry_budget.consume();
             const key = try self.parseKey();
             var key_owned = true;
             errdefer if (key_owned) self.allocator.free(key);
@@ -548,6 +572,8 @@ const Parser = struct {
                 break;
             }
 
+            // Charge the sequence item before allocating its scalar/container.
+            try self.entry_budget.consume();
             self.pos = content_pos + 1;
             while (self.pos < self.source.len and
                 (self.source[self.pos] == ' ' or self.source[self.pos] == '\t')) self.pos += 1;
@@ -730,6 +756,8 @@ const Parser = struct {
             }
             const text = std.mem.trim(u8, self.source[value_start..self.pos], " \t");
             if (text.len == 0) return error.InvalidYamlDocument;
+            // Scanning is allocation-free; charge before decoding the value.
+            try self.entry_budget.consume();
             var value = try self.parseInlineValue(text);
             values.append(self.allocator, value) catch |err| {
                 value.deinit(self.allocator);
@@ -800,6 +828,8 @@ const Parser = struct {
             const key_quoted = key.len >= 2 and
                 ((key[0] == '"' and key[key.len - 1] == '"') or
                     (key[0] == '\'' and key[key.len - 1] == '\''));
+            // Charge before decoding or duplicating the mapping key.
+            try self.entry_budget.consume();
             const key_copy = if (self.strict and key_quoted)
                 try decodeStrictQuoted(self.allocator, key)
             else blk: {
@@ -935,6 +965,7 @@ const Parser = struct {
             var nested = Parser{
                 .allocator = self.allocator,
                 .source = trimmed,
+                .entry_budget = self.entry_budget,
                 .strict = self.strict,
                 .depth = self.depth + 1,
             };
@@ -1031,6 +1062,9 @@ const Parser = struct {
                     val_str = val_str[1 .. val_str.len - 1];
                 }
 
+                // The recursively decoded map shares the document budget.
+                // Charge before allocating either its key or value.
+                try self.entry_budget.consume();
                 const key_copy = if (self.strict and key_quoted)
                     try decodeStrictQuoted(self.allocator, key)
                 else blk: {
@@ -1152,21 +1186,52 @@ const Parser = struct {
     }
 };
 
+fn parseWithEntryLimit(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    entry_limit: usize,
+) !YamlValue {
+    var budget = CollectionEntryBudget{ .limit = entry_limit };
+    var p = Parser{
+        .allocator = allocator,
+        .source = src,
+        .entry_budget = &budget,
+    };
+    return p.parseValue(0);
+}
+
 pub fn parse(allocator: std.mem.Allocator, src: []const u8) !YamlValue {
-    var p = Parser{ .allocator = allocator, .source = src };
-    return try p.parseValue(0);
+    return parseWithEntryLimit(allocator, src, collection_entry_count_max);
+}
+
+fn parseDocumentWithEntryLimit(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    entry_limit: usize,
+) !YamlValue {
+    const without_bom = if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src[3..] else src;
+    const content = stripDocumentStart(without_bom);
+    var budget = CollectionEntryBudget{ .limit = entry_limit };
+    var p = Parser{
+        .allocator = allocator,
+        .source = content,
+        .entry_budget = &budget,
+        .strict = true,
+    };
+    var value = try p.parseValue(0);
+    errdefer value.deinit(allocator);
+    try p.requireOnlyTrailingTrivia();
+    return value;
 }
 
 /// Parses the subset of YAML understood by zc as one complete document.
 /// Unlike `parse`, this entry point rejects duplicate keys and ignored tails.
 pub fn parseDocument(allocator: std.mem.Allocator, src: []const u8) !YamlValue {
-    const without_bom = if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src[3..] else src;
-    const content = stripDocumentStart(without_bom);
-    var p = Parser{ .allocator = allocator, .source = content, .strict = true };
-    var value = try p.parseValue(0);
-    errdefer value.deinit(allocator);
-    try p.requireOnlyTrailingTrivia();
-    return value;
+    return parseDocumentWithEntryLimit(
+        allocator,
+        src,
+        collection_entry_count_max,
+    );
 }
 
 fn stripDocumentStart(source: []const u8) []const u8 {
@@ -1181,4 +1246,25 @@ fn stripDocumentStart(source: []const u8) []const u8 {
         position = if (line_end < source.len) line_end + 1 else line_end;
     }
     return source;
+}
+
+test "nested parser shares the document collection entry budget" {
+    const source = "root: [[0], 1]\n";
+    try std.testing.expectError(
+        error.YamlCollectionEntryLimitExceeded,
+        parseDocumentWithEntryLimit(std.testing.allocator, source, 3),
+    );
+    try std.testing.expectError(
+        error.YamlCollectionEntryLimitExceeded,
+        parseWithEntryLimit(std.testing.allocator, source, 3),
+    );
+
+    var strict = try parseDocumentWithEntryLimit(
+        std.testing.allocator,
+        source,
+        4,
+    );
+    strict.deinit(std.testing.allocator);
+    var legacy = try parseWithEntryLimit(std.testing.allocator, source, 4);
+    legacy.deinit(std.testing.allocator);
 }

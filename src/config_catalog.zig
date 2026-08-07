@@ -2,6 +2,14 @@ const std = @import("std");
 const config_identity = @import("config_identity.zig");
 
 pub const max_catalog_bytes = 4 * 1024 * 1024;
+pub const persisted_selection_count_max: usize = 1024;
+
+pub fn requirePersistedSelectionLimit(selection_count: usize) !void {
+    if (selection_count > persisted_selection_count_max) {
+        return error.PersistedSelectionCountLimitExceeded;
+    }
+}
+
 // Persisted catalogs grandfather keys accepted by earlier releases. New keys
 // reserve room for the derived legacy mirror's `.yaml` suffix on filesystems
 // with the common 255-byte NAME_MAX limit.
@@ -189,6 +197,11 @@ pub fn decodeCanonical(backing_allocator: std.mem.Allocator, bytes: []const u8) 
         else => return error.CorruptCatalog,
     };
     if (disk.schema_version != 2) return error.CorruptCatalog;
+    for (disk.profiles) |disk_profile| {
+        requirePersistedSelectionLimit(
+            disk_profile.desired.selections.len,
+        ) catch return error.CorruptCatalog;
+    }
 
     const profiles = try allocator.alloc(Profile, disk.profiles.len);
     for (disk.profiles, profiles) |disk_profile, *profile| {
@@ -235,6 +248,10 @@ pub fn decodeCanonical(backing_allocator: std.mem.Allocator, bytes: []const u8) 
 }
 
 fn validateState(allocator: std.mem.Allocator, state: State) !void {
+    for (state.profiles) |profile| {
+        try requirePersistedSelectionLimit(profile.desired.selections.len);
+    }
+
     var keys = std.StringHashMap(void).init(allocator);
     defer keys.deinit();
     var storage_ids = std.AutoHashMap([32]u8, void).init(allocator);

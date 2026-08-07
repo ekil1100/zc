@@ -8,17 +8,30 @@
 //! 二进制由首个用例触发 `zig build` 产出（zig-out/bin/zc），之后直接复用。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const daemon = @import("daemon.zig");
 const runtime_descriptor = @import("runtime_descriptor.zig");
 const runtime_dir = @import("runtime_dir.zig");
+const config = @import("config.zig");
+const config_catalog = @import("config_catalog.zig");
 const config_identity = @import("config_identity.zig");
 const selection_state = @import("selection_state.zig");
+const state_authority = @import("state_authority.zig");
 
 const max_output = 1024 * 1024;
 const zc_binary = "zig-out/bin/zc";
+const cli_awake_timeout_seconds = 60;
+const build_awake_timeout_seconds = 180;
 
 var zc_binary_ready = false;
+
+fn awakeTimeoutSeconds(seconds: i64) std.Io.Timeout {
+    return .{ .duration = .{
+        .clock = .awake,
+        .raw = std.Io.Duration.fromSeconds(seconds),
+    } };
+}
 
 fn exitCode(term: anytype) !u8 {
     return switch (term) {
@@ -29,7 +42,12 @@ fn exitCode(term: anytype) !u8 {
 
 fn ensureZcBinary(allocator: std.mem.Allocator) !void {
     if (zc_binary_ready) return;
-    const result = try compat.childRun(allocator, &.{ "zig", "build" }, max_output);
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ "zig", "build" },
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = awakeTimeoutSeconds(build_awake_timeout_seconds),
+    });
     defer {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
@@ -60,7 +78,12 @@ fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !CliRun {
     try argv.append(allocator, zc_binary);
     for (args) |arg| try argv.append(allocator, arg);
 
-    const result = try compat.childRun(allocator, argv.items, max_output);
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = argv.items,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = awakeTimeoutSeconds(cli_awake_timeout_seconds),
+    });
     errdefer {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
@@ -93,6 +116,7 @@ fn runCliWithHome(
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
+        .timeout = awakeTimeoutSeconds(cli_awake_timeout_seconds),
     });
     errdefer {
         allocator.free(result.stdout);
@@ -122,6 +146,111 @@ fn expectErrorEnvelope(root: std.json.Value, command: []const u8, code: []const 
     try std.testing.expectEqualStrings(code, err.get("code").?.string);
     try std.testing.expect(err.get("message").?.string.len != 0);
     try std.testing.expect(err.get("hint").?.string.len != 0);
+}
+
+const config_capability_message =
+    "config revision cannot be activated because it uses an unsupported runtime capability";
+const download_capability_hint =
+    "retry without `-d` to retain an inactive revision; inspect its raw source with " ++
+    "`zc config dump -c <name> --no-override`, then fix the subscription source";
+const update_capability_hint =
+    "fix the subscription source, then retry `zc config update <name>`";
+const use_capability_hint =
+    "inspect the retained raw source with `zc config dump -c <name> --no-override`; " ++
+    "fix the subscription source, then retry";
+const source_resource_limit_message =
+    "config exceeds resource limits: 4096 proxies, 1024 proxy groups, " ++
+    "5120 mixed entries, or 5122 members per group";
+const source_resource_limit_hint =
+    "remove unused proxies, groups, members, or subscription banner entries and retry";
+const yaml_collection_entry_limit_message =
+    "config exceeds the global limit of 262144 decoded YAML collection entries";
+const yaml_collection_entry_limit_hint =
+    "remove unused YAML mapping entries or sequence items, including unknown extension data, and retry";
+const rule_provider_count_limit_message =
+    "config exceeds the limit of 4096 rule providers";
+const rule_provider_count_limit_hint =
+    "remove unused rule-provider declarations and retry";
+
+fn expectCapabilityError(
+    root: std.json.Value,
+    command: []const u8,
+    expected_hint: []const u8,
+) !void {
+    try expectErrorEnvelope(root, command, "CONFIG_CAPABILITY_UNSUPPORTED");
+    const capability_error = root.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        config_capability_message,
+        capability_error.get("message").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        expected_hint,
+        capability_error.get("hint").?.string,
+    );
+}
+
+fn expectResourceLimitError(
+    root: std.json.Value,
+    command: []const u8,
+    code: []const u8,
+) !void {
+    try expectErrorEnvelope(root, command, code);
+    const resource_error = root.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        source_resource_limit_message,
+        resource_error.get("message").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        source_resource_limit_hint,
+        resource_error.get("hint").?.string,
+    );
+}
+
+fn expectRuleProviderCountLimitError(
+    root: std.json.Value,
+    command: []const u8,
+    code: []const u8,
+) !void {
+    try expectErrorEnvelope(root, command, code);
+    const limit_error = root.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        rule_provider_count_limit_message,
+        limit_error.get("message").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        rule_provider_count_limit_hint,
+        limit_error.get("hint").?.string,
+    );
+}
+
+fn expectConfigTooLargeError(
+    root: std.json.Value,
+    command: []const u8,
+    code: []const u8,
+    message: []const u8,
+    hint: []const u8,
+) !void {
+    try expectErrorEnvelope(root, command, code);
+    const size_error = root.object.get("error").?.object;
+    try std.testing.expectEqualStrings(message, size_error.get("message").?.string);
+    try std.testing.expectEqualStrings(hint, size_error.get("hint").?.string);
+}
+
+fn expectYamlCollectionEntryLimitError(
+    root: std.json.Value,
+    command: []const u8,
+    code: []const u8,
+) !void {
+    try expectErrorEnvelope(root, command, code);
+    const limit_error = root.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        yaml_collection_entry_limit_message,
+        limit_error.get("message").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        yaml_collection_entry_limit_hint,
+        limit_error.get("hint").?.string,
+    );
 }
 
 /// 写到 cwd（仓库根）下的 .zig-cache，返回 zc 子进程可用的相对路径。
@@ -160,6 +289,354 @@ fn validConfigYaml(allocator: std.mem.Allocator, mixed_port: u16) ![]u8 {
         \\  - MATCH,PROXY
         \\
     , .{mixed_port});
+}
+
+const runtime_ready_managed_config =
+    \\mixed-port: 7890
+    \\proxy-groups:
+    \\  - name: Proxy
+    \\    type: select
+    \\    proxies:
+    \\      - DIRECT
+    \\      - REJECT
+    \\rules:
+    \\  - MATCH,Proxy
+;
+
+const malformed_obfs_managed_config =
+    \\mixed-port: 7890
+    \\proxies:
+    \\  - name: recoverable
+    \\    type: ss
+    \\    server: example.com
+    \\    port: 8388
+    \\    cipher: aes-128-gcm
+    \\    password: secret
+    \\    plugin: obfs
+    \\    plugin-opts: "obfs=http;obfs-host=example.com"
+    \\rules:
+    \\  - MATCH,recoverable
+;
+
+fn makeRepeatedResourceConfig(
+    allocator: std.mem.Allocator,
+    header: []const u8,
+    entry: []const u8,
+    count: usize,
+) ![]u8 {
+    var document = std.ArrayList(u8).empty;
+    errdefer document.deinit(allocator);
+    try document.appendSlice(allocator, header);
+    for (0..count) |_| try document.appendSlice(allocator, entry);
+    return document.toOwnedSlice(allocator);
+}
+
+fn makeProxyCountLimitConfig(allocator: std.mem.Allocator) ![]u8 {
+    return makeRepeatedResourceConfig(
+        allocator,
+        "proxies:\n",
+        "  - { name: node, type: direct }\n",
+        4097,
+    );
+}
+
+fn makeRuleProviderCountLimitConfig(
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var source = std.ArrayList(u8).empty;
+    errdefer source.deinit(allocator);
+    try source.appendSlice(allocator, "rule-providers:\n");
+    for (0..config.rule_provider_count_max + 1) |index| {
+        var line_buffer: [128]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &line_buffer,
+            "  provider-{d}: {{ type: file, behavior: domain, path: p{d}.txt }}\n",
+            .{ index, index },
+        );
+        try source.appendSlice(allocator, line);
+    }
+    try source.appendSlice(allocator, "rules:\n  - MATCH,DIRECT\n");
+    return source.toOwnedSlice(allocator);
+}
+
+fn makeProxyGroupCountLimitConfig(allocator: std.mem.Allocator) ![]u8 {
+    return makeRepeatedResourceConfig(
+        allocator,
+        "proxy-groups:\n",
+        "  - { name: group, type: select, proxies: [DIRECT] }\n",
+        1025,
+    );
+}
+
+fn makeProxyGroupMemberLimitConfig(allocator: std.mem.Allocator) ![]u8 {
+    return makeRepeatedResourceConfig(
+        allocator,
+        "proxy-groups:\n  - name: bounded\n    type: select\n    proxies:\n",
+        "      - DIRECT\n",
+        5123,
+    );
+}
+
+fn makeProxyEntryCountLimitConfig(allocator: std.mem.Allocator) ![]u8 {
+    return makeRepeatedResourceConfig(
+        allocator,
+        "proxies:\n",
+        "  - { name: \"Traffic: quota\", type: direct }\n",
+        5121,
+    );
+}
+
+fn makeYamlCollectionEntryLimitConfig(
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var source = std.ArrayList(u8).empty;
+    errdefer source.deinit(allocator);
+    try source.appendSlice(allocator, "unknown: [");
+    for (0..config.yaml_collection_entry_count_max) |index| {
+        if (index != 0) try source.append(allocator, ',');
+        try source.append(allocator, '0');
+    }
+    try source.appendSlice(allocator, "]\n");
+    return source.toOwnedSlice(allocator);
+}
+
+fn makeConfigSourceTooLarge(allocator: std.mem.Allocator) ![]u8 {
+    const source = try allocator.alloc(u8, config.config_source_bytes_max + 1);
+    @memset(source, ' ');
+    return source;
+}
+
+fn makeOverrideMaterializationTooLargeSource(
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const prefix = "mixed-port: 7890\nsecret: '";
+    const suffix = "'\nrules:\n  - MATCH,DIRECT\n";
+    const escaped_bytes = config.config_source_bytes_max / 2 + 4096;
+    const source = try allocator.alloc(
+        u8,
+        prefix.len + escaped_bytes + suffix.len,
+    );
+    @memcpy(source[0..prefix.len], prefix);
+    @memset(source[prefix.len .. prefix.len + escaped_bytes], '\\');
+    @memcpy(source[prefix.len + escaped_bytes ..], suffix);
+    return source;
+}
+
+fn writeAbsoluteFile(path: []const u8, bytes: []const u8) !void {
+    const file = try compat.fs.createFileAbsolute(path, .{});
+    defer file.close(compat.io());
+    try compat.fileWriteAll(file, bytes);
+}
+
+fn catalogRootPathAlloc(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) ![]u8 {
+    return compat.fs.path.join(allocator, &.{ home, ".config", "zc" });
+}
+
+fn seedDesiredSelection(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    key: []const u8,
+) !void {
+    const root_path = try catalogRootPathAlloc(allocator, home);
+    defer allocator.free(root_path);
+    const root = try compat.fs.openDirAbsolute(root_path, .{
+        .follow_symlinks = false,
+    });
+    defer root.close(compat.io());
+
+    var inspection = try state_authority.Authority.init(allocator, root).inspect();
+    defer inspection.deinit();
+    const revision = switch (inspection) {
+        .catalog_v2 => |*observed| blk: {
+            for (observed.catalog.state.profiles) |profile| {
+                if (std.mem.eql(u8, profile.key, key)) break :blk profile.head;
+            }
+            return error.ManagedProfileNotFound;
+        },
+        .missing, .legacy_v1 => return error.Schema2CatalogRequired,
+    };
+    const receipt = try selection_state.State.init(allocator, root).persist(
+        .{ .key = key, .revision = revision },
+        "Proxy",
+        "DIRECT",
+    );
+    try std.testing.expect(receipt.generation != null);
+    try std.testing.expect(receipt.generation.? > 0);
+}
+
+fn catalogStateBytes(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) ![]u8 {
+    const root_path = try catalogRootPathAlloc(allocator, home);
+    defer allocator.free(root_path);
+    const root = try compat.fs.openDirAbsolute(root_path, .{
+        .follow_symlinks = false,
+    });
+    defer root.close(compat.io());
+    return root.readFileAlloc(
+        compat.io(),
+        "state-v2.json",
+        allocator,
+        .limited(config_catalog.max_catalog_bytes),
+    );
+}
+
+const RevisionObjectPaths = struct {
+    allocator: std.mem.Allocator,
+    identity: []const u8,
+    source: []const u8,
+    manifest: []const u8,
+
+    fn deinit(self: *RevisionObjectPaths) void {
+        self.allocator.free(self.identity);
+        self.allocator.free(self.source);
+        self.allocator.free(self.manifest);
+        self.* = undefined;
+    }
+};
+
+fn exactRevisionObjectPaths(
+    allocator: std.mem.Allocator,
+    root: std.Io.Dir,
+    key: []const u8,
+) !RevisionObjectPaths {
+    var inspection = try state_authority.Authority.init(allocator, root).inspect();
+    defer inspection.deinit();
+    const identity = switch (inspection) {
+        .catalog_v2 => |*observed| blk: {
+            for (observed.catalog.state.profiles) |profile| {
+                if (std.mem.eql(u8, profile.key, key)) break :blk .{
+                    .storage_id = profile.storage_id,
+                    .revision = profile.head,
+                };
+            }
+            return error.ManagedProfileNotFound;
+        },
+        .missing, .legacy_v1 => return error.Schema2CatalogRequired,
+    };
+    var storage_hex: [64]u8 = undefined;
+    var revision_hex: [32]u8 = undefined;
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "profiles/{s}/revisions/{s}",
+        .{
+            identity.storage_id.formatHex(&storage_hex),
+            identity.revision.formatHex(&revision_hex),
+        },
+    );
+    defer allocator.free(prefix);
+    const identity_path = try std.fmt.allocPrint(
+        allocator,
+        "profiles/{s}/identity.json",
+        .{identity.storage_id.formatHex(&storage_hex)},
+    );
+    errdefer allocator.free(identity_path);
+    const source_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/source.yaml",
+        .{prefix},
+    );
+    errdefer allocator.free(source_path);
+    return .{
+        .allocator = allocator,
+        .identity = identity_path,
+        .source = source_path,
+        .manifest = try std.fmt.allocPrint(
+            allocator,
+            "{s}/manifest.json",
+            .{prefix},
+        ),
+    };
+}
+
+fn overwriteCatalogObject(
+    root: std.Io.Dir,
+    path: []const u8,
+    bytes: []const u8,
+) !void {
+    const file = try root.createFile(compat.io(), path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(compat.io());
+    if (builtin.os.tag != .windows) {
+        try file.setPermissions(
+            compat.io(),
+            std.Io.File.Permissions.fromMode(0o600),
+        );
+    }
+    try compat.fileWriteAll(file, bytes);
+}
+
+fn authoritativeStateSnapshot(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    active_key: []const u8,
+) ![]u8 {
+    const bytes = try catalogStateBytes(allocator, home);
+    errdefer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const state = parsed.value.object;
+    try std.testing.expect(state.get("sequence").?.integer > 0);
+    const active = state.get("active").?.object;
+    try std.testing.expectEqualStrings(active_key, active.get("key").?.string);
+    try std.testing.expectEqual(@as(usize, 32), active.get("revision").?.string.len);
+
+    var found_profile = false;
+    for (state.get("profiles").?.array.items) |profile_value| {
+        const profile = profile_value.object;
+        if (!std.mem.eql(u8, profile.get("key").?.string, active_key)) continue;
+        found_profile = true;
+        try std.testing.expectEqual(@as(usize, 32), profile.get("head").?.string.len);
+        const desired = profile.get("desired").?.object;
+        try std.testing.expect(desired.get("generation").?.integer > 0);
+        const selections = desired.get("selections").?.array.items;
+        try std.testing.expect(selections.len > 0);
+        try std.testing.expectEqualStrings(
+            "Proxy",
+            selections[0].object.get("group").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "DIRECT",
+            selections[0].object.get("proxy").?.string,
+        );
+    }
+    try std.testing.expect(found_profile);
+    return bytes;
+}
+
+fn expectAuthoritativeStateUnchanged(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    active_key: []const u8,
+    before: []const u8,
+) !void {
+    const after = try authoritativeStateSnapshot(allocator, home, active_key);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+fn loadBaselineWithDesiredSelection(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !void {
+    const source_path = try compat.fs.path.join(allocator, &.{ home, "baseline.yaml" });
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(source_path, runtime_ready_managed_config);
+    var loaded = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), loaded.code);
+    try seedDesiredSelection(allocator, home, "baseline");
 }
 
 /// 绑定再立刻释放一个端口：拿到“几乎必然无人监听”的端口号。
@@ -538,64 +1015,774 @@ test "integration: zc doctor text keeps frozen labels and exit 0 on healthy conf
 }
 
 // ---------------------------------------------------------------------------
-// 本地 HTTP 应答器：让连通性探测（curl 经“代理”端口）在沙箱内可确定成功。
+// 本地 HTTP 应答器：配置订阅与连通性探测都只访问测试沙箱。
 // ---------------------------------------------------------------------------
+
+const fixture_listener_poll_ms: i64 = 100;
+const fixture_connection_timeout_ms: i64 = 5000;
+const fixture_socket_none: std.posix.fd_t = -1;
+
+const ResponderStartOptions = struct {
+    inject_thread_spawn_failure: bool = false,
+    observed_port: ?*u16 = null,
+};
+
+const FixtureDeadline = struct {
+    expires_ms: i64,
+
+    fn init(timeout_ms: i64) FixtureDeadline {
+        std.debug.assert(timeout_ms > 0);
+        return .{
+            .expires_ms = std.math.add(
+                i64,
+                compat.monotonicMilliTimestamp(),
+                timeout_ms,
+            ) catch std.math.maxInt(i64),
+        };
+    }
+
+    fn remaining(self: FixtureDeadline) !i32 {
+        const now_ms = compat.monotonicMilliTimestamp();
+        if (now_ms >= self.expires_ms) return error.DeadlineExceeded;
+        const remaining_ms = std.math.sub(
+            i64,
+            self.expires_ms,
+            now_ms,
+        ) catch return error.DeadlineExceeded;
+        return @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+    }
+};
+
+fn fixtureWaitForEvents(
+    fd: std.posix.fd_t,
+    requested: i16,
+    deadline: FixtureDeadline,
+) !i16 {
+    while (true) {
+        var descriptors = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = requested,
+            .revents = 0,
+        }};
+        const result = std.c.poll(
+            descriptors[0..].ptr,
+            @intCast(descriptors.len),
+            try deadline.remaining(),
+        );
+        if (result < 0) {
+            switch (std.c.errno(result)) {
+                .INTR => continue,
+                .NOMEM => return error.SystemResources,
+                else => return error.PollFailed,
+            }
+        }
+        if (result == 0) continue;
+        const events = descriptors[0].revents;
+        if (events & std.posix.POLL.NVAL != 0) return error.InvalidSocket;
+        if (events &
+            (requested | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0)
+        {
+            return events;
+        }
+        return error.UnexpectedPollEvent;
+    }
+}
+
+fn fixtureWriteAllWithinStop(
+    fd: std.posix.fd_t,
+    bytes: []const u8,
+    deadline: FixtureDeadline,
+    stop_flag: ?*const std.atomic.Value(bool),
+    backpressure_observed: ?*std.atomic.Value(bool),
+) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        if (stop_flag) |flag| {
+            if (flag.load(.acquire)) return error.ResponderStopped;
+        }
+        // Check the same monotonic absolute deadline before every send attempt,
+        // including retries after EINTR, partial writes, and writable sockets.
+        _ = try deadline.remaining();
+        const flags: u32 = if (@hasDecl(std.c.MSG, "NOSIGNAL"))
+            @intCast(std.c.MSG.NOSIGNAL)
+        else
+            0;
+        const result = std.c.send(
+            fd,
+            bytes[offset..].ptr,
+            bytes.len - offset,
+            flags,
+        );
+        if (result < 0) {
+            switch (std.c.errno(result)) {
+                .INTR => continue,
+                // Zig exposes the equal EAGAIN/EWOULDBLOCK errno as AGAIN.
+                .AGAIN => {
+                    if (backpressure_observed) |observed| {
+                        observed.store(true, .release);
+                    }
+                    _ = try fixtureWaitForEvents(
+                        fd,
+                        std.posix.POLL.OUT,
+                        deadline,
+                    );
+                    continue;
+                },
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .BADF => return error.NotOpenForWriting,
+                else => return error.SocketWriteFailed,
+            }
+        }
+        if (result == 0) return error.WriteZero;
+        const count: usize = @intCast(result);
+        if (count > bytes.len - offset) return error.InvalidWriteCount;
+        offset = std.math.add(usize, offset, count) catch
+            return error.LengthOverflow;
+    }
+}
+
+fn fixtureWriteAllWithin(
+    fd: std.posix.fd_t,
+    bytes: []const u8,
+    deadline: FixtureDeadline,
+) !void {
+    return fixtureWriteAllWithinStop(fd, bytes, deadline, null, null);
+}
+
+fn fixtureConfigureRawSendSocket(fd: std.posix.fd_t) !void {
+    if (comptime builtin.os.tag.isDarwin() and
+        @hasDecl(std.c.SO, "NOSIGPIPE"))
+    {
+        var enabled: c_int = 1;
+        if (std.c.setsockopt(
+            fd,
+            std.c.SOL.SOCKET,
+            std.c.SO.NOSIGPIPE,
+            std.mem.asBytes(&enabled),
+            @sizeOf(c_int),
+        ) != 0) return error.SocketSetupFailed;
+    }
+}
+
+fn fixtureExpectNoSigpipe(fd: std.posix.fd_t) !void {
+    if (comptime !builtin.os.tag.isDarwin() or
+        !@hasDecl(std.c.SO, "NOSIGPIPE")) return;
+
+    var enabled: c_int = 0;
+    var enabled_size: std.c.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(
+        fd,
+        std.c.SOL.SOCKET,
+        std.c.SO.NOSIGPIPE,
+        std.mem.asBytes(&enabled).ptr,
+        &enabled_size,
+    ) != 0) return error.SocketOptionFailed;
+    try std.testing.expectEqual(@as(c_int, 1), enabled);
+}
+
+fn fixtureConnectWithin(
+    address: compat.net.Address,
+    deadline: FixtureDeadline,
+) !compat.net.Stream {
+    const fd = std.c.socket(
+        std.c.AF.INET,
+        std.c.SOCK.STREAM,
+        std.c.IPPROTO.TCP,
+    );
+    if (fd < 0) return error.SocketSetupFailed;
+    errdefer _ = std.c.close(fd);
+    try fixtureConfigureRawSendSocket(fd);
+    try compat.setNonBlock(fd);
+    const socket_address = address.in.sa;
+    while (true) {
+        const result = std.c.connect(
+            fd,
+            @ptrCast(&socket_address),
+            @sizeOf(std.c.sockaddr.in),
+        );
+        if (result == 0) return .{ .handle = fd };
+        switch (std.c.errno(result)) {
+            .INTR => continue,
+            .ISCONN => return .{ .handle = fd },
+            .INPROGRESS, .ALREADY, .AGAIN => break,
+            .CONNREFUSED => return error.ConnectionRefused,
+            else => return error.ConnectFailed,
+        }
+    }
+    _ = try fixtureWaitForEvents(fd, std.posix.POLL.OUT, deadline);
+    var socket_error: c_int = 0;
+    var socket_error_size: std.c.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(
+        fd,
+        std.c.SOL.SOCKET,
+        std.c.SO.ERROR,
+        &socket_error,
+        &socket_error_size,
+    ) != 0) return error.ConnectFailed;
+    if (socket_error != 0) return error.ConnectFailed;
+    return .{ .handle = fd };
+}
+
+fn fixtureReadHttpRequest(
+    fd: std.posix.fd_t,
+    buffer: []u8,
+    stop_flag: *const std.atomic.Value(bool),
+) !void {
+    const deadline = FixtureDeadline.init(fixture_connection_timeout_ms);
+    var used: usize = 0;
+    while (used < buffer.len) {
+        if (stop_flag.load(.acquire)) return error.ResponderStopped;
+        _ = try fixtureWaitForEvents(fd, std.posix.POLL.IN, deadline);
+        const result = std.c.recv(fd, buffer[used..].ptr, buffer.len - used, 0);
+        if (result < 0) {
+            switch (std.c.errno(result)) {
+                .INTR, .AGAIN => continue,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .BADF => return error.NotOpenForReading,
+                else => return error.SocketReadFailed,
+            }
+        }
+        if (result == 0) return error.UnexpectedEndOfStream;
+        used = std.math.add(usize, used, @intCast(result)) catch
+            return error.LengthOverflow;
+        if (std.mem.indexOf(u8, buffer[0..used], "\r\n\r\n") != null) return;
+    }
+    return error.RequestTooLarge;
+}
+
+fn fixtureClaimActiveFd(
+    active_fd: *std.atomic.Value(std.posix.fd_t),
+    active_lock: *std.Io.Mutex,
+    stop_flag: *const std.atomic.Value(bool),
+    fd: std.posix.fd_t,
+) bool {
+    active_lock.lockUncancelable(compat.io());
+    defer active_lock.unlock(compat.io());
+    if (stop_flag.load(.acquire)) return false;
+    std.debug.assert(active_fd.load(.acquire) == fixture_socket_none);
+    active_fd.store(fd, .release);
+    return true;
+}
+
+fn fixtureReleaseActiveFd(
+    active_fd: *std.atomic.Value(std.posix.fd_t),
+    active_lock: *std.Io.Mutex,
+    fd: std.posix.fd_t,
+) void {
+    active_lock.lockUncancelable(compat.io());
+    defer active_lock.unlock(compat.io());
+    std.debug.assert(active_fd.load(.acquire) == fd);
+    active_fd.store(fixture_socket_none, .release);
+    _ = std.c.close(fd);
+}
+
+fn fixtureWakeActiveFd(
+    active_fd: *std.atomic.Value(std.posix.fd_t),
+    active_lock: *std.Io.Mutex,
+) void {
+    active_lock.lockUncancelable(compat.io());
+    defer active_lock.unlock(compat.io());
+    const fd = active_fd.load(.acquire);
+    if (fd == fixture_socket_none) return;
+    for (0..4) |_| {
+        const result = std.c.shutdown(fd, std.c.SHUT.RDWR);
+        if (result == 0) return;
+        switch (std.c.errno(result)) {
+            .INTR => continue,
+            .BADF, .INVAL, .NOTCONN => return,
+            else => return,
+        }
+    }
+}
+
+fn fixtureWaitForActiveFd(
+    active_fd: *const std.atomic.Value(std.posix.fd_t),
+    timeout_ms: i64,
+) !void {
+    const deadline = FixtureDeadline.init(timeout_ms);
+    while (true) {
+        if (active_fd.load(.acquire) != fixture_socket_none) return;
+        const remaining_ms = try deadline.remaining();
+        compat.sleepNs(
+            @as(u64, @intCast(@min(remaining_ms, 1))) *
+                std.time.ns_per_ms,
+        );
+    }
+}
+
+fn fixtureWaitForTrueUntil(
+    value: *const std.atomic.Value(bool),
+    deadline: FixtureDeadline,
+) !void {
+    while (true) {
+        if (value.load(.acquire)) return;
+        const remaining_ms = try deadline.remaining();
+        compat.sleepNs(
+            @as(u64, @intCast(@min(remaining_ms, 1))) *
+                std.time.ns_per_ms,
+        );
+    }
+}
+
+fn fixtureWaitForTrue(
+    value: *const std.atomic.Value(bool),
+    timeout_ms: i64,
+) !void {
+    try fixtureWaitForTrueUntil(value, FixtureDeadline.init(timeout_ms));
+}
+
+const ConfigHttpResponder = struct {
+    listener: compat.net.ReuseAddrListener,
+    thread: std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    active_fd: std.atomic.Value(std.posix.fd_t),
+    active_lock: std.Io.Mutex,
+    request_index: std.atomic.Value(usize),
+    response_started: std.atomic.Value(bool),
+    backpressure_observed: std.atomic.Value(bool),
+    responses: []const []const u8,
+
+    fn start(responses: []const []const u8) !*ConfigHttpResponder {
+        return startWithOptions(responses, .{});
+    }
+
+    fn startWithOptions(
+        responses: []const []const u8,
+        options: ResponderStartOptions,
+    ) !*ConfigHttpResponder {
+        std.debug.assert(responses.len > 0);
+        const self = try std.heap.page_allocator.create(ConfigHttpResponder);
+        errdefer std.heap.page_allocator.destroy(self);
+        const address = try compat.net.Address.parseIp4("127.0.0.1", 0);
+        const listener = try compat.net.listenReuseAddr(address);
+        self.* = .{
+            .listener = listener,
+            .thread = undefined,
+            .stop_flag = .init(false),
+            .active_fd = .init(fixture_socket_none),
+            .active_lock = .init,
+            .request_index = .init(0),
+            .response_started = .init(false),
+            .backpressure_observed = .init(false),
+            .responses = responses,
+        };
+        errdefer self.listener.deinit();
+        try compat.setNonBlock(self.listener.fd);
+        if (options.observed_port) |observed| observed.* = self.port();
+        if (options.inject_thread_spawn_failure) {
+            return error.InjectedThreadSpawnFailure;
+        }
+        self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
+        return self;
+    }
+
+    fn port(self: *const ConfigHttpResponder) u16 {
+        return self.listener.listen_address.getPort();
+    }
+
+    fn urlAlloc(
+        self: *ConfigHttpResponder,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        return std.fmt.allocPrint(
+            allocator,
+            "http://127.0.0.1:{d}/config.yaml",
+            .{self.port()},
+        );
+    }
+
+    fn waitForResponseStart(
+        self: *const ConfigHttpResponder,
+        timeout_ms: i64,
+    ) !void {
+        try fixtureWaitForTrue(&self.response_started, timeout_ms);
+    }
+
+    fn waitForBackpressure(
+        self: *const ConfigHttpResponder,
+        deadline: FixtureDeadline,
+    ) !void {
+        try fixtureWaitForTrueUntil(&self.backpressure_observed, deadline);
+    }
+
+    fn stop(self: *ConfigHttpResponder) void {
+        self.stop_flag.store(true, .release);
+        fixtureWakeActiveFd(&self.active_fd, &self.active_lock);
+        self.thread.join();
+        std.debug.assert(
+            self.active_fd.load(.acquire) == fixture_socket_none,
+        );
+        self.listener.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn serveLoop(self: *ConfigHttpResponder) void {
+        while (true) {
+            if (self.stop_flag.load(.acquire)) return;
+            _ = fixtureWaitForEvents(
+                self.listener.fd,
+                std.posix.POLL.IN,
+                FixtureDeadline.init(fixture_listener_poll_ms),
+            ) catch |err| switch (err) {
+                error.DeadlineExceeded => continue,
+                else => return,
+            };
+            if (self.stop_flag.load(.acquire)) return;
+            const connection = self.listener.accept() catch |err| switch (err) {
+                error.WouldBlock, error.ConnectionAborted => continue,
+                else => return,
+            };
+            const fd = connection.stream.handle;
+            fixtureConfigureRawSendSocket(fd) catch {
+                _ = std.c.close(fd);
+                continue;
+            };
+            compat.setNonBlock(fd) catch {
+                _ = std.c.close(fd);
+                continue;
+            };
+            if (!fixtureClaimActiveFd(
+                &self.active_fd,
+                &self.active_lock,
+                &self.stop_flag,
+                fd,
+            )) {
+                _ = std.c.close(fd);
+                return;
+            }
+            self.serveConnection(fd);
+            fixtureReleaseActiveFd(
+                &self.active_fd,
+                &self.active_lock,
+                fd,
+            );
+        }
+    }
+
+    fn serveConnection(
+        self: *ConfigHttpResponder,
+        fd: std.posix.fd_t,
+    ) void {
+        var request_buffer: [4096]u8 = undefined;
+        fixtureReadHttpRequest(
+            fd,
+            &request_buffer,
+            &self.stop_flag,
+        ) catch return;
+        const request_index = self.request_index.fetchAdd(1, .monotonic);
+        const response_index = @min(request_index, self.responses.len - 1);
+        const response_body = self.responses[response_index];
+        var header_buffer: [256]u8 = undefined;
+        const header = std.fmt.bufPrint(
+            &header_buffer,
+            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n" ++
+                "Content-Type: application/yaml\r\nConnection: close\r\n\r\n",
+            .{response_body.len},
+        ) catch return;
+        self.response_started.store(true, .release);
+        const deadline = FixtureDeadline.init(fixture_connection_timeout_ms);
+        fixtureWriteAllWithinStop(
+            fd,
+            header,
+            deadline,
+            &self.stop_flag,
+            &self.backpressure_observed,
+        ) catch return;
+        fixtureWriteAllWithinStop(
+            fd,
+            response_body,
+            deadline,
+            &self.stop_flag,
+            &self.backpressure_observed,
+        ) catch return;
+    }
+};
 
 const HttpResponder = struct {
     listener: compat.net.ReuseAddrListener,
     thread: std.Thread,
     stop_flag: std.atomic.Value(bool),
+    active_fd: std.atomic.Value(std.posix.fd_t),
+    active_lock: std.Io.Mutex,
 
     fn start() !*HttpResponder {
+        return startWithOptions(.{});
+    }
+
+    fn startWithOptions(
+        options: ResponderStartOptions,
+    ) !*HttpResponder {
         const self = try std.heap.page_allocator.create(HttpResponder);
         errdefer std.heap.page_allocator.destroy(self);
-        const addr = try compat.net.Address.parseIp4("127.0.0.1", 0);
-        self.listener = try compat.net.listenReuseAddr(addr);
-        self.stop_flag = std.atomic.Value(bool).init(false);
+        const address = try compat.net.Address.parseIp4("127.0.0.1", 0);
+        const listener = try compat.net.listenReuseAddr(address);
+        self.* = .{
+            .listener = listener,
+            .thread = undefined,
+            .stop_flag = .init(false),
+            .active_fd = .init(fixture_socket_none),
+            .active_lock = .init,
+        };
+        errdefer self.listener.deinit();
+        try compat.setNonBlock(self.listener.fd);
+        if (options.observed_port) |observed| observed.* = self.port();
+        if (options.inject_thread_spawn_failure) {
+            return error.InjectedThreadSpawnFailure;
+        }
         self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
         return self;
     }
 
-    fn port(self: *HttpResponder) u16 {
+    fn port(self: *const HttpResponder) u16 {
         return self.listener.listen_address.getPort();
     }
 
+    fn waitForActiveConnection(
+        self: *const HttpResponder,
+        timeout_ms: i64,
+    ) !void {
+        try fixtureWaitForActiveFd(&self.active_fd, timeout_ms);
+    }
+
     fn stop(self: *HttpResponder) void {
-        // serveLoop polls the listener with a timeout and re-checks stop_flag, so
-        // setting the flag is enough to make it return — no need to wake a blocking
-        // accept() with a self-connect. The old self-connect wake was best-effort
-        // (其错误被 else |_| 吞掉); under full-suite load it could fail to wake the
-        // accept(), leaving this join() deadlocked forever (worker parked in
-        // inet_csk_accept, main in join). Flag + bounded poll removes that race.
-        self.stop_flag.store(true, .seq_cst);
+        self.stop_flag.store(true, .release);
+        fixtureWakeActiveFd(&self.active_fd, &self.active_lock);
         self.thread.join();
+        std.debug.assert(
+            self.active_fd.load(.acquire) == fixture_socket_none,
+        );
         self.listener.deinit();
         std.heap.page_allocator.destroy(self);
     }
 
     fn serveLoop(self: *HttpResponder) void {
         while (true) {
-            if (self.stop_flag.load(.seq_cst)) return;
-            // Wait for a pending connection with a 100ms timeout instead of a bare
-            // blocking accept(), so a concurrent stop() is noticed within one tick.
-            var fds = [_]std.posix.pollfd{.{
-                .fd = self.listener.fd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = std.posix.poll(&fds, 100) catch return;
-            if (ready == 0) continue; // timeout: loop back and re-check stop_flag
-            const conn = self.listener.accept() catch continue;
-            var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            conn.stream.writeAll(
-                "HTTP/1.1 204 No Content\r\n" ++
-                    "Content-Length: 0\r\nConnection: close\r\n\r\n",
-            ) catch {};
-            conn.stream.close();
+            if (self.stop_flag.load(.acquire)) return;
+            _ = fixtureWaitForEvents(
+                self.listener.fd,
+                std.posix.POLL.IN,
+                FixtureDeadline.init(fixture_listener_poll_ms),
+            ) catch |err| switch (err) {
+                error.DeadlineExceeded => continue,
+                else => return,
+            };
+            if (self.stop_flag.load(.acquire)) return;
+            const connection = self.listener.accept() catch |err| switch (err) {
+                error.WouldBlock, error.ConnectionAborted => continue,
+                else => return,
+            };
+            const fd = connection.stream.handle;
+            fixtureConfigureRawSendSocket(fd) catch {
+                _ = std.c.close(fd);
+                continue;
+            };
+            compat.setNonBlock(fd) catch {
+                _ = std.c.close(fd);
+                continue;
+            };
+            if (!fixtureClaimActiveFd(
+                &self.active_fd,
+                &self.active_lock,
+                &self.stop_flag,
+                fd,
+            )) {
+                _ = std.c.close(fd);
+                return;
+            }
+            self.serveConnection(fd);
+            fixtureReleaseActiveFd(
+                &self.active_fd,
+                &self.active_lock,
+                fd,
+            );
         }
     }
+
+    fn serveConnection(
+        self: *HttpResponder,
+        fd: std.posix.fd_t,
+    ) void {
+        var request_buffer: [4096]u8 = undefined;
+        fixtureReadHttpRequest(
+            fd,
+            &request_buffer,
+            &self.stop_flag,
+        ) catch return;
+        fixtureWriteAllWithinStop(
+            fd,
+            "HTTP/1.1 204 No Content\r\n" ++
+                "Content-Length: 0\r\nConnection: close\r\n\r\n",
+            FixtureDeadline.init(fixture_connection_timeout_ms),
+            &self.stop_flag,
+            null,
+        ) catch return;
+    }
 };
+
+test "HTTP fixture listener cleanup runs when thread spawn fails" {
+    var config_port: u16 = 0;
+    try std.testing.expectError(
+        error.InjectedThreadSpawnFailure,
+        ConfigHttpResponder.startWithOptions(&.{"ok\n"}, .{
+            .inject_thread_spawn_failure = true,
+            .observed_port = &config_port,
+        }),
+    );
+    const config_address = try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        config_port,
+    );
+    var config_listener = try compat.net.listenReuseAddr(config_address);
+    config_listener.deinit();
+
+    var probe_port: u16 = 0;
+    try std.testing.expectError(
+        error.InjectedThreadSpawnFailure,
+        HttpResponder.startWithOptions(.{
+            .inject_thread_spawn_failure = true,
+            .observed_port = &probe_port,
+        }),
+    );
+    const probe_address = try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        probe_port,
+    );
+    var probe_listener = try compat.net.listenReuseAddr(probe_address);
+    probe_listener.deinit();
+}
+
+test "HTTP fixture stop wakes a stalled accepted request" {
+    var responder = try HttpResponder.start();
+    var stopped = false;
+    defer if (!stopped) responder.stop();
+    const address = try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        responder.port(),
+    );
+    const client = try fixtureConnectWithin(
+        address,
+        FixtureDeadline.init(500),
+    );
+    defer client.close();
+    try responder.waitForActiveConnection(1000);
+
+    const started_ms = compat.monotonicMilliTimestamp();
+    responder.stop();
+    stopped = true;
+    try std.testing.expect(
+        compat.monotonicMilliTimestamp() - started_ms < 3000,
+    );
+}
+
+test "fixture write rejects an expired deadline before a writable one-byte send" {
+    var descriptors: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(
+            @intCast(std.posix.AF.UNIX),
+            @intCast(std.posix.SOCK.STREAM),
+            0,
+            &descriptors,
+        ),
+    );
+    defer _ = std.c.close(descriptors[0]);
+    defer _ = std.c.close(descriptors[1]);
+    try fixtureConfigureRawSendSocket(descriptors[0]);
+
+    var writable = [_]std.posix.pollfd{.{
+        .fd = descriptors[0],
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try std.posix.poll(&writable, 0),
+    );
+    try std.testing.expect(writable[0].revents & std.posix.POLL.OUT != 0);
+
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        fixtureWriteAllWithinStop(
+            descriptors[0],
+            "x",
+            .{ .expires_ms = compat.monotonicMilliTimestamp() },
+            null,
+            null,
+        ),
+    );
+
+    var readable = [_]std.posix.pollfd{.{
+        .fd = descriptors[1],
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try std.posix.poll(&readable, 0),
+    );
+}
+
+test "config HTTP fixture raw-send sockets suppress SIGPIPE on macOS" {
+    var responder = try ConfigHttpResponder.start(&.{"ok\n"});
+    var stopped = false;
+    defer if (!stopped) responder.stop();
+    const deadline = FixtureDeadline.init(2000);
+    const address = try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        responder.port(),
+    );
+    const client = try fixtureConnectWithin(address, deadline);
+    defer client.close();
+    try fixtureWaitForActiveFd(&responder.active_fd, try deadline.remaining());
+
+    try fixtureExpectNoSigpipe(client.handle);
+    const accepted_fd = responder.active_fd.load(.acquire);
+    try std.testing.expect(accepted_fd != fixture_socket_none);
+    try fixtureExpectNoSigpipe(accepted_fd);
+
+    responder.stop();
+    stopped = true;
+    _ = try deadline.remaining();
+}
+
+test "config HTTP fixture stop wakes a backpressured response" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.alloc(u8, config.config_source_bytes_max);
+    defer allocator.free(body);
+    @memset(body, 'x');
+    var responder = try ConfigHttpResponder.start(&.{body});
+    var stopped = false;
+    defer if (!stopped) responder.stop();
+    const total_deadline = FixtureDeadline.init(5000);
+    const address = try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        responder.port(),
+    );
+    const client = try fixtureConnectWithin(address, total_deadline);
+    defer client.close();
+    var receive_buffer_bytes: c_int = 1024;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.setsockopt(
+            client.handle,
+            std.c.SOL.SOCKET,
+            std.c.SO.RCVBUF,
+            std.mem.asBytes(&receive_buffer_bytes),
+            @sizeOf(c_int),
+        ),
+    );
+    try fixtureWriteAllWithin(
+        client.handle,
+        "GET /config.yaml HTTP/1.1\r\nHost: local\r\n\r\n",
+        total_deadline,
+    );
+    try responder.waitForBackpressure(total_deadline);
+
+    responder.stop();
+    stopped = true;
+    _ = try total_deadline.remaining();
+}
 
 fn connectController(port: u16) !compat.net.Stream {
     const address = try compat.net.Address.parseIp4("127.0.0.1", port);
@@ -747,7 +1934,935 @@ test "integration: special pid files fail without blocking" {
     try expectErrorEnvelope(envelope.value, "status", "STATUS_FAILED");
 }
 
-test "integration: incompatible legacy config migrates for inspection but cannot start" {
+test "integration: config load reports proxy count limit without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeProxyCountLimitConfig(allocator);
+    defer allocator.free(oversized);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "too-many-proxies.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(source_path, oversized);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectResourceLimitError(
+        rejected_envelope.value,
+        "config load",
+        "CONFIG_LOAD_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config load maps rule-provider count limit without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeRuleProviderCountLimitConfig(allocator);
+    defer allocator.free(oversized);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "too-many-rule-providers.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(source_path, oversized);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer envelope.deinit();
+    try expectRuleProviderCountLimitError(
+        envelope.value,
+        "config load",
+        "CONFIG_LOAD_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config load maps global YAML collection entry limit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeYamlCollectionEntryLimitConfig(allocator);
+    defer allocator.free(oversized);
+    try std.testing.expect(oversized.len < 1024 * 1024);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "too-many-yaml-entries.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(source_path, oversized);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectYamlCollectionEntryLimitError(
+        rejected_envelope.value,
+        "config load",
+        "CONFIG_LOAD_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config download maps rule-provider count limit without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeRuleProviderCountLimitConfig(allocator);
+    defer allocator.free(oversized);
+    var responder = try ConfigHttpResponder.start(&.{oversized});
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{
+            "config",
+            "download",
+            url,
+            "-n",
+            "too-many-rule-providers",
+            "--json",
+        },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer envelope.deinit();
+    try expectRuleProviderCountLimitError(
+        envelope.value,
+        "config download",
+        "CONFIG_DOWNLOAD_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config download reports group count limit without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeProxyGroupCountLimitConfig(allocator);
+    defer allocator.free(oversized);
+    var responder = try ConfigHttpResponder.start(&.{oversized});
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{
+            "config",
+            "download",
+            url,
+            "-n",
+            "too-many-groups",
+            "--json",
+        },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectResourceLimitError(
+        rejected_envelope.value,
+        "config download",
+        "CONFIG_DOWNLOAD_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config update maps rule-provider count limit without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const oversized = try makeRuleProviderCountLimitConfig(allocator);
+    defer allocator.free(oversized);
+    var responder = try ConfigHttpResponder.start(&.{
+        runtime_ready_managed_config,
+        oversized,
+    });
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+
+    var initial = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "primary", "--json" },
+    );
+    defer initial.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), initial.code);
+    try seedDesiredSelection(allocator, home, "primary");
+    const before = try authoritativeStateSnapshot(allocator, home, "primary");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "update", "primary", "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer envelope.deinit();
+    try expectRuleProviderCountLimitError(
+        envelope.value,
+        "config update",
+        "CONFIG_UPDATE_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "primary",
+        before,
+    );
+}
+
+test "integration: config update reports group member limit without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const oversized = try makeProxyGroupMemberLimitConfig(allocator);
+    defer allocator.free(oversized);
+    var responder = try ConfigHttpResponder.start(&.{
+        runtime_ready_managed_config,
+        oversized,
+    });
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+
+    var initial = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "primary", "--json" },
+    );
+    defer initial.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), initial.code);
+    try seedDesiredSelection(allocator, home, "primary");
+    const before = try authoritativeStateSnapshot(allocator, home, "primary");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "update", "primary", "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectResourceLimitError(
+        rejected_envelope.value,
+        "config update",
+        "CONFIG_UPDATE_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "primary",
+        before,
+    );
+}
+
+test "integration: config download maps mixed proxy entry limit without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeProxyEntryCountLimitConfig(allocator);
+    defer allocator.free(oversized);
+    var responder = try ConfigHttpResponder.start(&.{oversized});
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "too-many-entries", "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            rejected.stderr,
+            "ProxyEntryCountLimitExceeded",
+        ) != null,
+    );
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectResourceLimitError(
+        rejected_envelope.value,
+        "config download",
+        "CONFIG_DOWNLOAD_LIMIT_EXCEEDED",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config load maps 16 MiB plus one without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeConfigSourceTooLarge(allocator);
+    defer allocator.free(oversized);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "too-large.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(source_path, oversized);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectConfigTooLargeError(
+        rejected_envelope.value,
+        "config load",
+        "CONFIG_LOAD_TOO_LARGE",
+        "local config exceeds the 16 MiB limit",
+        "reduce the complete config source to 16 MiB or less and retry",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config download maps 16 MiB plus one without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    try loadBaselineWithDesiredSelection(allocator, home);
+
+    const oversized = try makeConfigSourceTooLarge(allocator);
+    defer allocator.free(oversized);
+    var responder = try ConfigHttpResponder.start(&.{oversized});
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+    const before = try authoritativeStateSnapshot(allocator, home, "baseline");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "too-large", "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectConfigTooLargeError(
+        rejected_envelope.value,
+        "config download",
+        "CONFIG_DOWNLOAD_TOO_LARGE",
+        "downloaded config exceeds the 16 MiB limit",
+        "reduce the config size and retry",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "baseline",
+        before,
+    );
+}
+
+test "integration: config update maps 16 MiB plus one without state mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+
+    const oversized = try makeConfigSourceTooLarge(allocator);
+    defer allocator.free(oversized);
+    var responder = try ConfigHttpResponder.start(&.{
+        runtime_ready_managed_config,
+        oversized,
+    });
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+    var initial = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "primary", "--json" },
+    );
+    defer initial.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), initial.code);
+    try seedDesiredSelection(allocator, home, "primary");
+    const before = try authoritativeStateSnapshot(allocator, home, "primary");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "update", "primary", "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectConfigTooLargeError(
+        rejected_envelope.value,
+        "config update",
+        "CONFIG_UPDATE_TOO_LARGE",
+        "updated config exceeds the 16 MiB limit",
+        "reduce the config size and retry",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "primary",
+        before,
+    );
+}
+
+test "integration: persisted override update maps materialized size and preserves state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+
+    const expanded = try makeOverrideMaterializationTooLargeSource(allocator);
+    defer allocator.free(expanded);
+    var responder = try ConfigHttpResponder.start(&.{
+        runtime_ready_managed_config,
+        expanded,
+    });
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+
+    var initial = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "primary", "--json" },
+    );
+    defer initial.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), initial.code);
+
+    const script_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "persisted-override.sh" },
+    );
+    defer allocator.free(script_path);
+    try writeAbsoluteFile(
+        script_path,
+        "#!/bin/sh\nprintf 'mixed-port: 9000\\n'\n",
+    );
+    var overridden = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "override", script_path, "--json" },
+    );
+    defer overridden.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), overridden.code);
+    try seedDesiredSelection(allocator, home, "primary");
+
+    const before = try authoritativeStateSnapshot(allocator, home, "primary");
+    defer allocator.free(before);
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "update", "primary", "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectConfigTooLargeError(
+        rejected_envelope.value,
+        "config update",
+        "CONFIG_UPDATE_TOO_LARGE",
+        "updated config exceeds the 16 MiB limit",
+        "reduce the config size and retry",
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "primary",
+        before,
+    );
+}
+
+test "integration: malformed first download stays inactive and -d preserves exact state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+
+    var responder = try ConfigHttpResponder.start(&.{
+        malformed_obfs_managed_config,
+        runtime_ready_managed_config,
+        malformed_obfs_managed_config,
+    });
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+
+    var retained = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "recovery", "--json" },
+    );
+    defer retained.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), retained.code);
+    var retained_envelope = try parseEnvelope(allocator, retained.stdout);
+    defer retained_envelope.deinit();
+    const retained_data = retained_envelope.value.object.get("data").?.object;
+    try std.testing.expectEqualStrings(
+        "recovery",
+        retained_data.get("name").?.string,
+    );
+    try std.testing.expect(!retained_data.get("set_default").?.bool);
+
+    var dumped = try runCliWithHome(
+        allocator,
+        home,
+        &.{
+            "config",
+            "dump",
+            "-c",
+            "recovery",
+            "--no-override",
+        },
+    );
+    defer dumped.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), dumped.code);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        dumped.stdout,
+        "plugin-opts: \"obfs=http;obfs-host=example.com\"",
+    ) != null);
+    var inspected = try config.parseCatalogDocument(allocator, dumped.stdout);
+    defer inspected.deinit();
+    try std.testing.expectEqual(
+        config.ProxySemanticState.malformed,
+        inspected.proxies.items[0].semantic_state,
+    );
+
+    var listed = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "list", "--json" },
+    );
+    defer listed.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), listed.code);
+    var list_envelope = try parseEnvelope(allocator, listed.stdout);
+    defer list_envelope.deinit();
+    const list_data = list_envelope.value.object.get("data").?.object;
+    try std.testing.expect(
+        list_data.get("active") == null or list_data.get("active").? == .null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        list_data.get("configs").?.array.items.len,
+    );
+
+    var first_ready = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "ready", "--json" },
+    );
+    defer first_ready.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), first_ready.code);
+    var ready_envelope = try parseEnvelope(allocator, first_ready.stdout);
+    defer ready_envelope.deinit();
+    try std.testing.expect(
+        ready_envelope.value.object.get("data").?.object.get(
+            "set_default",
+        ).?.bool,
+    );
+    try seedDesiredSelection(allocator, home, "ready");
+    const before = try authoritativeStateSnapshot(allocator, home, "ready");
+    defer allocator.free(before);
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{
+            "config",
+            "download",
+            url,
+            "-n",
+            "explicit-active",
+            "-d",
+            "--json",
+        },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var rejected_envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer rejected_envelope.deinit();
+    try expectCapabilityError(
+        rejected_envelope.value,
+        "config download",
+        download_capability_hint,
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "ready",
+        before,
+    );
+
+    var ready_list = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "list", "--json" },
+    );
+    defer ready_list.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), ready_list.code);
+    var ready_list_envelope = try parseEnvelope(allocator, ready_list.stdout);
+    defer ready_list_envelope.deinit();
+    const ready_list_data = ready_list_envelope.value.object.get(
+        "data",
+    ).?.object;
+    try std.testing.expectEqualStrings(
+        "ready",
+        ready_list_data.get("active").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        ready_list_data.get("configs").?.array.items.len,
+    );
+}
+
+test "integration: malformed raw dump fails closed for corrupt revision objects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Corruption = enum {
+        identity,
+        source,
+        manifest,
+        unsafe_source_permissions,
+    };
+    const cases = [_]struct {
+        home_name: []const u8,
+        corruption: Corruption,
+    }{
+        .{ .home_name = "identity-home", .corruption = .identity },
+        .{ .home_name = "source-home", .corruption = .source },
+        .{ .home_name = "manifest-home", .corruption = .manifest },
+        .{
+            .home_name = "permissions-home",
+            .corruption = .unsafe_source_permissions,
+        },
+    };
+    var responder = try ConfigHttpResponder.start(&.{
+        malformed_obfs_managed_config,
+    });
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+
+    for (cases) |case| {
+        if (case.corruption == .unsafe_source_permissions and
+            builtin.os.tag == .windows)
+        {
+            continue;
+        }
+        try tmp.dir.createDir(compat.io(), case.home_name, .default_dir);
+        const home = try tmp.dir.realPathFileAlloc(
+            compat.io(),
+            case.home_name,
+            allocator,
+        );
+        defer allocator.free(home);
+        var retained = try runCliWithHome(
+            allocator,
+            home,
+            &.{ "config", "download", url, "-n", "recovery", "--json" },
+        );
+        defer retained.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), retained.code);
+
+        const state_before = try catalogStateBytes(allocator, home);
+        defer allocator.free(state_before);
+        const root_path = try catalogRootPathAlloc(allocator, home);
+        defer allocator.free(root_path);
+        const root = try compat.fs.openDirAbsolute(root_path, .{
+            .follow_symlinks = false,
+        });
+        defer root.close(compat.io());
+        var paths = try exactRevisionObjectPaths(
+            allocator,
+            root,
+            "recovery",
+        );
+        defer paths.deinit();
+        switch (case.corruption) {
+            .identity => try overwriteCatalogObject(
+                root,
+                paths.identity,
+                "raw-secret-never-print: corrupt identity\n",
+            ),
+            .source => try overwriteCatalogObject(
+                root,
+                paths.source,
+                "password: raw-secret-never-print\n",
+            ),
+            .manifest => try overwriteCatalogObject(
+                root,
+                paths.manifest,
+                "{\"raw-secret-never-print\":true}\n",
+            ),
+            .unsafe_source_permissions => {
+                const source = try root.openFile(
+                    compat.io(),
+                    paths.source,
+                    .{},
+                );
+                defer source.close(compat.io());
+                try source.setPermissions(
+                    compat.io(),
+                    std.Io.File.Permissions.fromMode(0o644),
+                );
+            },
+        }
+
+        var rejected = try runCliWithHome(
+            allocator,
+            home,
+            &.{
+                "config",
+                "dump",
+                "-c",
+                "recovery",
+                "--no-override",
+            },
+        );
+        defer rejected.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 1), rejected.code);
+        try std.testing.expectEqualStrings("", rejected.stdout);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rejected.stdout,
+            "raw-secret-never-print",
+        ) == null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rejected.stdout,
+            "password: secret",
+        ) == null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rejected.stdout,
+            "plugin-opts",
+        ) == null);
+        const state_after = try catalogStateBytes(allocator, home);
+        defer allocator.free(state_after);
+        try std.testing.expectEqualStrings(state_before, state_after);
+    }
+}
+
+test "integration: active update and use capability failures preserve exact state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+
+    var responder = try ConfigHttpResponder.start(&.{
+        runtime_ready_managed_config,
+        malformed_obfs_managed_config,
+        malformed_obfs_managed_config,
+    });
+    defer responder.stop();
+    const url = try responder.urlAlloc(allocator);
+    defer allocator.free(url);
+
+    var initial = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "primary", "--json" },
+    );
+    defer initial.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), initial.code);
+    var recovery = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "download", url, "-n", "recovery", "--json" },
+    );
+    defer recovery.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), recovery.code);
+    try seedDesiredSelection(allocator, home, "primary");
+    const before = try authoritativeStateSnapshot(allocator, home, "primary");
+    defer allocator.free(before);
+
+    var rejected_update = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "update", "primary", "--json" },
+    );
+    defer rejected_update.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected_update.code);
+    var update_envelope = try parseEnvelope(allocator, rejected_update.stdout);
+    defer update_envelope.deinit();
+    try expectCapabilityError(
+        update_envelope.value,
+        "config update",
+        update_capability_hint,
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "primary",
+        before,
+    );
+
+    var rejected_use = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "use", "recovery", "--json" },
+    );
+    defer rejected_use.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected_use.code);
+    var use_envelope = try parseEnvelope(allocator, rejected_use.stdout);
+    defer use_envelope.deinit();
+    try expectCapabilityError(
+        use_envelope.value,
+        "config use",
+        use_capability_hint,
+    );
+    try expectAuthoritativeStateUnchanged(
+        allocator,
+        home,
+        "primary",
+        before,
+    );
+}
+
+test "integration: malformed plugin legacy config migrates for inspection but cannot start" {
     const allocator = std.testing.allocator;
     try ensureZcBinary(allocator);
     var tmp = std.testing.tmpDir(.{});
@@ -759,7 +2874,6 @@ test "integration: incompatible legacy config migrates for inspection but cannot
     try tmp.dir.writeFile(compat.io(), .{
         .sub_path = "home/.config/zc/configs/legacy.yaml",
         .data =
-        \\port: 7890
         \\mixed-port: 7891
         \\proxies:
         \\  - name: legacy-obfs
@@ -769,7 +2883,7 @@ test "integration: incompatible legacy config migrates for inspection but cannot
         \\    cipher: aes-128-gcm
         \\    password: test-password
         \\    plugin: obfs
-        \\    udp: true
+        \\    plugin-opts: "obfs=http"
         \\proxy-groups:
         \\  - name: Proxy
         \\    type: select
@@ -851,7 +2965,14 @@ test "integration: incompatible legacy config migrates for inspection but cannot
         &.{ "config", "use", "legacy", "--json" },
     );
     defer selected.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0), selected.code);
+    try std.testing.expectEqual(@as(u8, 1), selected.code);
+    var selected_envelope = try parseEnvelope(allocator, selected.stdout);
+    defer selected_envelope.deinit();
+    try expectCapabilityError(
+        selected_envelope.value,
+        "config use",
+        use_capability_hint,
+    );
 
     var unsupported_start = try runCliWithHome(
         allocator,
@@ -868,7 +2989,7 @@ test "integration: incompatible legacy config migrates for inspection but cannot
     try expectErrorEnvelope(
         unsupported_envelope.value,
         "start",
-        "CONFIG_CAPABILITY_UNSUPPORTED",
+        "START_CONFIG_NOT_SELECTED",
     );
 
     var deleted = try runCliWithHome(
@@ -1302,9 +3423,7 @@ test "integration: startup preserves endpoint validation errors" {
         \\allow-lan: true
         \\bind-address: invalid-address
         \\mixed-port: 7891
-        \\proxies:
-        \\  - name: DIRECT
-        \\    type: direct
+        \\proxies: []
         \\rules:
         \\  - MATCH,DIRECT
         \\
@@ -1348,9 +3467,7 @@ test "integration: startup preserves endpoint validation errors" {
         .data =
         \\mixed-port: 7891
         \\external-controller: localhost:9090
-        \\proxies:
-        \\  - name: DIRECT
-        \\    type: direct
+        \\proxies: []
         \\rules:
         \\  - MATCH,DIRECT
         \\
@@ -1375,6 +3492,88 @@ test "integration: startup preserves endpoint validation errors" {
         controller_envelope.value,
         "start",
         "START_EXTERNAL_CONTROLLER_INVALID",
+    );
+}
+
+test "integration: reserved proxy names fail before outbound dial" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home/.config");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const config_path = try compat.fs.path.join(
+        allocator,
+        &.{ root, "reserved.yaml" },
+    );
+    defer allocator.free(config_path);
+
+    const address = try compat.net.Address.parseIp4("127.0.0.1", 0);
+    var outbound_listener = try compat.net.listenReuseAddr(address);
+    defer outbound_listener.deinit();
+    const mixed_port = try reserveClosedPort();
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nproxies:\n  - name: DIRECT\n    type: ss\n    server: 127.0.0.1\n    port: {d}\n    cipher: aes-128-gcm\n    password: secret\nrules:\n  - MATCH,DIRECT\n",
+        .{ mixed_port, outbound_listener.listen_address.getPort() },
+    );
+    defer allocator.free(source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "reserved.yaml",
+        .data = source,
+    });
+
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            zc_binary,
+            "start",
+            "--foreground",
+            "-c",
+            config_path,
+            "--json",
+        },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromSeconds(5),
+        } },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 1), try exitCode(result.term));
+    var envelope = try parseEnvelope(allocator, result.stdout);
+    defer envelope.deinit();
+    try std.testing.expect(!envelope.value.object.get("ok").?.bool);
+
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = outbound_listener.fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try std.posix.poll(&descriptors, 0),
     );
 }
 
@@ -1410,7 +3609,7 @@ test "integration: provisional startup is not reported as running" {
     const mixed_port = try reserveClosedPort();
     const source = try std.fmt.allocPrint(
         allocator,
-        "mixed-port: {d}\nproxies:\n  - name: DIRECT\n    type: direct\nrules:\n  - MATCH,DIRECT\n",
+        "mixed-port: {d}\nproxies: []\nrules:\n  - MATCH,DIRECT\n",
         .{mixed_port},
     );
     defer allocator.free(source);
@@ -1565,7 +3764,7 @@ test "integration: restart preparation failure keeps the old daemon running" {
     }
     const old_source = try std.fmt.allocPrint(
         allocator,
-        "mixed-port: {d}\nproxies:\n  - name: DIRECT\n    type: direct\nrules:\n  - MATCH,DIRECT\n",
+        "mixed-port: {d}\nproxies: []\nrules:\n  - MATCH,DIRECT\n",
         .{old_port},
     );
     defer allocator.free(old_source);
@@ -2248,11 +4447,7 @@ test "integration: background start returns only after listeners are ready" {
     const source = try std.fmt.allocPrint(allocator,
         \\mixed-port: {d}
         \\external-controller: 127.0.0.1:{d}
-        \\proxies:
-        \\  - name: DIRECT
-        \\    type: direct
-        \\  - name: REJECT
-        \\    type: reject
+        \\proxies: []
         \\proxy-groups:
         \\  - name: Proxy
         \\    type: select
@@ -2885,9 +5080,7 @@ test "integration: background start returns only after listeners are ready" {
     const no_controller_port = try reserveClosedPort();
     const no_controller_source = try std.fmt.allocPrint(allocator,
         \\mixed-port: {d}
-        \\proxies:
-        \\  - name: DIRECT
-        \\    type: direct
+        \\proxies: []
         \\rules:
         \\  - MATCH,DIRECT
         \\
@@ -3167,9 +5360,7 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
         \\mixed-port: {d}
         \\external-controller: 127.0.0.1:{d}
         \\secret: test-secret
-        \\proxies:
-        \\  - name: DIRECT
-        \\    type: direct
+        \\proxies: []
         \\proxy-groups:
         \\  - name: Proxy
         \\    type: select

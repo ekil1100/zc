@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 4 ]; then
-    echo "usage: run-core.sh <zc> <origin> <fixture-dir> <testdata-dir>" >&2
+if [ "$#" -ne 5 ]; then
+    echo "usage: run-core.sh <zc> <origin> <obfs-oracle> <fixture-dir> <testdata-dir>" >&2
     exit 2
 fi
 
 zc_bin="$1"
 origin_bin="$2"
-fixture_dir="$3"
-testdata_dir="$4"
+obfs_oracle_bin="$3"
+fixture_dir="$4"
+testdata_dir="$5"
 ssserver_bin="$fixture_dir/ssserver"
 trojan_bin="$fixture_dir/trojan-go"
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/zc-core-e2e.XXXXXX")"
@@ -20,6 +21,10 @@ origin_ready="$work_root/origin.ready"
 origin_log="$work_root/origin.log"
 fallback_ready="$work_root/fallback.ready"
 fallback_log="$work_root/fallback.log"
+obfs_oracle_obfs_log="$work_root/obfs-oracle-obfs.log"
+obfs_oracle_obfs_error_log="$work_root/obfs-oracle-obfs.error.log"
+obfs_oracle_local_log="$work_root/obfs-oracle-obfs-local.log"
+obfs_oracle_local_error_log="$work_root/obfs-oracle-obfs-local.error.log"
 managed_config="$config_dir/core.yaml"
 unmanaged_config="$config_dir/unmanaged.yaml"
 process_ids=()
@@ -219,6 +224,95 @@ wait_for_log_growth() {
     return 1
 }
 
+obfs_oracle_event_count() {
+    local log_path="$1"
+    local event_name="$2"
+    local endpoint_id="$3"
+    local count
+    count="$(grep -Ec "^E2E_OBFS_ORACLE_${event_name}=${endpoint_id}:" \
+        "$log_path" 2>/dev/null || true)"
+    printf '%s\n' "${count:-0}"
+}
+
+obfs_oracle_raw_count() {
+    obfs_oracle_event_count "$1" RAW_ACCEPTED "$2"
+}
+
+obfs_oracle_verified_count() {
+    obfs_oracle_event_count "$1" VERIFIED "$2"
+}
+
+assert_tcp_closed_now() {
+    local port="$1"
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then
+        exec 3>&- 3<&-
+        echo "Unexpected listener on 127.0.0.1:$port" >&2
+        return 1
+    fi
+}
+
+assert_obfs_preflight_rejected() {
+    local label="$1"
+    local config_path="$2"
+    local mixed_port="$3"
+    local obfs_raw_before obfs_verified_before local_raw_before local_verified_before
+    obfs_raw_before="$(obfs_oracle_raw_count \
+        "$obfs_oracle_obfs_log" obfs)"
+    obfs_verified_before="$(obfs_oracle_verified_count \
+        "$obfs_oracle_obfs_log" obfs)"
+    local_raw_before="$(obfs_oracle_raw_count \
+        "$obfs_oracle_local_log" obfs-local)"
+    local_verified_before="$(obfs_oracle_verified_count \
+        "$obfs_oracle_local_log" obfs-local)"
+    local output_path="$work_root/obfs-negative-$label.json"
+    if "$zc_bin" start -c "$config_path" --port "$mixed_port" --json \
+        >"$output_path" 2>&1; then
+        echo "Unsupported obfs config unexpectedly started: $label" >&2
+        return 1
+    fi
+    if [ "$label" = "crlf" ]; then
+        grep -q '"code":"START_PREFLIGHT_FAILED"' "$output_path"
+    else
+        grep -q '"code":"CONFIG_CAPABILITY_UNSUPPORTED"' "$output_path"
+    fi
+    assert_tcp_closed_now "$mixed_port"
+    test "$(obfs_oracle_raw_count \
+        "$obfs_oracle_obfs_log" obfs)" = "$obfs_raw_before"
+    test "$(obfs_oracle_verified_count \
+        "$obfs_oracle_obfs_log" obfs)" = "$obfs_verified_before"
+    test "$(obfs_oracle_raw_count \
+        "$obfs_oracle_local_log" obfs-local)" = "$local_raw_before"
+    test "$(obfs_oracle_verified_count \
+        "$obfs_oracle_local_log" obfs-local)" = "$local_verified_before"
+}
+
+send_obfs_content_length_negative() {
+    local endpoint_id="$1"
+    local log_path="$2"
+    local port="$3"
+    local host="$4"
+    local declared_length="$5"
+    local raw_before verified_before rejected_before
+    raw_before="$(obfs_oracle_raw_count "$log_path" "$endpoint_id")"
+    verified_before="$(obfs_oracle_verified_count "$log_path" "$endpoint_id")"
+    rejected_before="$(log_match_count "$log_path" \
+        "^E2E_OBFS_ORACLE_REJECTED=${endpoint_id}:")"
+    exec 3<>"/dev/tcp/127.0.0.1/$port"
+    printf 'GET / HTTP/1.1\r\nHost: %s:%s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\nContent-Length: %s\r\n\r\n' \
+        "$host" "$port" "$declared_length" >&3
+    exec 3>&- 3<&-
+    wait_for_log_growth "$log_path" \
+        "^E2E_OBFS_ORACLE_RAW_ACCEPTED=${endpoint_id}:" \
+        "$raw_before" "$endpoint_id raw-negative"
+    wait_for_log_growth "$log_path" \
+        "^E2E_OBFS_ORACLE_REJECTED=${endpoint_id}:" \
+        "$rejected_before" "$endpoint_id rejected-negative"
+    test "$(obfs_oracle_verified_count \
+        "$log_path" "$endpoint_id")" = "$verified_before"
+    grep -q "^E2E_OBFS_ORACLE_REJECTED=${endpoint_id}:.*error=ContentLengthMismatch$" \
+        "$log_path"
+}
+
 origin_request_count() {
     local nonce="$1"
     local count
@@ -354,6 +448,7 @@ ss_aes128_port="$(reserve_port)"
 ss_aes256_port="$(reserve_port)"
 ss_chacha_port="$(reserve_port)"
 trojan_port="$(reserve_port)"
+negative_obfs_mixed_port="$(reserve_port)"
 
 "$ssserver_bin" -s "127.0.0.1:$ss_aes128_port" -k e2e-password \
     -m aes-128-gcm -v --log-without-time >"$work_root/ss-aes128.log" 2>&1 &
@@ -394,6 +489,179 @@ wait_for_tcp "$ss_aes256_port" "$ss_aes256_pid"
 wait_for_tcp "$ss_chacha_port" "$ss_chacha_pid"
 wait_for_tcp "$trojan_port" "$trojan_pid"
 
+obfs_host="obfs-alias.example.test"
+obfs_local_host="obfs-local-alias.example.test"
+# AES-128-GCM initial body: 16-byte salt + encrypted length (2+16) +
+# encrypted domain address (ATYP+LEN+HOST+PORT+16-byte tag).
+expected_initial_body_bytes=$((16 + 18 + 1 + 1 + ${#target_host} + 2 + 16))
+test "$expected_initial_body_bytes" = "72"
+
+"$obfs_oracle_bin" "$ss_aes128_port" "$obfs_host" \
+    "$expected_initial_body_bytes" fragmented_header obfs \
+    >"$obfs_oracle_obfs_log" 2>"$obfs_oracle_obfs_error_log" &
+obfs_oracle_obfs_pid=$!
+process_ids+=("$obfs_oracle_obfs_pid")
+"$obfs_oracle_bin" "$ss_aes128_port" "$obfs_local_host" \
+    "$expected_initial_body_bytes" same_write_tail obfs-local \
+    >"$obfs_oracle_local_log" 2>"$obfs_oracle_local_error_log" &
+obfs_oracle_local_pid=$!
+process_ids+=("$obfs_oracle_local_pid")
+wait_for_file "$obfs_oracle_obfs_log"
+wait_for_file "$obfs_oracle_local_log"
+obfs_oracle_port="$(awk -F: \
+    '/^E2E_OBFS_ORACLE_READY=obfs:/ { print $2 }' \
+    "$obfs_oracle_obfs_log")"
+obfs_oracle_local_port="$(awk -F: \
+    '/^E2E_OBFS_ORACLE_READY=obfs-local:/ { print $2 }' \
+    "$obfs_oracle_local_log")"
+test -n "$obfs_oracle_port"
+test -n "$obfs_oracle_local_port"
+test "$obfs_oracle_port" != "$obfs_oracle_local_port"
+kill -0 "$obfs_oracle_obfs_pid"
+kill -0 "$obfs_oracle_local_pid"
+test "$(obfs_oracle_raw_count "$obfs_oracle_obfs_log" obfs)" = "0"
+test "$(obfs_oracle_verified_count "$obfs_oracle_obfs_log" obfs)" = "0"
+test "$(obfs_oracle_raw_count \
+    "$obfs_oracle_local_log" obfs-local)" = "0"
+test "$(obfs_oracle_verified_count \
+    "$obfs_oracle_local_log" obfs-local)" = "0"
+
+# Exact off-by-one negatives prove that a range-only Content-Length check could
+# not satisfy either independently-bound alias oracle.
+send_obfs_content_length_negative \
+    obfs "$obfs_oracle_obfs_log" "$obfs_oracle_port" "$obfs_host" 71
+send_obfs_content_length_negative \
+    obfs-local "$obfs_oracle_local_log" "$obfs_oracle_local_port" \
+    "$obfs_local_host" 73
+
+cat >"$config_dir/obfs-negative-tls.yaml" <<EOF
+mixed-port: $negative_obfs_mixed_port
+proxies:
+  - name: bad-obfs
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: obfs
+    plugin-opts: { mode: tls, host: $obfs_host }
+rules:
+  - MATCH,bad-obfs
+EOF
+cat >"$config_dir/obfs-negative-unknown-plugin.yaml" <<EOF
+mixed-port: $negative_obfs_mixed_port
+proxies:
+  - name: bad-obfs
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: unknown-plugin
+rules:
+  - MATCH,bad-obfs
+EOF
+cat >"$config_dir/obfs-negative-unknown-mode.yaml" <<EOF
+mixed-port: $negative_obfs_mixed_port
+proxies:
+  - name: bad-obfs
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: obfs-local
+    plugin-opts: { mode: quic, host: $obfs_host }
+rules:
+  - MATCH,bad-obfs
+EOF
+cat >"$config_dir/obfs-negative-missing-options.yaml" <<EOF
+mixed-port: $negative_obfs_mixed_port
+proxies:
+  - name: bad-obfs
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: obfs
+rules:
+  - MATCH,bad-obfs
+EOF
+cat >"$config_dir/obfs-negative-missing-host.yaml" <<EOF
+mixed-port: $negative_obfs_mixed_port
+proxies:
+  - name: bad-obfs
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: obfs
+    plugin-opts: { mode: http }
+rules:
+  - MATCH,bad-obfs
+EOF
+{
+    cat <<EOF
+mixed-port: $negative_obfs_mixed_port
+proxies:
+  - name: bad-obfs
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: obfs
+    plugin-opts:
+      mode: http
+EOF
+    printf '      host: "safe\r\nInjected"\n'
+    cat <<EOF
+rules:
+  - MATCH,bad-obfs
+EOF
+} >"$config_dir/obfs-negative-crlf.yaml"
+cat >"$config_dir/obfs-negative-udp.yaml" <<EOF
+mixed-port: $negative_obfs_mixed_port
+proxies:
+  - name: bad-obfs
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    udp: true
+rules:
+  - MATCH,bad-obfs
+EOF
+
+for negative_label in \
+    tls \
+    unknown-plugin \
+    unknown-mode \
+    missing-options \
+    missing-host \
+    crlf \
+    udp; do
+    assert_obfs_preflight_rejected \
+        "$negative_label" \
+        "$config_dir/obfs-negative-$negative_label.yaml" \
+        "$negative_obfs_mixed_port"
+done
+test "$(obfs_oracle_raw_count "$obfs_oracle_obfs_log" obfs)" = "1"
+test "$(obfs_oracle_verified_count "$obfs_oracle_obfs_log" obfs)" = "0"
+test "$(obfs_oracle_raw_count \
+    "$obfs_oracle_local_log" obfs-local)" = "1"
+test "$(obfs_oracle_verified_count \
+    "$obfs_oracle_local_log" obfs-local)" = "0"
+test "$(log_match_count "$obfs_oracle_obfs_log" \
+    '^E2E_OBFS_ORACLE_REJECTED=obfs:')" = "1"
+test "$(log_match_count "$obfs_oracle_local_log" \
+    '^E2E_OBFS_ORACLE_REJECTED=obfs-local:')" = "1"
+grep -q '"state":"stopped"' <<<"$($zc_bin status --json)"
+echo "E2E_OBFS_NEGATIVE_PREFLIGHT=PASS"
+
 cat >"$managed_config" <<EOF
 mixed-port: $mixed_port
 external-controller: 127.0.0.1:$controller_port
@@ -405,6 +673,26 @@ proxies:
     port: $ss_aes128_port
     cipher: aes-128-gcm
     password: e2e-password
+  - name: ss-obfs-http
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: obfs
+    plugin-opts:
+      mode: http
+      host: $obfs_host
+  - name: ss-obfs-local-http
+    type: ss
+    server: 127.0.0.1
+    port: $obfs_oracle_local_port
+    cipher: aes-128-gcm
+    password: e2e-password
+    plugin: obfs-local
+    plugin_opts:
+      mode: http
+      host: $obfs_local_host
   - name: ss-aes256
     type: ss
     server: 127.0.0.1
@@ -450,6 +738,8 @@ proxy-groups:
       - DIRECT
       - REJECT
       - ss-aes128
+      - ss-obfs-http
+      - ss-obfs-local-http
       - ss-aes256
       - ss-chacha
       - ss-chacha-ietf
@@ -505,6 +795,81 @@ for proxy_name in ss-aes128 ss-aes256 ss-chacha ss-chacha-ietf trojan; do
     fi
     echo "E2E_PROXY_${proxy_name}=PASS"
 done
+
+obfs_fixture_pattern="established tcp tunnel .*${target_host}:${origin_port}"
+for obfs_proxy_name in ss-obfs-http ss-obfs-local-http; do
+    if [ "$obfs_proxy_name" = "ss-obfs-http" ]; then
+        endpoint_id=obfs
+        endpoint_log="$obfs_oracle_obfs_log"
+        other_id=obfs-local
+        other_log="$obfs_oracle_local_log"
+        nonce=socks-ss-obfs-http
+    else
+        endpoint_id=obfs-local
+        endpoint_log="$obfs_oracle_local_log"
+        other_id=obfs
+        other_log="$obfs_oracle_obfs_log"
+        nonce=socks-ss-obfs-local-http
+    fi
+    raw_before="$(obfs_oracle_raw_count "$endpoint_log" "$endpoint_id")"
+    verified_before="$(obfs_oracle_verified_count \
+        "$endpoint_log" "$endpoint_id")"
+    other_raw_before="$(obfs_oracle_raw_count "$other_log" "$other_id")"
+    other_verified_before="$(obfs_oracle_verified_count \
+        "$other_log" "$other_id")"
+    fixture_count="$(log_match_count "$work_root/ss-aes128.log" \
+        "$obfs_fixture_pattern")"
+
+    select_proxy "$obfs_proxy_name"
+    probe_socks_success "$mixed_port" "$origin_port" "$nonce"
+    wait_for_log_growth "$endpoint_log" \
+        "^E2E_OBFS_ORACLE_RAW_ACCEPTED=${endpoint_id}:" \
+        "$raw_before" "$obfs_proxy_name raw"
+    wait_for_log_growth "$endpoint_log" \
+        "^E2E_OBFS_ORACLE_VERIFIED=${endpoint_id}:" \
+        "$verified_before" "$obfs_proxy_name verified"
+    test "$(obfs_oracle_raw_count \
+        "$endpoint_log" "$endpoint_id")" = "$((raw_before + 1))"
+    test "$(obfs_oracle_verified_count \
+        "$endpoint_log" "$endpoint_id")" = "$((verified_before + 1))"
+    test "$(obfs_oracle_raw_count \
+        "$other_log" "$other_id")" = "$other_raw_before"
+    test "$(obfs_oracle_verified_count \
+        "$other_log" "$other_id")" = "$other_verified_before"
+    wait_for_log_growth "$work_root/ss-aes128.log" \
+        "$obfs_fixture_pattern" "$fixture_count" "$obfs_proxy_name"
+done
+
+test "$(obfs_oracle_raw_count "$obfs_oracle_obfs_log" obfs)" = "2"
+test "$(obfs_oracle_verified_count "$obfs_oracle_obfs_log" obfs)" = "1"
+test "$(obfs_oracle_raw_count \
+    "$obfs_oracle_local_log" obfs-local)" = "2"
+test "$(obfs_oracle_verified_count \
+    "$obfs_oracle_local_log" obfs-local)" = "1"
+grep -q "^E2E_OBFS_ORACLE_EXPECTED=obfs:host=${obfs_host}:body=${expected_initial_body_bytes}:mode=fragmented_header$" \
+    "$obfs_oracle_obfs_log"
+grep -q "^E2E_OBFS_ORACLE_EXPECTED=obfs-local:host=${obfs_local_host}:body=${expected_initial_body_bytes}:mode=same_write_tail$" \
+    "$obfs_oracle_local_log"
+grep -q "^E2E_OBFS_ORACLE_REQUEST=obfs:GET_HOST_UPGRADE_CONNECTION_KEY_CONTENT_LENGTH_EXACT:${expected_initial_body_bytes}$" \
+    "$obfs_oracle_obfs_log"
+grep -q "^E2E_OBFS_ORACLE_REQUEST=obfs-local:GET_HOST_UPGRADE_CONNECTION_KEY_CONTENT_LENGTH_EXACT:${expected_initial_body_bytes}$" \
+    "$obfs_oracle_local_log"
+grep -q '^E2E_OBFS_ORACLE_RESPONSE=obfs:fragmented_header$' \
+    "$obfs_oracle_obfs_log"
+grep -q '^E2E_OBFS_ORACLE_RESPONSE=obfs-local:same_write_tail$' \
+    "$obfs_oracle_local_log"
+grep -q '^E2E_OBFS_ORACLE_FORWARD=obfs:RAW_TCP_HALF_CLOSE_PASS$' \
+    "$obfs_oracle_obfs_log"
+grep -q '^E2E_OBFS_ORACLE_FORWARD=obfs-local:RAW_TCP_HALF_CLOSE_PASS$' \
+    "$obfs_oracle_local_log"
+test "$(log_match_count "$obfs_oracle_obfs_log" \
+    '^E2E_OBFS_ORACLE_REJECTED=obfs:')" = "1"
+test "$(log_match_count "$obfs_oracle_local_log" \
+    '^E2E_OBFS_ORACLE_REJECTED=obfs-local:')" = "1"
+kill -0 "$obfs_oracle_obfs_pid"
+kill -0 "$obfs_oracle_local_pid"
+echo "E2E_OBFS_ALIASES=INDEPENDENT_ENDPOINT_HOST_RAW_VERIFIED_PASS"
+echo "E2E_OBFS_THREE_PARTY_ATTESTATION=ORACLE_SSSERVER_ORIGIN_PASS"
 
 ss_failure_pattern='tcp handshake failed'
 ss_failure_count="$(log_match_count "$work_root/ss-aes128.log" "$ss_failure_pattern")"

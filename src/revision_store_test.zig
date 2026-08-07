@@ -189,6 +189,66 @@ test "RevisionStore rejects oversized encoded identity before persistence" {
     try testing.expectError(error.FileNotFound, tmp.dir.access(compat.io(), "profiles", .{}));
 }
 
+test "RevisionStore migration preflight is side-effect free and matches publication" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "config.yaml", "mixed-port: 7890\n");
+    const source_path = try realPath(allocator, tmp.dir, "config.yaml");
+    defer allocator.free(source_path);
+    var bundle = try ConfigBundle.capture(allocator, source_path, .{});
+    defer bundle.deinit();
+    const store = RevisionStore.init(allocator, tmp.dir);
+
+    try testing.expectError(
+        error.InvalidMetadata,
+        store.preflightMigration("home", &bundle, .{ .params = &.{.{
+            .key = "",
+            .value = "invalid",
+        }} }),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "profiles", .{}),
+    );
+    const oversized_url = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(oversized_url);
+    @memset(oversized_url, 'u');
+    try testing.expectError(
+        error.ManifestTooLarge,
+        store.preflightMigration(
+            "home",
+            &bundle,
+            .{ .url = oversized_url },
+        ),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "profiles", .{}),
+    );
+
+    const preflight = try store.preflightMigration(
+        "home",
+        &bundle,
+        .{ .params = &.{.{ .key = "target", .value = "clash" }} },
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(compat.io(), "profiles", .{}),
+    );
+    const published = try store.publishMigration(
+        "home",
+        &bundle,
+        .{ .params = &.{.{ .key = "target", .value = "clash" }} },
+    );
+    try testing.expect(preflight.revision.eql(published.revision));
+    try testing.expectEqualSlices(
+        u8,
+        &preflight.storage_id,
+        &published.storage_id,
+    );
+}
+
 test "RevisionStore strict reopen rejects FIFO and dangling optional symlink" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = testing.allocator;
@@ -217,7 +277,7 @@ test "RevisionStore strict reopen rejects FIFO and dangling optional symlink" {
     try testing.expectError(error.CorruptRevision, store.openVerified("home", published.revision));
 }
 
-test "RevisionStore tightens existing file permissions on verified reopen" {
+test "RevisionStore verified reopen rejects and preserves unsafe file permissions" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -235,12 +295,14 @@ test "RevisionStore tightens existing file permissions on verified reopen" {
     try file.setPermissions(compat.io(), std.Io.File.Permissions.fromMode(0o666));
     file.close(compat.io());
 
-    var view = try store.openVerified("home", published.revision);
-    view.deinit();
+    try testing.expectError(
+        error.CorruptRevision,
+        store.openVerified("home", published.revision),
+    );
     const reopened = try tmp.dir.openFile(compat.io(), stored_source, .{});
     defer reopened.close(compat.io());
     const stat = try reopened.stat(compat.io());
-    try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    try testing.expectEqual(@as(std.posix.mode_t, 0o666), stat.permissions.toMode() & 0o777);
 }
 
 fn publishRevisionAllocationFixture(allocator: std.mem.Allocator) !void {

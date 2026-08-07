@@ -13,11 +13,12 @@ zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当
 3. 从 v1.0 范围移除 TUI；
 4. 清理过期文档；
 5. 用统一 capability gate 在 bind/dial 前拒绝未经验证的协议；
-6. 让代理选择具备持久、revision-aware 的一致语义；
-7. 增加经过验证、仅 CLI 可用的本地 config import；
-8. 修复安全审计阻断项并通过最终 smoke gate 后再标记 `v1.0.0`。
+6. simple-obfs HTTP 与精确 capability enable 已通过互操作门禁；Shadowsocks AEAD UDP 仍未支持；
+7. 让代理选择具备持久、revision-aware 的一致语义；
+8. 增加经过验证、仅 CLI 可用的本地 config import；
+9. 修复安全审计阻断项并通过最终 smoke gate 后再标记 `v1.0.0`。
 
-公开 v1.0 roadmap 见 [`roadmap/v1.0.md`](roadmap/v1.0.md)。可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)。
+公开 v1.0 roadmap 见 [`roadmap/v1.0.md`](roadmap/v1.0.md)。可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。托管下载只自动激活首个 runtime-ready revision；可恢复的 malformed simple-obfs raw revision 保持 inactive，capability 与资源上界错误使用文档化的 `CONFIG_CAPABILITY_UNSUPPORTED` / `CONFIG_*_LIMIT_EXCEEDED`。运行时 outbound manager 是 owned opaque handle，借用的配置及嵌套存储在 handle 销毁前必须保持 immutable/address-stable；准入使用预建 borrowed-key 索引，因此成本按 group 解析深度固定，不随配置节点总数线性增长。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)，错误码见 [`api/error-codes.md`](api/error-codes.md)。
 
 ## v1.0 documentation map
 
@@ -30,6 +31,7 @@ zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当
 | Install | [`install/README.md`](install/README.md) | Standalone one-line installer、static release、Homebrew 与本地验证流程。 |
 | API | [`api/README.md`](api/README.md) | Minimal API endpoints currently implemented. |
 | E2E | [`reliability/e2e.md`](reliability/e2e.md) | PR/tag-only real binary, network and protocol interoperability gate. |
+| Research | [`research/shadowsocks-simple-obfs-udp.md`](research/shadowsocks-simple-obfs-udp.md) | Primary-source wire and acceptance basis for simple-obfs HTTP and Shadowsocks UDP. |
 | Reliability | [`reliability/soak-guide.md`](reliability/soak-guide.md) | Soak runner usage and release-gate evidence. |
 | Perf reports | [`perf/reports/README.md`](perf/reports/README.md) | Perf report storage used by scripts. |
 

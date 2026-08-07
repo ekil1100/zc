@@ -93,7 +93,12 @@ log-level: debug
 - unknown/unsupported key: error (`OVERRIDE_OUTPUT_INVALID`)
 - YAML `null` 清除 `external-controller`；带引号的 `"null"` 保持为字符串
 
-`RULE-SET` in `rules` is supported via `rule-providers`.
+The materialized result remains subject to all shared fixed limits: 4096 proxy nodes, 1024 proxy groups, 5120 mixed `proxies:` entries, 5122 members per group, 4096 rule providers, 262144 aggregate normalized provider entries / 64 MiB normalized bytes, 64 MiB aggregate raw provider source bytes per synchronization/authoritative load pass (16 MiB per source), and 262144 expanded rules / 64 MiB owned payload+target bytes. Override replacement cannot bypass or truncate these limits. The parser exposes typed proxy/provider/expanded-rule limit errors; the override transaction surfaces its existing merge/apply failure code. Reduce/filter the replacement list and retry; there is no limit switch or fallback.
+
+`RULE-SET` in `rules` is supported via `rule-providers`. Each provider is also bounded to 262144 normalized entries, including raw legacy/classical lines. Multiple providers share the aggregate normalized budgets and the independent 64 MiB raw-source budget; a raw payload at the exact normalized aggregate bound succeeds and its next normalized entry returns `RuleProviderAggregateEntryCountLimitExceeded` before cloning. A YAML wrapper may instead reach the separate global decoded-YAML budget first. Expansion uses a borrowed-key hash index, rejects duplicate provider names, charges repeated references and targets, and reserves output only after a checked count/byte preflight. YAML allocation, collection-budget, and nesting failures never fall back to the line parser. Managed revisions expand captured local providers offline, but a referenced remote provider left as `RULE-SET` is not catalog-admissible or runtime-ready; it is rejected before revision publication and at the exact activation gate. Unreferenced remote provider declarations may remain deferred.
+
+Frozen materialization applies the shared v1 runtime-capability gate to both empty and non-empty patches. Reserved proxy/group declarations, disabled proxy/group types, standalone `port`/`socks-port`, and plugin capability errors all return `UnsupportedCapability`. This materialization gate performs no provider download or local-asset resolution; those remain responsibilities of the later bundle/offline-runtime preparation stages.
+
 Runtime preparation behavior:
 
 - missing provider file + `url` present: download required (failure returns error)
@@ -103,8 +108,8 @@ Runtime preparation behavior:
 
 ## Dump Output
 
-`zc config dump` prints merged config with sensitive fields redacted (`password`, `uuid`, `secret`, `sni`).
-`zc config dump` reads the frozen materialized bytes from the exact active revision. A temporary override flag is then applied once, if supplied. `--no-override` reads the immutable source bytes instead.
+`zc config dump` normally prints merged config with sensitive fields redacted (`password`, `uuid`, `secret`, `sni`).
+`zc config dump` reads the frozen materialized bytes from the exact active revision. A temporary override flag is then applied once, if supplied. `--no-override` reads the immutable source bytes instead. Shadowsocks `plugin_opts`/`plugin-opts` map input is normalized to canonical `plugin-opts` output, preserving `mode` and `host`. The recovery-only text command `zc config dump -c <name> --no-override` emits a retained malformed revision's verified raw YAML because it cannot be safely normalized; treat that output as sensitive.
 
 ## Error Codes
 

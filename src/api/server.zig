@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("../compat.zig");
 const net = compat.net;
 const config_mod = @import("../config.zig");
@@ -19,9 +20,34 @@ pub const max_response_body_bytes: usize = 4 * 1024 * 1024;
 const max_request_bytes = max_header_bytes + 4 + max_body_bytes;
 const request_timeout_ms: i64 = 2_000;
 const response_timeout_ms: i64 = 2_000;
+const test_request_timeout_ms: i64 = 5_000;
 const max_connections: u32 = 16;
 // Linux glibc accounts the executable's static TLS against each pthread stack.
 const connection_stack_bytes: usize = 1024 * 1024;
+const test_accept_fault_timeout_ms: i64 = 3_000;
+
+pub const TestAcceptAction = if (builtin.is_test) enum(u8) {
+    waiting,
+    fail,
+    cancel,
+} else enum(u8) {
+    unavailable,
+};
+
+/// Test-only synchronization for a bounded fatal-accept scenario. It contains
+/// no callbacks and compiles to a zero-sized unavailable type in production.
+pub const TestAcceptFault = if (builtin.is_test) struct {
+    action: std.atomic.Value(TestAcceptAction) = .init(.waiting),
+    bound_port: std.atomic.Value(u16) = .init(0),
+    before_next_accept: std.atomic.Value(bool) = .init(false),
+    connection_thread: ?std.Thread = null,
+
+    pub fn takeConnectionThread(self: *TestAcceptFault) ?std.Thread {
+        const thread = self.connection_thread;
+        self.connection_thread = null;
+        return thread;
+    }
+} else struct {};
 
 comptime {
     std.debug.assert(max_header_bytes < max_request_bytes);
@@ -203,18 +229,12 @@ fn waitForSocket(
     deadline_ms: i64,
 ) !void {
     while (true) {
-        const remaining = deadline_ms - compat.monotonicMilliTimestamp();
-        if (remaining <= 0) return error.RequestTimeout;
-        const timeout_ms: i32 = @intCast(@min(
-            remaining,
-            @as(i64, std.math.maxInt(i32)),
-        ));
         var descriptors = [_]std.posix.pollfd{.{
             .fd = fd,
             .events = events,
             .revents = 0,
         }};
-        const ready = std.posix.poll(&descriptors, timeout_ms) catch
+        const ready = compat.pollUntil(&descriptors, deadline_ms) catch
             return error.PollFailed;
         if (ready == 0) return error.RequestTimeout;
         const result = descriptors[0].revents;
@@ -287,6 +307,8 @@ pub const ApiServer = struct {
     selection_apply_lock: std.atomic.Mutex = .unlocked,
     runtime_ready: ?*std.atomic.Value(bool) = null,
     managed_runtime: bool,
+    test_accept_fault: if (builtin.is_test) ?*TestAcceptFault else void =
+        if (builtin.is_test) null else {},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -304,6 +326,21 @@ pub const ApiServer = struct {
             .port = port,
             .managed_runtime = managed_runtime,
         };
+    }
+
+    pub fn setTestAcceptFault(
+        self: *ApiServer,
+        fault: *TestAcceptFault,
+    ) void {
+        if (comptime builtin.is_test) {
+            self.test_accept_fault = fault;
+        } else {
+            @compileError("accept fault injection is test-only");
+        }
+    }
+
+    pub fn testActiveConnections(self: *const ApiServer) u32 {
+        return self.active_connections.load(.acquire);
     }
 
     pub fn start(self: *ApiServer) !void {
@@ -329,18 +366,73 @@ pub const ApiServer = struct {
         // TIME_WAIT on restart, but a 2nd active listener still fails.
         var server = try net.listenReuseAddr(address);
         defer server.deinit();
+        var test_fault_deadline_ms: i64 = 0;
+        if (comptime builtin.is_test) {
+            if (self.test_accept_fault) |fault| {
+                // Nonblocking accept lets cancellation and the injected fatal
+                // result wake this test listener without closing its fd from a
+                // foreign thread.
+                try compat.setNonBlock(server.fd);
+                fault.bound_port.store(
+                    server.listen_address.getPort(),
+                    .release,
+                );
+            }
+        }
 
         std.debug.print("REST API listening on port {}\n", .{self.port});
         if (ready_count) |count| _ = count.fetchAdd(1, .release);
         if (accept_gate) |gate| {
             while (!gate.load(.acquire)) {
+                if (comptime builtin.is_test) {
+                    if (self.test_accept_fault) |fault| {
+                        if (fault.action.load(.acquire) == .cancel) {
+                            return error.InjectedAcceptCancelled;
+                        }
+                    }
+                }
                 compat.sleepNs(1 * std.time.ns_per_ms);
             }
         }
 
         while (true) {
+            if (comptime builtin.is_test) {
+                if (self.test_accept_fault) |fault| {
+                    if (fault.action.load(.acquire) == .cancel) {
+                        return error.InjectedAcceptCancelled;
+                    }
+                    if (fault.connection_thread != null) {
+                        if (!fault.before_next_accept.load(.monotonic)) {
+                            test_fault_deadline_ms =
+                                compat.monotonicMilliTimestamp() +
+                                test_accept_fault_timeout_ms;
+                            fault.before_next_accept.store(true, .release);
+                        }
+                        switch (fault.action.load(.acquire)) {
+                            .fail => return error.InjectedAcceptFailure,
+                            .cancel => return error.InjectedAcceptCancelled,
+                            .waiting => {},
+                        }
+                        if (compat.monotonicMilliTimestamp() >=
+                            test_fault_deadline_ms)
+                        {
+                            return error.InjectedAcceptTimeout;
+                        }
+                        compat.sleepNs(1 * std.time.ns_per_ms);
+                        continue;
+                    }
+                }
+            }
             const conn = server.accept() catch |err| switch (err) {
-                error.WouldBlock, error.ConnectionAborted => continue,
+                error.WouldBlock => {
+                    if (comptime builtin.is_test) {
+                        if (self.test_accept_fault != null) {
+                            compat.sleepNs(1 * std.time.ns_per_ms);
+                        }
+                    }
+                    continue;
+                },
+                error.ConnectionAborted => continue,
                 error.ProcessFdQuotaExceeded,
                 error.SystemFdQuotaExceeded,
                 => {
@@ -373,7 +465,16 @@ pub const ApiServer = struct {
                 std.debug.print("API connection spawn error: {}\n", .{err});
                 continue;
             };
-            thread.detach();
+            if (comptime builtin.is_test) {
+                if (self.test_accept_fault) |fault| {
+                    std.debug.assert(fault.connection_thread == null);
+                    fault.connection_thread = thread;
+                } else {
+                    thread.detach();
+                }
+            } else {
+                thread.detach();
+            }
         }
     }
 
@@ -466,7 +567,14 @@ pub const ApiServer = struct {
     ) !OwnedRequest {
         const storage = try self.allocator.alloc(u8, max_request_bytes);
         errdefer self.allocator.free(storage);
-        const deadline_ms = compat.monotonicMilliTimestamp() + request_timeout_ms;
+        const timeout_ms = if (comptime builtin.is_test)
+            if (self.test_accept_fault != null)
+                test_request_timeout_ms
+            else
+                request_timeout_ms
+        else
+            request_timeout_ms;
+        const deadline_ms = compat.monotonicMilliTimestamp() + timeout_ms;
         var used: usize = 0;
 
         while (true) {
@@ -673,27 +781,33 @@ pub const ApiServer = struct {
                 }
             }
             if (!requested_selection_found) return false;
-            var transaction = (try self.manager.beginPersistedSelections(
+            const transaction = (try self.manager.beginPersistedSelections(
                 desired.selections,
                 desired.generation,
             )) orelse return false;
-            defer transaction.deinit();
+            const prepared_generation = transaction.preparedGeneration();
 
-            const outcome = try store.publish(.{ .state = .{
-                .nonce = descriptor.nonce,
-                .generation = descriptor.generation,
-                .ready = descriptor.ready,
-            } }, .{
-                .pid = descriptor.pid,
-                .nonce = descriptor.nonce,
-                .endpoint = descriptor.endpoint,
-                .identity = identity,
-                .generation = request.generation,
-                .ready = descriptor.ready,
-                .invocation = descriptor.invocation,
-            });
-            switch (outcome) {
-                .committed, .durability_uncertain => return transaction.commit(),
+            const completion = try runtime_selection
+                .publishPreparedSelectionTransaction(
+                transaction,
+                store,
+                .{ .state = .{
+                    .nonce = descriptor.nonce,
+                    .generation = descriptor.generation,
+                    .ready = descriptor.ready,
+                } },
+                .{
+                    .pid = descriptor.pid,
+                    .nonce = descriptor.nonce,
+                    .endpoint = descriptor.endpoint,
+                    .identity = identity,
+                    .generation = prepared_generation,
+                    .ready = descriptor.ready,
+                    .invocation = descriptor.invocation,
+                },
+            );
+            switch (completion) {
+                .applied => return true,
                 .conflict => continue,
             }
         }

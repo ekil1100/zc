@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const config = @import("config.zig");
 const config_import = @import("config_import.zig");
@@ -62,6 +63,128 @@ const ListenerStartup = struct {
     control_available: std.atomic.Value(bool) = .init(false),
     committed: std.atomic.Value(bool) = .init(false),
 };
+
+/// Owns the heap-stable API server until its listener thread is successfully
+/// spawned. Once transferred, the API listener and its detached connection
+/// children borrow the server for the rest of the process lifetime. There is no
+/// graceful listener shutdown today, so process exit is the only reclamation
+/// point after transfer.
+const ApiServerOwner = struct {
+    const State = union(enum) {
+        absent,
+        prepared: *api.ApiServer,
+        process_lifetime: *api.ApiServer,
+    };
+
+    allocator: std.mem.Allocator,
+    state: State,
+
+    fn absent(allocator: std.mem.Allocator) ApiServerOwner {
+        return .{ .allocator = allocator, .state = .absent };
+    }
+
+    fn prepare(
+        allocator: std.mem.Allocator,
+        cfg: *const config.Config,
+        engine: *rule_engine.Engine,
+        manager: *outbound.OutboundManager,
+        port: u16,
+        managed_runtime: bool,
+    ) !ApiServerOwner {
+        const server = try allocator.create(api.ApiServer);
+        server.* = api.ApiServer.init(
+            allocator,
+            cfg,
+            engine,
+            manager,
+            port,
+            managed_runtime,
+        );
+        return .{ .allocator = allocator, .state = .{ .prepared = server } };
+    }
+
+    fn preparedServer(self: *const ApiServerOwner) ?*api.ApiServer {
+        return switch (self.state) {
+            .prepared => |server| server,
+            .absent, .process_lifetime => null,
+        };
+    }
+
+    fn processLifetimeServer(self: *const ApiServerOwner) ?*api.ApiServer {
+        return switch (self.state) {
+            .process_lifetime => |server| server,
+            .absent, .prepared => null,
+        };
+    }
+
+    fn isAbsent(self: *const ApiServerOwner) bool {
+        return self.state == .absent;
+    }
+
+    fn isProcessLifetime(self: *const ApiServerOwner) bool {
+        return self.state == .process_lifetime;
+    }
+
+    fn destroyPrepared(self: *ApiServerOwner) void {
+        const server = switch (self.state) {
+            .prepared => |server| server,
+            .absent, .process_lifetime => unreachable,
+        };
+        self.allocator.destroy(server);
+        self.state = .absent;
+    }
+
+    fn transferToProcessLifetime(self: *ApiServerOwner) *api.ApiServer {
+        const server = switch (self.state) {
+            .prepared => |server| server,
+            .absent, .process_lifetime => unreachable,
+        };
+        self.state = .{ .process_lifetime = server };
+        return server;
+    }
+
+    fn reclaimProcessLifetimeForTest(self: *ApiServerOwner) void {
+        if (comptime !builtin.is_test) {
+            @compileError("process-lifetime API owners are reclaimable only in tests");
+        }
+        const server = switch (self.state) {
+            .process_lifetime => |server| server,
+            .absent, .prepared => unreachable,
+        };
+        self.state = .{ .prepared = server };
+    }
+
+    fn deinit(self: *ApiServerOwner) void {
+        switch (self.state) {
+            .prepared => |server| self.allocator.destroy(server),
+            .absent => {},
+            .process_lifetime => @panic(
+                "process-lifetime API owner reached a normal unwind",
+            ),
+        }
+        self.state = .absent;
+    }
+};
+
+fn prepareApiServerOwner(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    engine: *rule_engine.Engine,
+    manager: *outbound.OutboundManager,
+    managed_runtime: bool,
+) !ApiServerOwner {
+    const endpoint = cfg.external_controller orelse
+        return ApiServerOwner.absent(allocator);
+    const port = try parseExternalControllerPort(endpoint);
+    return ApiServerOwner.prepare(
+        allocator,
+        cfg,
+        engine,
+        manager,
+        port,
+        managed_runtime,
+    );
+}
 
 const StartCommandOptions = struct {
     config_path: ?[]const u8 = null,
@@ -473,6 +596,13 @@ pub fn main(init: std.process.Init) !void {
             daemon_config_path,
             daemon_args.items,
         ) catch |err| {
+            // std.process.exit does not run defers. A failed child never owns
+            // the prepared snapshot, so remove it explicitly after startDaemon
+            // has terminated/reaped that child.
+            if (prepared) |*snapshot| {
+                snapshot.deinit();
+                prepared = null;
+            }
             switch (err) {
                 error.PortAlreadyInUse,
                 error.ControllerPortAlreadyInUse,
@@ -982,6 +1112,148 @@ fn wantsCommandHelp(args: []const []const u8) bool {
     return false;
 }
 
+const ConfigCapabilityOperation = enum {
+    download_activate,
+    update_active,
+    use_existing,
+};
+
+const ConfigMutationCommand = enum { load, download, update };
+
+fn configResourceLimitCode(command: ConfigMutationCommand) []const u8 {
+    return switch (command) {
+        .load => "CONFIG_LOAD_LIMIT_EXCEEDED",
+        .download => "CONFIG_DOWNLOAD_LIMIT_EXCEEDED",
+        .update => "CONFIG_UPDATE_LIMIT_EXCEEDED",
+    };
+}
+
+fn printConfigCapabilityUnsupported(
+    json_output: bool,
+    operation: ConfigCapabilityOperation,
+) void {
+    const hint = switch (operation) {
+        .download_activate => "retry without `-d` to retain an inactive revision; " ++
+            "inspect its raw source with `zc config dump -c <name> --no-override`, " ++
+            "then fix the subscription source",
+        .update_active => "fix the subscription source, then retry `zc config update <name>`",
+        .use_existing => "inspect the retained raw source with " ++
+            "`zc config dump -c <name> --no-override`; fix the subscription source, " ++
+            "then retry",
+    };
+    printCliError(
+        json_output,
+        "CONFIG_CAPABILITY_UNSUPPORTED",
+        "config revision cannot be activated because it uses an unsupported runtime capability",
+        hint,
+    );
+}
+
+fn printConfigResourceLimitExceeded(
+    json_output: bool,
+    code: []const u8,
+    err: anyerror,
+) void {
+    switch (err) {
+        error.YamlCollectionEntryLimitExceeded => printCliError(
+            json_output,
+            code,
+            "config exceeds the global limit of 262144 decoded YAML collection entries",
+            "remove unused YAML mapping entries or sequence items, including unknown extension data, and retry",
+        ),
+        error.PersistedSelectionCountLimitExceeded => printCliError(
+            json_output,
+            code,
+            "profile exceeds the limit of 1024 persisted selections",
+            "remove unused persisted selections and retry",
+        ),
+        error.RuleProviderCountLimitExceeded => printCliError(
+            json_output,
+            code,
+            "config exceeds the limit of 4096 rule providers",
+            "remove unused rule-provider declarations and retry",
+        ),
+        error.RuleProviderFileTooLarge => printCliError(
+            json_output,
+            code,
+            "a local rule-provider source exceeds the 16 MiB limit",
+            "reduce each local rule-provider source to 16 MiB or less and retry",
+        ),
+        error.RuleProviderAggregateEntryCountLimitExceeded => printCliError(
+            json_output,
+            code,
+            "rule providers exceed the aggregate limit of 262144 normalized entries",
+            "reduce the combined rule-provider payloads and retry",
+        ),
+        error.RuleProviderAggregateBytesLimitExceeded => printCliError(
+            json_output,
+            code,
+            "rule providers exceed the aggregate limit of 64 MiB of normalized entry bytes",
+            "reduce the combined normalized rule-provider payloads and retry",
+        ),
+        error.RuleProviderAggregateSourceBytesLimitExceeded => printCliError(
+            json_output,
+            code,
+            "rule providers exceed the aggregate limit of 64 MiB of raw source bytes",
+            "reduce the combined cached or downloaded rule-provider sources and retry",
+        ),
+        error.ExpandedRuleCountLimitExceeded => printCliError(
+            json_output,
+            code,
+            "expanded rules exceed the limit of 262144 rules",
+            "remove repeated RULE-SET references or reduce provider entries and retry",
+        ),
+        error.ExpandedRuleBytesLimitExceeded => printCliError(
+            json_output,
+            code,
+            "expanded rules exceed the limit of 64 MiB of owned payload and target bytes",
+            "shorten targets or reduce repeated RULE-SET expansion and retry",
+        ),
+        error.ProxyCountLimitExceeded,
+        error.ProxyGroupCountLimitExceeded,
+        error.ProxyEntryCountLimitExceeded,
+        error.ProxyGroupMemberCountLimitExceeded,
+        => printCliError(
+            json_output,
+            code,
+            "config exceeds resource limits: 4096 proxies, 1024 proxy groups, " ++
+                "5120 mixed entries, or 5122 members per group",
+            "remove unused proxies, groups, members, or subscription banner entries and retry",
+        ),
+        else => unreachable,
+    }
+}
+
+fn isConfigResourceLimitError(err: anyerror) bool {
+    return switch (err) {
+        error.YamlCollectionEntryLimitExceeded,
+        error.ProxyCountLimitExceeded,
+        error.ProxyGroupCountLimitExceeded,
+        error.ProxyEntryCountLimitExceeded,
+        error.ProxyGroupMemberCountLimitExceeded,
+        error.PersistedSelectionCountLimitExceeded,
+        error.RuleProviderCountLimitExceeded,
+        error.RuleProviderFileTooLarge,
+        error.RuleProviderAggregateEntryCountLimitExceeded,
+        error.RuleProviderAggregateBytesLimitExceeded,
+        error.RuleProviderAggregateSourceBytesLimitExceeded,
+        error.ExpandedRuleCountLimitExceeded,
+        error.ExpandedRuleBytesLimitExceeded,
+        => true,
+        else => false,
+    };
+}
+
+fn printConfigResourceLimitError(
+    json_output: bool,
+    code: []const u8,
+    err: anyerror,
+) bool {
+    if (!isConfigResourceLimitError(err)) return false;
+    printConfigResourceLimitExceeded(json_output, code, err);
+    return true;
+}
+
 fn printOverrideOptionError(json_output: bool, err: anyerror) void {
     switch (err) {
         error.MissingOverrideScriptPath => printCliError(json_output, "OVERRIDE_SCRIPT_NOT_FOUND", "missing --override-script path", "use `--override-script <path>`"),
@@ -1020,7 +1292,9 @@ fn printOverrideRuntimeError(json_output: bool, err: anyerror) bool {
                 json_output,
                 "CONFIG_CAPABILITY_UNSUPPORTED",
                 "config uses a capability not supported in zc v1.0",
-                "run `zc doctor -c <config>` and use direct/reject/ss/trojan",
+                "run `zc doctor -c <config>`; Shadowsocks supports plain AEAD " ++
+                    "or obfs/obfs-local with explicit HTTP mode and host; " ++
+                    "TLS plugins and UDP remain unsupported",
             );
             return true;
         },
@@ -1458,6 +1732,58 @@ fn catalogMirrorPathAlloc(
     return compat.fs.path.join(allocator, &.{ configs_dir, filename });
 }
 
+fn tryReadMalformedManagedSource(
+    allocator: std.mem.Allocator,
+    selector: []const u8,
+) !?catalog_commands.Source {
+    const inferred_key = try config.inferConfigKeyFromPath(allocator, selector);
+    defer if (inferred_key) |key| allocator.free(key);
+    const key_from_path = inferred_key != null;
+    const key = inferred_key orelse
+        config.normalizeManagedConfigKey(selector) catch return null;
+    const root_path = (try config.getDefaultConfigDir(allocator)) orelse
+        return null;
+    defer allocator.free(root_path);
+    const root = compat.fs.openDirAbsolute(root_path, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer root.close(compat.io());
+    var source = catalog_commands.Commands.init(allocator, root).source(key) catch |err| switch (err) {
+        error.Schema2CatalogRequired => return null,
+        error.ManagedProfileNotFound => if (key_from_path) return err else return null,
+        else => return err,
+    };
+    errdefer source.deinit();
+    var parsed = try config.parseCatalogDocument(allocator, source.bytes);
+    defer parsed.deinit();
+    for (parsed.proxies.items) |proxy| {
+        if (proxy.semantic_state == .malformed or
+            proxy.plugin_options_state == .malformed)
+        {
+            return source;
+        }
+    }
+    source.deinit();
+    return null;
+}
+
+fn writeRawConfigDocument(
+    json_output: bool,
+    source: []const u8,
+) void {
+    std.debug.assert(!json_output);
+    var streams = StdStreams{};
+    var out = streams.output(false);
+    out.print("{s}", .{source}) catch {};
+    if (source.len == 0 or source[source.len - 1] != '\n') {
+        out.print("\n", .{}) catch {};
+    }
+    out.flush() catch {};
+}
+
 /// config 命令树 dispatch。错误统一走 printCliError（envelope/error block）
 /// 并以非零码退出；用法错误用 exit_usage，运行失败用 exit_failure。
 fn runConfigCommand(
@@ -1492,6 +1818,33 @@ fn runConfigCommand(
             switch (err) {
                 error.ManagedProfileAlreadyExists => printCliError(json_output, "CONFIG_ALREADY_EXISTS", "a config with this name already exists", "rename the file or delete the existing config first"),
                 error.InvalidConfig, error.InvalidConfigKey => printCliError(json_output, "CONFIG_LOAD_INVALID", "local config is invalid", "fix the config and retry"),
+                error.ConfigTooLarge,
+                error.SourceTooLarge,
+                error.MaterializedSourceTooLarge,
+                => printCliError(
+                    json_output,
+                    "CONFIG_LOAD_TOO_LARGE",
+                    "local config exceeds the 16 MiB limit",
+                    "reduce the complete config source to 16 MiB or less and retry",
+                ),
+                error.YamlCollectionEntryLimitExceeded,
+                error.ProxyCountLimitExceeded,
+                error.ProxyGroupCountLimitExceeded,
+                error.ProxyEntryCountLimitExceeded,
+                error.ProxyGroupMemberCountLimitExceeded,
+                error.PersistedSelectionCountLimitExceeded,
+                error.RuleProviderCountLimitExceeded,
+                error.RuleProviderFileTooLarge,
+                error.RuleProviderAggregateEntryCountLimitExceeded,
+                error.RuleProviderAggregateBytesLimitExceeded,
+                error.RuleProviderAggregateSourceBytesLimitExceeded,
+                error.ExpandedRuleCountLimitExceeded,
+                error.ExpandedRuleBytesLimitExceeded,
+                => printConfigResourceLimitExceeded(
+                    json_output,
+                    configResourceLimitCode(.load),
+                    err,
+                ),
                 else => printCliError(json_output, "CONFIG_LOAD_FAILED", "failed to load local config", "check the path, local dependencies, and file permissions"),
             }
             std.process.exit(cli_output.exit_failure);
@@ -1613,7 +1966,13 @@ fn runConfigCommand(
         }
         var root = openDefaultCatalogRoot(allocator) catch |err| {
             out.note("config catalog open failed: {s}\n", .{@errorName(err)}) catch {};
-            printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config could not be stored", "repair the managed catalog and retry");
+            if (!printConfigResourceLimitError(
+                json_output,
+                configResourceLimitCode(.download),
+                err,
+            )) {
+                printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config could not be stored", "repair the managed catalog and retry");
+            }
             std.process.exit(cli_output.exit_failure);
         };
         defer root.deinit();
@@ -1629,6 +1988,28 @@ fn runConfigCommand(
             switch (err) {
                 error.ManagedProfileAlreadyExists => printCliError(json_output, "CONFIG_ALREADY_EXISTS", "a config with this name already exists", "use `zc config update`, or choose another name"),
                 error.InvalidConfig, error.InvalidConfigKey => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config is invalid", "fix the source config and retry"),
+                error.ProfileNotRuntimeReady => printConfigCapabilityUnsupported(
+                    json_output,
+                    .download_activate,
+                ),
+                error.YamlCollectionEntryLimitExceeded,
+                error.ProxyCountLimitExceeded,
+                error.ProxyGroupCountLimitExceeded,
+                error.ProxyEntryCountLimitExceeded,
+                error.ProxyGroupMemberCountLimitExceeded,
+                error.PersistedSelectionCountLimitExceeded,
+                error.RuleProviderCountLimitExceeded,
+                error.RuleProviderFileTooLarge,
+                error.RuleProviderAggregateEntryCountLimitExceeded,
+                error.RuleProviderAggregateBytesLimitExceeded,
+                error.RuleProviderAggregateSourceBytesLimitExceeded,
+                error.ExpandedRuleCountLimitExceeded,
+                error.ExpandedRuleBytesLimitExceeded,
+                => printConfigResourceLimitExceeded(
+                    json_output,
+                    configResourceLimitCode(.download),
+                    err,
+                ),
                 else => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config could not be committed", "repair the managed catalog and retry"),
             }
             std.process.exit(cli_output.exit_failure);
@@ -1681,14 +2062,26 @@ fn runConfigCommand(
 
         var streams = StdStreams{};
         var out = streams.output(json_output);
-        var root = openDefaultCatalogRoot(allocator) catch {
-            printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to open the managed catalog", "repair the managed catalog and retry");
+        var root = openDefaultCatalogRoot(allocator) catch |err| {
+            if (!printConfigResourceLimitError(
+                json_output,
+                configResourceLimitCode(.update),
+                err,
+            )) {
+                printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to open the managed catalog", "repair the managed catalog and retry");
+            }
             std.process.exit(cli_output.exit_failure);
         };
         defer root.deinit();
         const commands = catalog_commands.Commands.init(allocator, root.dir);
-        var listing = commands.list() catch {
-            printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to read the managed catalog", "repair the managed catalog and retry");
+        var listing = commands.list() catch |err| {
+            if (!printConfigResourceLimitError(
+                json_output,
+                configResourceLimitCode(.update),
+                err,
+            )) {
+                printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to read the managed catalog", "repair the managed catalog and retry");
+            }
             std.process.exit(cli_output.exit_failure);
         };
         defer listing.deinit();
@@ -1704,7 +2097,13 @@ fn runConfigCommand(
             switch (err) {
                 error.NoSubscriptionUrl => printCliError(json_output, "CONFIG_UPDATE_NO_SUBSCRIPTION", "no subscription url recorded for this config", "use `zc config download <url>` to recreate it"),
                 error.ManagedProfileNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and choose an existing config"),
-                else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to read the managed revision", "repair the managed catalog and retry"),
+                else => if (!printConfigResourceLimitError(
+                    json_output,
+                    configResourceLimitCode(.update),
+                    err,
+                )) {
+                    printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to read the managed revision", "repair the managed catalog and retry");
+                },
             }
             std.process.exit(cli_output.exit_failure);
         };
@@ -1733,7 +2132,37 @@ fn runConfigCommand(
             out.note("config catalog update failed: {s}\n", .{@errorName(err)}) catch {};
             switch (err) {
                 error.InvalidConfig => printCliError(json_output, "CONFIG_UPDATE_FAILED", "updated config is invalid", "fix the subscription source and retry"),
+                error.SourceTooLarge,
+                error.MaterializedSourceTooLarge,
+                => printCliError(
+                    json_output,
+                    "CONFIG_UPDATE_TOO_LARGE",
+                    "updated config exceeds the 16 MiB limit",
+                    "reduce the config size and retry",
+                ),
                 error.ManagedProfileNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and choose an existing config"),
+                error.ProfileNotRuntimeReady => printConfigCapabilityUnsupported(
+                    json_output,
+                    .update_active,
+                ),
+                error.YamlCollectionEntryLimitExceeded,
+                error.ProxyCountLimitExceeded,
+                error.ProxyGroupCountLimitExceeded,
+                error.ProxyEntryCountLimitExceeded,
+                error.ProxyGroupMemberCountLimitExceeded,
+                error.PersistedSelectionCountLimitExceeded,
+                error.RuleProviderCountLimitExceeded,
+                error.RuleProviderFileTooLarge,
+                error.RuleProviderAggregateEntryCountLimitExceeded,
+                error.RuleProviderAggregateBytesLimitExceeded,
+                error.RuleProviderAggregateSourceBytesLimitExceeded,
+                error.ExpandedRuleCountLimitExceeded,
+                error.ExpandedRuleBytesLimitExceeded,
+                => printConfigResourceLimitExceeded(
+                    json_output,
+                    configResourceLimitCode(.update),
+                    err,
+                ),
                 error.ProfileIdentityConflict, error.StateConflict => printCliError(json_output, "CONFIG_UPDATE_CONFLICT", "config changed while its update was downloading", "retry `zc config update` against the new profile revision"),
                 else => printCliError(json_output, "CONFIG_UPDATE_FAILED", "failed to commit the updated revision", "repair the managed catalog and retry"),
             }
@@ -1832,6 +2261,10 @@ fn runConfigCommand(
         ).activate(key) catch |err| {
             switch (err) {
                 error.ManagedProfileNotFound => printCliError(json_output, "CONFIG_NOT_FOUND", "config not found", "run `zc config list` and pick an existing config name"),
+                error.ProfileNotRuntimeReady => printConfigCapabilityUnsupported(
+                    json_output,
+                    .use_existing,
+                ),
                 else => printCliError(json_output, "CONFIG_SWITCH_FAILED", "failed to switch active config", "repair the managed catalog and retry"),
             }
             std.process.exit(cli_output.exit_failure);
@@ -1922,6 +2355,22 @@ fn runConfigCommand(
         };
         const config_path = dump_args.config_path;
         const no_override = dump_args.no_override;
+        if (!json_output and no_override) {
+            if (config_path) |selector| {
+                var malformed_source = tryReadMalformedManagedSource(
+                    allocator,
+                    selector,
+                ) catch |err| {
+                    printConfigDumpError(json_output, err);
+                    std.process.exit(cli_output.exit_failure);
+                };
+                if (malformed_source) |*source| {
+                    defer source.deinit();
+                    writeRawConfigDocument(json_output, source.bytes);
+                    return;
+                }
+            }
+        }
         var loaded = if (config_path) |path| blk: {
             const managed = tryLoadExactManagedRuntime(
                 allocator,
@@ -3019,11 +3468,7 @@ fn loadExactRuntimeConfig(
             provider_policy orelse ruleProviderSyncPolicyForCommand(command_name),
         );
     } else {
-        for (loaded.value.rules.items) |rule| {
-            if (rule.rule_type == .rule_set) {
-                return error.ManagedRemoteRuleProviderUnsupported;
-            }
-        }
+        try config.requireManagedRuleProvidersResolved(&loaded.value);
     }
     try validateRuntimeEndpointSyntax(&loaded.value);
     var validation_result = try validator.validate(allocator, &loaded.value);
@@ -3040,7 +3485,9 @@ fn startupFailureForError(err: anyerror) daemon.StartupFailure {
         error.PortConflict => .port_conflict,
         error.InvalidBindAddress => .invalid_bind_address,
         error.InvalidExternalController => .invalid_controller,
-        error.ListenerStartupFailed => .listener_failed,
+        error.ListenerStartupFailed,
+        error.InjectedApiThreadSpawnFailure,
+        => .listener_failed,
         error.ListenerStartupTimeout => .readiness,
         error.InvalidInheritedDaemonLock => .lock_handoff,
         error.UnsupportedCapability => .capability,
@@ -3130,6 +3577,14 @@ fn runProxy(
         exact_invocation.port_override = mixed_port_override;
     }
     const cfg = &loaded.value;
+    // Validation must see the ordinary selected port, but the dedicated
+    // compile-time API-owner fault must not probe or open any proxy listener.
+    // Zero the ports only after load/validation and before preflight/threading.
+    if (comptime build_options.api_owner_spawn_fault) {
+        cfg.mixed_port = 0;
+        cfg.port = 0;
+        cfg.socks_port = 0;
+    }
     try preflightPortCheck(cfg, true);
 
     var legacy_config_key: ?[]const u8 = null;
@@ -3143,7 +3598,7 @@ fn runProxy(
         ) catch null;
         break :blk legacy_config_key;
     } else null;
-    var manager = try outbound.OutboundManager.initWithKey(allocator, cfg, config_key);
+    const manager = try outbound.OutboundManager.initWithKey(allocator, cfg, config_key);
     defer manager.deinit();
     manager.setTrafficReady(false);
 
@@ -3183,6 +3638,25 @@ fn runProxy(
     var engine = try rule_engine.Engine.init(allocator, &cfg.rules);
     defer engine.deinit();
 
+    // Allocate the final selection-barrier owner before any listener thread can
+    // be detached. After this point startup has no normally-unwinding OOM path:
+    // the late acquire only locks and is infallible.
+    var prepared_selection_barrier: ?*outbound.OutboundManager.PreparedSelectionBarrier =
+        try manager.prepareSelectionBarrier();
+    defer if (prepared_selection_barrier) |barrier| barrier.deinit();
+
+    // The API server itself must be stable before the first listener can be
+    // detached: its connection children retain this pointer after the accept
+    // loop reports a fatal error. No controller means no owner allocation.
+    var api_owner = try prepareApiServerOwner(
+        allocator,
+        cfg,
+        &engine,
+        manager,
+        loaded.identity != null,
+    );
+    defer api_owner.deinit();
+
     var listener_startup = ListenerStartup{};
     var expected_listeners: u8 = 0;
     if (cfg.mixed_port > 0) {
@@ -3191,45 +3665,37 @@ fn runProxy(
         if (cfg.port > 0) expected_listeners += 1;
         if (cfg.socks_port > 0) expected_listeners += 1;
     }
+    if (api_owner.preparedServer() != null) expected_listeners += 1;
 
-    const proxy_thread = try std.Thread.spawn(
-        .{},
-        proxyThreadFn,
-        .{ allocator, cfg, &engine, &manager, &listener_startup },
+    const proxy_thread = try spawnProxyListenerThread(
+        allocator,
+        cfg,
+        &engine,
+        manager,
+        &listener_startup,
     );
     proxy_thread.detach();
 
-    if (cfg.external_controller) |ec| {
-        expected_listeners += 1;
-        const port = parseExternalControllerPort(ec) catch |err|
+    if (api_owner.preparedServer()) |api_server| {
+        const api_thread = spawnApiListenerThread(
+            api_server,
+            &listener_startup,
+        ) catch |err| {
+            // No API thread borrowed the prepared owner when spawn failed. A
+            // proxy listener is already detached, so cleanup this owner and
+            // terminate through the started-runtime abort path; never unwind.
+            api_owner.destroyPrepared();
             abortStartedRuntime(
                 allocator,
                 json_output,
                 "START_FAILED",
-                "controller endpoint failed during startup",
-                "check the configured external-controller endpoint",
+                "controller thread failed during startup",
+                "check process thread limits and retry",
                 err,
             );
-        const api_thread = std.Thread.spawn(
-            .{},
-            apiThreadFn,
-            .{
-                allocator,
-                cfg,
-                &engine,
-                &manager,
-                port,
-                loaded.identity != null,
-                &listener_startup,
-            },
-        ) catch |err| abortStartedRuntime(
-            allocator,
-            json_output,
-            "START_FAILED",
-            "controller thread failed during startup",
-            "check process thread limits and retry",
-            err,
-        );
+        };
+        const transferred = api_owner.transferToProcessLifetime();
+        std.debug.assert(transferred == api_server);
         api_thread.detach();
     }
     const readiness_timeout_ms = if (std.mem.eql(u8, command_name, "daemon-run"))
@@ -3270,7 +3736,7 @@ fn runProxy(
     );
     _ = reconcileRuntimeDesired(
         allocator,
-        &manager,
+        manager,
         applied_identity,
         runtime_nonce,
     ) catch |err| abortStartedRuntime(
@@ -3288,7 +3754,7 @@ fn runProxy(
         while (attempt < 16) : (attempt += 1) {
             _ = reconcileRuntimeDesired(
                 allocator,
-                &manager,
+                manager,
                 applied_identity,
                 runtime_nonce,
             ) catch |err| abortStartedRuntime(
@@ -3353,7 +3819,8 @@ fn runProxy(
             error.ListenerStartupFailed,
         );
     }
-    var selection_barrier = manager.acquireSelectionBarrier();
+    const selection_barrier = prepared_selection_barrier.?.acquire();
+    prepared_selection_barrier = null;
     listener_startup.committed.store(true, .release);
     promoteRuntimeDescriptorReady(allocator, runtime_nonce) catch |err|
         abortStartedRuntime(
@@ -3511,7 +3978,7 @@ fn reconcileRuntimeDesired(
         if (desired.generation == descriptor.generation) {
             return descriptor.generation;
         }
-        var transaction = (try manager.beginPersistedSelections(
+        const transaction = (try manager.beginPersistedSelections(
             desired.selections,
             desired.generation,
         )) orelse {
@@ -3520,23 +3987,27 @@ fn reconcileRuntimeDesired(
             }
             return error.InvalidDesiredSelection;
         };
-        defer transaction.deinit();
-        const outcome = try store.publish(.{ .state = .{
-            .nonce = descriptor.nonce,
-            .generation = descriptor.generation,
-        } }, .{
-            .pid = descriptor.pid,
-            .nonce = descriptor.nonce,
-            .endpoint = descriptor.endpoint,
-            .identity = observed_identity,
-            .generation = desired.generation,
-            .ready = descriptor.ready,
-            .invocation = descriptor.invocation,
-        });
-        switch (outcome) {
-            .committed, .durability_uncertain => {
-                if (!transaction.commit()) continue;
+        const prepared_generation = transaction.preparedGeneration();
+        const completion = try runtime_selection
+            .publishPreparedSelectionTransaction(
+            transaction,
+            store,
+            .{ .state = .{
+                .nonce = descriptor.nonce,
+                .generation = descriptor.generation,
+            } },
+            .{
+                .pid = descriptor.pid,
+                .nonce = descriptor.nonce,
+                .endpoint = descriptor.endpoint,
+                .identity = observed_identity,
+                .generation = prepared_generation,
+                .ready = descriptor.ready,
+                .invocation = descriptor.invocation,
             },
+        );
+        switch (completion) {
+            .applied => {},
             .conflict => continue,
         }
     }
@@ -3935,11 +4406,7 @@ fn prepareDaemonManagedIdentity(
     defer loaded.deinit();
     try requireRuntimeCapabilities(allocator, &loaded.value);
     applyRuntimePortSelection(&loaded.value, port_override);
-    for (loaded.value.rules.items) |rule| {
-        if (rule.rule_type == .rule_set) {
-            return error.ManagedRemoteRuleProviderUnsupported;
-        }
-    }
+    try config.requireManagedRuleProvidersResolved(&loaded.value);
     try validateRuntimeEndpointSyntax(&loaded.value);
     var validation_result = try validator.validate(allocator, &loaded.value);
     defer validation_result.deinit();
@@ -4426,7 +4893,14 @@ fn reportListenerFailure(
 ) void {
     std.debug.print("{s} fatal error: {}\n", .{ label, err });
     const previous = startup.phase.swap(.failed, .acq_rel);
-    if (previous == .committed) std.process.exit(cli_output.exit_failure);
+    switch (previous) {
+        // Once runProxy commits, every listener fatal is process-terminal; it
+        // must not return into a detached thread while process-owned borrows live.
+        .committed => std.process.exit(cli_output.exit_failure),
+        // During initialization, runProxy observes `.failed` and terminates via
+        // abortStartedRuntime. A repeated failure cannot reopen the phase.
+        .initializing, .failed => {},
+    }
 }
 
 fn waitForListenerReadiness(
@@ -4448,6 +4922,30 @@ fn waitForListenerReadiness(
     if (startup.phase.load(.acquire) == .failed) {
         return error.ListenerStartupFailed;
     }
+}
+
+fn spawnProxyListenerThread(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    engine: *rule_engine.Engine,
+    manager: *outbound.OutboundManager,
+    startup: *ListenerStartup,
+) !std.Thread {
+    return std.Thread.spawn(
+        .{},
+        proxyThreadFn,
+        .{ allocator, cfg, engine, manager, startup },
+    );
+}
+
+fn spawnApiListenerThread(
+    server: *api.ApiServer,
+    startup: *ListenerStartup,
+) !std.Thread {
+    if (comptime build_options.api_owner_spawn_fault) {
+        return error.InjectedApiThreadSpawnFailure;
+    }
+    return std.Thread.spawn(.{}, apiThreadFn, .{ server, startup });
 }
 
 fn proxyThreadFn(
@@ -4508,22 +5006,11 @@ fn proxyThreadFn(
 }
 
 fn apiThreadFn(
-    allocator: std.mem.Allocator,
-    cfg: *const config.Config,
-    engine: *rule_engine.Engine,
-    manager: *outbound.OutboundManager,
-    port: u16,
-    managed_runtime: bool,
+    api_server: *api.ApiServer,
     startup: *ListenerStartup,
 ) void {
-    var api_server = api.ApiServer.init(
-        allocator,
-        cfg,
-        engine,
-        manager,
-        port,
-        managed_runtime,
-    );
+    // `api_server` is a process-lifetime heap owner. Detached connection
+    // children borrow it even if this accept-loop thread reports a fatal error.
     api_server.startWithAcceptGate(
         &startup.ready,
         &startup.control_available,
@@ -4622,6 +5109,12 @@ fn preflightPortCheckAllowing(
     allowed_proxy_port: ?u16,
     allowed_controller_port: ?u16,
 ) !void {
+    // The dedicated ReleaseFast API-owner fault binary never starts its API
+    // listener: it fails at thread spawn by construction. Skipping unrelated
+    // bind probes removes the test-only port handoff race; production and every
+    // ordinary test compile this branch out.
+    if (comptime build_options.api_owner_spawn_fault) return;
+
     const bind_ip = effectiveBindAddress(cfg);
 
     // 进程内端口冲突检查
@@ -5017,6 +5510,23 @@ test "hasInProcessPortConflict detects conflicts" {
     try testing.expect(try hasInProcessPortConflict(&cfg));
 }
 
+test "local provider file size uses command resource-limit classification" {
+    try std.testing.expect(isConfigResourceLimitError(error.RuleProviderFileTooLarge));
+    try std.testing.expect(!isConfigResourceLimitError(error.ConfigTooLarge));
+    try std.testing.expectEqualStrings(
+        "CONFIG_LOAD_LIMIT_EXCEEDED",
+        configResourceLimitCode(.load),
+    );
+    try std.testing.expectEqualStrings(
+        "CONFIG_DOWNLOAD_LIMIT_EXCEEDED",
+        configResourceLimitCode(.download),
+    );
+    try std.testing.expectEqualStrings(
+        "CONFIG_UPDATE_LIMIT_EXCEEDED",
+        configResourceLimitCode(.update),
+    );
+}
+
 test "parseConfigDownloadArgs parses url, -n, -d and rejects missing url" {
     const testing = std.testing;
 
@@ -5236,6 +5746,90 @@ test "runtime capability preflight rejects unsupported proxies" {
     );
 }
 
+test "CLI runtime preflight admits HTTP obfs aliases and rejects unsafe variants" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const valid_documents = [_][]const u8{
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: obfs
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: obfs
+        \\    plugin-opts: { mode: http, host: cdn.example.com }
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: obfs-local
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: obfs-local
+        \\    plugin_opts: { mode: http, host: cdn.example.com }
+        ,
+    };
+    for (valid_documents) |document| {
+        var cfg = try config.parseDocument(allocator, document);
+        defer cfg.deinit();
+        try requireRuntimeCapabilities(allocator, &cfg);
+    }
+
+    const invalid_documents = [_][]const u8{
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - { name: tls, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs, plugin-opts: { mode: tls, host: example.com } }
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - { name: unknown, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: unknown }
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - { name: missing, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs }
+        ,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - { name: udp, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, udp: true }
+        ,
+    };
+    for (invalid_documents) |document| {
+        var cfg = try config.parseDocument(allocator, document);
+        defer cfg.deinit();
+        try testing.expectError(
+            error.UnsupportedCapability,
+            requireRuntimeCapabilities(allocator, &cfg),
+        );
+    }
+
+    var injected = try config.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: injected
+        \\    type: ss
+        \\    server: example.com
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\    plugin: obfs
+        \\    plugin-opts: { mode: http, host: safe.example.com }
+    );
+    defer injected.deinit();
+    allocator.free(injected.proxies.items[0].obfs_host.?);
+    injected.proxies.items[0].obfs_host = try allocator.dupe(
+        u8,
+        "safe\r\nInjected",
+    );
+    try testing.expectError(
+        error.UnsupportedCapability,
+        requireRuntimeCapabilities(allocator, &injected),
+    );
+}
+
 test "applyRuntimePortSelection prefers explicit port and keeps mixed mode" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -5385,4 +5979,348 @@ test "shadowsocks hasPendingRead should ignore encrypted leftover-only state" {
 
     client.read_leftover = try allocator.dupe(u8, "partial");
     try testing.expect(!client.hasPendingRead());
+}
+
+test "API owner allocation is conditional and pre-spawn failure is reclaimable" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var cfg = try config.parseDocument(allocator,
+        \\mixed-port: 19081
+        \\proxies: []
+        \\proxy-groups: []
+        \\rules: []
+    );
+    defer cfg.deinit();
+    const manager = try outbound.OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+    var engine = try rule_engine.Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    var absent = try prepareApiServerOwner(
+        failing.allocator(),
+        &cfg,
+        &engine,
+        manager,
+        false,
+    );
+    defer absent.deinit();
+    try testing.expect(absent.isAbsent());
+    try testing.expect(!failing.has_induced_failure);
+
+    cfg.external_controller = try allocator.dupe(u8, "127.0.0.1:19082");
+    try testing.expectError(
+        error.OutOfMemory,
+        prepareApiServerOwner(
+            failing.allocator(),
+            &cfg,
+            &engine,
+            manager,
+            false,
+        ),
+    );
+    try testing.expect(failing.has_induced_failure);
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.has_induced_failure = false;
+    var spawn_failed = try prepareApiServerOwner(
+        failing.allocator(),
+        &cfg,
+        &engine,
+        manager,
+        false,
+    );
+    try testing.expect(spawn_failed.preparedServer() != null);
+    spawn_failed.destroyPrepared();
+    try testing.expect(spawn_failed.isAbsent());
+    spawn_failed.deinit();
+
+    var transferred = try prepareApiServerOwner(
+        failing.allocator(),
+        &cfg,
+        &engine,
+        manager,
+        false,
+    );
+    const stable_server = transferred.transferToProcessLifetime();
+    try testing.expect(transferred.isProcessLifetime());
+    try testing.expectEqual(stable_server, transferred.processLifetimeServer().?);
+    transferred.reclaimProcessLifetimeForTest();
+    transferred.deinit();
+}
+
+test "runProxy prepares API owner before detach and aborts after API spawn failure" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try compat.fs.cwd().readFileAlloc(
+        allocator,
+        "src/main.zig",
+        2 * 1024 * 1024,
+    );
+    defer allocator.free(content);
+
+    const run_proxy_start = std.mem.indexOf(u8, content, "fn runProxy(") orelse
+        return error.TestUnexpectedResult;
+    const final_guard_start = std.mem.indexOfPos(
+        u8,
+        content,
+        run_proxy_start,
+        "const FinalDesiredGuard",
+    ) orelse return error.TestUnexpectedResult;
+    const body = content[run_proxy_start..final_guard_start];
+    const owner_prepare = std.mem.indexOf(
+        u8,
+        body,
+        "prepareApiServerOwner(",
+    ) orelse return error.TestUnexpectedResult;
+    const proxy_spawn = std.mem.indexOf(
+        u8,
+        body,
+        "spawnProxyListenerThread(",
+    ) orelse return error.TestUnexpectedResult;
+    const api_spawn = std.mem.indexOf(
+        u8,
+        body,
+        "spawnApiListenerThread(",
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expect(owner_prepare < proxy_spawn);
+    try testing.expect(proxy_spawn < api_spawn);
+
+    const api_failure = body[api_spawn..];
+    const cleanup = std.mem.indexOf(
+        u8,
+        api_failure,
+        "api_owner.destroyPrepared();",
+    ) orelse return error.TestUnexpectedResult;
+    const abort = std.mem.indexOf(
+        u8,
+        api_failure,
+        "abortStartedRuntime(",
+    ) orelse return error.TestUnexpectedResult;
+    const transfer = std.mem.indexOf(
+        u8,
+        api_failure,
+        "api_owner.transferToProcessLifetime()",
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expect(cleanup < abort);
+    try testing.expect(abort < transfer);
+}
+
+test "API fatal accept keeps process-lifetime owner valid for slow child" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const timeout_ms: i64 = 3000;
+
+    const SocketIo = struct {
+        fn wait(fd: std.posix.fd_t, events: i16, deadline_ms: i64) !void {
+            while (true) {
+                const remaining = deadline_ms - compat.monotonicMilliTimestamp();
+                if (remaining <= 0) return error.TestSocketTimeout;
+                var descriptors = [_]std.posix.pollfd{.{
+                    .fd = fd,
+                    .events = events,
+                    .revents = 0,
+                }};
+                const ready = try std.posix.poll(
+                    &descriptors,
+                    @intCast(@min(remaining, std.math.maxInt(i32))),
+                );
+                if (ready == 0) return error.TestSocketTimeout;
+                if (descriptors[0].revents & std.posix.POLL.NVAL != 0) {
+                    return error.InvalidSocket;
+                }
+                if (descriptors[0].revents & std.posix.POLL.ERR != 0) {
+                    return error.SocketFailure;
+                }
+                if (descriptors[0].revents & events != 0 or
+                    descriptors[0].revents & std.posix.POLL.HUP != 0)
+                {
+                    return;
+                }
+            }
+        }
+
+        fn connect(
+            address: compat.net.Address,
+            deadline_ms: i64,
+        ) !compat.net.Stream {
+            const fd = std.c.socket(
+                std.c.AF.INET,
+                std.c.SOCK.STREAM,
+                std.c.IPPROTO.TCP,
+            );
+            if (fd < 0) return error.TestSocketSetupFailed;
+            errdefer _ = std.c.close(fd);
+            if (comptime builtin.os.tag.isDarwin() and
+                @hasDecl(std.c.SO, "NOSIGPIPE"))
+            {
+                var enabled: c_int = 1;
+                if (std.c.setsockopt(
+                    fd,
+                    std.c.SOL.SOCKET,
+                    std.c.SO.NOSIGPIPE,
+                    &enabled,
+                    @sizeOf(c_int),
+                ) != 0) return error.TestSocketSetupFailed;
+            }
+            try compat.setNonBlock(fd);
+            const socket_address = address.in.sa;
+            const result = std.c.connect(
+                fd,
+                @ptrCast(&socket_address),
+                @sizeOf(std.c.sockaddr.in),
+            );
+            if (result < 0) switch (std.c.errno(result)) {
+                .INPROGRESS, .AGAIN => {},
+                else => return error.TestSocketConnectFailed,
+            };
+            try wait(fd, std.posix.POLL.OUT, deadline_ms);
+            return .{ .handle = fd };
+        }
+
+        fn writeAll(fd: std.posix.fd_t, bytes: []const u8, deadline_ms: i64) !void {
+            const flags: u32 = if (@hasDecl(std.c.MSG, "NOSIGNAL"))
+                @intCast(std.c.MSG.NOSIGNAL)
+            else
+                0;
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                try wait(fd, std.posix.POLL.OUT, deadline_ms);
+                const written = std.c.send(
+                    fd,
+                    bytes[offset..].ptr,
+                    bytes.len - offset,
+                    flags,
+                );
+                if (written < 0) switch (std.c.errno(written)) {
+                    .INTR, .AGAIN => continue,
+                    .PIPE => return error.TestBrokenPipe,
+                    .CONNRESET => return error.TestConnectionReset,
+                    else => return error.TestSocketWriteFailed,
+                };
+                if (written == 0) return error.TestSocketWriteFailed;
+                offset += @intCast(written);
+            }
+        }
+
+        fn readResponse(fd: std.posix.fd_t, buffer: []u8, deadline_ms: i64) ![]const u8 {
+            var used: usize = 0;
+            while (used < buffer.len) {
+                try wait(fd, std.posix.POLL.IN, deadline_ms);
+                const count = std.c.recv(fd, buffer[used..].ptr, buffer.len - used, 0);
+                if (count < 0) switch (std.c.errno(count)) {
+                    .INTR, .AGAIN => continue,
+                    else => return error.TestSocketReadFailed,
+                };
+                if (count == 0) return buffer[0..used];
+                used += @intCast(count);
+            }
+            return error.TestResponseTooLarge;
+        }
+    };
+
+    var cfg = try config.parseDocument(allocator,
+        \\mixed-port: 19083
+        \\proxies: []
+        \\proxy-groups: []
+        \\rules: []
+    );
+    defer cfg.deinit();
+    const manager = try outbound.OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+    var engine = try rule_engine.Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+
+    var api_owner = try ApiServerOwner.prepare(
+        allocator,
+        &cfg,
+        &engine,
+        manager,
+        0,
+        false,
+    );
+    defer api_owner.deinit();
+    const api_server = api_owner.preparedServer().?;
+    var fault = api.TestAcceptFault{};
+    api_server.setTestAcceptFault(&fault);
+    var startup = ListenerStartup{};
+
+    var listener_thread: ?std.Thread = try std.Thread.spawn(
+        .{},
+        apiThreadFn,
+        .{ api_server, &startup },
+    );
+    _ = api_owner.transferToProcessLifetime();
+    var client: ?compat.net.Stream = null;
+    defer {
+        fault.action.store(.cancel, .release);
+        if (listener_thread) |thread| thread.join();
+        if (client) |stream| stream.close();
+        if (fault.takeConnectionThread()) |thread| thread.join();
+        if (api_owner.isProcessLifetime()) {
+            api_owner.reclaimProcessLifetimeForTest();
+        }
+    }
+
+    var deadline = compat.monotonicMilliTimestamp() + timeout_ms;
+    while (fault.bound_port.load(.acquire) == 0 or
+        startup.ready.load(.acquire) == 0)
+    {
+        if (compat.monotonicMilliTimestamp() >= deadline) {
+            return error.TestListenerReadyTimeout;
+        }
+        compat.sleepNs(std.time.ns_per_ms);
+    }
+    try testing.expectEqual(
+        ListenerStartupPhase.initializing,
+        startup.phase.load(.acquire),
+    );
+
+    startup.control_available.store(true, .release);
+    const address = try compat.net.Address.parseIp4(
+        "127.0.0.1",
+        fault.bound_port.load(.acquire),
+    );
+    deadline = compat.monotonicMilliTimestamp() + timeout_ms;
+    client = try SocketIo.connect(address, deadline);
+
+    deadline = compat.monotonicMilliTimestamp() + timeout_ms;
+    while (!fault.before_next_accept.load(.acquire)) {
+        if (compat.monotonicMilliTimestamp() >= deadline) {
+            return error.TestConnectionAcceptTimeout;
+        }
+        compat.sleepNs(std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 1), api_server.testActiveConnections());
+
+    fault.action.store(.fail, .release);
+    listener_thread.?.join();
+    listener_thread = null;
+    try testing.expectEqual(
+        ListenerStartupPhase.failed,
+        startup.phase.load(.acquire),
+    );
+    try testing.expect(api_owner.isProcessLifetime());
+
+    const request = "GET /version HTTP/1.1\r\nHost: local\r\n\r\n";
+    deadline = compat.monotonicMilliTimestamp() + timeout_ms;
+    try SocketIo.writeAll(client.?.handle, request, deadline);
+    var response_buffer: [4096]u8 = undefined;
+    const response = try SocketIo.readResponse(
+        client.?.handle,
+        &response_buffer,
+        deadline,
+    );
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK"));
+    try testing.expect(std.mem.indexOf(u8, response, "\"version\":") != null);
+
+    client.?.close();
+    client = null;
+    const connection_thread = fault.takeConnectionThread() orelse
+        return error.TestConnectionThreadMissing;
+    connection_thread.join();
+    try testing.expectEqual(@as(u32, 0), api_server.testActiveConnections());
+    api_owner.reclaimProcessLifetimeForTest();
 }
