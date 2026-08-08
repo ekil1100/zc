@@ -1292,9 +1292,9 @@ fn printOverrideRuntimeError(json_output: bool, err: anyerror) bool {
                 json_output,
                 "CONFIG_CAPABILITY_UNSUPPORTED",
                 "config uses a capability not supported in zc v1.0",
-                "run `zc doctor -c <config>`; Shadowsocks supports plain AEAD " ++
-                    "or obfs/obfs-local with explicit HTTP mode and host; " ++
-                    "TLS plugins and UDP remain unsupported",
+                "run `zc doctor -c <config>`; Shadowsocks supports classic " ++
+                    "AEAD TCP/UDP and obfs/obfs-local with explicit HTTP " ++
+                    "mode and host; TLS plugins remain unsupported",
             );
             return true;
         },
@@ -5746,7 +5746,7 @@ test "runtime capability preflight rejects unsupported proxies" {
     );
 }
 
-test "CLI runtime preflight admits HTTP obfs aliases and rejects unsafe variants" {
+test "CLI runtime preflight admits HTTP obfs aliases with UDP and rejects unsafe variants" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const valid_documents = [_][]const u8{
@@ -5760,6 +5760,7 @@ test "CLI runtime preflight admits HTTP obfs aliases and rejects unsafe variants
         \\    password: secret
         \\    plugin: obfs
         \\    plugin-opts: { mode: http, host: cdn.example.com }
+        \\    udp: true
         ,
         \\mixed-port: 7890
         \\proxies:
@@ -5771,6 +5772,7 @@ test "CLI runtime preflight admits HTTP obfs aliases and rejects unsafe variants
         \\    password: secret
         \\    plugin: obfs-local
         \\    plugin_opts: { mode: http, host: cdn.example.com }
+        \\    udp: true
         ,
     };
     for (valid_documents) |document| {
@@ -5791,10 +5793,6 @@ test "CLI runtime preflight admits HTTP obfs aliases and rejects unsafe variants
         \\mixed-port: 7890
         \\proxies:
         \\  - { name: missing, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs }
-        ,
-        \\mixed-port: 7890
-        \\proxies:
-        \\  - { name: udp, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, udp: true }
         ,
     };
     for (invalid_documents) |document| {

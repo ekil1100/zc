@@ -111,6 +111,38 @@ pub fn pollAbsolute(
     return pollUntil(descriptors, deadline_ms);
 }
 
+/// Reports whether a cancellation descriptor has data or a terminal condition.
+/// The descriptor is never consumed here: callers can use this both as a
+/// pre-operation fast path and as the authoritative zero-wait race check after
+/// an asynchronous winner completes.
+pub fn cancelFdTriggered(fd: std.posix.fd_t) !bool {
+    var descriptor = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    var ops = SystemPollOps{};
+    while (true) {
+        descriptor[0].revents = 0;
+        const ready = ops.poll(&descriptor, 0) catch |err| switch (err) {
+            error.Interrupted => continue,
+            else => |other| return other,
+        };
+        if (ready == 0) return false;
+        return descriptor[0].revents & (std.posix.POLL.IN |
+            std.posix.POLL.HUP |
+            std.posix.POLL.ERR |
+            std.posix.POLL.NVAL) != 0;
+    }
+}
+
+/// Turns an optional cancellation descriptor into the shared control-flow
+/// error used by DNS, session creation, and the classic relay.
+pub fn checkCancelFd(cancel_fd: ?std.posix.fd_t) !void {
+    const fd = cancel_fd orelse return;
+    if (try cancelFdTriggered(fd)) return error.Canceled;
+}
+
 fn pollUntilUsing(
     comptime Ops: type,
     ops: *Ops,
@@ -219,56 +251,203 @@ pub fn posixRecv(fd: std.posix.fd_t, buffer: []u8, flags: u32) !usize {
 }
 
 // ---------------------------------------------------------------------------
-// D1: IPv4 UDP helpers (getsockname / recvfrom) for the UoT relay datapath.
+// IPv4 UDP helpers for classic datagram relays.
 // ---------------------------------------------------------------------------
 
-/// A bound IPv4 endpoint: octets in network order ([0..4] order) + host-order port.
-pub const BoundAddr = struct { ip: [4]u8, port: u16 };
+/// IPv4 octets and a host-order port.
+pub const UdpEndpoint4 = struct {
+    ip: [4]u8,
+    port: u16,
+};
 
-/// One recvfrom result: bytes read + the raw IPv4 sender sockaddr.
-pub const RecvFrom = struct { n: usize, addr: std.c.sockaddr.in };
+/// One recvfrom result with its IPv4 sender.
+pub const RecvFrom = struct {
+    n: usize,
+    addr: std.c.sockaddr.in,
+};
 
-/// getsockname on a bound IPv4 UDP socket. Returns the host-order port and the
-/// IPv4 octets. MUST-FIX #6: the returned family must be AF.INET; anything else
-/// (e.g. a v6 / unix fd handed to us by mistake) is a hard error rather than a
-/// silently mis-decoded address.
-pub fn udpGetSockName(fd: std.posix.fd_t) !BoundAddr {
-    var sa: std.c.sockaddr.in = undefined;
-    var sl: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
-    if (std.c.getsockname(fd, @ptrCast(&sa), &sl) < 0) return error.GetSockNameFailed;
-    if (sa.family != std.c.AF.INET) return error.UnexpectedAddressFamily;
-    const port = std.mem.bigToNative(u16, sa.port); // sa.port is network-order
-    const ip: [4]u8 = @bitCast(sa.addr); // network-order octets, already [0..4]
-    return .{ .ip = ip, .port = port };
+pub fn udpEndpoint4ToSockaddr(endpoint: UdpEndpoint4) std.c.sockaddr.in {
+    var address: std.c.sockaddr.in = .{
+        .family = std.c.AF.INET,
+        .port = std.mem.nativeToBig(u16, endpoint.port),
+        .addr = undefined,
+    };
+    @memcpy(std.mem.asBytes(&address.addr)[0..4], &endpoint.ip);
+    return address;
 }
 
-/// recvfrom one datagram, learning the peer (sender) IPv4 address.
-///
-/// Error mapping (MUST-FIX #3):
-///   EAGAIN/EWOULDBLOCK -> error.WouldBlock   (no data on a nonblocking socket)
-///   EINTR              -> retry              (spurious interrupt)
-///   EMSGSIZE / ECONNREFUSED / other non-fatal per-datagram errnos
-///                      -> error.PacketDropped (caller drops THIS datagram and
-///                         keeps the association alive — never folded into
-///                         error.InputOutput which would kill the relay)
-///   anything else      -> error.InputOutput
-pub fn udpRecvFrom(fd: std.posix.fd_t, buffer: []u8) !RecvFrom {
+pub fn sockaddrInToUdpEndpoint4(
+    address: std.c.sockaddr.in,
+) !UdpEndpoint4 {
+    if (address.family != std.c.AF.INET) {
+        return error.UnexpectedAddressFamily;
+    }
+    return .{
+        .ip = std.mem.asBytes(&address.addr)[0..4].*,
+        .port = std.mem.bigToNative(u16, address.port),
+    };
+}
+
+/// Returns the local endpoint of any IPv4 socket, including accepted TCP sockets.
+pub fn socketGetName4(fd: std.posix.fd_t) !UdpEndpoint4 {
+    var address: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
+    var address_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
     while (true) {
-        var sa: std.c.sockaddr.in = undefined;
-        var sl: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
-        const rc = std.c.recvfrom(fd, buffer.ptr, buffer.len, 0, @ptrCast(&sa), &sl);
-        if (rc < 0) {
-            switch (std.c.errno(rc)) {
-                .AGAIN => return error.WouldBlock,
-                .INTR => continue, // spurious interrupt: retry the syscall
-                // Per-datagram, non-fatal conditions. ECONNREFUSED is the
-                // ICMP port-unreachable that a prior sendto provoked; EMSGSIZE
-                // is an oversized datagram. Drop the packet, keep the relay up.
-                .MSGSIZE, .CONNREFUSED, .HOSTUNREACH, .NETUNREACH, .NOMEM => return error.PacketDropped,
-                else => return error.InputOutput,
+        const result = std.c.getsockname(
+            fd,
+            @ptrCast(&address),
+            &address_len,
+        );
+        if (result == 0) break;
+        if (std.c.errno(result) == .INTR) continue;
+        return error.GetSockNameFailed;
+    }
+    if (address_len < @sizeOf(std.c.sockaddr.in)) {
+        return error.InvalidSocketAddress;
+    }
+    return sockaddrInToUdpEndpoint4(address);
+}
+
+/// Receives one complete IPv4 datagram and its sender.
+pub fn udpRecvFrom(fd: std.posix.fd_t, buffer: []u8) !RecvFrom {
+    const flags: c_int = if (@hasDecl(std.c.MSG, "TRUNC"))
+        @intCast(std.c.MSG.TRUNC)
+    else
+        0;
+    while (true) {
+        var address: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
+        var address_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        const result = std.c.recvfrom(
+            fd,
+            buffer.ptr,
+            buffer.len,
+            flags,
+            @ptrCast(&address),
+            &address_len,
+        );
+        if (result >= 0) {
+            const datagram_len: usize = @intCast(result);
+            if (datagram_len > buffer.len) return error.DatagramTooLarge;
+            if (address_len < @sizeOf(std.c.sockaddr.in)) {
+                return error.PacketDropped;
             }
+            return .{ .n = datagram_len, .addr = address };
         }
-        return .{ .n = @intCast(rc), .addr = sa };
+        switch (std.c.errno(result)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .MSGSIZE => return error.DatagramTooLarge,
+            .CONNREFUSED,
+            .CONNRESET,
+            .HOSTUNREACH,
+            .NETUNREACH,
+            .NOBUFS,
+            .NOMEM,
+            .PIPE,
+            .TIMEDOUT,
+            => return error.PacketDropped,
+            else => return error.InputOutput,
+        }
+    }
+}
+
+/// Sends exactly one IPv4 datagram without retrying a short result.
+pub fn udpSendTo4(
+    fd: std.posix.fd_t,
+    buffer: []const u8,
+    destination: UdpEndpoint4,
+) !void {
+    const address = udpEndpoint4ToSockaddr(destination);
+    const flags: u32 = if (@hasDecl(std.c.MSG, "NOSIGNAL"))
+        @intCast(std.c.MSG.NOSIGNAL)
+    else
+        0;
+    while (true) {
+        const result = std.c.sendto(
+            fd,
+            buffer.ptr,
+            buffer.len,
+            flags,
+            @ptrCast(&address),
+            @sizeOf(std.c.sockaddr.in),
+        );
+        if (result >= 0) {
+            if (@as(usize, @intCast(result)) != buffer.len) {
+                return error.PacketDropped;
+            }
+            return;
+        }
+        switch (std.c.errno(result)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .MSGSIZE => return error.DatagramTooLarge,
+            .CONNREFUSED,
+            .CONNRESET,
+            .HOSTUNREACH,
+            .NETUNREACH,
+            .NOBUFS,
+            .NOMEM,
+            .PIPE,
+            .TIMEDOUT,
+            => return error.PacketDropped,
+            else => return error.InputOutput,
+        }
+    }
+}
+
+/// Sends exactly one connected UDP datagram without exposing SIGPIPE. A short
+/// result is treated as a dropped packet because callers must never split or
+/// retry a partial datagram as another syscall.
+pub fn udpConnectedSend(fd: std.posix.fd_t, buffer: []const u8) !void {
+    const flags: u32 = if (@hasDecl(std.c.MSG, "NOSIGNAL"))
+        @intCast(std.c.MSG.NOSIGNAL)
+    else
+        0;
+    while (true) {
+        const rc = std.c.send(fd, buffer.ptr, buffer.len, flags);
+        if (rc >= 0) {
+            if (@as(usize, @intCast(rc)) != buffer.len) return error.PacketDropped;
+            return;
+        }
+        switch (std.c.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .MSGSIZE => return error.DatagramTooLarge,
+            .CONNREFUSED,
+            .CONNRESET,
+            .HOSTUNREACH,
+            .NETUNREACH,
+            .NOBUFS,
+            .NOMEM,
+            .PIPE,
+            .TIMEDOUT,
+            => return error.PacketDropped,
+            else => return error.InputOutput,
+        }
+    }
+}
+
+/// Receives one complete datagram from a connected nonblocking UDP socket.
+/// Packet-scoped network errors remain recoverable for the association.
+pub fn udpConnectedReceive(fd: std.posix.fd_t, buffer: []u8) !usize {
+    while (true) {
+        const rc = std.c.recv(fd, buffer.ptr, buffer.len, 0);
+        if (rc >= 0) return @intCast(rc);
+        switch (std.c.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .MSGSIZE => return error.DatagramTooLarge,
+            .CONNREFUSED,
+            .CONNRESET,
+            .HOSTUNREACH,
+            .NETUNREACH,
+            .NOBUFS,
+            .NOMEM,
+            .PIPE,
+            .TIMEDOUT,
+            => return error.PacketDropped,
+            else => return error.InputOutput,
+        }
     }
 }
 
@@ -393,16 +572,84 @@ pub const Notifier = struct {
     }
 };
 
-pub fn udpSocket4() !std.posix.fd_t {
-    const any = try net.Address.parseIp4("0.0.0.0", 0);
-    var inner = any.toIo();
-    const socket = try inner.bind(io(), .{ .mode = .dgram });
+const udp_wire_size_max: c_int = 65_507;
+const udp_receive_buffer_size: c_int = 262_144;
+
+fn socketBufferSize(fd: std.posix.fd_t, option: u32) !c_int {
+    var reported_size: c_int = 0;
+    var reported_size_len: std.c.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(
+        fd,
+        std.c.SOL.SOCKET,
+        option,
+        std.mem.asBytes(&reported_size).ptr,
+        &reported_size_len,
+    ) != 0) return error.SocketSetupFailed;
+    if (reported_size_len != @sizeOf(c_int) or reported_size < 0) {
+        return error.SocketSetupFailed;
+    }
+
+    // Linux reports twice the user-requested value to include kernel overhead.
+    return if (comptime builtin.os.tag == .linux)
+        @divTrunc(reported_size, 2)
+    else
+        reported_size;
+}
+
+fn raiseSocketBuffer(
+    fd: std.posix.fd_t,
+    option: u32,
+    requested_size: c_int,
+    minimum_size: c_int,
+) !void {
+    std.debug.assert(requested_size >= minimum_size);
+    if (try socketBufferSize(fd, option) >= minimum_size) return;
+
+    if (std.c.setsockopt(
+        fd,
+        std.c.SOL.SOCKET,
+        option,
+        std.mem.asBytes(&requested_size),
+        @sizeOf(c_int),
+    ) != 0) return error.SocketSetupFailed;
+    if (try socketBufferSize(fd, option) < minimum_size) {
+        return error.SocketBufferTooSmall;
+    }
+}
+
+/// Configures one UDP socket to carry every portable IPv4 datagram atomically.
+pub fn configureUdpDatagramBuffers(fd: std.posix.fd_t) !void {
+    try raiseSocketBuffer(
+        fd,
+        std.c.SO.SNDBUF,
+        udp_wire_size_max,
+        udp_wire_size_max,
+    );
+    try raiseSocketBuffer(
+        fd,
+        std.c.SO.RCVBUF,
+        udp_receive_buffer_size,
+        udp_wire_size_max,
+    );
+}
+
+/// Binds a CLOEXEC IPv4 UDP socket to the exact host-order endpoint.
+pub fn udpBind4(ip: [4]u8, port: u16) !std.posix.fd_t {
+    var address = net.Address.initIp4(ip, port).toIo();
+    const socket = try address.bind(io(), .{ .mode = .dgram });
+    errdefer socket.close(io());
+    try net.configureSocketWriteSafety(socket.handle);
+    try configureUdpDatagramBuffers(socket.handle);
     return socket.handle;
 }
 
-/// Set O_NONBLOCK on a socket fd. udpSocket4() returns a BLOCKING socket on this
-/// toolchain (std.Io.Threaded), so the poll-driven UoT relay MUST mark its client
-/// UDP socket nonblocking before polling — otherwise recvfrom blocks the worker.
+pub fn udpSocket4() !std.posix.fd_t {
+    return udpBind4(.{ 0, 0, 0, 0 }, 0);
+}
+
+/// Set O_NONBLOCK on a socket fd. udpSocket4() returns a blocking socket on this
+/// toolchain (std.Io.Threaded), so a poll-driven UDP relay must mark its client
+/// socket nonblocking before polling; otherwise recvfrom blocks the worker.
 pub fn setNonBlock(fd: std.posix.fd_t) !void {
     const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
     if (flags < 0) return error.SetNonblockFailed;
@@ -1047,7 +1294,11 @@ pub const net = struct {
         host: []const u8,
         port: u16,
         timeout_ms: u32,
+        cancel_fd: ?std.posix.fd_t,
     ) !AddressList {
+        try checkCancelFd(cancel_fd);
+        if (timeout_ms == 0) return error.AddressResolutionTimeout;
+
         // Keep the test seam fail-closed too: DNSService accepts a C string and
         // would otherwise silently truncate an embedded NUL or accept names
         // that Zig's native resolver rejects.
@@ -1057,11 +1308,13 @@ pub const net = struct {
             monotonicMilliTimestamp(),
             @intCast(timeout_ms),
         ) catch std.math.maxInt(i64);
+        try checkCancelFd(cancel_fd);
         const hostname = try allocator.dupeZ(u8, host);
         defer allocator.free(hostname);
         if (monotonicMilliTimestamp() >= deadline_ms) {
             return error.AddressResolutionTimeout;
         }
+        try checkCancelFd(cancel_fd);
 
         var context = DarwinAddressContext{
             .allocator = allocator,
@@ -1069,19 +1322,57 @@ pub const net = struct {
         };
         defer context.deinit();
         var sd_ref: DarwinDnsServiceRef = null;
-        try ops.start(&sd_ref, hostname, darwinAddressCallback, &context);
+        ops.start(
+            &sd_ref,
+            hostname,
+            darwinAddressCallback,
+            &context,
+        ) catch |err| {
+            try checkCancelFd(cancel_fd);
+            return err;
+        };
         std.debug.assert(sd_ref != null);
         defer ops.deallocate(sd_ref);
-        const fd = try ops.socketFd(sd_ref);
+        const fd = ops.socketFd(sd_ref) catch |err| {
+            try checkCancelFd(cancel_fd);
+            return err;
+        };
 
         while (!context.batch_complete) {
-            var descriptors = [_]std.posix.pollfd{.{
-                .fd = fd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try ops.wait(&descriptors, deadline_ms);
+            var descriptor_count: usize = 1;
+            var descriptors = [_]std.posix.pollfd{
+                .{
+                    .fd = fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+                .{
+                    .fd = cancel_fd orelse -1,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+            };
+            if (cancel_fd != null) descriptor_count = 2;
+            const ready = ops.wait(
+                descriptors[0..descriptor_count],
+                deadline_ms,
+            ) catch |err| {
+                try checkCancelFd(cancel_fd);
+                return err;
+            };
             if (ready == 0) return error.AddressResolutionTimeout;
+
+            // Cancellation is authoritative when DNS and control become ready
+            // in the same poll batch. The sd_ref defer deallocates immediately.
+            if (cancel_fd != null and
+                descriptors[1].revents & (std.posix.POLL.IN |
+                    std.posix.POLL.HUP |
+                    std.posix.POLL.ERR |
+                    std.posix.POLL.NVAL) != 0)
+            {
+                return error.Canceled;
+            }
+
             const revents = descriptors[0].revents;
             if (revents & std.posix.POLL.NVAL != 0) {
                 return error.AddressResolutionFailed;
@@ -1092,15 +1383,23 @@ pub const net = struct {
                 }
                 continue;
             }
-            try ops.process(sd_ref);
+            ops.process(sd_ref) catch |err| {
+                try checkCancelFd(cancel_fd);
+                return err;
+            };
+            try checkCancelFd(cancel_fd);
             if (context.callback_error) |err| return err;
         }
+        try checkCancelFd(cancel_fd);
         if (context.callback_error) |err| return err;
         if (context.addresses.items.len == 0) return error.UnknownHostName;
-        return .{
+        var addresses = AddressList{
             .addrs = try context.addresses.toOwnedSlice(allocator),
             .allocator = allocator,
         };
+        errdefer addresses.deinit();
+        try checkCancelFd(cancel_fd);
+        return addresses;
     }
 
     fn singleAddressList(
@@ -1112,9 +1411,10 @@ pub const net = struct {
         return .{ .addrs = addresses, .allocator = allocator };
     }
 
-    const AddressListTimeoutEvent = union(enum) {
+    const AddressListEvent = union(enum) {
         addresses: anyerror!AddressList,
         deadline: anyerror!void,
+        canceled: anyerror!void,
     };
 
     const SystemAddressListResolver = struct {
@@ -1140,6 +1440,50 @@ pub const net = struct {
             try self.deadline.wait(io());
         }
     };
+
+    /// Opens a connected UDP socket under an existing awake-clock deadline.
+    /// std.Io creates it atomically CLOEXEC; explicit fcntl then makes the data
+    /// plane nonblocking without reopening the caller's time budget.
+    pub fn udpConnectToAddressAbsolute(
+        address: Address,
+        deadline_ms: i64,
+    ) !std.posix.fd_t {
+        if (monotonicMilliTimestamp() >= deadline_ms) {
+            return error.DeadlineExceeded;
+        }
+
+        var inner_address = address.toIo();
+        const stream = inner_address.connect(io(), .{ .mode = .dgram }) catch |err| {
+            if (monotonicMilliTimestamp() >= deadline_ms) {
+                return error.DeadlineExceeded;
+            }
+            return err;
+        };
+        errdefer stream.close(io());
+        configureUdpDatagramBuffers(stream.socket.handle) catch |err| {
+            if (monotonicMilliTimestamp() >= deadline_ms) {
+                return error.DeadlineExceeded;
+            }
+            return err;
+        };
+        configureSocketWriteSafety(stream.socket.handle) catch |err| {
+            if (monotonicMilliTimestamp() >= deadline_ms) {
+                return error.DeadlineExceeded;
+            }
+            return err;
+        };
+        setNonBlock(stream.socket.handle) catch |err| {
+            if (monotonicMilliTimestamp() >= deadline_ms) {
+                return error.DeadlineExceeded;
+            }
+            return err;
+        };
+
+        if (monotonicMilliTimestamp() >= deadline_ms) {
+            return error.DeadlineExceeded;
+        }
+        return stream.socket.handle;
+    }
 
     pub fn tcpConnectToAddress(address: Address) !Stream {
         var inner_address = address.toIo();
@@ -1301,29 +1645,59 @@ pub const net = struct {
         };
     }
 
-    /// Resolves a host under one awake-clock timeout. Select owns both tasks;
-    /// cancel waits for the losing task and every queued AddressList is drained
-    /// and deinitialized before return, including a lookup/timeout completion
-    /// race. No detached resolver thread can outlive the caller.
+    /// Resolves a host under one awake-clock timeout. This compatibility entry
+    /// point keeps its historical behavior by supplying no cancellation fd.
     pub fn getAddressListWithTimeout(
         allocator: std.mem.Allocator,
         host: []const u8,
         port: u16,
         timeout_ms: u32,
     ) !AddressList {
+        return getAddressListWithTimeoutCancelFd(
+            allocator,
+            host,
+            port,
+            timeout_ms,
+            null,
+        );
+    }
+
+    /// Resolves a host while treating readability or termination on cancel_fd
+    /// as authoritative cancellation. All Select tasks are owned, canceled,
+    /// joined, and drained before return; no resolver or watcher is detached.
+    pub fn getAddressListWithTimeoutCancelFd(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        timeout_ms: u32,
+        cancel_fd: ?std.posix.fd_t,
+    ) !AddressList {
+        try checkCancelFd(cancel_fd);
         if (timeout_ms == 0) return error.AddressResolutionTimeout;
-        // Numeric literals never enter either asynchronous resolver.
+
+        // Numeric literals never enter either asynchronous resolver. Check
+        // cancellation immediately before allocation, then once again after it
+        // so a simultaneous control close remains authoritative.
         if (Address.parseIp4(host, port)) |address| {
-            return singleAddressList(allocator, address);
+            try checkCancelFd(cancel_fd);
+            var addresses = try singleAddressList(allocator, address);
+            errdefer addresses.deinit();
+            try checkCancelFd(cancel_fd);
+            return addresses;
         } else |_| {}
         if (Address.parseIp6(host, port)) |address| {
-            return singleAddressList(allocator, address);
+            try checkCancelFd(cancel_fd);
+            var addresses = try singleAddressList(allocator, address);
+            errdefer addresses.deinit();
+            try checkCancelFd(cancel_fd);
+            return addresses;
         } else |_| {}
 
         // Validate once, before selecting the OS resolver. In particular,
         // Darwin's DNSService C-string API must reject exactly the same
         // embedded-NUL, invalid-label, and overlong inputs as std's resolver.
         _ = try ionet.HostName.init(host);
+        try checkCancelFd(cancel_fd);
 
         if (comptime builtin.os.tag.isDarwin()) {
             var ops = DarwinDnsApi{};
@@ -1334,11 +1708,14 @@ pub const net = struct {
                 host,
                 port,
                 timeout_ms,
+                cancel_fd,
             );
         }
 
         // std.Io.Threaded uses Zig's native cancellable DNS implementation on
-        // Linux, so Select cancellation remains bounded there.
+        // Linux. The fd watcher only performs zero-wait readiness checks and a
+        // cancellable awake sleep, so it neither consumes the borrowed fd nor
+        // leaves Select waiting on a raw blocking poll task.
         var resolver = SystemAddressListResolver.init(timeout_ms);
         return getAddressListWithTimeoutUsing(
             SystemAddressListResolver,
@@ -1347,6 +1724,7 @@ pub const net = struct {
             host,
             port,
             timeout_ms,
+            cancel_fd,
         );
     }
 
@@ -1357,7 +1735,9 @@ pub const net = struct {
         host: []const u8,
         port: u16,
         timeout_ms: u32,
+        cancel_fd: ?std.posix.fd_t,
     ) !AddressList {
+        try checkCancelFd(cancel_fd);
         if (timeout_ms == 0) return error.AddressResolutionTimeout;
 
         const Workers = struct {
@@ -1381,10 +1761,25 @@ pub const net = struct {
             ) anyerror!void {
                 return Resolver.wait(worker_resolver, worker_timeout_ms);
             }
+
+            fn cancellation(worker_fd: std.posix.fd_t) anyerror!void {
+                while (true) {
+                    // Readiness is observed without consuming the borrowed fd.
+                    // The awake sleep is a Select cancellation point, bounding
+                    // both detection latency and loser join latency without a
+                    // raw blocking poll or detached watcher.
+                    if (try cancelFdTriggered(worker_fd)) return;
+                    try std.Io.sleep(
+                        io(),
+                        .fromMilliseconds(5),
+                        .awake,
+                    );
+                }
+            }
         };
 
-        var event_buffer: [2]AddressListTimeoutEvent = undefined;
-        var select: std.Io.Select(AddressListTimeoutEvent) = .init(
+        var event_buffer: [3]AddressListEvent = undefined;
+        var select: std.Io.Select(AddressListEvent) = .init(
             io(),
             &event_buffer,
         );
@@ -1394,34 +1789,59 @@ pub const net = struct {
             .{ resolver, allocator, host, port },
         );
         select.async(.deadline, Workers.deadline, .{ resolver, timeout_ms });
+        if (cancel_fd) |fd| {
+            select.async(.canceled, Workers.cancellation, .{fd});
+        }
 
         const winner = select.await() catch |err| {
-            drainAddressListSelect(&select);
+            _ = drainAddressListSelect(&select);
             return err;
         };
         return switch (winner) {
-            .addresses => |result| addresses: {
-                const value = result catch |err| {
-                    drainAddressListSelect(&select);
+            .addresses => |result| {
+                const drained = drainAddressListSelect(&select);
+                const canceled = selectCancellationTriggered(
+                    cancel_fd,
+                    drained,
+                ) catch |err| {
+                    if (result) |value| {
+                        var addresses = value;
+                        addresses.deinit();
+                    } else |_| {}
                     return err;
                 };
-                drainAddressListSelect(&select);
-                break :addresses value;
+                if (canceled) {
+                    if (result) |value| {
+                        var addresses = value;
+                        addresses.deinit();
+                    } else |_| {}
+                    return error.Canceled;
+                }
+                return result;
             },
             .deadline => |result| {
-                result catch |err| {
-                    drainAddressListSelect(&select);
-                    return err;
-                };
-                drainAddressListSelect(&select);
+                const drained = drainAddressListSelect(&select);
+                if (try selectCancellationTriggered(cancel_fd, drained)) {
+                    return error.Canceled;
+                }
+                try result;
                 return error.AddressResolutionTimeout;
+            },
+            .canceled => {
+                _ = drainAddressListSelect(&select);
+                return error.Canceled;
             },
         };
     }
 
+    const AddressListSelectDrain = struct {
+        cancellation_observed: bool = false,
+    };
+
     fn drainAddressListSelect(
-        select: *std.Io.Select(AddressListTimeoutEvent),
-    ) void {
+        select: *std.Io.Select(AddressListEvent),
+    ) AddressListSelectDrain {
+        var drained = AddressListSelectDrain{};
         while (select.cancel()) |event| switch (event) {
             .addresses => |result| {
                 if (result) |value| {
@@ -1430,7 +1850,29 @@ pub const net = struct {
                 } else |_| {}
             },
             .deadline => {},
+            .canceled => |result| {
+                if (result) |_| {
+                    drained.cancellation_observed = true;
+                } else |err| {
+                    // error.Canceled means Select stopped the watcher sleep;
+                    // every other completion represents a terminal fd result.
+                    if (err != error.Canceled) {
+                        drained.cancellation_observed = true;
+                    }
+                }
+            },
         };
+        return drained;
+    }
+
+    fn selectCancellationTriggered(
+        cancel_fd: ?std.posix.fd_t,
+        drained: AddressListSelectDrain,
+    ) !bool {
+        if (drained.cancellation_observed) return true;
+        const fd = cancel_fd orelse return false;
+        // Close the address-winner race after the watcher has been joined.
+        return cancelFdTriggered(fd);
     }
 };
 
@@ -1644,6 +2086,7 @@ test "getAddressListWithTimeout validates hostnames before the OS resolver" {
                 invalid.host,
                 53,
                 100,
+                null,
             ),
         );
         try std.testing.expectEqual(@as(usize, 0), ops.starts);
@@ -1667,6 +2110,80 @@ test "Darwin DNSService resolver returns bounded localhost addresses with the re
     for (addresses.addrs) |address| {
         try std.testing.expectEqual(@as(u16, 4242), address.getPort());
     }
+}
+
+test "Darwin DNSService cancel event wins a simultaneous DNS event" {
+    const CancelOps = struct {
+        peer_fd: std.posix.fd_t,
+        deallocated: bool = false,
+        processed: bool = false,
+
+        fn start(
+            _: *@This(),
+            sd_ref: *net.DarwinDnsServiceRef,
+            _: [*:0]const u8,
+            _: net.DarwinDnsGetAddrInfoReply,
+            _: ?*anyopaque,
+        ) !void {
+            sd_ref.* = @ptrFromInt(1);
+        }
+
+        fn socketFd(_: *@This(), _: net.DarwinDnsServiceRef) !std.posix.fd_t {
+            return 42;
+        }
+
+        fn wait(
+            self: *@This(),
+            descriptors: []std.posix.pollfd,
+            _: i64,
+        ) !usize {
+            if (descriptors.len != 2) return error.TestMissingCancelDescriptor;
+            posixClose(self.peer_fd);
+            self.peer_fd = -1;
+            // Simulate one poll batch in which both sources became ready.
+            descriptors[0].revents = std.posix.POLL.IN;
+            descriptors[1].revents = std.posix.POLL.IN | std.posix.POLL.HUP;
+            return 2;
+        }
+
+        fn process(self: *@This(), _: net.DarwinDnsServiceRef) !void {
+            self.processed = true;
+            return error.TestUnexpectedDnsProcessing;
+        }
+
+        fn deallocate(self: *@This(), _: net.DarwinDnsServiceRef) void {
+            self.deallocated = true;
+        }
+    };
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(
+        std.c.AF.UNIX,
+        std.c.SOCK.STREAM,
+        0,
+        &sockets,
+    ) != 0) return error.TestSocketPairFailed;
+    defer posixClose(sockets[0]);
+
+    var ops = CancelOps{ .peer_fd = sockets[1] };
+    defer if (ops.peer_fd >= 0) posixClose(ops.peer_fd);
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try std.testing.expectError(
+        error.Canceled,
+        net.getDarwinAddressListWithTimeoutUsing(
+            CancelOps,
+            &ops,
+            tracking.allocator(),
+            "simultaneous-dns-cancel.invalid",
+            53,
+            1_000,
+            sockets[0],
+        ),
+    );
+    try std.testing.expect(ops.deallocated);
+    try std.testing.expect(!ops.processed);
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    try std.testing.expectEqual(tracking.allocations, tracking.deallocations);
 }
 
 test "Darwin DNSService timeout seam deallocates the active query" {
@@ -1715,6 +2232,7 @@ test "Darwin DNSService timeout seam deallocates the active query" {
             "resolver-timeout.invalid",
             53,
             50,
+            null,
         ),
     );
     try std.testing.expect(ops.deallocated);
@@ -1776,6 +2294,7 @@ fn darwinResolverAllocationFixture(allocator: std.mem.Allocator) !void {
         "localhost",
         5353,
         100,
+        null,
     );
     defer addresses.deinit();
     try std.testing.expectEqual(@as(usize, 1), addresses.addrs.len);
@@ -1834,11 +2353,142 @@ test "getAddressListWithTimeout cancels and drains an allocating resolver" {
             "resolver-never-completes.invalid",
             8388,
             10,
+            null,
         ),
     );
     try std.testing.expect(monotonicMilliTimestamp() - started_ms < 2_000);
     try std.testing.expect(resolver.started.load(.acquire));
     try std.testing.expect(resolver.cancellation_observed.load(.acquire));
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    try std.testing.expectEqual(tracking.allocations, tracking.deallocations);
+}
+
+test "cancel marker wins without being consumed and joins a slow allocating resolver" {
+    const SlowResolver = struct {
+        started: *Notifier,
+        cancellation_observed: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn resolve(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            port: u16,
+        ) !net.AddressList {
+            defer self.finished.store(true, .release);
+            const addrs = try allocator.alloc(net.Address, 1);
+            errdefer allocator.free(addrs);
+            addrs[0] = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+            self.started.signal();
+            std.Io.sleep(io(), .fromSeconds(30), .awake) catch |err| switch (err) {
+                // Return an allocated success after cancellation. The resolver
+                // seam must join this loser and drain its AddressList.
+                error.Canceled => self.cancellation_observed.store(true, .release),
+            };
+            return .{ .addrs = addrs, .allocator = allocator };
+        }
+
+        fn wait(_: *@This(), timeout_ms: u32) !void {
+            try std.Io.sleep(
+                io(),
+                .fromMilliseconds(timeout_ms),
+                .awake,
+            );
+        }
+    };
+    const Canceler = struct {
+        started: *Notifier,
+        peer_fd: std.posix.fd_t,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer {
+                posixClose(self.peer_fd);
+                self.peer_fd = -1;
+            }
+            var descriptors = [_]std.posix.pollfd{.{
+                .fd = self.started.handle(),
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const deadline_ms = std.math.add(
+                i64,
+                monotonicMilliTimestamp(),
+                2_000,
+            ) catch std.math.maxInt(i64);
+            const ready = pollAbsolute(&descriptors, deadline_ms) catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (ready == 0) {
+                self.failure = error.TestBarrierTimeout;
+                return;
+            }
+            self.started.drain();
+            const marker = "x";
+            const written = posixWrite(self.peer_fd, marker) catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (written != marker.len) {
+                self.failure = error.TestShortCancelWrite;
+            }
+        }
+    };
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(
+        std.c.AF.UNIX,
+        std.c.SOCK.STREAM,
+        0,
+        &sockets,
+    ) != 0) return error.TestSocketPairFailed;
+    defer posixClose(sockets[0]);
+
+    var started = try Notifier.init();
+    defer started.deinit();
+    var canceler = Canceler{
+        .started = &started,
+        .peer_fd = sockets[1],
+    };
+    const canceler_thread = try std.Thread.spawn(.{}, Canceler.run, .{&canceler});
+    var canceler_joined = false;
+    defer {
+        // Active failure cleanup: release a blocked canceler before joining it.
+        started.signal();
+        if (!canceler_joined) canceler_thread.join();
+        if (canceler.peer_fd >= 0) posixClose(canceler.peer_fd);
+    }
+
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var resolver = SlowResolver{ .started = &started };
+    const before_ms = monotonicMilliTimestamp();
+    try std.testing.expectError(
+        error.Canceled,
+        net.getAddressListWithTimeoutUsing(
+            SlowResolver,
+            &resolver,
+            tracking.allocator(),
+            "slow-cancel.invalid",
+            8388,
+            3_000,
+            sockets[0],
+        ),
+    );
+    const elapsed_ms = monotonicMilliTimestamp() - before_ms;
+    canceler_thread.join();
+    canceler_joined = true;
+
+    try std.testing.expect(canceler.failure == null);
+    try std.testing.expect(elapsed_ms < 2_000);
+    try std.testing.expect(resolver.cancellation_observed.load(.acquire));
+    try std.testing.expect(resolver.finished.load(.acquire));
+
+    // The watcher borrows this descriptor. Its one-byte marker must remain for
+    // the owner (or another observer) after cancellation has been resolved.
+    var marker: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posixRead(sockets[0], &marker));
+    try std.testing.expectEqualStrings("x", &marker);
     try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
     try std.testing.expectEqual(tracking.allocations, tracking.deallocations);
 }
@@ -1898,13 +2548,133 @@ test "Darwin compat.net connect and accept paths set SO_NOSIGPIPE" {
 }
 
 // ---------------------------------------------------------------------------
-// D1: UDP helper tests
+// UDP helper tests
 // ---------------------------------------------------------------------------
 
-test "D1: udpGetSockName returns AF.INET + nonzero ephemeral port" {
+test "IPv4 UDP endpoint conversion preserves octets and host-order port" {
+    const endpoint = UdpEndpoint4{
+        .ip = .{ 192, 0, 2, 44 },
+        .port = 0x1234,
+    };
+    const address = udpEndpoint4ToSockaddr(endpoint);
+
+    try std.testing.expectEqual(std.c.AF.INET, address.family);
+    try std.testing.expectEqual(
+        std.mem.nativeToBig(u16, 0x1234),
+        address.port,
+    );
+    try std.testing.expectEqual(endpoint, try sockaddrInToUdpEndpoint4(address));
+
+    var wrong_family = address;
+    wrong_family.family = std.c.AF.INET6;
+    try std.testing.expectError(
+        error.UnexpectedAddressFamily,
+        sockaddrInToUdpEndpoint4(wrong_family),
+    );
+}
+
+test "bound IPv4 UDP helpers are CLOEXEC and exchange one atomic datagram" {
+    const loopback = [4]u8{ 127, 0, 0, 1 };
+    const receiver_fd = try udpBind4(loopback, 0);
+    defer posixClose(receiver_fd);
+    try setNonBlock(receiver_fd);
+    const receiver = try socketGetName4(receiver_fd);
+    try std.testing.expectEqual(loopback, receiver.ip);
+    try std.testing.expect(receiver.port != 0);
+
+    const descriptor_flags = std.c.fcntl(
+        receiver_fd,
+        std.posix.F.GETFD,
+        @as(c_int, 0),
+    );
+    if (descriptor_flags < 0) return error.TestFcntlFailed;
+    try std.testing.expect(descriptor_flags & std.posix.FD_CLOEXEC != 0);
+
+    const sender_fd = try udpBind4(loopback, 0);
+    defer posixClose(sender_fd);
+    try udpSendTo4(sender_fd, "atomic-loopback", receiver);
+
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = receiver_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try pollAbsolute(
+        &descriptors,
+        std.math.add(
+            i64,
+            monotonicMilliTimestamp(),
+            2_000,
+        ) catch std.math.maxInt(i64),
+    );
+    if (ready == 0) return error.TestTimeout;
+
+    var buffer: [32]u8 = undefined;
+    const received = try udpRecvFrom(receiver_fd, &buffer);
+    try std.testing.expectEqualStrings(
+        "atomic-loopback",
+        buffer[0..received.n],
+    );
+    const sender = try sockaddrInToUdpEndpoint4(received.addr);
+    try std.testing.expectEqual(loopback, sender.ip);
+    try std.testing.expect(sender.port != 0);
+}
+
+test "UDP datagram buffer configuration preserves larger socket buffers" {
+    const fd = try udpBind4(.{ 127, 0, 0, 1 }, 0);
+    defer posixClose(fd);
+
+    const requested_size: c_int = udp_receive_buffer_size;
+    if (std.c.setsockopt(
+        fd,
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDBUF,
+        std.mem.asBytes(&requested_size),
+        @sizeOf(c_int),
+    ) != 0) return error.TestSocketOptionFailed;
+    const before = try socketBufferSize(fd, std.c.SO.SNDBUF);
+    try configureUdpDatagramBuffers(fd);
+    const after = try socketBufferSize(fd, std.c.SO.SNDBUF);
+    try std.testing.expect(after >= before);
+}
+
+test "bound IPv4 UDP helpers carry the maximum portable datagram" {
+    const loopback = [4]u8{ 127, 0, 0, 1 };
+    const receiver_fd = try udpBind4(loopback, 0);
+    defer posixClose(receiver_fd);
+    const receiver = try socketGetName4(receiver_fd);
+    const sender_fd = try udpBind4(loopback, 0);
+    defer posixClose(sender_fd);
+
+    const wire_size_max: usize = 65_507;
+    var payload: [wire_size_max]u8 = @splat(0x5a);
+    try udpSendTo4(sender_fd, &payload, receiver);
+
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = receiver_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try pollAbsolute(
+        &descriptors,
+        std.math.add(
+            i64,
+            monotonicMilliTimestamp(),
+            2_000,
+        ) catch std.math.maxInt(i64),
+    );
+    if (ready == 0) return error.TestTimeout;
+
+    var received_payload: [wire_size_max]u8 = undefined;
+    const received = try udpRecvFrom(receiver_fd, &received_payload);
+    try std.testing.expectEqual(wire_size_max, received.n);
+    try std.testing.expectEqualSlices(u8, &payload, &received_payload);
+}
+
+test "socketGetName4 returns AF.INET and a nonzero ephemeral port" {
     const fd = try udpSocket4();
     defer posixClose(fd);
-    const bnd = try udpGetSockName(fd);
+    const bnd = try socketGetName4(fd);
     try std.testing.expect(bnd.port != 0); // ephemeral bind resolved
 }
 
@@ -1914,7 +2684,7 @@ test "D1: loopback sendto -> udpRecvFrom returns sender addr + payload bytes" {
     const tx = try udpSocket4();
     defer posixClose(tx);
 
-    const rx_bnd = try udpGetSockName(rx);
+    const rx_bnd = try socketGetName4(rx);
 
     // Send to 127.0.0.1:rx_port from tx.
     var dst: std.c.sockaddr.in = .{
@@ -1957,4 +2727,92 @@ test "D1: udpRecvFrom on empty nonblocking socket -> error.WouldBlock" {
     if (std.c.fcntl(fd, std.posix.F.SETFL, nb) < 0) return error.SetNonblockFailed;
     var buf: [64]u8 = undefined;
     try std.testing.expectError(error.WouldBlock, udpRecvFrom(fd, &buf));
+}
+
+test "connected UDP compat is CLOEXEC nonblocking atomic and deadline bounded" {
+    // The production seam opens through std.Io, then exposes raw one-packet syscalls.
+    const server_fd = try udpSocket4();
+    defer posixClose(server_fd);
+    try setNonBlock(server_fd);
+    const bound = try socketGetName4(server_fd);
+    const server_address = net.Address.initIp4(
+        .{ 127, 0, 0, 1 },
+        bound.port,
+    );
+
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        net.udpConnectToAddressAbsolute(
+            server_address,
+            monotonicMilliTimestamp(),
+        ),
+    );
+    const client_fd = try net.udpConnectToAddressAbsolute(
+        server_address,
+        std.math.add(
+            i64,
+            monotonicMilliTimestamp(),
+            2_000,
+        ) catch std.math.maxInt(i64),
+    );
+    defer posixClose(client_fd);
+
+    const descriptor_flags = std.c.fcntl(
+        client_fd,
+        std.posix.F.GETFD,
+        @as(c_int, 0),
+    );
+    if (descriptor_flags < 0) return error.TestFcntlFailed;
+    try std.testing.expect(descriptor_flags & std.posix.FD_CLOEXEC != 0);
+    const status_flags = std.c.fcntl(
+        client_fd,
+        std.posix.F.GETFL,
+        @as(c_int, 0),
+    );
+    if (status_flags < 0) return error.TestFcntlFailed;
+    const nonblocking: c_int = @bitCast(@as(
+        u32,
+        @bitCast(std.posix.O{ .NONBLOCK = true }),
+    ));
+    try std.testing.expect(status_flags & nonblocking != 0);
+
+    if (comptime builtin.os.tag.isDarwin()) {
+        var no_sigpipe: c_int = 0;
+        var option_len: std.c.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(
+            client_fd,
+            std.c.SOL.SOCKET,
+            std.c.SO.NOSIGPIPE,
+            &no_sigpipe,
+            &option_len,
+        ) != 0) return error.SocketOptionReadFailed;
+        try std.testing.expectEqual(@as(c_int, 1), no_sigpipe);
+    }
+
+    var empty_buffer: [1]u8 = undefined;
+    try std.testing.expectError(
+        error.WouldBlock,
+        udpConnectedReceive(client_fd, &empty_buffer),
+    );
+    try udpConnectedSend(client_fd, "atomic");
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = server_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try pollAbsolute(
+        &descriptors,
+        std.math.add(
+            i64,
+            monotonicMilliTimestamp(),
+            2_000,
+        ) catch std.math.maxInt(i64),
+    );
+    if (ready == 0) return error.TestTimeout;
+    var received_buffer: [16]u8 = undefined;
+    const received = try udpRecvFrom(server_fd, &received_buffer);
+    try std.testing.expectEqualStrings(
+        "atomic",
+        received_buffer[0..received.n],
+    );
 }

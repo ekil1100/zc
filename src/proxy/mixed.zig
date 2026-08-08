@@ -9,18 +9,22 @@ const OutboundManager = outbound.OutboundManager;
 const aead = @import("../crypto/aead.zig");
 const ss = @import("outbound/shadowsocks.zig");
 const simple_obfs_http = @import("outbound/simple_obfs_http.zig");
+const socks_address = @import("../protocol/socks_address.zig");
+const socks5_udp = @import("socks5_udp.zig");
 const socket_options = @import("../socket_options.zig");
-const udp_uot = @import("udp_uot.zig");
 
 // macOS reserves 16MiB of virtual stack per pthread by default. Linux glibc
 // also needs enough room for the executable's static TLS before pthread_create
 // accepts a worker. Keep the worker stack explicit, portable, and bounded.
 const connection_task_stack_size: usize = 1024 * 1024;
 const max_connections: u32 = 128;
+const max_udp_associations: u32 = 64;
 const handshake_timeout_ms: i64 = 5_000;
 
 comptime {
     std.debug.assert(max_connections > 0);
+    std.debug.assert(max_udp_associations > 0);
+    std.debug.assert(max_udp_associations <= max_connections);
     std.debug.assert(
         max_connections * connection_task_stack_size <= 128 * 1024 * 1024,
     );
@@ -29,6 +33,7 @@ comptime {
 const ConnectionLimiter = struct {
     allocator: std.mem.Allocator,
     active: std.atomic.Value(u32) = .init(0),
+    active_udp: std.atomic.Value(u32) = .init(0),
     references: std.atomic.Value(u32) = .init(1),
 
     fn create(allocator: std.mem.Allocator) !*ConnectionLimiter {
@@ -52,6 +57,34 @@ const ConnectionLimiter = struct {
         const previous = self.active.fetchSub(1, .monotonic);
         std.debug.assert(previous > 0);
         self.releaseReference();
+    }
+
+    /// A worker already owns the listener-state reference, so UDP admission
+    /// changes only the bounded association count.
+    fn acquireUdp(self: *ConnectionLimiter) bool {
+        var current = self.active_udp.load(.monotonic);
+        for (0..max_connections) |_| {
+            if (current >= max_udp_associations) return false;
+            if (self.active_udp.cmpxchgWeak(
+                current,
+                current + 1,
+                .monotonic,
+                .monotonic,
+            )) |actual| {
+                current = actual;
+            } else {
+                return true;
+            }
+        }
+        // Contention or repeated weak-CAS failure rejects admission rather than
+        // violating the hard bound or spinning a listener worker indefinitely.
+        return false;
+    }
+
+    fn releaseUdp(self: *ConnectionLimiter) void {
+        const previous = self.active_udp.fetchSub(1, .monotonic);
+        std.debug.assert(previous > 0);
+        std.debug.assert(previous <= max_udp_associations);
     }
 
     fn releaseReference(self: *ConnectionLimiter) void {
@@ -186,7 +219,13 @@ fn spawnConnectionTask(
 fn connectionTaskMain(task: *ConnTask) void {
     defer task.allocator.destroy(task);
     defer task.limiter.release();
-    handleConnection(task.allocator, task.conn, task.engine, task.manager) catch |err| {
+    handleConnectionWithLimiter(
+        task.allocator,
+        task.conn,
+        task.engine,
+        task.manager,
+        task.limiter,
+    ) catch |err| {
         std.debug.print("Mixed connection error: {}\n", .{err});
     };
 }
@@ -218,7 +257,96 @@ fn readBeforeDeadline(
     }
 }
 
-fn handleConnection(allocator: std.mem.Allocator, conn: net.Server.Connection, engine: *Engine, manager: *OutboundManager) !void {
+fn readExactBeforeDeadline(
+    stream: net.Stream,
+    output: []u8,
+    deadline_ms: i64,
+) !void {
+    var read_count: usize = 0;
+    while (read_count < output.len) {
+        const count = try readBeforeDeadline(
+            stream,
+            output[read_count..],
+            deadline_ms,
+        );
+        if (count == 0) return error.UnexpectedEof;
+        read_count += count;
+    }
+}
+
+fn readSocks5Request(
+    stream: net.Stream,
+    buffer: *[3 + socks_address.encoded_size_max]u8,
+    deadline_ms: i64,
+) ![]const u8 {
+    const fixed_header_size: usize = 4;
+    try readExactBeforeDeadline(
+        stream,
+        buffer[0..fixed_header_size],
+        deadline_ms,
+    );
+
+    const request_size: usize = switch (buffer[3]) {
+        0x01 => 3 + 7,
+        0x04 => 3 + 19,
+        0x03 => size: {
+            try readExactBeforeDeadline(
+                stream,
+                buffer[fixed_header_size .. fixed_header_size + 1],
+                deadline_ms,
+            );
+            break :size 3 + 1 + 1 + @as(usize, buffer[4]) + 2;
+        },
+        else => fixed_header_size,
+    };
+    std.debug.assert(request_size <= buffer.len);
+    const already_read: usize = if (buffer[3] == 0x03)
+        fixed_header_size + 1
+    else
+        fixed_header_size;
+    try readExactBeforeDeadline(
+        stream,
+        buffer[already_read..request_size],
+        deadline_ms,
+    );
+    return buffer[0..request_size];
+}
+
+fn validateSocks5Request(
+    request: []const u8,
+) !socks_address.Parsed {
+    if (request.len < 4) return error.InvalidRequest;
+    if (request[0] != 0x05) return error.InvalidVersion;
+    if (request[2] != 0x00) return error.InvalidReservedByte;
+    const address = try socks_address.parse(request[3..]);
+    if (address.consumed != request.len - 3) {
+        return error.TrailingRequestData;
+    }
+    return address;
+}
+
+fn handleConnection(
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    engine: *Engine,
+    manager: *OutboundManager,
+) !void {
+    return handleConnectionWithLimiter(
+        allocator,
+        conn,
+        engine,
+        manager,
+        null,
+    );
+}
+
+fn handleConnectionWithLimiter(
+    allocator: std.mem.Allocator,
+    conn: net.Server.Connection,
+    engine: *Engine,
+    manager: *OutboundManager,
+    limiter: ?*ConnectionLimiter,
+) !void {
     defer conn.stream.close();
     const handshake_deadline = compat.monotonicMilliTimestamp() +
         handshake_timeout_ms;
@@ -242,6 +370,7 @@ fn handleConnection(allocator: std.mem.Allocator, conn: net.Server.Connection, e
             first_byte[0],
             engine,
             manager,
+            limiter,
             handshake_deadline,
         );
     } else if (first_byte[0] == 0x04) {
@@ -268,24 +397,29 @@ fn handleSocks5(
     first_byte: u8,
     engine: *Engine,
     manager: *OutboundManager,
+    limiter: ?*ConnectionLimiter,
     handshake_deadline: i64,
 ) !void {
     _ = allocator;
 
-    var buf: [256]u8 = undefined;
-    const n = try readBeforeDeadline(
+    var method_count_buffer: [1]u8 = undefined;
+    try readExactBeforeDeadline(
         conn.stream,
-        &buf,
+        &method_count_buffer,
         handshake_deadline,
     );
-    if (n < 2) return error.InvalidGreeting;
-
-    const num_methods = buf[0];
-    if (n < 1 + num_methods) return error.InvalidGreeting;
+    const method_count = method_count_buffer[0];
+    if (method_count == 0) return error.InvalidGreeting;
+    var methods: [255]u8 = undefined;
+    try readExactBeforeDeadline(
+        conn.stream,
+        methods[0..method_count],
+        handshake_deadline,
+    );
 
     var found_no_auth = false;
-    for (0..num_methods) |i| {
-        if (buf[1 + i] == 0x00) {
+    for (methods[0..method_count]) |method| {
+        if (method == 0x00) {
             found_no_auth = true;
             break;
         }
@@ -297,45 +431,67 @@ fn handleSocks5(
 
     try conn.stream.writeAll(&.{ first_byte, 0x00 });
 
-    const req_n = try readBeforeDeadline(
+    var request_buffer: [3 + socks_address.encoded_size_max]u8 = undefined;
+    const request = try readSocks5Request(
         conn.stream,
-        &buf,
+        &request_buffer,
         handshake_deadline,
     );
-    if (req_n < 7) return error.InvalidRequest;
-    if (buf[0] != 0x05) return error.InvalidVersion;
-    switch (buf[1]) {
-        0x01 => {}, // CONNECT: fall through to the existing path below (verbatim)
-        0x03 => {
-            // UDP ASSOCIATE: bind a client UDP socket, reply with the bound
-            // endpoint, and run the UoT relay for the association lifetime. The
-            // request DST is advisory (RFC1928) and ignored; proxy selection is
-            // deferred to the first datagram (FIRST-DATAGRAM-TARGET).
-            return udp_uot.handleSocks5Associate(conn, engine, manager);
-        },
-        else => {
-            try conn.stream.writeAll(&.{ 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+    if (request[1] == 0x03) {
+        _ = validateSocks5Request(request) catch {
+            try conn.stream.writeAll(
+                &.{ 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+            );
             return;
-        },
+        };
+        if (!manager.canAssociateUdp()) {
+            try conn.stream.writeAll(
+                &.{ 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+            );
+            return;
+        }
+        const admission = limiter orelse {
+            try conn.stream.writeAll(
+                &.{ 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+            );
+            return;
+        };
+        if (!admission.acquireUdp()) {
+            try conn.stream.writeAll(
+                &.{ 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+            );
+            return;
+        }
+        defer admission.releaseUdp();
+        return socks5_udp.handleAssociate(conn, engine, manager);
+    }
+    if (request[1] != 0x01) {
+        try conn.stream.writeAll(
+            &.{ 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+        );
+        return;
     }
 
-    const atyp = buf[3];
-    var target_port: u16 = 0;
-    var host_buf: [256]u8 = undefined;
-    const target_host: []const u8 = switch (atyp) {
-        0x01 => blk: { // IPv4
-            if (req_n < 10) return error.InvalidRequest;
-            target_port = (@as(u16, buf[8]) << 8) | buf[9];
-            break :blk try std.fmt.bufPrint(&host_buf, "{}.{}.{}.{}", .{ buf[4], buf[5], buf[6], buf[7] });
-        },
-        0x03 => blk: { // Domain
-            const domain_len: usize = buf[4];
-            if (req_n < 5 + domain_len + 2) return error.InvalidRequest;
-            target_port = (@as(u16, buf[5 + domain_len]) << 8) | buf[5 + domain_len + 1];
-            break :blk buf[5 .. 5 + domain_len];
-        },
-        else => {
-            try conn.stream.writeAll(&.{ 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+    const address = validateSocks5Request(request) catch {
+        try conn.stream.writeAll(
+            &.{ 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+        );
+        return;
+    };
+    const atyp = request[3];
+    const target_port = address.port;
+    var host_buf: [64]u8 = undefined;
+    const target_host: []const u8 = switch (address.host) {
+        .ipv4 => |ip| try std.fmt.bufPrint(
+            &host_buf,
+            "{d}.{d}.{d}.{d}",
+            .{ ip[0], ip[1], ip[2], ip[3] },
+        ),
+        .domain => |domain| domain,
+        .ipv6 => {
+            try conn.stream.writeAll(
+                &.{ 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+            );
             return;
         },
     };
@@ -1354,6 +1510,66 @@ test "mixed connection workers have bounded count and stack" {
     try std.testing.expectEqual(@as(u32, 0), limiter.active.load(.monotonic));
 }
 
+test "mixed UDP association admission accepts exactly 64 and releases slots" {
+    const limiter = try ConnectionLimiter.create(std.testing.allocator);
+    defer limiter.releaseReference();
+    const references_before = limiter.references.load(.monotonic);
+
+    for (0..max_udp_associations) |_| {
+        try std.testing.expect(limiter.acquireUdp());
+    }
+    try std.testing.expect(!limiter.acquireUdp());
+    try std.testing.expectEqual(
+        max_udp_associations,
+        limiter.active_udp.load(.monotonic),
+    );
+    try std.testing.expectEqual(
+        references_before,
+        limiter.references.load(.monotonic),
+    );
+
+    limiter.releaseUdp();
+    try std.testing.expect(limiter.acquireUdp());
+    for (0..max_udp_associations) |_| limiter.releaseUdp();
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        limiter.active_udp.load(.monotonic),
+    );
+    try std.testing.expectEqual(
+        references_before,
+        limiter.references.load(.monotonic),
+    );
+}
+
+test "mixed validates one complete SOCKS5 UDP request before admission" {
+    const valid_requests = [_][]const u8{
+        "\x05\x03\x00\x01\x7f\x00\x00\x01\x00\x00",
+        "\x05\x03\x00\x03\x03dns\x00\x35",
+        "\x05\x03\x00\x04" ++ ("\x00" ** 15) ++ "\x01\x01\xbb",
+    };
+    for (valid_requests) |request| {
+        const address = try validateSocks5Request(request);
+        try std.testing.expectEqual(request.len - 3, address.consumed);
+    }
+
+    try std.testing.expectError(
+        error.InvalidReservedByte,
+        validateSocks5Request(
+            "\x05\x03\x01\x01\x7f\x00\x00\x01\x00\x00",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnknownAddressType,
+        validateSocks5Request("\x05\x03\x00\x02"),
+    );
+    try std.testing.expectError(
+        error.TrailingRequestData,
+        validateSocks5Request(
+            "\x05\x03\x00\x01\x7f\x00\x00\x01\x00\x00x",
+        ),
+    );
+}
+
 test "mixed handshake reads honor one monotonic deadline" {
     const pair = try makeTcpStreamPair();
     defer pair.left.close();
@@ -1366,6 +1582,101 @@ test "mixed handshake reads honor one monotonic deadline" {
             &buffer,
             compat.monotonicMilliTimestamp() + 20,
         ),
+    );
+}
+
+test "SOCKS5 UDP ASSOCIATE returns command-not-supported without an association" {
+    const allocator = std.testing.allocator;
+    var cfg = @import("../config.zig").Config{
+        .allocator = allocator,
+        .mode = try allocator.dupe(u8, "rule"),
+        .log_level = try allocator.dupe(u8, "info"),
+        .bind_address = try allocator.dupe(u8, "*"),
+        .proxies = .empty,
+        .proxy_groups = .empty,
+        .rules = .empty,
+    };
+    defer cfg.deinit();
+    const manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+    var engine = try Engine.init(allocator, &cfg.rules);
+    defer engine.deinit();
+    const limiter = try ConnectionLimiter.create(allocator);
+    defer limiter.releaseReference();
+
+    const pair = try makeTcpStreamPair();
+    var pair_owned = true;
+    errdefer if (pair_owned) {
+        pair.left.close();
+        pair.right.close();
+    };
+    const conn = net.Server.Connection{
+        .stream = pair.left,
+        .address = try net.Address.parseIp4("127.0.0.1", 12345),
+    };
+    const client = pair.right;
+
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        conn: net.Server.Connection,
+        engine: *Engine,
+        manager: *OutboundManager,
+        limiter: *ConnectionLimiter,
+        failure: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            handleConnectionWithLimiter(
+                context.allocator,
+                context.conn,
+                context.engine,
+                context.manager,
+                context.limiter,
+            ) catch |err| {
+                context.failure = err;
+            };
+        }
+    };
+    var context = Context{
+        .allocator = allocator,
+        .conn = conn,
+        .engine = &engine,
+        .manager = manager,
+        .limiter = limiter,
+    };
+    const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    pair_owned = false;
+    var client_open = true;
+    var thread_joined = false;
+    defer {
+        if (client_open) client.close();
+        if (!thread_joined) thread.join();
+    }
+
+    try setReadTimeoutMs(client.handle, 1_000);
+    try client.writeAll(&.{ 0x05, 0x01, 0x00 });
+    var method_reply: [2]u8 = undefined;
+    try readExactFd(client.handle, &method_reply);
+    try std.testing.expectEqualSlices(u8, &.{ 0x05, 0x00 }, &method_reply);
+
+    try client.writeAll(&.{
+        0x05, 0x03, 0x00, 0x01, 127, 0, 0, 1, 0, 0,
+    });
+    var command_reply: [10]u8 = undefined;
+    try readExactFd(client.handle, &command_reply);
+    client.close();
+    client_open = false;
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
+        &command_reply,
+    );
+    try std.testing.expect(context.failure == null);
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        limiter.active_udp.load(.monotonic),
     );
 }
 
@@ -1965,6 +2276,15 @@ fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
         written += try compat.posixSocketWrite(fd, data[written..]);
+    }
+}
+
+fn readExactFd(fd: std.posix.fd_t, output: []u8) !void {
+    var read: usize = 0;
+    while (read < output.len) {
+        const count = try compat.posixRead(fd, output[read..]);
+        if (count == 0) return error.UnexpectedEof;
+        read += count;
     }
 }
 

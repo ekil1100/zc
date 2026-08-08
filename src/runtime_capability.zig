@@ -66,7 +66,6 @@ pub const CapabilityError = error{
     ReservedProxyName,
     PluginMetadataRequiresShadowsocks,
     UnsupportedProxyType,
-    ShadowsocksUdpNotSupported,
     ShadowsocksTlsNotSupported,
     InconsistentShadowsocksPluginFields,
     UnsupportedShadowsocksPlugin,
@@ -108,14 +107,8 @@ pub fn assessProxy(proxy: *const config.Proxy) ProxyAssessment {
             });
         },
         .ss => {
-            // UDP and top-level TLS are independent transport capabilities. Keep
-            // them separate from plugin parsing so catalog recovery can suppress
-            // only a malformed plugin finding without hiding either flag.
-            if (proxy.udp) {
-                result.findings.append(.{
-                    .shadowsocks = .udp_not_supported,
-                });
-            }
+            // Top-level TLS is independent from plugin parsing so catalog
+            // recovery cannot hide it with malformed plugin metadata.
             if (proxy.tls) {
                 result.findings.append(.{
                     .shadowsocks = .tls_not_supported,
@@ -178,7 +171,7 @@ pub fn assessProxyGroup(group: *const config.ProxyGroup) Assessment {
 }
 
 /// Catalog capture may retain only explicitly marked, recoverable Shadowsocks
-/// plugin semantics. UDP, TLS, cipher, WebSocket, declarations, and every
+/// plugin semantics. TLS, cipher, WebSocket, declarations, and every
 /// non-Shadowsocks finding remain reportable.
 pub fn reportsProxyFailure(
     mode: Mode,
@@ -194,7 +187,7 @@ pub fn reportsProxyFailure(
 
     return switch (failure) {
         .shadowsocks => |plugin_failure| switch (plugin_failure) {
-            .udp_not_supported, .tls_not_supported => true,
+            .tls_not_supported => true,
             .inconsistent_plugin_fields,
             .unsupported_plugin,
             .missing_plugin_options,
@@ -259,7 +252,6 @@ pub fn failureToError(failure: Failure) CapabilityError {
         .plugin_metadata_requires_shadowsocks => error.PluginMetadataRequiresShadowsocks,
         .unsupported_proxy_type => error.UnsupportedProxyType,
         .shadowsocks => |ss_failure| switch (ss_failure) {
-            .udp_not_supported => error.ShadowsocksUdpNotSupported,
             .tls_not_supported => error.ShadowsocksTlsNotSupported,
             .inconsistent_plugin_fields => error.InconsistentShadowsocksPluginFields,
             .unsupported_plugin => error.UnsupportedShadowsocksPlugin,
@@ -322,7 +314,7 @@ test "shared proxy assessment covers the complete v1 capability matrix" {
     proxy.ws = true;
     proxy.semantic_state = .malformed;
     assessment = assessProxy(&proxy);
-    try std.testing.expectEqual(@as(usize, 5), assessment.items().len);
+    try std.testing.expectEqual(@as(usize, 4), assessment.items().len);
     try std.testing.expect(hasFailureTag(
         &assessment,
         .unsupported_shadowsocks_cipher,
@@ -347,6 +339,23 @@ test "shared proxy assessment covers the complete v1 capability matrix" {
     ));
 }
 
+test "classic Shadowsocks UDP is admitted independently of TCP transport" {
+    var proxy = testProxy(.ss);
+    proxy.cipher = "aes-256-gcm";
+    proxy.udp = true;
+
+    const assessment = assessProxy(&proxy);
+    try std.testing.expectEqual(@as(usize, 0), assessment.items().len);
+    const capability = try requireProxy(&proxy);
+    switch (capability) {
+        .shadowsocks => |transport| try std.testing.expectEqual(
+            shadowsocks.Transport.plain,
+            transport,
+        ),
+        else => return error.ExpectedShadowsocksCapability,
+    }
+}
+
 test "catalog recovery suppresses only marked Shadowsocks plugin semantics" {
     var proxy = testProxy(.ss);
     proxy.semantic_state = .malformed;
@@ -362,8 +371,7 @@ test "catalog recovery suppresses only marked Shadowsocks plugin semantics" {
         reported += 1;
         switch (failure) {
             .shadowsocks => |ss_failure| try std.testing.expect(
-                ss_failure == .udp_not_supported or
-                    ss_failure == .tls_not_supported,
+                ss_failure == .tls_not_supported,
             ),
             .unsupported_shadowsocks_cipher,
             .websocket_not_supported,
@@ -371,7 +379,7 @@ test "catalog recovery suppresses only marked Shadowsocks plugin semantics" {
             else => return error.UnexpectedCatalogRecoveryFinding,
         }
     }
-    try std.testing.expectEqual(@as(usize, 4), reported);
+    try std.testing.expectEqual(@as(usize, 3), reported);
 }
 
 test "global and group assessment include standalone ports and declarations" {

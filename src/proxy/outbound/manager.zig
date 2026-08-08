@@ -6,19 +6,16 @@ const Config = config.Config;
 const Proxy = config.Proxy;
 const ProxyType = config.ProxyType;
 const meta = @import("../../meta.zig");
+const socks_address = @import("../../protocol/socks_address.zig");
+const aead = @import("../../crypto/aead.zig");
 const ss = @import("shadowsocks.zig");
+const shadowsocks_udp = @import("shadowsocks_udp.zig");
 const simple_obfs_http = @import("simple_obfs_http.zig");
 const runtime_capability = @import("../../runtime_capability.zig");
 const anytls = @import("../../protocol/anytls.zig");
 const anytls_pool = @import("anytls_pool.zig");
-const udp_uot = @import("../udp_uot.zig");
 const runtime_selection = @import("../../runtime_selection.zig");
 const config_catalog = @import("../../config_catalog.zig");
-
-/// The production UoT v2 codec instantiated over a real borrowed anytls.Stream.
-/// The ProxyStream UDP arm owns a heap instance of this; the relay (D6) drives
-/// writeDatagram/readDatagram on it via ProxyStream.udpStream().
-pub const AnyTlsUdpStream = udp_uot.UotStream(anytls.Stream);
 const crypto = std.crypto;
 const trojan = @import("../../protocol/trojan.zig");
 const socket_options = @import("../../socket_options.zig");
@@ -65,10 +62,6 @@ pub const ProxyStream = struct {
     /// the Session here (that is the pool's drain in §13).
     owned_anytls_stream: ?*anytls.Stream = null,
     owned_trojan_client: ?*trojan.Client = null,
-    /// Retained AnyTLS UoT v2 arm for protocol tests and future capability work.
-    /// The v1 `connectUdp` path never constructs it. It never flows through
-    /// relay(); only close/getHandle/udpStream/move are valid.
-    owned_anytls_udp: ?*AnyTlsUdpStream = null,
     is_closed: bool = false,
 
     pub fn initDirect(stream: net.Stream) ProxyStream {
@@ -117,18 +110,6 @@ pub const ProxyStream = struct {
         };
     }
 
-    /// Wrap a heap AnyTlsUdpStream (UoT v2 over a borrowed anytls.Stream) as a
-    /// UDP-only ProxyStream (D5). base_stream is the fd=-1 sentinel; the byte
-    /// methods @panic. The relay drives I/O through udpStream(); close() frees
-    /// the UotStream + routes the inner Stream.close.
-    pub fn initAnyTlsUdp(allocator: std.mem.Allocator, ust: *AnyTlsUdpStream) ProxyStream {
-        return .{
-            .base_stream = .{ .handle = -1 },
-            .allocator = allocator,
-            .owned_anytls_udp = ust,
-        };
-    }
-
     pub fn move(self: *ProxyStream) ProxyStream {
         const moved = self.*;
         self.base_stream = .{ .handle = -1 };
@@ -136,19 +117,11 @@ pub const ProxyStream = struct {
         self.owned_ss_client = null;
         self.owned_anytls_stream = null;
         self.owned_trojan_client = null;
-        self.owned_anytls_udp = null;
         self.is_closed = true;
         return moved;
     }
 
-    /// Accessor for the relay (D6). The UDP arm exposes ONLY this + close +
-    /// getHandle + move; the byte-stream methods @panic on a UDP ProxyStream.
-    pub fn udpStream(self: *ProxyStream) *AnyTlsUdpStream {
-        return self.owned_anytls_udp.?;
-    }
-
     pub fn write(self: *ProxyStream, data: []const u8) !void {
-        if (self.owned_anytls_udp != null) @panic("ProxyStream.write called on a UDP (UoT) arm");
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             try client.write(data);
@@ -162,7 +135,6 @@ pub const ProxyStream = struct {
     }
 
     pub fn read(self: *ProxyStream, buf: []u8) !usize {
-        if (self.owned_anytls_udp != null) @panic("ProxyStream.read called on a UDP (UoT) arm");
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             return try client.read(buf);
@@ -180,7 +152,6 @@ pub const ProxyStream = struct {
     /// Shadowsocks polls across synthetic WouldBlock from split salts/frames;
     /// direct and Trojan retain their plain blocking read behavior.
     pub fn readBlocking(self: *ProxyStream, buf: []u8) !usize {
-        if (self.owned_anytls_udp != null) @panic("ProxyStream.readBlocking called on a UDP (UoT) arm");
         if (self.is_closed) return error.StreamClosed;
         if (self.owned_ss_client) |client| {
             return try client.readBlocking(buf);
@@ -195,17 +166,6 @@ pub const ProxyStream = struct {
         if (self.is_closed) return;
         self.is_closed = true;
 
-        if (self.owned_anytls_udp) |u| {
-            // UDP arm teardown (D5). Route the inner Stream.close (FIN + return
-            // the Session to the pool's idle list / discard + drop the relay
-            // borrow ref) exactly like the TCP anytls arm, then free the
-            // UotStream (deinit frees its rx buffer) and the heap wrapper.
-            self.owned_anytls_udp = null;
-            u.stream.close();
-            u.deinit();
-            self.allocator.?.destroy(u);
-            return;
-        }
         if (self.owned_ss_client) |client| {
             self.owned_ss_client = null;
             client.deinit();
@@ -231,7 +191,6 @@ pub const ProxyStream = struct {
     }
 
     pub fn hasPendingRead(self: *const ProxyStream) bool {
-        if (self.owned_anytls_udp != null) @panic("ProxyStream.hasPendingRead called on a UDP (UoT) arm");
         if (self.is_closed) return false;
         if (self.owned_ss_client) |client| {
             return client.hasPendingRead();
@@ -278,11 +237,6 @@ pub const ProxyStream = struct {
 
     pub fn getHandle(self: *ProxyStream) std.posix.fd_t {
         if (self.is_closed) return -1;
-        if (self.owned_anytls_udp) |u| {
-            // The UDP relay (D6) polls the inner anytls Stream's notifier fd for
-            // inbound UoT frames exactly as the TCP relay polls a stream fd.
-            return u.stream.getHandle();
-        }
         if (self.owned_anytls_stream) |stream| {
             // The per-stream notifier read fd: the plain CONNECT relay polls this
             // for readiness exactly as it would a socket fd.
@@ -297,7 +251,6 @@ pub const ProxyStream = struct {
     /// compat.shutdownWrite(getHandle()) — byte-for-byte what shutdownTargetWrite
     /// did before (direct/ss/trojan/vless all shut down the real socket fd).
     pub fn shutdownWrite(self: *ProxyStream) !void {
-        if (self.owned_anytls_udp != null) @panic("ProxyStream.shutdownWrite called on a UDP (UoT) arm");
         if (self.is_closed) return;
         if (self.owned_anytls_stream) |stream| {
             stream.shutdownWrite();
@@ -322,6 +275,9 @@ const Impl = struct {
     /// Values point directly into the immutable Config arrays.
     proxy_index: std.StringHashMap(*const Proxy),
     group_index: std.StringHashMap(GroupIndexEntry),
+    /// Precomputed only from admitted entries actually inserted into the
+    /// first-match proxy index.
+    udp_association_available: bool = false,
 
     /// 每个代理组的当前选择（group_name → proxy_name）
     group_selections: std.StringHashMap([]const u8),
@@ -393,6 +349,9 @@ const Impl = struct {
             // first-match behavior for manually constructed configs as well.
             if (self.proxy_index.contains(proxy.name)) continue;
             self.proxy_index.putAssumeCapacity(proxy.name, proxy);
+            if (proxy.proxy_type == .ss and proxy.udp) {
+                self.udp_association_available = true;
+            }
         }
 
         try self.group_index.ensureTotalCapacity(
@@ -409,6 +368,52 @@ const Impl = struct {
 
     fn borrowedConfig(self: *const Impl) *const Config {
         return self.config;
+    }
+
+    fn canAssociateUdp(self: *const Impl) bool {
+        return self.udp_association_available;
+    }
+
+    const ShadowsocksUdpOptions = struct {
+        server: []const u8,
+        port: u16,
+        password: []const u8,
+        cipher: aead.CipherType,
+    };
+
+    const ShadowsocksUdpPreflightError = error{
+        UdpNotSupportedByProxy,
+        MissingServer,
+        InvalidProxyPort,
+        MissingPassword,
+        MissingCipher,
+        UnsupportedShadowsocksCipher,
+    };
+
+    /// Validates and borrows only the fields used by classic Shadowsocks UDP.
+    /// In particular, TCP-only plugin/obfs metadata cannot enter the result.
+    fn preflightShadowsocksUdp(
+        proxy: *const Proxy,
+    ) ShadowsocksUdpPreflightError!ShadowsocksUdpOptions {
+        if (proxy.proxy_type != .ss) return error.UdpNotSupportedByProxy;
+        if (!proxy.udp) return error.UdpNotSupportedByProxy;
+        if (proxy.server.len == 0) return error.MissingServer;
+        if (proxy.port == 0) return error.InvalidProxyPort;
+
+        const password = proxy.password orelse return error.MissingPassword;
+        if (password.len == 0) return error.MissingPassword;
+
+        const cipher_name = proxy.cipher orelse return error.MissingCipher;
+        if (cipher_name.len == 0) return error.MissingCipher;
+        const cipher = aead.parseCipherType(cipher_name) orelse
+            return error.UnsupportedShadowsocksCipher;
+
+        return .{
+            .server = proxy.server,
+            .port = proxy.port,
+            .password = password,
+            .cipher = cipher,
+        };
     }
 
     fn requireCompleteCapabilities(self: *Impl) !void {
@@ -1021,6 +1026,30 @@ const Impl = struct {
         }
     }
 
+    fn waitForTrafficReadyCancelable(
+        self: *Impl,
+        cancel_fd: ?std.posix.fd_t,
+        absolute_deadline_ms: i64,
+    ) !void {
+        while (!self.traffic_ready.load(.acquire)) {
+            // Cancellation remains authoritative when both control and the
+            // awake-clock deadline become ready in the same iteration.
+            try compat.checkCancelFd(cancel_fd);
+            if (compat.monotonicMilliTimestamp() >= absolute_deadline_ms) {
+                return error.DeadlineExceeded;
+            }
+            // Awake-clock timestamps have millisecond precision, so one
+            // millisecond is both deadline-bounded and the maximum sleep.
+            compat.sleepNs(std.time.ns_per_ms);
+        }
+        // Recheck both boundaries after observing readiness; readiness must not
+        // allow an already-canceled or expired open to continue into selection.
+        try compat.checkCancelFd(cancel_fd);
+        if (compat.monotonicMilliTimestamp() >= absolute_deadline_ms) {
+            return error.DeadlineExceeded;
+        }
+    }
+
     /// 根据代理名称建立连接（返回加密的代理流）
     pub fn connect(self: *Impl, proxy_name: []const u8, target: []const u8, port: u16) !ProxyStream {
         _ = self.borrowedConfig();
@@ -1071,53 +1100,64 @@ const Impl = struct {
         );
     }
 
-    /// Reject all v1 UDP proxy paths before dialing. DIRECT and REJECT preserve
-    /// their narrower policy errors so SOCKS5 can report an accurate denial.
-    pub fn connectUdp(self: *Impl, proxy_name: []const u8) !ProxyStream {
+    /// Resolves one policy and creates a classic Shadowsocks UDP session. The
+    /// selected proxy and every required field are checked before Session.create
+    /// can allocate, resolve DNS, or open a socket.
+    pub fn connectUdp(
+        self: *Impl,
+        proxy_name: []const u8,
+        absolute_deadline_ms: i64,
+        cancel_fd: ?std.posix.fd_t,
+    ) !*shadowsocks_udp.Session {
+        try compat.checkCancelFd(cancel_fd);
         _ = self.borrowedConfig();
-        self.waitForTrafficReady();
-        if (std.mem.eql(u8, proxy_name, "DIRECT")) return error.UdpNotSupportedForDirect;
-        if (std.mem.eql(u8, proxy_name, "REJECT")) return error.ConnectionRejected;
+        try self.waitForTrafficReadyCancelable(
+            cancel_fd,
+            absolute_deadline_ms,
+        );
+        if (std.mem.eql(u8, proxy_name, "DIRECT")) {
+            return error.UdpNotSupportedForDirect;
+        }
+        if (std.mem.eql(u8, proxy_name, "REJECT")) {
+            return error.ConnectionRejected;
+        }
 
         // TCP and UDP share one bounded resolver and selection-lock scope.
         const current_name = try self.resolvePolicyName(proxy_name);
 
         // A group may resolve to the literal DIRECT/REJECT names.
-        if (std.mem.eql(u8, current_name, "DIRECT")) return error.UdpNotSupportedForDirect;
-        if (std.mem.eql(u8, current_name, "REJECT")) return error.ConnectionRejected;
+        if (std.mem.eql(u8, current_name, "DIRECT")) {
+            return error.UdpNotSupportedForDirect;
+        }
+        if (std.mem.eql(u8, current_name, "REJECT")) {
+            return error.ConnectionRejected;
+        }
 
-        const proxy = self.findProxy(current_name) orelse return error.ProxyNotFound;
+        const proxy = self.findProxy(current_name) orelse
+            return error.ProxyNotFound;
         const capability = try self.requireSelectedCapabilities(proxy);
-        return switch (capability) {
-            .direct => error.UdpNotSupportedForDirect,
-            .reject => error.ConnectionRejected,
-            .shadowsocks, .trojan => error.UnsupportedProxyType,
-        };
-    }
-
-    /// Open the single UoT v2 stream for an association: gate on the proxy being
-    /// anytls + udp:true, then check out a Stream to the magic UoT dest via the
-    /// SAME SessionPool the TCP path uses (shared poolKey). Wrap it in a heap
-    /// AnyTlsUdpStream owned by the returned ProxyStream's UDP arm.
-    fn connectAnyTlsUdp(self: *Impl, proxy: *const Proxy) !ProxyStream {
-        switch (proxy.proxy_type) {
+        const options = switch (capability) {
             .direct => return error.UdpNotSupportedForDirect,
             .reject => return error.ConnectionRejected,
-            .anytls => {},
-            else => return error.UdpNotSupportedByProxy,
+            .shadowsocks => try preflightShadowsocksUdp(proxy),
+            .trojan => return error.UdpNotSupportedByProxy,
+        };
+
+        // Do not allocate a predictably expired or canceled Session only to
+        // rediscover the same boundary inside Session.create.
+        try compat.checkCancelFd(cancel_fd);
+        if (compat.monotonicMilliTimestamp() >= absolute_deadline_ms) {
+            return error.DeadlineExceeded;
         }
-        if (!proxy.udp) return error.UdpNotSupportedByProxy;
-
-        const key = try self.poolKey(proxy);
-        defer self.allocator.free(key);
-        const pool = try self.getOrCreatePool(key, proxy);
-        const stream = try pool.createStream(udp_uot.MAGIC_DOMAIN, udp_uot.MAGIC_PORT);
-        errdefer stream.close();
-
-        const ust = try self.allocator.create(AnyTlsUdpStream);
-        errdefer self.allocator.destroy(ust);
-        ust.* = AnyTlsUdpStream.init(self.allocator, stream);
-        return ProxyStream.initAnyTlsUdp(self.allocator, ust);
+        return shadowsocks_udp.Session.create(
+            self.allocator,
+            options.server,
+            options.port,
+            options.password,
+            options.cipher,
+            absolute_deadline_ms,
+            cancel_fd,
+        );
     }
 
     /// Connects an already-admitted concrete proxy. The capability value came
@@ -1142,11 +1182,11 @@ const Impl = struct {
                     client.deinit();
                     self.allocator.destroy(client);
                 }
-                const addr = ss.Address{
+                const address = socks_address.Address{
                     .host = target,
                     .port = port,
                 };
-                const stream = try client.connect(addr);
+                const stream = try client.connect(address);
                 return ProxyStream.initShadowsocks(self.allocator, stream, client);
             },
             .trojan => {
@@ -1517,6 +1557,10 @@ pub const OutboundManager = opaque {
         return self.constImpl().configKey();
     }
 
+    pub fn canAssociateUdp(self: *const OutboundManager) bool {
+        return self.constImpl().canAssociateUdp();
+    }
+
     pub fn snapshotSelections(
         self: *OutboundManager,
         allocator: std.mem.Allocator,
@@ -1544,8 +1588,14 @@ pub const OutboundManager = opaque {
     pub fn connectUdp(
         self: *OutboundManager,
         proxy_name: []const u8,
-    ) !ProxyStream {
-        return self.impl().connectUdp(proxy_name);
+        absolute_deadline_ms: i64,
+        cancel_fd: ?std.posix.fd_t,
+    ) !*shadowsocks_udp.Session {
+        return self.impl().connectUdp(
+            proxy_name,
+            absolute_deadline_ms,
+            cancel_fd,
+        );
     }
 };
 
@@ -1908,6 +1958,32 @@ fn expectProxyStreamError(expected: anyerror, result: anyerror!ProxyStream) !voi
     }
 }
 
+fn udpTestDeadline() i64 {
+    return std.math.maxInt(i64);
+}
+
+fn countOpenFileDescriptorsForUdpTest() usize {
+    var count: usize = 0;
+    var fd: std.posix.fd_t = 0;
+    while (fd < 1_024) : (fd += 1) {
+        const result = std.c.fcntl(fd, std.posix.F.GETFD, @as(c_int, 0));
+        if (result >= 0) count += 1;
+    }
+    return count;
+}
+
+fn expectUdpSessionError(
+    expected: anyerror,
+    result: anyerror!*shadowsocks_udp.Session,
+) !void {
+    if (result) |session| {
+        session.destroy();
+        return error.TestExpectedError;
+    } else |actual| {
+        try std.testing.expectEqual(expected, actual);
+    }
+}
+
 fn expectBeginPersistedSelectionsError(
     expected: anyerror,
     manager: *OutboundManager,
@@ -2057,6 +2133,70 @@ test "manager index construction unwinds every allocation failure" {
     );
 }
 
+test "duplicate proxy UDP availability follows the indexed first match" {
+    // Full validation rejects duplicate names. Exercise the private production
+    // index builder directly without adding a bypass hook.
+    const Fixture = struct {
+        fn expectAvailability(first_udp: bool, expected: bool) !void {
+            const allocator = std.testing.allocator;
+            var proxies = [_]Proxy{
+                .{
+                    .name = "duplicate",
+                    .proxy_type = .ss,
+                    .server = "203.0.113.10",
+                    .port = 8388,
+                    .password = "secret",
+                    .cipher = "aes-128-gcm",
+                    .udp = first_udp,
+                },
+                .{
+                    .name = "duplicate",
+                    .proxy_type = .ss,
+                    .server = "203.0.113.11",
+                    .port = 8389,
+                    .password = "secret",
+                    .cipher = "aes-128-gcm",
+                    .udp = !first_udp,
+                },
+            };
+            var cfg = Config{
+                .allocator = allocator,
+                .proxies = .{
+                    .items = proxies[0..],
+                    .capacity = proxies.len,
+                },
+                .proxy_groups = .empty,
+                .rules = .empty,
+            };
+            var impl = Impl{
+                .allocator = allocator,
+                .config = &cfg,
+                .proxy_index = std.StringHashMap(*const Proxy).init(allocator),
+                .group_index = std.StringHashMap(Impl.GroupIndexEntry).init(
+                    allocator,
+                ),
+                .group_selections = std.StringHashMap([]const u8).init(
+                    allocator,
+                ),
+                .group_selection_sources = std.StringHashMap(
+                    runtime_selection.SelectionSource,
+                ).init(allocator),
+            };
+            defer impl.proxy_index.deinit();
+            defer impl.group_index.deinit();
+            defer impl.group_selections.deinit();
+            defer impl.group_selection_sources.deinit();
+
+            try impl.buildConfigIndexes();
+            try std.testing.expectEqual(expected, impl.canAssociateUdp());
+            try std.testing.expect(impl.proxy_index.get("duplicate").? == &proxies[0]);
+        }
+    };
+
+    try Fixture.expectAvailability(false, false);
+    try Fixture.expectAvailability(true, true);
+}
+
 test "large config literal TCP and UDP avoid complete capability scans" {
     // Exercise both data paths at the public maxima. The probe distinguishes a
     // complete scan from the constant-size initialization-proof check.
@@ -2086,9 +2226,9 @@ test "large config literal TCP and UDP avoid complete capability scans" {
     stream.close();
     const accepted = try target_server.accept();
     accepted.stream.close();
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.UdpNotSupportedForDirect,
-        manager.connectUdp("DIRECT"),
+        manager.connectUdp("DIRECT", udpTestDeadline(), null),
     );
 
     try std.testing.expectEqual(@as(u32, 0), probe.complete_scans);
@@ -2138,9 +2278,9 @@ test "near-maximum eleven-layer tail uses indexed TCP and UDP lookups" {
     try std.testing.expectEqual(@as(u32, 1), probe.selected_proxy_gates);
 
     probe = .{};
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.UdpNotSupportedForDirect,
-        manager.connectUdp(policy),
+        manager.connectUdp(policy, udpTestDeadline(), null),
     );
     try std.testing.expectEqual(@as(u32, 0), probe.complete_scans);
     try std.testing.expectEqual(@as(u32, 0), probe.linear_config_scans);
@@ -2174,9 +2314,9 @@ test "eleven nested groups resolve for TCP and UDP at actual depth cost" {
     try std.testing.expectEqual(@as(u32, 0), probe.proxy_index_lookups);
 
     probe = .{};
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.UdpNotSupportedForDirect,
-        manager.connectUdp("chain-group-0"),
+        manager.connectUdp("chain-group-0", udpTestDeadline(), null),
     );
     try std.testing.expectEqual(@as(u32, 11), probe.group_index_lookups);
     try std.testing.expectEqual(@as(u32, 0), probe.proxy_index_lookups);
@@ -2207,9 +2347,9 @@ test "maximum 1024 unique nested groups resolve for TCP and UDP" {
     try std.testing.expectEqual(@as(u32, 0), probe.proxy_index_lookups);
 
     probe = .{};
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.ConnectionRejected,
-        manager.connectUdp("chain-group-0"),
+        manager.connectUdp("chain-group-0", udpTestDeadline(), null),
     );
     try std.testing.expectEqual(
         @as(u32, config.proxy_group_count_max),
@@ -2243,9 +2383,9 @@ test "a 1025th group hit returns the explicit resolution limit" {
     try std.testing.expectEqual(@as(u32, 0), probe.proxy_index_lookups);
 
     probe = .{};
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.ProxyGroupResolutionLimit,
-        manager.connectUdp("chain-group-0"),
+        manager.connectUdp("chain-group-0", udpTestDeadline(), null),
     );
     try std.testing.expectEqual(
         @as(u32, config.proxy_group_count_max + 1),
@@ -2302,9 +2442,9 @@ test "self and two-group cycles fail bounded for TCP and UDP" {
 
         // The resolver error must release the selection mutex before returning.
         probe = .{};
-        try expectProxyStreamError(
+        try expectUdpSessionError(
             error.ProxyGroupResolutionCycle,
-            manager.connectUdp(case.policy),
+            manager.connectUdp(case.policy, udpTestDeadline(), null),
         );
         try std.testing.expectEqual(
             case.expected_lookups,
@@ -2344,9 +2484,9 @@ test "nested selected literals terminate TCP and UDP resolution immediately" {
     try std.testing.expectEqual(@as(u32, 0), probe.proxy_index_lookups);
 
     probe = .{};
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.ConnectionRejected,
-        manager.connectUdp("outer"),
+        manager.connectUdp("outer", udpTestDeadline(), null),
     );
     try std.testing.expectEqual(@as(u32, 2), probe.group_index_lookups);
     try std.testing.expectEqual(@as(u32, 0), probe.proxy_index_lookups);
@@ -2370,9 +2510,9 @@ test "unknown nested terminal retains final ProxyNotFound lookup" {
     try std.testing.expectEqual(@as(u32, 1), probe.proxy_index_lookups);
 
     probe = .{};
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.ProxyNotFound,
-        manager.connectUdp("chain-group-0"),
+        manager.connectUdp("chain-group-0", udpTestDeadline(), null),
     );
     try std.testing.expectEqual(@as(u32, 3), probe.group_index_lookups);
     try std.testing.expectEqual(@as(u32, 1), probe.proxy_index_lookups);
@@ -3336,9 +3476,9 @@ test "legal select groups retain DIRECT and REJECT members" {
         "Policy",
         "DIRECT",
     ));
-    try expectProxyStreamError(
+    try expectUdpSessionError(
         error.UdpNotSupportedForDirect,
-        manager.connectUdp("Policy"),
+        manager.connectUdp("Policy", udpTestDeadline(), null),
     );
 }
 
@@ -3485,19 +3625,6 @@ test "initWithKey rejects whole-config capability failures before allocation" {
         .{
             .source =
             \\proxies:
-            \\  - name: udp-ss
-            \\    type: ss
-            \\    server: 127.0.0.1
-            \\    port: 8388
-            \\    cipher: aes-128-gcm
-            \\    password: secret
-            \\    udp: true
-            ,
-            .expected = error.ShadowsocksUdpNotSupported,
-        },
-        .{
-            .source =
-            \\proxies:
             \\  - { name: tls-ss, type: ss, server: 127.0.0.1, port: 8388, cipher: aes-128-gcm, password: secret, tls: true }
             ,
             .expected = error.ShadowsocksTlsNotSupported,
@@ -3598,11 +3725,7 @@ test "focused proxy capability gate covers every selected proxy class" {
     );
     proxy.plugin = null;
     proxy.udp = true;
-    try std.testing.expectError(
-        error.ShadowsocksUdpNotSupported,
-        requireSelectedProxyCapabilities(&proxy, null),
-    );
-    proxy.udp = false;
+    _ = try requireSelectedProxyCapabilities(&proxy, null);
     proxy.tls = true;
     try std.testing.expectError(
         error.ShadowsocksTlsNotSupported,
@@ -3690,9 +3813,96 @@ test "selected Shadowsocks gets one focused gate before private shortcut" {
     try std.testing.expectEqual(@as(u32, 1), probe.selected_proxy_gates);
 }
 
-test "connectUdp applies only the selected proxy capability gate" {
-    // A valid TCP-only Shadowsocks node reaches UDP's protocol rejection after
-    // one focused gate and without a complete configuration scan.
+test "Shadowsocks UDP preflight rejects every invalid field and omits obfs" {
+    const valid = Proxy{
+        .name = "selected-ss",
+        .proxy_type = .ss,
+        .server = "203.0.113.10",
+        .port = 8388,
+        .password = "secret",
+        .cipher = "aes-128-gcm",
+        .udp = true,
+    };
+
+    var candidate = valid;
+    candidate.proxy_type = .trojan;
+    try std.testing.expectError(
+        error.UdpNotSupportedByProxy,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.udp = false;
+    try std.testing.expectError(
+        error.UdpNotSupportedByProxy,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.server = "";
+    try std.testing.expectError(
+        error.MissingServer,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.port = 0;
+    try std.testing.expectError(
+        error.InvalidProxyPort,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.password = null;
+    try std.testing.expectError(
+        error.MissingPassword,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.password = "";
+    try std.testing.expectError(
+        error.MissingPassword,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.cipher = null;
+    try std.testing.expectError(
+        error.MissingCipher,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.cipher = "";
+    try std.testing.expectError(
+        error.MissingCipher,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.cipher = "aes-128-cfb";
+    try std.testing.expectError(
+        error.UnsupportedShadowsocksCipher,
+        Impl.preflightShadowsocksUdp(&candidate),
+    );
+
+    candidate = valid;
+    candidate.plugin = "obfs";
+    candidate.plugin_options_state = .map;
+    candidate.obfs_mode = "http";
+    candidate.obfs_host = "cdn.example.com";
+    const options = try Impl.preflightShadowsocksUdp(&candidate);
+    try std.testing.expectEqualStrings(candidate.server, options.server);
+    try std.testing.expectEqual(candidate.port, options.port);
+    try std.testing.expectEqualStrings(candidate.password.?, options.password);
+    try std.testing.expectEqual(aead.CipherType.aes_128_gcm, options.cipher);
+    try std.testing.expect(!@hasField(Impl.ShadowsocksUdpOptions, "plugin"));
+    try std.testing.expect(!@hasField(Impl.ShadowsocksUdpOptions, "obfs_mode"));
+    try std.testing.expect(!@hasField(Impl.ShadowsocksUdpOptions, "obfs_host"));
+}
+
+test "connectUdp rejects a selected TCP-only Shadowsocks proxy after one focused gate" {
     const allocator = std.testing.allocator;
     var cfg = try config.parseDocument(allocator,
         \\proxies:
@@ -3710,12 +3920,30 @@ test "connectUdp applies only the selected proxy capability gate" {
     managerImpl(manager).capability_validation_probe = &probe;
     defer managerImpl(manager).capability_validation_probe = null;
 
-    try std.testing.expectError(
-        error.UnsupportedProxyType,
-        manager.connectUdp("selected-ss"),
+    try expectUdpSessionError(
+        error.UdpNotSupportedByProxy,
+        manager.connectUdp("selected-ss", udpTestDeadline(), null),
     );
     try std.testing.expectEqual(@as(u32, 0), probe.complete_scans);
     try std.testing.expectEqual(@as(u32, 1), probe.selected_proxy_gates);
+}
+
+test "canAssociateUdp is false for an admitted TCP-only configuration" {
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(allocator,
+        \\proxies:
+        \\  - name: tcp-only
+        \\    type: ss
+        \\    server: 203.0.113.10
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+    );
+    defer cfg.deinit();
+    const manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    try std.testing.expect(!manager.canAssociateUdp());
 }
 
 test "manager init rejects non-Shadowsocks plugin metadata before allocation" {
@@ -3959,7 +4187,6 @@ test "focused gate forwards every Shadowsocks classifier failure" {
         .{ .index = 3, .expected = error.MissingShadowsocksPluginOptions },
         .{ .index = 4, .expected = error.MissingSimpleObfsHost },
         .{ .index = 5, .expected = error.InvalidSimpleObfsHost },
-        .{ .index = 6, .expected = error.ShadowsocksUdpNotSupported },
         .{ .index = 7, .expected = error.InconsistentShadowsocksPluginFields },
     };
     for (cases) |case| {
@@ -3971,6 +4198,7 @@ test "focused gate forwards every Shadowsocks classifier failure" {
             ),
         );
     }
+    _ = try requireSelectedProxyCapabilities(&cfg.proxies.items[6], null);
 }
 
 test "ProxyStream move transfers shadowsocks ownership" {
@@ -4560,7 +4788,7 @@ test "connect bypasses proxy groups for loopback targets" {
 }
 
 // ===========================================================================
-// D5: manager UDP path (connectUdp / connectAnyTlsUdp + ProxyStream UDP arm)
+// Manager classic Shadowsocks UDP session seam
 // ===========================================================================
 
 const ConfigZ = @import("../../config.zig");
@@ -4580,28 +4808,66 @@ fn makeUdpTestConfig(allocator: std.mem.Allocator) !Config {
     };
 }
 
-test "D5: connectUdp(DIRECT) -> error.UdpNotSupportedForDirect" {
+test "connectUdp(DIRECT) returns UdpNotSupportedForDirect" {
     const allocator = std.testing.allocator;
     var cfg = try makeUdpTestConfig(allocator);
     defer cfg.deinit();
     const manager = try OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
-    try std.testing.expectError(error.UdpNotSupportedForDirect, manager.connectUdp("DIRECT"));
+    try expectUdpSessionError(
+        error.UdpNotSupportedForDirect,
+        manager.connectUdp("DIRECT", udpTestDeadline(), null),
+    );
 }
 
-test "D5: connectUdp(REJECT) -> error.ConnectionRejected" {
+test "connectUdp(REJECT) returns ConnectionRejected" {
     const allocator = std.testing.allocator;
     var cfg = try makeUdpTestConfig(allocator);
     defer cfg.deinit();
     const manager = try OutboundManager.init(allocator, &cfg);
     defer manager.deinit();
 
-    try std.testing.expectError(error.ConnectionRejected, manager.connectUdp("REJECT"));
+    try expectUdpSessionError(
+        error.ConnectionRejected,
+        manager.connectUdp("REJECT", udpTestDeadline(), null),
+    );
+}
+
+test "connectUdp traffic readiness wait honors an expired deadline" {
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = tracking.allocator();
+    var cfg = try makeUdpTestConfig(allocator);
+    defer cfg.deinit();
+    const manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+
+    manager.setTrafficReady(false);
+    // Restore the production startup gate before manager teardown even if an
+    // assertion fails; this test needs no background thread to release it.
+    defer manager.setTrafficReady(true);
+
+    const allocations_before = tracking.allocations;
+    const descriptors_before = countOpenFileDescriptorsForUdpTest();
+    const deadline_ms = compat.monotonicMilliTimestamp();
+    const started_ms = deadline_ms;
+    try expectUdpSessionError(
+        error.DeadlineExceeded,
+        manager.connectUdp("DIRECT", deadline_ms, null),
+    );
+
+    try std.testing.expect(
+        compat.monotonicMilliTimestamp() - started_ms < 250,
+    );
+    try std.testing.expectEqual(allocations_before, tracking.allocations);
+    try std.testing.expectEqual(
+        descriptors_before,
+        countOpenFileDescriptorsForUdpTest(),
+    );
 }
 
 test "manager init rejects AnyTLS UDP before dialing" {
-    // No UDP transport is enabled in v1, even when the node requests udp:true.
+    // AnyTLS remains outside the admitted v1 protocol set regardless of flags.
     const allocator = std.testing.allocator;
     var cfg = try makeUdpTestConfig(allocator);
     defer cfg.deinit();
@@ -4637,7 +4903,7 @@ test "manager init rejects AnyTLS without dialing" {
     );
 }
 
-test "manager init rejects Shadowsocks UDP" {
+test "manager init admits Shadowsocks UDP and indexes availability" {
     const allocator = std.testing.allocator;
     var cfg = try makeUdpTestConfig(allocator);
     defer cfg.deinit();
@@ -4648,12 +4914,12 @@ test "manager init rejects Shadowsocks UDP" {
         .port = 8388,
         .password = try allocator.dupe(u8, "password"),
         .cipher = try allocator.dupe(u8, "aes-128-gcm"),
-        .udp = true, // udp:true ignored for non-anytls
+        .udp = true,
     });
-    try std.testing.expectError(
-        error.ShadowsocksUdpNotSupported,
-        OutboundManager.init(allocator, &cfg),
-    );
+
+    const manager = try OutboundManager.init(allocator, &cfg);
+    defer manager.deinit();
+    try std.testing.expect(manager.canAssociateUdp());
 }
 
 test "manager init rejects a group containing AnyTLS" {
@@ -4679,65 +4945,6 @@ test "manager init rejects a group containing AnyTLS" {
         error.UnsupportedProxyType,
         OutboundManager.init(allocator, &cfg),
     );
-}
-
-// MUST-FIX #5: the byte-stream methods (write/read/readBlocking/hasPendingRead/
-// shutdownWrite) on a UDP ProxyStream arm @panic. Zig 0.16's std.testing has no
-// expectPanic, so this is verified by code inspection + the @panic guards added
-// at the top of each method; the close/getHandle/udpStream/move paths ARE
-// exercised by the test below. (A panic in a unit test would abort the runner,
-// so we cannot positively assert it without a child-process harness.)
-
-test "D5: ProxyStream UDP arm close frees the UotStream + returns Session to idle (no leak/UAF)" {
-    // Stand-in mirrors the C-stage seam: a real anytls.Stream bound to a
-    // non-dialed Session, wrapped in the production AnyTlsUdpStream, then handed
-    // to a UDP ProxyStream. close() must route Stream.close (FIN swallowed on a
-    // conn==null stand-in; drops the relay-borrow ref) AND free the UotStream
-    // (its rx ArrayList) + the heap wrapper — all under std.testing.allocator.
-    const allocator = std.testing.allocator;
-
-    const standin = try makeStandinAnyTlsStream(allocator);
-    const session = standin.session;
-    const stream = standin.stream;
-
-    const ust = try allocator.create(AnyTlsUdpStream);
-    ust.* = AnyTlsUdpStream.init(allocator, stream);
-
-    var ps = ProxyStream.initAnyTlsUdp(allocator, ust);
-    // Accessors valid on the UDP arm.
-    try std.testing.expect(ps.udpStream() == ust);
-    try std.testing.expect(ps.getHandle() == stream.getHandle());
-
-    // close() frees the UotStream (rx) + wrapper, routes Stream.close.
-    ps.close();
-    try std.testing.expect(ps.is_closed);
-    try std.testing.expect(ps.owned_anytls_udp == null);
-
-    // Drive the rest of the stand-in teardown like a recv-loop exit would.
-    session.requestClose(.shutdown);
-    session.releaseRef();
-}
-
-test "D5: ProxyStream move transfers the UDP arm" {
-    const allocator = std.testing.allocator;
-
-    const standin = try makeStandinAnyTlsStream(allocator);
-    const session = standin.session;
-    const stream = standin.stream;
-
-    const ust = try allocator.create(AnyTlsUdpStream);
-    ust.* = AnyTlsUdpStream.init(allocator, stream);
-
-    var source = ProxyStream.initAnyTlsUdp(allocator, ust);
-    var moved = source.move();
-    try std.testing.expect(source.is_closed);
-    try std.testing.expect(source.owned_anytls_udp == null);
-    try std.testing.expect(moved.owned_anytls_udp == ust);
-
-    source.close(); // no-op (moved out)
-    moved.close(); // frees ust + routes Stream.close
-    session.requestClose(.shutdown);
-    session.releaseRef();
 }
 
 const SplitSaltWriterContext = struct {
@@ -4772,7 +4979,6 @@ const SplitSaltWriterContext = struct {
 
 test "ProxyStream.readBlocking handles a split Shadowsocks salt" {
     const allocator = std.testing.allocator;
-    const aead = @import("../../crypto/aead.zig");
 
     var fds: [2]std.posix.fd_t = undefined;
     const rc = std.c.socketpair(

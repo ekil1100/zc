@@ -289,11 +289,9 @@ pub const Session = struct {
     pool_key: []u8 = &.{},
 
     /// TEST-ONLY outbound sink. When non-null, `writeSessionPayload` delivers the
-    /// shaped-payload bytes here INSTEAD of the (absent) TLS connection, so a
-    /// stand-in Session (conn=null) can have a SUCCEEDING outbound write. This is
-    /// the seam the udp_uot D-stage branch-(c) e2e uses to drive the REAL
-    /// udpRelayLoop's outbound leg without a TLS handshake. NEVER set in
-    /// production (the production path always has a real `conn`).
+    /// shaped-payload bytes here instead of the absent TLS connection, so a
+    /// stand-in Session with conn=null can have a successful outbound write.
+    /// Production never sets this because it always has a real connection.
     test_outbound_sink: ?*const fn (ctx: ?*anyopaque, payload: []const u8) void = null,
     test_outbound_ctx: ?*anyopaque = null,
 

@@ -49,6 +49,7 @@ test "include zc test modules" {
     _ = @import("dns/protocol_test.zig");
     _ = @import("protocol/trojan.zig");
     _ = @import("protocol/anytls.zig");
+    _ = @import("protocol/socks_address.zig");
     _ = @import("protocol/vless.zig");
     _ = @import("protocol/vmess.zig");
     _ = @import("protocol/vmess_test.zig");
@@ -60,12 +61,13 @@ test "include zc test modules" {
     _ = @import("proxy/outbound/proxy_type_test.zig");
     _ = @import("proxy/outbound/shadowsocks.zig");
     _ = @import("proxy/outbound/shadowsocks_test.zig");
+    _ = @import("proxy/outbound/shadowsocks_udp_test.zig");
     _ = @import("proxy/outbound/simple_obfs_http_test.zig");
     _ = @import("proxy/proxy_test.zig");
     _ = @import("proxy/smart_group_test.zig");
     _ = @import("proxy/socks5.zig");
     _ = @import("proxy/socks5_test.zig");
-    _ = @import("proxy/udp_uot.zig");
+    _ = @import("proxy/socks5_udp.zig");
     _ = @import("proxy/websocket_extended_test.zig");
     _ = @import("proxy/websocket_test.zig");
     _ = @import("rule/engine.zig");

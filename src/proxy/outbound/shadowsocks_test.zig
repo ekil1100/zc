@@ -3,17 +3,27 @@ const testing = std.testing;
 const shadowsocks = @import("shadowsocks.zig");
 const simple_obfs_http = @import("simple_obfs_http.zig");
 const aead = @import("../../crypto/aead.zig");
+const socks_address = @import("../../protocol/socks_address.zig");
 const ShadowsocksClient = shadowsocks.ShadowsocksClient;
-const Address = shadowsocks.Address;
 
-test "Shadowsocks Address struct" {
-    const addr = Address{
+test "Shadowsocks callers use the shared SOCKS address module" {
+    // Callers must not recover the removed crypto or Shadowsocks address aliases.
+    try testing.expect(!@hasDecl(shadowsocks, "Address"));
+    try testing.expect(!@hasDecl(aead, "Address"));
+
+    const address = socks_address.Address{
         .host = "127.0.0.1",
         .port = 8080,
     };
+    var output: [7]u8 = undefined;
+    const encoded_size = try address.encode(&output);
 
-    try testing.expectEqualStrings("127.0.0.1", addr.host);
-    try testing.expectEqual(@as(u16, 8080), addr.port);
+    try testing.expectEqual(@as(usize, 7), encoded_size);
+    try testing.expectEqualSlices(
+        u8,
+        "\x01\x7f\x00\x00\x01\x1f\x90",
+        &output,
+    );
 }
 
 test "Shadowsocks cipher types" {
@@ -49,22 +59,15 @@ test "ShadowsocksClient init params" {
     try testing.expectEqual(aead.CipherType.aes_128_gcm, client.cipher_type);
 }
 
-test "Shadowsocks salt size" {
-    // Shadowsocks AEAD salts use the cipher key length, not the nonce length.
+test "Shadowsocks AEAD wire parameters match every supported datagram cipher" {
+    // Production constants must retain the protocol salt, nonce, tag, and wire limits.
     try testing.expectEqual(@as(usize, 16), aead.CipherType.aes_128_gcm.saltLen());
     try testing.expectEqual(@as(usize, 32), aead.CipherType.aes_256_gcm.saltLen());
-}
-
-test "Shadowsocks nonce size" {
-    // GCM mode uses 12-byte nonce
-    const nonce_size: usize = 12;
-    try testing.expectEqual(@as(usize, 12), nonce_size);
-}
-
-test "Shadowsocks tag size" {
-    // GCM mode uses 16-byte authentication tag
-    const tag_size: usize = 16;
-    try testing.expectEqual(@as(usize, 16), tag_size);
+    try testing.expectEqual(@as(usize, 32), aead.CipherType.chacha20_poly1305.saltLen());
+    try testing.expectEqual(@as(usize, 32), aead.CipherType.chacha20_ietf_poly1305.saltLen());
+    try testing.expectEqual(@as(usize, 12), aead.AeadDatagram.nonce_size);
+    try testing.expectEqual(@as(usize, 16), aead.AeadDatagram.tag_size);
+    try testing.expectEqual(@as(usize, 65_507), aead.AeadDatagram.wire_size_max);
 }
 
 test "Shadowsocks retry policy uses one 10 second absolute deadline" {

@@ -13,7 +13,7 @@ zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当
 3. 从 v1.0 范围移除 TUI；
 4. 清理过期文档；
 5. 用统一 capability gate 在 bind/dial 前拒绝未经验证的协议；
-6. simple-obfs HTTP 与精确 capability enable 已通过互操作门禁；Shadowsocks AEAD UDP 仍未支持；
+6. simple-obfs HTTP 与 classic Shadowsocks AEAD UDP 已通过独立 wire、真实 mixed socket 和固定版本互操作门禁；
 7. 让代理选择具备持久、revision-aware 的一致语义；
 8. 增加经过验证、仅 CLI 可用的本地 config import；
 9. 修复安全审计阻断项并通过最终 smoke gate 后再标记 `v1.0.0`。
@@ -55,7 +55,7 @@ Included:
 
 - daemon lifecycle through CLI: `start` (`up`), `stop` (`down`), `restart`, `reload`, `status`, `log`, `doctor`, with a uniform `--json` envelope on stdout and uniform exit codes (see [`cli/spec.md`](cli/spec.md));
 - default mixed inbound runtime;
-- DIRECT、REJECT、四种 Shadowsocks AEAD cipher 与 Trojan TCP/TLS 出站；
+- DIRECT、REJECT、四种 Shadowsocks AEAD cipher 的 TCP，以及 `udp:true` 节点经 mixed SOCKS5 UDP ASSOCIATE 的 classic AEAD UDP；
 - non-production explicit port override via `zc start --port <port>`;
 - core rule matching and rule-provider expansion;
 - minimal REST API for version/proxies/rules/proxy selection;

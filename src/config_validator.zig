@@ -297,10 +297,6 @@ fn addShadowsocksCapabilityError(
     failure: runtime_capability.ShadowsocksFailure,
 ) !void {
     switch (failure) {
-        .udp_not_supported => try result.addError(
-            "Proxy '{s}': udp:true is not supported for type 'ss' in zc v1.0",
-            .{proxy.name},
-        ),
         .tls_not_supported => try result.addError(
             "Proxy '{s}': tls:true is not supported for type 'ss' in zc v1.0",
             .{proxy.name},
@@ -1255,8 +1251,7 @@ test "catalog validation exempts only explicitly marked plugin capability errors
     defer udp.deinit();
     var udp_result = try validateCatalogCapture(allocator, &udp);
     defer udp_result.deinit();
-    try std.testing.expect(!udp_result.isValid());
-    try std.testing.expect(hasErrorContaining(&udp_result, "udp:true"));
+    try std.testing.expect(udp_result.isValid());
 
     const non_plugin_cases = [_]struct {
         cipher: []const u8 = "aes-128-gcm",
@@ -1580,7 +1575,7 @@ test "Shadowsocks capability gate explains every unsupported obfs shape" {
 
     var result = try validateRuntimeCapabilities(allocator, &cfg);
     defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 8), result.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 7), result.errors.items.len);
     const expected = [_][]const u8{
         "mode 'tls'",
         "mode 'quic'",
@@ -1589,7 +1584,6 @@ test "Shadowsocks capability gate explains every unsupported obfs shape" {
         "non-empty host",
         "CR, LF, or NUL",
         "do not match a plugin declaration",
-        "udp:true",
     };
     for (expected) |needle| {
         try std.testing.expect(hasErrorContaining(&result, needle));
@@ -1758,27 +1752,31 @@ test "C6: validator clamps defaults are valid (no clamp on the 30s default)" {
     try std.testing.expectEqual(@as(i64, 30), cfg.idle_session_timeout);
 }
 
-test "v1 capability gate rejects Shadowsocks udp" {
-    // A supported cipher does not imply support for its unimplemented UDP path.
+test "v1 capability gate accepts classic Shadowsocks UDP ciphers and alias" {
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
         \\proxies:
-        \\  - name: ss-udp
+        \\  - { name: aes128, type: ss, server: 1.2.3.4, port: 8388, password: pw, cipher: aes-128-gcm, udp: true }
+        \\  - { name: aes256, type: ss, server: 1.2.3.4, port: 8388, password: pw, cipher: aes-256-gcm, udp: true }
+        \\  - { name: chacha, type: ss, server: 1.2.3.4, port: 8388, password: pw, cipher: chacha20-ietf-poly1305, udp: true }
+        \\  - name: chacha-alias-obfs
         \\    type: ss
         \\    server: 1.2.3.4
         \\    port: 8388
         \\    password: pw
-        \\    cipher: aes-256-gcm
+        \\    cipher: chacha20-poly1305
         \\    udp: true
+        \\    plugin: obfs
+        \\    plugin-opts: { mode: http, host: cdn.example.com }
     ;
     var cfg = try config_mod.parse(allocator, yaml_config);
     defer cfg.deinit();
     var result = try validateRuntimeCapabilities(allocator, &cfg);
     defer result.deinit();
 
-    try std.testing.expect(!result.isValid());
-    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
 }
 
 test "v1 capability gate rejects every unverified proxy type" {

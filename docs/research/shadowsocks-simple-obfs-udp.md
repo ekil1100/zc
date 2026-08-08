@@ -55,16 +55,16 @@ zc 应只实现 **simple-obfs HTTP 客户端传输层**，接受 mihomo 风格 `
                                 plaintext=ATYP||DST.ADDR||DST.PORT||DATA,
                                 aad=empty) || TAG
      ```
-     地址使用 SOCKS5 address encoding（IPv4、长度前缀 domain、IPv6；port 网络字节序）。响应 plaintext 同样以前缀地址开始，表示远端响应源。不得复用 TCP 的 length-chunk framing，也不得跨数据报递增 nonce。[Shadowsocks AEAD spec](https://shadowsocks.org/doc/aead.html) [shadowsocks-rust `udprelay/mod.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.23.5/crates/shadowsocks/src/relay/udprelay/mod.rs) [shadowsocks-rust `udprelay/aead.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.23.5/crates/shadowsocks/src/relay/udprelay/aead.rs)
+     地址使用 SOCKS5 address encoding（IPv4、长度前缀 domain、IPv6；port 网络字节序）。响应 plaintext 同样以前缀地址开始，表示远端响应源。不得复用 TCP 的 length-chunk framing，也不得跨数据报递增 nonce。[Shadowsocks AEAD spec](https://shadowsocks.org/doc/aead.html) [shadowsocks-rust `udprelay/mod.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.24.0/crates/shadowsocks/src/relay/udprelay/mod.rs) [shadowsocks-rust `udprelay/aead.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.24.0/crates/shadowsocks/src/relay/udprelay/aead.rs)
    - **[规范要求]** salt 必须在 master key 整个生命周期内唯一；规范文字要求随机生成以确保唯一。zc 必须使用 OS CSPRNG，绝不能计时器、PRNG 或全零 salt。[Shadowsocks AEAD spec](https://shadowsocks.org/doc/aead.html)
-   - **[重放要求的准确边界]** 协议的发送端 salt 唯一性是 MUST 级密码学要求；接收端历史缓存不属于 wire compatibility。shadowsocks-org #44 将 Bloom-filter 检测描述为防御建议且“does not change the protocol”，并建议成功认证后再查重；但 shadowsocks-rust v1.23.5 的经典 AEAD UDP 解密路径明确注释掉 `check_nonce_replay(salt)`。因此不能把有限窗口去重声称为 2017 UDP 互操作的规范 MUST。[shadowsocks-org #44](https://github.com/shadowsocks/shadowsocks-org/issues/44) [shadowsocks-rust `udprelay/aead.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.23.5/crates/shadowsocks/src/relay/udprelay/aead.rs)
+   - **[重放要求的准确边界]** 协议的发送端 salt 唯一性是 MUST 级密码学要求；接收端历史缓存不属于 wire compatibility。shadowsocks-org #44 将 Bloom-filter 检测描述为防御建议且“does not change the protocol”，并建议成功认证后再查重；但 shadowsocks-rust v1.24.0 的经典 AEAD UDP 解密路径明确注释掉 `check_nonce_replay(salt)`。因此不能把有限窗口去重声称为 2017 UDP 互操作的规范 MUST。[shadowsocks-org #44](https://github.com/shadowsocks/shadowsocks-org/issues/44) [shadowsocks-rust `udprelay/aead.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.24.0/crates/shadowsocks/src/relay/udprelay/aead.rs)
    - **[zc 设计建议]** v1 最少保证 CSPRNG salt 和认证失败静默丢包；若加入接收端 replay cache，应只在 AEAD 验证成功后插入，采用有界双窗口/时间轮，指标化 replay/eviction/false-positive，并先做跨 NAT、重复 UDP 应用包测试。不要缓存未认证 salt（可被内存 DoS）。若当前实现只有客户端 outbound，则无需接收端全局 replay cache，因为响应来自可信配置的 server，且成熟 oracle 默认不做经典 AEAD UDP 查重。
 
 5. **SOCKS5 UDP ASSOCIATE framing、FRAG 与生命周期（严重度：Blocker）**
    - **[规范要求]** TCP 控制连接经鉴权后发送 `VER=05 CMD=03 RSV=00 ATYP DST.ADDR DST.PORT`；未知本地 UDP endpoint 时请求必须用全零地址/端口。成功响应的 `BND.ADDR/BND.PORT` 是客户端必须发送 UDP 的 relay endpoint。association 在承载 UDP ASSOCIATE 的 TCP 连接终止时终止。[RFC 1928 §4, §6](https://www.rfc-editor.org/rfc/rfc1928.txt)
    - **[规范要求]** 每个 SOCKS5 UDP datagram 是 `RSV(0000)||FRAG||ATYP||DST.ADDR||DST.PORT||DATA`；响应使用相同 header 表示源地址。relay 必须丢弃非 association 所记录客户端 IP 发来的包。FRAG=0 表示独立包；fragmentation 可选，不实现时必须丢弃所有 FRAG!=0，不能转发残片数据。[RFC 1928 §7](https://www.rfc-editor.org/rfc/rfc1928.txt)
-   - **[成熟实现惯例]** shadowsocks-rust 在 TCP handler 成功回复后持续读控制连接直到 EOF；UDP relay 对 `FRAG != 0` 直接丢弃。其 UDP association 默认 idle timeout 为 5 分钟，接收 buffer 常量为 65536；文档提供 `udp_timeout: 300` 和 `udp_max_associations`（示例 512）配置。[shadowsocks-rust `tcprelay.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.23.5/crates/shadowsocks-service/src/local/socks/server/socks5/tcprelay.rs) [shadowsocks-rust `udprelay.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.23.5/crates/shadowsocks-service/src/local/socks/server/socks5/udprelay.rs) [shadowsocks-rust `udprelay/mod.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.23.5/crates/shadowsocks/src/relay/udprelay/mod.rs) [shadowsocks-rust README](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.23.5/README.md)
-   - **[zc 设计建议]** association key 至少绑定 TCP control connection identity + client IP，并在首个合法 UDP 包后锁定源 port；TCP close 立即回收，另加 300 s idle 回收和全局 512 association 上限。每 association 的发送队列必须有界（建议 64 datagrams 或按字节计量），满时丢包并计数，不允许无界 allocator 增长。
+   - **[成熟实现惯例]** shadowsocks-rust 在 TCP handler 成功回复后持续读控制连接直到 EOF；UDP relay 对 `FRAG != 0` 直接丢弃。其 UDP association 默认 idle timeout 为 5 分钟，接收 buffer 常量为 65536；文档提供 `udp_timeout: 300` 和 `udp_max_associations`（示例 512）配置。[shadowsocks-rust `tcprelay.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.24.0/crates/shadowsocks-service/src/local/socks/server/socks5/tcprelay.rs) [shadowsocks-rust `udprelay.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.24.0/crates/shadowsocks-service/src/local/socks/server/socks5/udprelay.rs) [shadowsocks-rust `udprelay/mod.rs`](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.24.0/crates/shadowsocks/src/relay/udprelay/mod.rs) [shadowsocks-rust README](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.24.0/README.md)
+   - **[zc 设计决定]** association key 绑定 TCP control connection identity + client IP，并在首个完全合法的 UDP 包后锁定源 port；TCP close 立即回收，另加 300 s awake-clock idle 回收和全局 64 association 上限。relay 不设置应用层 datagram queue，数据面不得逐包 allocation；kernel socket queue 是唯一排队点。64 的上限低于 mixed 的 128 worker 上限，允许容量满载时继续服务普通 mixed TCP。
 
 6. **资源、超时与数据报大小上界（严重度：Major）**
    - **[规范要求]** RFC 1928 要求 SOCKS-aware UDP API 向应用报告的可用空间比 OS buffer 少：IPv4 10、domain 262、IPv6 20 字节，再加认证方法开销；其目的就是避免封装后超限。[RFC 1928 §7](https://www.rfc-editor.org/rfc/rfc1928.txt)
@@ -76,11 +76,11 @@ zc 应只实现 **simple-obfs HTTP 客户端传输层**，接受 mihomo 风格 `
    - **[zc 设计建议]** 单个 UDP receive buffer 可固定 65536（与 shadowsocks-rust 一致）；AEAD 解密前先验证最小 `salt + tag + 最短地址`，地址长度解析全程 checked。HTTP response header 8 KiB、SOCKS handshake 10 s、远端 UDP 请求 deadline 10 s、association idle 300 s；所有 timeout 和资源拒绝均打结构化计数器，但不要记录 payload、密码、master key、salt/subkey。
 
 7. **固定版本独立互操作 oracle 与命令（严重度：Major）**
-   - **[固定 oracle]** Shadowsocks 使用官方 `shadowsocks-rust v1.23.5`；它有 macOS/Linux release artifacts，经典 AEAD UDP 实现路径固定在 tag。simple-obfs 使用官方最后版本 `v0.0.5`（项目已 deprecated）。[shadowsocks-rust v1.23.5](https://github.com/shadowsocks/shadowsocks-rust/releases/tag/v1.23.5) [simple-obfs v0.0.5](https://github.com/shadowsocks/simple-obfs/releases/tag/v0.0.5)
+   - **[固定 oracle]** Shadowsocks 使用官方 `shadowsocks-rust v1.24.0`；它有 macOS/Linux release artifacts，经典 AEAD UDP 实现路径固定在 tag。simple-obfs 使用官方最后版本 `v0.0.5`（项目已 deprecated）。[shadowsocks-rust v1.24.0](https://github.com/shadowsocks/shadowsocks-rust/releases/tag/v1.24.0) [simple-obfs v0.0.5](https://github.com/shadowsocks/simple-obfs/releases/tag/v0.0.5)
    - **[构建 oracle；不含真实凭据]**
      ```bash
      git clone https://github.com/shadowsocks/shadowsocks-rust.git
-     git -C shadowsocks-rust checkout v1.23.5
+     git -C shadowsocks-rust checkout v1.24.0
      cargo build --manifest-path shadowsocks-rust/Cargo.toml --release --bin sslocal --bin ssserver
 
      git clone https://github.com/shadowsocks/simple-obfs.git
@@ -118,9 +118,9 @@ zc 应只实现 **simple-obfs HTTP 客户端传输层**，接受 mihomo 风格 `
 | 配置 | `obfs`/`obfs-local` 归一化；缺 host、CRLF host、tls mode、未知 mode 均明确报错 |
 | HTTP obfs | 首写 header+payload；后续 raw；响应 header 每字节切分均可；terminator 后余留不丢；8 KiB+1 拒绝 |
 | capability | `udp:false` 返回 REP 07 且零 association；`udp:true` 三种 AEAD 开放；obfs 不影响 UDP 路径 |
-| AEAD UDP | 三 cipher 对 v1.23.5 双向互通；salt 长度/subkey/zero nonce/tag；篡改任一字节静默丢弃 |
+| AEAD UDP | 三 cipher 对 v1.24.0 双向互通；salt 长度/subkey/zero nonce/tag；篡改任一字节静默丢弃 |
 | SOCKS5 UDP | IPv4/domain/IPv6；FRAG!=0 丢弃；错误 RSV/ATYP/长度丢弃；TCP close 立即销毁 |
-| 资源 | 512 association 上限、300 s idle、队列满丢包、65507 wire cap、所有长度运算无溢出 |
+| 资源 | 64 association 上限、300 s awake-clock idle、无应用层队列/逐包 allocation、65507 wire cap、所有长度运算无溢出 |
 
 ## Sources
 
@@ -129,7 +129,7 @@ zc 应只实现 **simple-obfs HTTP 客户端传输层**，接受 mihomo 风格 `
 - **Kept:** [simple-obfs README](https://github.com/shadowsocks/simple-obfs/blob/master/README.md) — 官方配置、HTTP/TLS mode、弃用状态和部署命令。
 - **Kept:** [simple-obfs `src/obfs_http.c`](https://github.com/shadowsocks/simple-obfs/blob/master/src/obfs_http.c) — HTTP 请求/响应 wire 和一次性 header 边界。
 - **Kept:** [simple-obfs `src/obfs_tls.c`](https://github.com/shadowsocks/simple-obfs/blob/master/src/obfs_tls.c) — TLS mode 确实存在及其独立 framing。
-- **Kept:** [shadowsocks-rust v1.23.5 source](https://github.com/shadowsocks/shadowsocks-rust/tree/v1.23.5) — 固定成熟实现的 AEAD UDP、SOCKS5、资源惯例。
+- **Kept:** [shadowsocks-rust v1.24.0 source](https://github.com/shadowsocks/shadowsocks-rust/tree/v1.24.0) — 固定成熟实现的 AEAD UDP、SOCKS5、资源惯例。
 - **Kept:** [mihomo shadowsocks.go](https://github.com/MetaCubeX/mihomo/blob/Alpha/adapter/outbound/shadowsocks.go) / [base.go](https://github.com/MetaCubeX/mihomo/blob/Alpha/adapter/outbound/base.go) — `plugin: obfs` 的 mode/host 与 UDP capability 配置语义。
 - **Kept:** [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928.txt) — UDP ASSOCIATE、FRAG、源地址和生命周期规范。
 - **Dropped:** 博客、发行版包装文档、第三方教程、issue 中的用户配置 — 不在用户允许的高信任主来源集合内，或无法替代规范/官方源码。
@@ -148,7 +148,7 @@ zc 应只实现 **simple-obfs HTTP 客户端传输层**，接受 mihomo 风格 `
     {
       "id": "criterion-1",
       "status": "satisfied",
-      "evidence": "研究给出 Blocker/Major 分级，并引用具体外部源码路径：simple-obfs/src/obfs_http.c、simple-obfs/src/obfs_tls.c、mihomo/adapter/outbound/shadowsocks.go、mihomo/adapter/outbound/base.go、shadowsocks-rust v1.23.5 的 udprelay/aead.rs、tcprelay.rs、udprelay.rs；产物路径为 .pi-subagents/artifacts/outputs/89d610f2/research.md。"
+      "evidence": "研究给出 Blocker/Major 分级，并引用具体外部源码路径：simple-obfs/src/obfs_http.c、simple-obfs/src/obfs_tls.c、mihomo/adapter/outbound/shadowsocks.go、mihomo/adapter/outbound/base.go、shadowsocks-rust v1.24.0 的 udprelay/aead.rs、tcprelay.rs、udprelay.rs；产物路径为 .pi-subagents/artifacts/outputs/89d610f2/research.md。"
     }
   ],
   "changedFiles": [

@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-08-06
+> 最近更新：2026-08-08
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -11,7 +11,7 @@
 
 当前代码**仍不应直接 GA tag**。本轮 cleanup 已完成 Zig 0.16.0 工具链对齐、TUI de-scope、旧根目录 roadmap/tasks 移除和主要文档重整；剩余阻塞项集中在：
 
-1. **配置准入与已验证运行能力必须持续一致**：`http` / `socks5` 未实现；VMess/VLESS wire/transport 未通过标准互操作；AnyTLS 生命周期与资源上界仍有安全阻断项。2026-08-06 已通过独立真实 socket 门禁开放 Shadowsocks simple-obfs HTTP 的精确 capability；经典 AEAD UDP 尚未实现，`udp:true` 继续 fail closed。
+1. **配置准入与已验证运行能力必须持续一致**：`http` / `socks5` 未实现；VMess/VLESS wire/transport 未通过标准互操作；AnyTLS 生命周期与资源上界仍有安全阻断项。Shadowsocks simple-obfs HTTP 已于 2026-08-06 开放；classic AEAD UDP 已于 2026-08-08 通过独立 wire、真实 mixed socket、资源、生命周期与固定版本互操作门禁后精确开放。
 2. ~~**CLI `test --json` 不生效**~~（已解决：全 CLI 输出契约对齐落地，`test --json` 走统一 envelope + `CHECKS_FAILED` 语义，见 `docs/cli/spec.md`）。
 3. **API v1 冻结为有界 minimal REST 子集**：实际只有 `/`, `/version`, `/proxies`, `/rules`, `PUT /proxies/<group>`；连接数、header/body/response 大小和读写期限均有固定上界。当前文档只能承诺 minimal API，不能宣传 runtime / profiles / connections / metrics / WebSocket 事件流。
 4. **日志系统未真正统一接入**：`src/logger.zig` 存在，但 `src/` 内仍有大量 `std.debug.print`。
@@ -19,7 +19,7 @@
 6. **minimal controller 端点已冻结**：v1 只接受显式 `127.0.0.1:<port>`，必须绑定精确配置端口；冲突时启动失败，不自动漂移或静默关闭控制面。
 7. **生命周期路径已按用户隔离并具备 instance-bound restart rollback**：pid/lock/log/runtime descriptor 统一位于经 owner/mode/no-follow 校验的 `XDG_RUNTIME_DIR`；未设置时使用规范化 `$HOME/.local/state/zc/runtime`。后台启动只消费 parent 发布的 owner-only HMAC snapshot；restart 在 stop 前完成 preparation，并以 PID/nonce 恢复 exact old snapshot。
 
-因此，v1.0 roadmap 现在应聚焦：**保持统一 capability gate；simple-obfs HTTP transport 与精确 enable 已关闭门禁，下一项 Shadowsocks 扩展只剩独立的 AEAD UDP 工作且当前不得开放；完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import；修复安全审计阻断项后，再做最终 smoke gate 和 GA tag 判断。**
+因此，v1.0 roadmap 现在应聚焦：**保持统一 capability gate 与已验证的 Shadowsocks TCP/UDP 边界；完成 P0-6 的 revisioned config identity、可靠代理选择和本地 config import；修复剩余安全审计阻断项后，再做最终 smoke gate 和 GA tag 判断。**
 
 ---
 
@@ -49,6 +49,55 @@ env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summa
 ```
 
 结果：2026-07-20 当前代码在本机 Zig 0.16.0 下可构建，666/666 测试通过（0 skipped）；默认 `zig build test` 已包含 StateAuthority schema-2 typed mutations、ConfigBundle、RevisionStore、legacy bootstrap/mirror、exact loader 与 runtime descriptor 安全边界测试。
+
+### Shadowsocks UDP capability gate（2026-08-08，Darwin arm64）
+
+在 capability-enable 当前树上执行：
+
+```bash
+zig build test --summary all
+# 20/20 steps succeeded; 1059/1059 tests passed
+
+zig build test -Doptimize=ReleaseFast --summary all
+# 20/20 steps succeeded; 1059/1059 tests passed
+
+zig build e2e --summary all
+# 15/15 steps succeeded; 46/46 oracle tests passed; CORE_E2E_RESULT=PASS
+
+zig build e2e-release -Doptimize=ReleaseFast --summary all
+# 15/15 steps succeeded; 46/46 oracle tests passed; CORE_E2E_RESULT=PASS
+
+zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast
+# all passed
+
+prefix=/tmp/zc-ss-udp-linux-x86_64-release
+rm -rf "$prefix"
+zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast \
+  --prefix "$prefix"
+find "$prefix" -mindepth 1 -print | LC_ALL=C sort
+# /tmp/zc-ss-udp-linux-x86_64-release/bin
+# /tmp/zc-ss-udp-linux-x86_64-release/bin/zc
+file "$prefix/bin/zc"
+# ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, with debug_info, not stripped
+find "$prefix" -type f ! -path "$prefix/bin/zc" -print | wc -l
+# 0
+find "$prefix" -type l -print | wc -l
+# 0
+
+bash tools/config-migrator/run-regression.sh
+# MIGRATOR_REGRESSION_SUMMARY=PASS total=29 failed_rules=0 failed_samples=0
+
+bash scripts/install/run-all-regression.sh
+# INSTALL_ALL_RESULT=PASS
+
+bash scripts/run-full-validation.sh
+# VALIDATION_RESULT=PASS
+# VALIDATION_PASS=3/3
+```
+
+真实 E2E 明确输出 `E2E_SS_UDP_RESPONSE_DROP_RECOVERY`、`E2E_SS_UDP_INDEPENDENT_THREE_CIPHER_ADDRESS_MAX`、`E2E_SS_UDP_MALFORMED_PIN_AND_CONTROL_LIFECYCLE`、`E2E_SS_UDP_NO_DIRECT_OR_LEAF_FALLBACK`、`E2E_SS_UDP_SIMPLE_OBFS_TCP_BYPASS`、`E2E_SS_UDP_SHADOWSOCKS_RUST_V1_24_0_THREE_CIPHER` 与 `E2E_SS_UDP_CAPACITY_64_PLUS_1_RELEASE` 全部 `PASS`。ReleaseFast Linux x86_64 install prefix 仅包含 statically linked `bin/zc`；oracle/vector generator 未安装。
 
 ### 迁移、安装与完整回归（2026-07-20）
 
@@ -211,7 +260,7 @@ bash scripts/run-full-validation.sh
 
 - `direct`
 - `reject`
-- Shadowsocks AEAD：`aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`，支持 plain TCP 或 `obfs|obfs-local` + 显式 HTTP mode/合法 host 的内置 simple-obfs HTTP
+- Shadowsocks AEAD：`aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`，支持 plain/simple-obfs HTTP TCP，以及 `udp:true` 节点经 mixed SOCKS5 UDP ASSOCIATE 的 classic AEAD UDP
 - Trojan TCP/TLS
 
 以下类型在 v1.0 必须由 validator/doctor/runtime 一致地提前拒绝：
@@ -224,7 +273,7 @@ bash scripts/run-full-validation.sh
 
 协议细节限制：
 
-- Shadowsocks：`src/crypto/aead.zig` 实际只解析 `aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`。simple-obfs 仅开放 HTTP；TLS、通用外部 plugin 与 UDP 明确拒绝。validator 中列出的 CFB / rc4-md5 / none 等并非真实可用。
+- Shadowsocks：`src/crypto/aead.zig` 实际只解析 `aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305`。simple-obfs 仅开放 HTTP 且只包装 TCP；classic UDP 直接使用同一 server endpoint。TLS、通用外部 plugin、AEAD-2022、standalone SOCKS UDP 与 fragmentation 明确拒绝。validator 中列出的 CFB / rc4-md5 / none 等并非真实可用。
 - VMess：当前 client 是最小 TCP 握手实现；`tls` / `ws-opts` 等配置字段未传入 VMess client。
 - VLESS：文件注释明确是“最小可用版本，仅 TCP”；`tls` / ws / reality / grpc 等主流变体未实现。
 - Trojan：实现 TLS + CONNECT；没有看到 Trojan WS / gRPC 等传输变体。
@@ -319,7 +368,7 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 - 默认 mixed inbound 可启动、停止、重启、查看状态。
 - 不发布 TUI；v1.0 只承诺 CLI + minimal API + daemon runtime。
 - `zc start --port <port>` 非生产端口开发入口稳定。
-- DIRECT / REJECT / Shadowsocks AEAD TCP（plain 或经验证的 simple-obfs HTTP）与 Trojan TCP/TLS 的边界清晰；Shadowsocks UDP 和其他协议在 bind/dial 前 fail closed。
+- DIRECT / REJECT / Shadowsocks AEAD TCP（plain 或经验证的 simple-obfs HTTP）、mixed SOCKS5 上的 classic Shadowsocks AEAD UDP 与 Trojan TCP/TLS 边界清晰；未验证的 transport/协议仍在 bind/dial 前 fail closed。
 - 规则：DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / IP-CIDR / IP-CIDR6 / RULE-SET / MATCH 稳定可用。
 - 配置解析失败、端口冲突、provider 下载失败有可操作错误。
 - `doctor --json` 可作为最小诊断包。
@@ -365,29 +414,31 @@ v1.0 不应承诺“完整 mihomo/c 替代”。基于当前代码，建议 v1.0
 
 - workflow 中不再出现 `0.15.2`。
 
-### P0-2：统一 v1 capability gate — simple-obfs HTTP enabled, UDP pending
+### P0-2：统一 v1 capability gate — verified Shadowsocks expansion done
 
-2026-08-06 按严格顺序完成前两阶段，第三阶段未开始且未开放：
+Shadowsocks 三阶段扩展已按顺序完成：
 
 1. ~~完成内置 simple-obfs HTTP 流式 transport~~（done）；
 2. ~~通过独立互操作后，仅开放 `plugin: obfs|obfs-local` + 显式 `mode: http` + 合法 host~~（done）；
-3. 完成经典 Shadowsocks AEAD UDP 与 SOCKS5 UDP ASSOCIATE（pending；`udp:true` 仍拒绝）。
+3. ~~完成经典 Shadowsocks AEAD UDP 与 mixed SOCKS5 UDP ASSOCIATE~~（done）。
 
 `mode: tls`、通用 SIP003 外部插件、AEAD-2022、UDP fragmentation、HTTP/SOCKS5/VMess/VLESS/AnyTLS outbound 仍不在本次范围，必须在 bind/dial 前 hard reject。协议代码保留不构成支持声明。
 
-HTTP capability 的公开测试 seam 使用真实 ReleaseSafe zc 和真实 socket：配置经过 `zc start/test/doctor` preflight，TCP 分别通过 mixed HTTP/SOCKS5 到 test-only 独立 obfs oracle，再转发固定 `shadowsocks-rust v1.24.0` 与 origin。oracle 不导入生产 config/SS/obfs 模块，独立校验 GET/Host/Upgrade/Connection/Key/Content-Length，并覆盖分片响应 header 与 same-write tail。TLS/unknown/missing/CRLF/UDP 负例在 bind/dial 前失败且 oracle counter 不增长。UDP 还没有正向 oracle seam，不得从 HTTP E2E 推导 UDP 支持。
+HTTP capability 的公开测试 seam 使用真实 ReleaseSafe zc 和真实 socket：配置经过公开 CLI preflight，TCP 分别通过 mixed HTTP/SOCKS5 到 test-only 独立 obfs oracle，再转发固定 `shadowsocks-rust v1.24.0` 与 origin。oracle 不导入生产 config/SS/obfs 模块，独立校验 GET/Host/Upgrade/Connection/Key/Content-Length，并覆盖分片响应 header 与 same-write tail。TLS/unknown/missing/CRLF 负例在 bind/dial 前失败且 oracle counter 不增长。
 
-重新启用能力的必要条件：固定协议版本的独立外部 oracle、正负 wire vectors、真实互操作、连接生命周期、资源上界和 ReleaseSafe/ReleaseFast 回归全部通过，并在独立 capability-enable 变更中更新 validator、doctor/runtime 与文档；只有 migrator 已有统一 capability rule 时才同步该 rule，当前旧 migrator 不为此扩散重写。研究依据见 `docs/research/shadowsocks-simple-obfs-udp.md`。
+UDP capability 的公开 seam 使用独立 Node crypto literal-vector generator、只导入 Zig `std`/`builtin` 的 test-only UDP oracle、真实 ReleaseSafe zc mixed SOCKS5 UDP ASSOCIATE、dual-stack echo 与固定 `shadowsocks-rust v1.24.0 -U`。三算法及配置 alias 完成 IPv4/domain/IPv6 双向互通，并覆盖 bad tag、截短 salt/tag、RSV/FRAG/ATYP/长度、65507/max+1、client IP/source port pin、control close、64+1 capacity、`udp:false` REP 07、DIRECT/非 UDP leaf teardown 和 simple-obfs TCP-only bypass。研究依据见 `docs/research/shadowsocks-simple-obfs-udp.md`。
 
 验收标准：
 
 - simple-obfs HTTP 首次请求与首次响应 header 支持任意 TCP 切分，8 KiB 上限，header 后同 read 的 Shadowsocks bytes 不丢失；后续 bytes 为 raw stream；host 拒绝空值、CR/LF/NUL 和超过 255 bytes。
 - capability 仅接受 `obfs` / `obfs-local`、显式 `mode: http` 与合法 host；`tls`、未知 mode/plugin 不得回退为裸 Shadowsocks。
-- **后续 UDP 阶段**：Shadowsocks UDP 必须使用独立 datagram AEAD wire：每包 CSPRNG salt、HKDF-SHA1 `ss-subkey`、零 nonce、认证失败丢弃，不复用 TCP chunk framing；完成前 `udp:true` 一律拒绝。
-- **后续 UDP 阶段**：SOCKS5 UDP ASSOCIATE 必须绑定 TCP control connection 与客户端 IP/首个 UDP port；control close 即清理；FRAG!=0 丢弃；association 数量、idle 时间、队列和每包 65507-byte wire size 均有硬上界。
-- simple-obfs 只包装 TCP；当前没有 Shadowsocks UDP runtime path，不得 DIRECT 回退或以 HTTP E2E 作为 UDP 支持证据。
+- **UDP wire seam**：Shadowsocks UDP 使用独立 2017 datagram AEAD wire；每包 CSPRNG salt、HKDF-SHA1 `ss-subkey`、零 nonce、空 AAD，认证失败静默丢弃，不复用 TCP chunk framing。实际算法为 AES-128-GCM、AES-256-GCM、ChaCha20-IETF-Poly1305；`chacha20-poly1305` 仅为同一 wire 的配置 alias。
+- **UDP association seam**：仅 mixed ingress 支持 SOCKS5 UDP ASSOCIATE；全局最多 64 个 association，300 秒 awake-clock idle，单个 wire datagram 最多 65507 bytes。association 绑定 control TCP 与客户端 IP，并由首个完全合法的数据报锁定 UDP source port；control close 立即清理；RSV 非零、FRAG 非零、坏 ATYP/长度均丢弃。
+- **UDP ownership seam**：relay 不设置应用层 datagram queue，数据面不得每包分配；kernel socket queue 是唯一排队点。首个合法目标只选择一次 proxy；DIRECT、group→DIRECT 与不支持 UDP 的 leaf 都必须 teardown，绝不 fallback。
+- simple-obfs 只包装 TCP；UDP 直接发往同一 Shadowsocks server UDP endpoint。AEAD-2022、standalone `socks-port` UDP、Trojan/AnyTLS UDP 与 fragmentation 均保持关闭。
+- capability 已在独立 literal vectors、真实 mixed socket、固定 `shadowsocks-rust v1.24.0 -U` 三算法互操作、错误 tag/RSV/FRAG/超限/关闭/64+1 生命周期门禁全部通过后，以独立变更开放。
 - `zc test` / `doctor` / config validation 使用同一 capability 结论；runtime manager 保留第二道 fail-closed 防线。
-- README、compat matrix、错误码与代码一致；当前 E2E 覆盖四个 plain Shadowsocks 配置名、两个 obfs HTTP alias、独立 wire attestation 与 bind/dial 前负例。错误 tag、FRAG、截短/超限数据报和 UDP 关闭清理属于后续 UDP 阶段，当前不得写成已覆盖。
+- README、compat matrix、错误码与代码一致；E2E 同时覆盖四个 Shadowsocks cipher 配置名、两个 obfs HTTP alias、独立 TCP/UDP wire attestation、固定外部实现、bind/dial 前负例及 UDP 生命周期/资源边界。
 
 ### P0-3：修正 CLI JSON 契约：`zc test --json`
 
@@ -706,7 +757,7 @@ git push origin v1.0.0
 
 按风险排序：
 
-1. **保持精确 capability gate**：simple-obfs HTTP 已由 validator/doctor 与 manager 双重开放；TLS/unknown/missing/CRLF/UDP 仍 fail closed。下一项协议工作是独立实现并验证 Shadowsocks UDP，不得扩散到 TLS/plugin launcher。
+1. **保持精确 capability gate**：simple-obfs HTTP 与 classic Shadowsocks UDP 已由 validator/doctor、manager 和独立 E2E 共同开放；TLS/unknown/missing/CRLF、AEAD-2022、standalone SOCKS UDP、fragmentation 与其他协议 UDP 仍 fail closed，不得扩散到 TLS/plugin launcher。
 2. **完成 P0-6 最终门禁**：managed writer cutover 已完成；下一步补齐 fault/crash 回归、复跑 ReleaseFast 跨目标与 selection/config smoke。
 3. ~~**补 `zc test --json`**~~：已完成（连同全 CLI 输出契约对齐一起落地）。
 4. **复跑最终 smoke gate**：P0-2 与 P0-6 均关闭后，确认构建、install、migrator、full validation、daemon start/status/stop 均通过。
@@ -725,8 +776,9 @@ git push origin v1.0.0
 - ✅ CI / release workflow Zig 版本已对齐到 0.16.0，`v1.0.0-rc6` 三平台 CD 与 Homebrew Tap 发布已通过
 - ✅ TUI 已从 v1.0 代码入口、help 和 active docs 中移除
 - ✅ 旧 `ROADMAP.md` / `TASKS.md` 和过期 TUI/API/install 草稿已删除或归档
-- ✅ v1 capability gate 已在 validator/doctor/runtime 与兼容性文档统一落地；2026-08-06 精确开放 simple-obfs HTTP，TLS/generic plugin/UDP 仍拒绝
+- ✅ v1 capability gate 已在 validator/doctor/runtime 与兼容性文档统一落地；2026-08-06 精确开放 simple-obfs HTTP，2026-08-08 精确开放 classic Shadowsocks AEAD UDP；TLS/generic plugin、AEAD-2022 与其他 UDP 范围仍拒绝
 - ✅ simple-obfs HTTP 已通过真实 zc + mixed HTTP/SOCKS5 + 独立 oracle + shadowsocks-rust v1.24.0 + origin 的 socket 互操作，覆盖分片 header、same-write tail 与零 dial 负例
+- ✅ classic Shadowsocks UDP 已通过独立三算法 vectors、真实 mixed SOCKS5、dual-stack echo、`shadowsocks-rust v1.24.0 -U`、错误包、65507、control close 与 64+1 资源门禁
 - ✅ `proxy select` durable/runtime identity、daemon startup restore、tracked controller discovery 与完整 managed config 命令族已进入 production path；legacy mirror 不再是 writer authority
 - ✅ `zc test --json` 符合 JSON 契约（全 CLI 输出契约对齐已落地，见 `docs/cli/spec.md` / `docs/cli/ux-workflow.md`）
 - ✅ API 已按 minimal API 口径进入 active docs；旧完整 OpenAPI 草案归档

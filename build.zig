@@ -207,6 +207,34 @@ pub fn build(b: *std.Build) void {
         b.pathFromRoot(".zig-cache/zc-test-run"),
     );
 
+    // The Shadowsocks UDP oracle remains a separate host-native test root. It
+    // imports only std/builtin and is never linked into the production module.
+    const e2e_shadowsocks_udp_oracle_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/e2e_shadowsocks_udp_oracle.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = optimize,
+    });
+    e2e_shadowsocks_udp_oracle_test_mod.link_libc = true;
+    const e2e_shadowsocks_udp_oracle_unit_tests = b.addTest(.{
+        .name = "zc-e2e-shadowsocks-udp-oracle-test",
+        .root_module = e2e_shadowsocks_udp_oracle_test_mod,
+        .filters = test_filters,
+    });
+    const run_e2e_shadowsocks_udp_oracle_unit_tests = b.addRunArtifact(
+        e2e_shadowsocks_udp_oracle_unit_tests,
+    );
+    run_e2e_shadowsocks_udp_oracle_unit_tests.step.dependOn(
+        &secure_test_runtime.step,
+    );
+    run_e2e_shadowsocks_udp_oracle_unit_tests.setEnvironmentVariable(
+        "HOME",
+        b.pathFromRoot(".zig-cache/zc-test-home"),
+    );
+    run_e2e_shadowsocks_udp_oracle_unit_tests.setEnvironmentVariable(
+        "XDG_RUNTIME_DIR",
+        b.pathFromRoot(".zig-cache/zc-test-run"),
+    );
+
     const config_flow_cmd = b.addSystemCommand(&.{
         "bash",
         b.pathFromRoot("scripts/test-config-load-selection.sh"),
@@ -216,6 +244,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit, process, and CLI flow tests");
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(&run_e2e_obfs_oracle_unit_tests.step);
+    test_step.dependOn(&run_e2e_shadowsocks_udp_oracle_unit_tests.step);
     test_step.dependOn(&authority_process_cmd.step);
     test_step.dependOn(&startup_barrier_process_cmd.step);
     test_step.dependOn(&socket_write_process_cmd.step);
@@ -253,6 +282,16 @@ pub fn build(b: *std.Build) void {
         .name = "zc-e2e-obfs-oracle",
         .root_module = e2e_obfs_oracle_mod,
     });
+    const e2e_shadowsocks_udp_oracle_mod = b.createModule(.{
+        .root_source_file = b.path("src/e2e_shadowsocks_udp_oracle.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .ReleaseSafe,
+    });
+    e2e_shadowsocks_udp_oracle_mod.link_libc = true;
+    const e2e_shadowsocks_udp_oracle = b.addExecutable(.{
+        .name = "zc-e2e-shadowsocks-udp-oracle",
+        .root_module = e2e_shadowsocks_udp_oracle_mod,
+    });
     const e2e_fixture_root = b.pathFromRoot(".zig-cache/e2e-fixtures");
     const fetch_e2e_fixtures = b.addSystemCommand(&.{
         "bash",
@@ -266,6 +305,7 @@ pub fn build(b: *std.Build) void {
     run_core_e2e.addArtifactArg(e2e_zc);
     run_core_e2e.addArtifactArg(e2e_origin);
     run_core_e2e.addArtifactArg(e2e_obfs_oracle);
+    run_core_e2e.addArtifactArg(e2e_shadowsocks_udp_oracle);
     run_core_e2e.addArgs(&.{
         e2e_fixture_root,
         b.pathFromRoot("testdata/e2e"),
@@ -279,6 +319,7 @@ pub fn build(b: *std.Build) void {
     run_installer_e2e.addArtifactArg(e2e_origin);
     const e2e_step = b.step("e2e", "Run installer and real network end-to-end tests");
     e2e_step.dependOn(&run_e2e_obfs_oracle_unit_tests.step);
+    e2e_step.dependOn(&run_e2e_shadowsocks_udp_oracle_unit_tests.step);
     e2e_step.dependOn(&run_installer_e2e.step);
     e2e_step.dependOn(&run_core_e2e.step);
 
@@ -289,6 +330,7 @@ pub fn build(b: *std.Build) void {
     run_release_core_e2e.addArtifactArg(exe);
     run_release_core_e2e.addArtifactArg(e2e_origin);
     run_release_core_e2e.addArtifactArg(e2e_obfs_oracle);
+    run_release_core_e2e.addArtifactArg(e2e_shadowsocks_udp_oracle);
     run_release_core_e2e.addArgs(&.{
         e2e_fixture_root,
         b.pathFromRoot("testdata/e2e"),
@@ -305,6 +347,9 @@ pub fn build(b: *std.Build) void {
         "Run E2E against the configured release artifact",
     );
     release_e2e_step.dependOn(&run_e2e_obfs_oracle_unit_tests.step);
+    release_e2e_step.dependOn(
+        &run_e2e_shadowsocks_udp_oracle_unit_tests.step,
+    );
     release_e2e_step.dependOn(&run_release_installer_e2e.step);
     release_e2e_step.dependOn(&run_release_core_e2e.step);
 

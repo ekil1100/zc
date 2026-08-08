@@ -2,9 +2,9 @@ const std = @import("std");
 const compat = @import("../../compat.zig");
 const net = compat.net;
 const aead = @import("../../crypto/aead.zig");
+const socks_address = @import("../../protocol/socks_address.zig");
 const socket_options = @import("../../socket_options.zig");
 const simple_obfs_http = @import("simple_obfs_http.zig");
-pub const Address = aead.Address;
 pub const connect_retry_attempts: usize = 3;
 pub const upstream_connect_timeout_ms: u32 = 10_000;
 const retry_backoff_ms = [_]u64{ 200, 500, 1000 };
@@ -107,7 +107,10 @@ pub const ShadowsocksClient = struct {
     }
 
     /// 连接到 Shadowsocks 服务器并发送目标地址
-    pub fn connect(self: *ShadowsocksClient, target: Address) !net.Stream {
+    pub fn connect(
+        self: *ShadowsocksClient,
+        target: socks_address.Address,
+    ) !net.Stream {
         std.debug.print("[SS] Connecting to {s}:{d} via SS\n", .{ self.server, self.port });
 
         // DNS, every retry backoff, and every TCP connect share this one
@@ -142,17 +145,13 @@ pub const ShadowsocksClient = struct {
         const salt_len = self.cipher_type.saltLen();
         var salt_buf: [32]u8 = undefined;
         const salt = salt_buf[0..salt_len];
-        compat.randomBytes(salt);
-
-        std.debug.print("[SS] Client salt ({} bytes): ", .{salt_len});
-        for (salt) |b| std.debug.print("{x:0>2}", .{b});
-        std.debug.print("\n", .{});
+        try std.Io.randomSecure(compat.io(), salt);
 
         // 4. Init encryption context with HKDF-derived session key
         self.enc_ctx = try aead.AeadStream.init(self.cipher_type, self.password, salt);
 
         // 5. Encode target address
-        var addr_buf: [260]u8 = undefined;
+        var addr_buf: [socks_address.encoded_size_max]u8 = undefined;
         const addr_len = try target.encode(&addr_buf);
 
         // 6. Encrypt target address as first AEAD chunk
@@ -623,7 +622,6 @@ pub const ShadowsocksClient = struct {
         );
         try self.consumeLeftoverFront(salt_len);
         self.dec_ctx = context;
-        std.debug.print("[SS] Read server salt ({} bytes)\n", .{salt_len});
         return did_transport_read;
     }
 };

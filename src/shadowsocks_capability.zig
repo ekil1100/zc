@@ -9,7 +9,6 @@ pub const Transport = union(enum) {
 };
 
 pub const Failure = enum {
-    udp_not_supported,
     tls_not_supported,
     inconsistent_plugin_fields,
     unsupported_plugin,
@@ -29,7 +28,6 @@ pub const Classification = union(enum) {
 
 pub const Input = struct {
     semantic_state: config.ProxySemanticState = .valid,
-    udp: bool = false,
     tls: bool = false,
     plugin: ?[]const u8 = null,
     plugin_options_state: config.PluginOptionsState = .absent,
@@ -38,7 +36,6 @@ pub const Input = struct {
 };
 
 pub const CapabilityError = error{
-    ShadowsocksUdpNotSupported,
     ShadowsocksTlsNotSupported,
     InconsistentShadowsocksPluginFields,
     UnsupportedShadowsocksPlugin,
@@ -54,7 +51,6 @@ pub const CapabilityError = error{
 pub fn classifyProxy(proxy: *const config.Proxy) Classification {
     return classify(.{
         .semantic_state = proxy.semantic_state,
-        .udp = proxy.udp,
         .tls = proxy.tls,
         .plugin = proxy.plugin,
         .plugin_options_state = proxy.plugin_options_state,
@@ -67,7 +63,6 @@ pub fn classify(input: Input) Classification {
     if (input.semantic_state == .malformed) {
         return .{ .rejected = .malformed_plugin_options };
     }
-    if (input.udp) return .{ .rejected = .udp_not_supported };
     if (input.tls) return .{ .rejected = .tls_not_supported };
 
     const plugin = input.plugin orelse {
@@ -122,7 +117,6 @@ pub fn requireProxy(proxy: *const config.Proxy) CapabilityError!Transport {
 
 fn failureToError(failure: Failure) CapabilityError {
     return switch (failure) {
-        .udp_not_supported => error.ShadowsocksUdpNotSupported,
         .tls_not_supported => error.ShadowsocksTlsNotSupported,
         .inconsistent_plugin_fields => error.InconsistentShadowsocksPluginFields,
         .unsupported_plugin => error.UnsupportedShadowsocksPlugin,
@@ -173,7 +167,6 @@ test "Shadowsocks capability matrix is exact and fail closed" {
             .expected_failure = null,
             .expected_transport = .simple_obfs_http,
         },
-        .{ .name = "udp", .input = .{ .udp = true }, .expected_failure = .udp_not_supported },
         .{ .name = "top-level tls", .input = .{ .tls = true }, .expected_failure = .tls_not_supported },
         .{
             .name = "derived mode without plugin",

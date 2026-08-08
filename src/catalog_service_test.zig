@@ -558,16 +558,6 @@ test "CatalogService catalog gate rejects every unrelated inactive defect withou
             ,
         },
         .{
-            .name = "udp",
-            .source =
-            \\mixed-port: 7890
-            \\proxies:
-            \\  - { name: recoverable, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: secret, plugin: obfs, plugin-opts: "obfs=http", udp: true }
-            \\rules:
-            \\  - MATCH,recoverable
-            ,
-        },
-        .{
             .name = "tls",
             .source =
             \\mixed-port: 7890
