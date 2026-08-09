@@ -96,6 +96,41 @@ test "LegacyCatalogBootstrap migrates exact active metadata and desired selectio
     );
 }
 
+test "LegacyCatalogBootstrap accepts ignored port declarations beside mixed-port" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "configs", .default_dir);
+    const source =
+        \\port: 7890
+        \\socks-port: 7891
+        \\mixed-port: 7892
+        \\rules:
+        \\  - MATCH,DIRECT
+    ;
+    try writeFile(tmp.dir, "configs/home.yaml", source);
+    try writeFile(
+        tmp.dir,
+        "meta.json",
+        "{\"active\":\"home\",\"configs\":{\"home\":{}}}\n",
+    );
+
+    const bootstrap = LegacyCatalogBootstrap.init(allocator, tmp.dir);
+    try testing.expect((try bootstrap.ensure()) == .migrated);
+
+    const authority = state_authority.Authority.init(allocator, tmp.dir);
+    var inspection = try authority.inspect();
+    defer inspection.deinit();
+    const head = switch (inspection) {
+        .catalog_v2 => |*observed| observed.catalog.state.active.?.revision,
+        else => return error.TestExpectedEqual,
+    };
+    const store = revision_store.RevisionStore.init(allocator, tmp.dir);
+    var view = try store.openVerified("home", head);
+    defer view.deinit();
+    try testing.expectEqualStrings(source, view.sourceBytes());
+}
+
 test "LegacyCatalogBootstrap rejects provider count excess before state or revision publication" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});

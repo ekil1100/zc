@@ -1687,6 +1687,31 @@ test "v1 capability gate rejects standalone inbound ports" {
     try std.testing.expect(hasErrorContaining(&result, "socks-port"));
 }
 
+test "v1 validator warns for ignored port declarations beside mixed-port" {
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\port: 7890
+        \\socks-port: 7891
+        \\mixed-port: 7892
+        \\rules:
+        \\  - MATCH,DIRECT
+    );
+    defer cfg.deinit();
+
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 2), result.warnings.items.len);
+    try std.testing.expectEqualStrings(
+        "mixed-port is set; HTTP port (7890) will be ignored",
+        result.warnings.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "mixed-port is set; SOCKS port (7891) will be ignored",
+        result.warnings.items[1].message,
+    );
+}
+
 test "C6: validator clamps both sub-5s idle interval/timeout to 30 and warns" {
     const allocator = std.testing.allocator;
     const yaml_config =

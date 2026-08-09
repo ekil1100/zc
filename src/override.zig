@@ -1897,7 +1897,6 @@ test "override materialization maps every runtime capability rejection for empty
         ,
         \\port: 7890
         \\socks-port: 7891
-        \\mixed-port: 7892
         \\rules:
         \\  - MATCH,DIRECT
         ,

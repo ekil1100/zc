@@ -84,8 +84,12 @@ pub const CapabilityError = error{
 
 pub fn assessGlobals(cfg: *const config.Config) Assessment {
     var result: Assessment = .{};
-    if (cfg.port != 0) result.append(.global_port);
-    if (cfg.socks_port != 0) result.append(.global_socks_port);
+    // A mixed listener already serves both protocols, so extra Clash listener
+    // declarations are compatibility-only and are cleared before binding.
+    if (cfg.mixed_port == 0) {
+        if (cfg.port != 0) result.append(.global_port);
+        if (cfg.socks_port != 0) result.append(.global_socks_port);
+    }
     return result;
 }
 
@@ -380,6 +384,20 @@ test "catalog recovery suppresses only marked Shadowsocks plugin semantics" {
         }
     }
     try std.testing.expectEqual(@as(usize, 3), reported);
+}
+
+test "global assessment ignores extra port declarations beside mixed-port" {
+    var cfg = config.Config{
+        .allocator = std.testing.allocator,
+        .port = 8080,
+        .socks_port = 1080,
+        .mixed_port = 7890,
+        .proxies = .empty,
+        .proxy_groups = .empty,
+        .rules = .empty,
+    };
+    const globals = assessGlobals(&cfg);
+    try std.testing.expectEqual(@as(usize, 0), globals.items().len);
 }
 
 test "global and group assessment include standalone ports and declarations" {

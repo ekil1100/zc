@@ -1,7 +1,7 @@
 # zc v1.0 Roadmap — code-first factual revision
 
 > 生成时间：2026-05-02
-> 最近更新：2026-08-08
+> 最近更新：2026-08-09
 > 原则：抛弃此前基于 `ROADMAP.md` / `TASKS.md` 的“已完成”结论，本版先按代码与本机验证结果重新判断。
 > 范围：当前 v1.0 cleanup 工作区。
 
@@ -242,7 +242,7 @@ bash scripts/run-full-validation.sh
 
 - `loadRuntimeConfig()` 会默认统一走 `mixed-port`。
 - `zc start --port <n>` 会覆盖本次 daemon mixed port。
-- `port` / `socks-port` 会在默认 runtime selection 中被清零。
+- 配置已有非零 `mixed-port` 时，兼容声明的 `port` / `socks-port` 按 validator 既有 ignored warning 语义处理，并在默认 runtime selection 中被清零；没有 mixed listener 的 standalone 声明仍在 bind 前拒绝。
 
 出站：`src/proxy/outbound/manager.zig`
 

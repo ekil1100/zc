@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- 修复 Clash 配置兼容准入：存在 mixed listener 时，legacy catalog 迁移与 override materialization 可保留被忽略的 `port` / `socks-port` 声明；standalone listener 仍不支持。
+
 ## [1.0.0-rc6] - 2026-07-20
 
 ### Added
