@@ -31,7 +31,7 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 - 代理协议兼容性
 - 默认运行行为
 
-## 方法选择
+## 开发流程选择
 
 - 核心逻辑、协议边界、解析器：TDD
 - CLI / minimal API 行为：BDD
@@ -46,8 +46,6 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 ## 开发流程
 
 - 本地开发启动 `zc` 时不要使用 `7899`，该端口保留给生产环境；优先提供 `zc start --port <port>` 这类显式入口，端口冲突时只报错并拒绝启动，避免误启动到其他端口
-- 实现完成后用 [iterative-review-fix skill](./.agents/skills/iterative-review-fix/SKILL.md) 检视代码
-- 完成验证后提交 commit，并合并回 `main`；合并完成后清理本地分支
 
 ## Git 规范
 
