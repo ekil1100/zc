@@ -4462,7 +4462,20 @@ fn prepareDaemonConfig(
             if (managed_key != null) {
                 source_path = try compat.fs.path.resolve(allocator, &.{path});
             } else {
-                source_path = try compat.fs.realpathAlloc(allocator, path);
+                const cwd = try std.process.currentPathAlloc(
+                    compat.io(),
+                    allocator,
+                );
+                defer allocator.free(cwd);
+                const absolute_path = try compat.fs.path.resolve(
+                    allocator,
+                    &.{ cwd, path },
+                );
+                defer allocator.free(absolute_path);
+                source_path = try compat.fs.realpathAlloc(
+                    allocator,
+                    absolute_path,
+                );
             }
         }
     }

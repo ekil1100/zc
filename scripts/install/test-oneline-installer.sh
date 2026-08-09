@@ -132,6 +132,21 @@ run_latest_installer_from_stdin() {
 
 write_fixture_binary "${version#v}"
 package_fixture
+
+default_home="$work_root/default-home"
+default_output="$work_root/default-install.out"
+mkdir -p "$default_home"
+HOME="$default_home" \
+    XDG_BIN_HOME= \
+    ZC_INSTALL_DIR= \
+    ZC_VERSION="$version" \
+    ZC_RELEASE_BASE_URL="file://$release_root" \
+    /bin/sh "$repo_root/install.sh" >"$default_output"
+test -x "$default_home/.local/bin/zc"
+test "$(tail -n 1 "$default_output")" = \
+    'export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"'
+echo "INSTALLER_DEFAULT_PATH_HINT=PASS"
+
 run_installer
 
 test -x "$install_dir/zc"

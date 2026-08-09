@@ -131,12 +131,15 @@ case "$(uname -m)" in
     *) zc_fail "unsupported architecture: $(uname -m)" ;;
 esac
 
+zc_default_path_hint=0
 if [ -n "${ZC_INSTALL_DIR:-}" ]; then
     zc_install_dir="$ZC_INSTALL_DIR"
 elif [ -n "${XDG_BIN_HOME:-}" ]; then
     zc_install_dir="$XDG_BIN_HOME"
+    zc_default_path_hint=1
 elif [ -n "${HOME:-}" ]; then
     zc_install_dir="$HOME/.local/bin"
+    zc_default_path_hint=1
 else
     zc_fail "HOME or ZC_INSTALL_DIR is required"
 fi
@@ -373,5 +376,11 @@ fi
 printf 'Installed %s to %s\n' "$zc_expected_version" "$zc_target"
 case ":${PATH:-}:" in
     *":$zc_install_dir:"*) ;;
-    *) printf 'Add %s to PATH to run zc directly.\n' "$zc_install_dir" ;;
+    *)
+        if [ "$zc_default_path_hint" -eq 1 ]; then
+            printf '%s\n' 'export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"'
+        else
+            printf 'Add %s to PATH to run zc directly.\n' "$zc_install_dir"
+        fi
+        ;;
 esac

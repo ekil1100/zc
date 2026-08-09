@@ -3380,6 +3380,75 @@ test "integration: configured missing runtime directory fails closed" {
     try expectErrorEnvelope(envelope.value, "status", "STATUS_FAILED");
 }
 
+test "integration: background start accepts a relative config path" {
+    const allocator = std.testing.allocator;
+    try ensureZcBinary(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(compat.io(), "home");
+    try tmp.dir.createDirPath(compat.io(), "run");
+    const runtime_handle = try tmp.dir.openDir(compat.io(), "run", .{});
+    defer runtime_handle.close(compat.io());
+    try compat.setDirPermissions(
+        runtime_handle,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const root = try tmp.dir.realPathFileAlloc(compat.io(), ".", allocator);
+    defer allocator.free(root);
+    const home = try compat.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    const runtime_path = try compat.fs.path.join(allocator, &.{ root, "run" });
+    defer allocator.free(runtime_path);
+    const relative_config_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/relative.yaml",
+        .{tmp.sub_path[0..]},
+    );
+    defer allocator.free(relative_config_path);
+    try std.testing.expect(!compat.fs.path.isAbsolute(relative_config_path));
+    const port = try reserveClosedPort();
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        .{port},
+    );
+    defer allocator.free(source);
+    try tmp.dir.writeFile(compat.io(), .{
+        .sub_path = "relative.yaml",
+        .data = source,
+    });
+    var environment = try std.process.Environ.createMap(
+        std.testing.environ,
+        allocator,
+    );
+    defer environment.deinit();
+    try environment.put("HOME", home);
+    try environment.put("XDG_RUNTIME_DIR", runtime_path);
+    defer stopIsolatedDaemon(allocator, &environment);
+
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            relative_config_path,
+            "--json",
+        },
+        .environ_map = &environment,
+        .stdout_limit = .limited(max_output),
+        .stderr_limit = .limited(max_output),
+        .timeout = awakeTimeoutSeconds(cli_awake_timeout_seconds),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 0), try exitCode(result.term));
+    var envelope = try parseEnvelope(allocator, result.stdout);
+    defer envelope.deinit();
+    try std.testing.expect(envelope.value.object.get("ok").?.bool);
+    const listener = try connectController(port);
+    listener.close();
+}
+
 test "integration: startup preserves endpoint validation errors" {
     const allocator = std.testing.allocator;
     try ensureZcBinary(allocator);

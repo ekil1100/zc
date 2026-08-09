@@ -2,9 +2,26 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-09
+
+### Added
+- 新增经过独立 wire、真实 mixed socket 与固定版本互操作验证的 Shadowsocks simple-obfs HTTP TCP 和 classic AEAD UDP。
+- 新增 Linux/macOS amd64/arm64 standalone installer、静态 Linux 产物、SHA-256 校验与真实网络 E2E 发布门禁。
+
+### Changed
+- 以统一 capability gate 精确发布 DIRECT、REJECT、Shadowsocks 与 Trojan TCP/TLS，其他未验证协议和 transport 在 bind/dial 前 fail closed。
+- 完成 catalog authority、immutable revision、durable proxy selection、instance-bound daemon lifecycle 与 managed config writer 收口。
+- 根 README 收敛为 zc 与 mihomo 的已实现、部分实现和未实现能力对照。
+- 关闭已完成的实现路线图，移除 agent 侧临时计划、迁移基线和一次性发布准备脚本。
+- `install.sh` 在默认安装目录尚未位于 `PATH` 时输出可直接复制的 `export PATH=…` 命令。
+
 ### Fixed
-- 修复 Clash 配置兼容准入：存在 mixed listener 时，legacy catalog 迁移与 override materialization 可保留被忽略的 `port` / `socks-port` 声明；standalone listener 仍不支持。
-- 修复 `zc test` 文本输出缓冲：并发测速结果现在按实际完成顺序逐项刷新，不再等全部探测结束后批量显示。
+- 对 controller、API、配置下载、YAML、代理 worker、协议地址与 Shadowsocks chunk 建立固定资源和期限上界。
+- 修复 daemon replacement、restart rollback、installer replacement、catalog/provider publication 与 legacy state 的原子性和实例归属。
+- 修复规则 first-match、REJECT 终态、缺失终态规则 fail-closed 与热路径无条件 tracing。
+- 修复 Clash 配置兼容准入：存在 mixed listener 时保留并忽略 `port` / `socks-port` 声明；standalone listener 仍不支持。
+- 修复 `zc test` 文本输出缓冲：并发测速结果按实际完成顺序逐项刷新。
+- 修复 `zc start -c <relative-path>` 在准备 daemon snapshot 时把相对路径传给 absolute-only API 导致的进程崩溃。
 
 ## [1.0.0-rc6] - 2026-07-20
 
@@ -73,10 +90,6 @@
 ### Archived
 - Move stale install, benchmark, roadmap, API versioning, TUI, and historical agent planning drafts under `docs/archive/`.
 - Archive the old full API v1 OpenAPI draft because it described endpoints and WebSocket events that are not implemented in v1.0.
-
-### Known Blockers Before v1.0.0
-- Decide and enforce the HTTP/SOCKS5 outbound policy: implement them or reject them early in validation/docs/migrator.
-- Pass the final smoke gate before tagging `v1.0.0`.
 
 ## [0.1.0] - 2025-12
 

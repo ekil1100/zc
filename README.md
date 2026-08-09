@@ -5,63 +5,10 @@
 <h1 align="center">zc</h1>
 
 <p align="center">
-  A Zig-powered, CLI-first proxy runtime inspired by the mihomo/clash ecosystem.
+  一个面向 mihomo/clash 配置生态的 CLI-first Zig 代理运行时。
 </p>
 
-<p align="center">
-  <a href="docs/README.md">Documentation</a>
-  |
-  <a href="docs/roadmap/v1.0.md">v1.0 roadmap</a>
-  |
-  <a href="docs/compat/mihomo-clash.md">Compatibility</a>
-  |
-  <a href="docs/api/README.md">Minimal API</a>
-</p>
-
-## What is zc?
-
-zc is a lightweight proxy runtime and command-line tool built with Zig. It follows familiar mihomo/clash concepts such as profiles, proxies, proxy groups, rules, daemon status, runtime state, and health checks, while keeping the product surface intentionally CLI-first.
-
-The goal is a small, observable runtime that can load mainstream proxy configurations, run a default mixed inbound listener, expose a minimal control API, and provide predictable commands for day-to-day operation.
-
-zc does **not** include a TUI, and v1.0 is **not** positioned as a full mihomo/clash replacement.
-
-## Project status
-
-zc is in **v1.0 release-candidate cleanup**. It is under active development and is already usable for core local workflows:
-
-- build and run the CLI with Zig 0.16.0+;
-- start, stop, restart, inspect, and diagnose the daemon;
-- load clash-style proxy, proxy-group, and rule configuration;
-- run the default mixed inbound runtime;
-- select proxies through the CLI or the minimal API;
-- validate install, migration, reliability, and performance gates from repository scripts.
-
-The remaining v1.0 work is tracked in [`docs/roadmap/v1.0.md`](docs/roadmap/v1.0.md). Do not treat the current release-candidate line as a final `v1.0.0` GA release until that roadmap gate is closed.
-
-## Features
-
-- **CLI-first operation**: `zc start`/`zc up`, `zc stop`/`zc down`, `zc restart`, `zc reload`, `zc status`, `zc log`, `zc doctor`, `zc test`, `zc config`, `zc proxy`, and `zc profile`, with generated help (`zc help <command>`).
-- **Agent-friendly output contract**: every command supports `--json` (one `{"ok","command","data"|"error"}` envelope per run on stdout, `zc log --json` as JSON Lines), diagnostics go to stderr, exit codes are uniform (0 success / 1 failure / 2 usage error), and color respects `NO_COLOR` / `--no-color`.
-- **Daemon lifecycle**: explicit process tracking, fork-and-exit start plus `zc start --foreground` for containers/systemd, hot reload via `zc reload`, JSON status output, log inspection, and diagnostics.
-- **Default mixed inbound**: one local listener for HTTP and SOCKS5-style client traffic.
-- **Config compatibility work**: parser and validator coverage for common clash-style fields, rule providers, proxy groups, and rule matching.
-- **Proxy selection**: list and switch select groups through `zc proxy` or `PUT /proxies/<group>`.
-- **Minimal API**: implemented endpoints for version, proxies, rules, and proxy-group selection when `external-controller` is configured.
-- **Operational gates**: install regression, config migrator regression, smoke validation, reliability scenarios, and performance report scripts.
-
-## Development requirements
-
-- Zig `0.16.0+`
-- Linux or another POSIX-like development environment for the current scripts
-- `bash` for repository validation scripts
-- `just` for the local install shortcut
-
-CI and local development target Zig `0.16.0`.
-
-## Install standalone (recommended)
-
-Linux/macOS amd64/arm64 可以直接安装，无需 Homebrew 或 `sudo`：
+## 安装
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
@@ -70,168 +17,87 @@ export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
 zc --version
 ```
 
-默认目标是 `${XDG_BIN_HOME:-$HOME/.local/bin}/zc`。Linux 发布物是静态 musl ELF；
-macOS 发布物只依赖系统库。installer 会验证版本化 Release SHA-256，并在下载、校验或
-自检失败时保留旧二进制；安装目标仍有进程运行时，即使新版本无法追踪其旧 runtime 状态，也拒绝覆盖。固定版本和自定义目录使用 `ZC_VERSION`、`ZC_INSTALL_DIR`，
-详见 [`docs/install/README.md`](docs/install/README.md)。
+## 与 mihomo 的功能对比
 
-## Install with Homebrew (release candidate)
+表格区分完整实现、部分实现和未实现能力。未支持的出站协议与代理组会在启动或连接前明确拒绝；仅为配置兼容而接受的字段会单独注明 ignored 或上下文限制。
 
-当前 release candidate 通过项目 Tap 发布：
+### 入站与运行模式
 
-```bash
-brew install ekil1100/tap/zc
-zc --version
-```
+| 功能 | zc | 与 mihomo 的差异 |
+| --- | --- | --- |
+| Mixed HTTP/SOCKS5 入站 | ✅ 已实现 | `mixed-port` 是唯一实际绑定的代理入口。 |
+| SOCKS5 UDP ASSOCIATE | ✅ 已实现 | 仅用于 `udp: true` 的 Shadowsocks classic AEAD 节点。 |
+| 独立 HTTP `port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |
+| 独立 `socks-port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |
+| TUN | ❌ 未实现 | 不创建 TUN 设备。 |
+| Redir / TProxy | ❌ 未实现 | `redir-port`、`tproxy-port` 不会创建 listener。 |
 
-升级到 Tap 中的最新版本时，先用旧二进制停止 daemon，避免跨版本 runtime 路径变化造成双实例：
+### 出站协议
 
-```bash
-zc stop
-brew upgrade ekil1100/tap/zc
-zc start  # only if it was running before the upgrade
-```
+| 协议或能力 | zc | 实现边界 |
+| --- | --- | --- |
+| DIRECT | ✅ 已实现 | TCP 直连。 |
+| REJECT | ✅ 已实现 | 终止连接，不会因目标是私网或 loopback 而改写为 DIRECT。 |
+| Shadowsocks classic AEAD TCP | ✅ 已实现 | `aes-128-gcm`、`aes-256-gcm`、`chacha20-poly1305`、`chacha20-ietf-poly1305`。 |
+| Shadowsocks classic AEAD UDP | ✅ 已实现 | 仅经 mixed SOCKS5 UDP ASSOCIATE；不支持分片。 |
+| Shadowsocks simple-obfs HTTP | ✅ 已实现 | 仅 `obfs` / `obfs-local` 的 HTTP 模式，且只包装 TCP。 |
+| Shadowsocks AEAD-2022 | ❌ 未实现 | 配置准入阶段拒绝。 |
+| Shadowsocks 通用 SIP003 外部插件 | ❌ 未实现 | 不启动外部 plugin；simple-obfs TLS 也不支持。 |
+| Trojan TCP/TLS | ✅ 已实现 | 支持 `password`、`server`、`port`、`sni`、`skip-cert-verify`。 |
+| Trojan UDP / WebSocket / gRPC | ❌ 未实现 | 仅支持 TCP/TLS CONNECT。 |
+| HTTP outbound | ❌ 未实现 | 配置准入阶段拒绝。 |
+| SOCKS5 outbound | ❌ 未实现 | 配置准入阶段拒绝。 |
+| VMess | ❌ 未实现 | 未通过标准 wire 与互操作验证。 |
+| VLESS | ❌ 未实现 | 未完成主流 transport 与互操作验证。 |
+| AnyTLS | ❌ 未实现 | 保留代码不构成运行时支持。 |
+| mihomo 的其他 outbound 协议 | ❌ 未实现 | 未列出的协议均不作为已支持能力。 |
 
-该渠道目前发布的是 `v1.0.0-rc6`，不代表 `v1.0.0` GA gate 已关闭。
+### 代理组
 
-## Install from source
+| 功能 | zc | 与 mihomo 的差异 |
+| --- | --- | --- |
+| `select` | ✅ 已实现 | 支持持久选择、嵌套组、DIRECT/REJECT 成员与循环检测。 |
+| `url-test` | ❌ 未实现 | parser 可识别，运行时准入拒绝。 |
+| `fallback` | ❌ 未实现 | parser 可识别，运行时准入拒绝。 |
+| `load-balance` | ❌ 未实现 | parser 可识别，运行时准入拒绝。 |
+| `relay` | ❌ 未实现 | parser 可识别，运行时准入拒绝。 |
 
-```bash
-git clone https://github.com/ekil1100/zc.git
-cd zc
+### 规则与 Provider
 
-just install
+| 功能 | zc | 实现边界 |
+| --- | --- | --- |
+| `DOMAIN` / `DOMAIN-SUFFIX` / `DOMAIN-KEYWORD` | ✅ 已实现 | 按声明顺序 first-match。 |
+| `IP-CIDR` / `IP-CIDR6` | ✅ 已实现 | 域名目标使用系统 resolver。 |
+| `RULE-SET` | ✅ 已实现 | 支持本地、被托管配置捕获的 rule-provider 展开。 |
+| `MATCH` | ✅ 已实现 | 作为终态规则。 |
+| `GEOIP` | ⚠️ 部分实现 | IPv6 GEOIP 不完整。 |
+| `DST-PORT` | ⚠️ 部分实现 | mixed HTTP CONNECT/forward 的完整上下文仍有限制。 |
+| `SRC-IP-CIDR` / `SRC-PORT` / `PROCESS-NAME` | ⚠️ 部分实现 | parser 已接入，但部分入站路径不会提供完整匹配上下文。 |
+| Remote `RULE-SET` 完整兼容 | ❌ 未实现 | 托管 revision 不允许引用尚未捕获的 remote provider。 |
+| `proxy-providers` | ❌ 未实现 | 不解析为运行时代理节点。 |
+| mihomo 的其他规则类型 | ❌ 未实现 | 未列出的规则不作为已支持能力。 |
 
-zc --help
-```
+### DNS
 
-Make sure `"$HOME/.local/bin"` is on your `PATH`.
+| 功能 | zc | 与 mihomo 的差异 |
+| --- | --- | --- |
+| 规则匹配所需的域名解析 | ✅ 已实现 | 使用系统 resolver 和有界进程缓存。 |
+| `dns:` 运行时配置 | ❌ 未实现 | 未接入完整 DNS 配置模型。 |
+| Fake IP | ❌ 未实现 | 不支持 fake-ip。 |
+| `enhanced-mode` / `nameserver-policy` | ❌ 未实现 | 不提供 mihomo DNS 行为兼容。 |
 
-## Quick start
+### 配置与控制面
 
-Use an explicit non-production port during local development. Port `7899` is reserved for production use in this project.
+| 功能 | zc | 实现边界 |
+| --- | --- | --- |
+| Clash-style YAML 核心字段 | ✅ 已实现 | 支持 mixed 入口、静态 proxies、select groups、rules 与 local rule-providers。 |
+| 托管配置 | ✅ 已实现 | 支持 load/download/update/use/delete/dump/override、immutable revision 与本地依赖捕获。 |
+| 持久代理选择 | ✅ 已实现 | 选择与 exact config revision 绑定，daemon 启动前恢复。 |
+| Daemon 生命周期 CLI | ✅ 已实现 | start/stop/restart/reload/status/log/test/doctor，支持结构化 JSON 输出。 |
+| Minimal REST API | ✅ 已实现 | `/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`。 |
+| mihomo 完整 Controller API | ❌ 未实现 | 没有 `/runtime`、`/profiles`、`/connections`、`/metrics` 等完整资源模型。 |
+| WebSocket 事件流 | ❌ 未实现 | 不兼容依赖事件流的 dashboard。 |
+| 第三方 dashboard 兼容 | ❌ 未实现 | minimal API 不等同于 mihomo Controller API。 |
+| 内置 TUI | ❌ 未实现 | 产品表面仅提供 CLI 与 minimal API。 |
 
-```bash
-zc up --port 7901 -c testdata/config/minimal.yaml --json
-zc status --json | jq -r .data.state
-zc proxy list --json | jq .data.groups
-zc doctor --json | jq .data.proxy_reachable
-zc reload --json
-zc down --json
-```
-
-`zc up`/`zc down` are aliases of `zc start`/`zc stop`. JSON envelopes are
-emitted on stdout, so they pipe directly into `jq`; human diagnostics stay on
-stderr. Set `NO_COLOR=1` or pass `--no-color` to disable ANSI colors. In
-containers or under systemd, run the daemon with `zc start --foreground`.
-生命周期文件优先写入 owner-only (`0700`) 的规范化 `XDG_RUNTIME_DIR`；未设置时使用 `$HOME/.local/state/zc/runtime`。后台 `start` 先绑定代理与 controller listener，但在 exact desired 对账与 runtime descriptor 发布完成前保持 accept gate 关闭；开放接入后才报告成功。
-
-The same binary can be run without installing:
-
-```bash
-zig build
-./zig-out/bin/zc start --port 7901 -c testdata/config/minimal.yaml --json
-```
-
-## Configuration
-
-zc reads clash-style YAML configuration. A minimal shape looks like this:
-
-```yaml
-mixed-port: 7901
-allow-lan: false
-mode: rule
-log-level: info
-
-proxies:
-  - name: demo-ss
-    type: ss
-    server: 127.0.0.1
-    port: 8388
-    cipher: aes-128-gcm
-    password: "password"
-
-proxy-groups:
-  - name: PROXY
-    type: select
-    proxies:
-      - demo-ss
-      - DIRECT
-
-rules:
-  - MATCH,PROXY
-```
-
-See [`testdata/config/`](testdata/config/) for runnable examples and [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md) for current compatibility boundaries.
-
-Managed downloads auto-activate only the first **runtime-ready** config. A strict-YAML revision whose only recoverable defect is malformed Shadowsocks simple-obfs metadata can be retained for repair, but remains inactive; `config download -d`, an active `config update`, and `config use` reject it with `CONFIG_CAPABILITY_UNSUPPORTED` until plugin/TLS/cipher/group issues are fixed. `config load/download/update` report their own `*_LIMIT_EXCEEDED` code for fixed YAML/proxy bounds plus 4096 rule providers (and at most 4096 captured local-provider assets), 262144 aggregate provider entries / 64 MiB normalized bytes, **64 MiB aggregate raw provider source bytes per sync/load pass**, and 262144 expanded rules / 64 MiB owned payload+target bytes; each local or remote provider source is limited to 16 MiB and uses the typed provider-file limit error, while only the complete config's separate 16 MiB source limit uses `*_TOO_LARGE`. Proxy-compatible std HTTP→curl fallback shares the same remaining provider-source window rather than granting each transport a full cap. The separate 1024 persisted-selection limit is enforced by catalog/selection mutations, not by YAML fields; an existing on-disk excess is corrupt state and fails closed. See [`docs/cli/spec.md`](docs/cli/spec.md) and [`docs/api/error-codes.md`](docs/api/error-codes.md).
-
-## Minimal API
-
-The API starts when `external-controller` is set to an explicit IPv4 loopback endpoint. zc uses the exact configured port and fails startup on conflicts:
-
-```yaml
-external-controller: 127.0.0.1:9090
-```
-
-Implemented endpoints include:
-
-- `GET /`
-- `GET /version`
-- `GET /proxies`
-- `GET /rules`
-- `PUT /proxies/<group_name>`
-
-This is a minimal control API, not a full mihomo/clash dashboard-compatible API. See [`docs/api/README.md`](docs/api/README.md).
-
-## Compatibility
-
-zc is compatibility-oriented, but intentionally conservative about what it claims.
-
-Current v1.0 documentation tracks implemented behavior for:
-
-- mixed inbound runtime;
-- core rule matching and rule-provider expansion;
-- select proxy groups;
-- DIRECT、REJECT、`aes-128-gcm` / `aes-256-gcm` / `chacha20-poly1305` / `chacha20-ietf-poly1305` Shadowsocks classic AEAD TCP 与 mixed SOCKS5 UDP ASSOCIATE，以及 Trojan TCP/TLS 出站；
-- minimal REST control endpoints.
-
-Shadowsocks 现在精确支持 classic 2017 AEAD TCP，以及 `udp: true` 节点经 mixed 端口提供的 SOCKS5 UDP ASSOCIATE。TCP 可使用 plain transport，或 `plugin: obfs|obfs-local` + `plugin-opts: {mode: http, host: <1..255 bytes>}`；`plugin_opts` map 会在输出时规范化为 `plugin-opts`。simple-obfs 始终只包装 TCP，UDP 直接使用同一 Shadowsocks server host/port。UDP association 全局最多 64 个，300 秒 awake-clock idle，单个 SOCKS/SS wire datagram 最多 65507 bytes；坏认证、非零 RSV/FRAG 与畸形地址静默丢弃，DIRECT 或不支持 UDP 的选中节点会终止 association，绝不 fallback。simple-obfs `tls`、未知 mode、通用外部插件、缺失/不安全 host、AEAD-2022、standalone `socks-port` UDP、fragmentation 及 Trojan UDP 仍保持关闭。HTTP、SOCKS5、VMess、VLESS、AnyTLS outbound 仍未支持。其他已知缺口包括完整 mihomo DNS、TUN/redir/tproxy、完整 REST API v1、WebSocket 事件流和第三方 dashboard 兼容。
-
-## Development
-
-Run the focused local gates before sending changes:
-
-```bash
-env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test --summary all
-env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast --summary all
-zig build e2e --summary all  # PR/tag gate; downloads checksum-pinned static fixtures
-bash tools/config-migrator/run-all.sh
-bash scripts/install/run-all-regression.sh
-bash scripts/run-full-validation.sh
-```
-
-Daemon smoke test:
-
-```bash
-./zig-out/bin/zc start --port 29001 -c testdata/config/minimal.yaml --json
-./zig-out/bin/zc status --json
-./zig-out/bin/zc stop --json
-```
-
-## Documentation
-
-- [`docs/README.md`](docs/README.md): documentation index
-- [`docs/roadmap/v1.0.md`](docs/roadmap/v1.0.md): public v1.0 release plan
-- [`docs/cli/spec.md`](docs/cli/spec.md): CLI command surface and JSON contracts
-- [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md): compatibility boundaries
-- [`docs/install/README.md`](docs/install/README.md): install and validation scripts
-- [`docs/api/README.md`](docs/api/README.md): implemented minimal API
-- [`docs/reliability/e2e.md`](docs/reliability/e2e.md): PR/tag-only real network E2E gate
-- [`docs/reliability/soak-guide.md`](docs/reliability/soak-guide.md): soak validation
-
-Historical drafts live under [`docs/archive/`](docs/archive/) and are not current commitments.
-
-## License
-
-MIT
+详细边界见 [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md)，实际 API 见 [`docs/api/README.md`](docs/api/README.md)。

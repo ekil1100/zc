@@ -4,7 +4,7 @@
 
 `latest.json`、现有 `history/` 和 `scripts/perf/run-baseline.sh` 来自旧 placeholder scaffold：它们没有 raw samples，**不能作为真实性能基线或回归门禁证据**。
 
-P0-6 Batch 1 新增只记录事实、不宣称 PASS/FAIL 的 ReleaseFast 入口：
+v1.0 state-authority 工作新增了只记录事实、不宣称 PASS/FAIL 的 ReleaseFast 入口：
 
 ```bash
 bash scripts/perf/run-control-plane-baseline.sh \
@@ -12,9 +12,9 @@ bash scripts/perf/run-control-plane-baseline.sh \
   --output .zig-cache/perf/control-plane.json
 ```
 
-新入口至少输出 5 份 raw samples、median、nearest-rank p95、subject/harness commit、Zig version、machine/CPU、OS/arch/optimize provenance；默认拒绝 dirty worktree，只写 `.zig-cache/perf/`，并拒绝自动覆盖本目录 tracked report。`subject_commit` 默认必须等于 clean HEAD；唯一例外是 direct parent + 单个 harness-only commit，且变更路径受脚本 allowlist 约束。Batch 1 当前测量 `legacy_bounded_read`、`strict_bounded_read` 以及 1/100/1000 profiles 的 `authority_commit`；connection admission、flow RSS 和 config import 在对应 seam 落地前明确列为 omitted，禁止用 `0` 或环境变量假值代替。
+新入口至少输出 5 份 raw samples、median、nearest-rank p95、subject/harness commit、Zig version、machine/CPU、OS/arch/optimize provenance；默认拒绝 dirty worktree，只写 `.zig-cache/perf/`，并拒绝自动覆盖本目录 tracked report。`subject_commit` 默认必须等于 clean HEAD；唯一例外是 direct parent + 单个 harness-only commit，且变更路径受脚本 allowlist 约束。当前 harness 测量 `legacy_bounded_read`、`strict_bounded_read` 以及 1/100/1000 profiles 的 `authority_commit`；未采集的 connection admission、flow RSS 和 config import 必须明确列为 omitted，禁止用 `0` 或环境变量假值代替。
 
-旧 `scripts/perf-regression.sh` 暂时保留兼容，但其 placeholder PASS 不得用于 P0-6 完成判断。
+旧 `scripts/perf-regression.sh` 的 placeholder PASS 不能作为真实性能门禁证据。
 
 ## 1) 目标
 

@@ -25,6 +25,7 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 - 可回滚：高风险改动必须能撤回
 - 文档同更：用户可感知行为变化同步更新文档
 - 性能门禁：关键路径性能劣化不能直接合入
+- 任务推进先定义可验证的验收标准，再进入实现
 
 以下变更必须同步更新 `docs/` 下相关文档：
 - `daemon/status`
@@ -36,12 +37,6 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 - 核心逻辑、协议边界、解析器：TDD
 - CLI / minimal API 行为：BDD
 - 性能与稳定性：Benchmark-Driven + Scenario-based
-
-## 执行要求
-
-- v1.0 发布计划以 `.agents/zc-v1.0-roadmap.md` 为工作事实源，公开文档入口为 `docs/README.md` 与 `docs/roadmap/v1.0.md`
-- 任务推进必须先定义验收标准，再进入实现
-- 路线变更时，先更新当前 v1.0 roadmap，再同步 `docs/README.md` / 相关用户文档
 
 ## 开发流程
 

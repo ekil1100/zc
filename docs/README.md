@@ -1,29 +1,20 @@
 # zc documentation
 
-This directory is the public documentation entry for the current zc v1.0 release work.
+This directory is the public documentation entry for zc.
 
-首次阅读请从根目录 [`README.md`](../README.md) 开始，其中包含项目概览、状态、Homebrew Tap 与源码安装入口、quick start 和当前项目标识。
+首次阅读请从根目录 [`README.md`](../README.md) 开始，其中只列出 zc 相对 mihomo 已实现与未实现的能力；安装、CLI、API 与运行细节由本目录中的专题文档分别维护。
 
 ## Current status
 
-zc 当前处于 **v1.0 release-candidate cleanup**，尚未进入最终 GA。当前发布计划以代码事实为准：
+v1.0 实现路线图已经完成，`v1.0.0` 是当前正式发布基线。已完成的范围和常规发布验证入口见 [`roadmap/v1.0.md`](roadmap/v1.0.md)；该文件是完成记录，不再作为进行中的任务清单。
 
-1. 修复工具链与 release workflow 漂移；
-2. 让文档声明与已实现能力一致；
-3. 从 v1.0 范围移除 TUI；
-4. 清理过期文档；
-5. 用统一 capability gate 在 bind/dial 前拒绝未经验证的协议；
-6. simple-obfs HTTP 与 classic Shadowsocks AEAD UDP 已通过独立 wire、真实 mixed socket 和固定版本互操作门禁；
-7. 让代理选择具备持久、revision-aware 的一致语义；
-8. 增加经过验证、仅 CLI 可用的本地 config import；
-9. 修复安全审计阻断项并通过最终 smoke gate 后再标记 `v1.0.0`。
-
-公开 v1.0 roadmap 见 [`roadmap/v1.0.md`](roadmap/v1.0.md)。可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。托管下载只自动激活首个 runtime-ready revision；可恢复的 malformed simple-obfs raw revision 保持 inactive，capability 与资源上界错误使用文档化的 `CONFIG_CAPABILITY_UNSUPPORTED` / `CONFIG_*_LIMIT_EXCEEDED`。运行时 outbound manager 是 owned opaque handle，借用的配置及嵌套存储在 handle 销毁前必须保持 immutable/address-stable；准入使用预建 borrowed-key 索引，因此成本按 group 解析深度固定，不随配置节点总数线性增长。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)，错误码见 [`api/error-codes.md`](api/error-codes.md)。
+可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。托管下载只自动激活首个 runtime-ready revision；可恢复的 malformed simple-obfs raw revision 保持 inactive，capability 与资源上界错误使用文档化的 `CONFIG_CAPABILITY_UNSUPPORTED` / `CONFIG_*_LIMIT_EXCEEDED`。运行时 outbound manager 是 owned opaque handle，借用的配置及嵌套存储在 handle 销毁前必须保持 immutable/address-stable；准入使用预建 borrowed-key 索引，因此成本按 group 解析深度固定，不随配置节点总数线性增长。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)，错误码见 [`api/error-codes.md`](api/error-codes.md)。
 
 ## v1.0 documentation map
 
 | Area | Document | Purpose |
 | --- | --- | --- |
+| Release | [`roadmap/v1.0.md`](roadmap/v1.0.md) | Completed v1.0 scope and validation record. |
 | CLI | [`cli/spec.md`](cli/spec.md) | Current command surface and JSON contract status. |
 | Config | [`config/override.md`](config/override.md) | Runtime override behavior. |
 | Compatibility | [`compat/mihomo-clash.md`](compat/mihomo-clash.md) | mihomo/clash compatibility boundaries and unsupported features. |

@@ -2,7 +2,7 @@
 
 This page documents the current v1.0 install scripts that exist in this repository.
 
-> v1.0 仍处于 release-candidate cleanup。Standalone installer 与 Homebrew Tap 可用于安装 rc 版本，但不代表 `v1.0.0` GA gate 已关闭。
+> v1.0 实现路线图已经完成。Standalone installer 与 Homebrew Tap 的实际可安装版本以 GitHub Release 为准。
 
 ## Standalone one-line installer
 
@@ -13,15 +13,20 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/ekil1100/zc/main/install.sh | sh
 ```
 
-默认安装到 `${XDG_BIN_HOME:-$HOME/.local/bin}/zc`。Linux 使用静态 musl ELF；macOS
-提供 standalone Mach-O，只依赖系统库。发布矩阵覆盖 Linux/macOS 的 amd64 与 arm64。
+默认安装到 `${XDG_BIN_HOME:-$HOME/.local/bin}/zc`。默认安装目录尚未位于 `PATH` 时，安装成功后的最后一行会给出可直接复制的命令：
+
+```bash
+export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
+```
+
+Linux 使用静态 musl ELF；macOS 提供 standalone Mach-O，只依赖系统库。发布矩阵覆盖 Linux/macOS 的 amd64 与 arm64。
 
 可固定版本或目录：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/ekil1100/zc/main/install.sh \
-  | ZC_VERSION=v1.0.0-rc6 ZC_INSTALL_DIR="$HOME/bin" sh
+  | ZC_VERSION=v1.0.0 ZC_INSTALL_DIR="$HOME/bin" sh
 ```
 
 installer 先把 `latest` 解析为 immutable tag，再下载版本化归档及对应 `.sha256`；缺少
@@ -40,14 +45,14 @@ identity 仍指向安装目标（例如 runtime 路径迁移后遗留的旧 daem
 
 ## Homebrew Tap
 
-macOS 或 Linux 的 amd64/arm64 用户可以从项目 Tap 安装当前 release candidate：
+macOS 或 Linux 的 amd64/arm64 用户可以从项目 Tap 安装当前发布版本：
 
 ```bash
 brew install ekil1100/tap/zc
 zc --version
 ```
 
-升级时使用同一个 fully qualified formula，避免与其他 Tap 的同名 formula 混淆。release candidate 之间可能迁移 runtime 路径，因此必须先用当前（旧）二进制停止 daemon，确认停止后再替换：
+升级时使用同一个 fully qualified formula，避免与其他 Tap 的同名 formula 混淆。版本之间可能迁移 runtime 路径，因此必须先用当前（旧）二进制停止 daemon，确认停止后再替换：
 
 ```bash
 zc stop
@@ -82,7 +87,7 @@ bash scripts/install/oc-run.sh install --target-dir /tmp/zc-install
 bash scripts/install/oc-run.sh verify --target-dir /tmp/zc-install
 
 # Upgrade requires an explicit version
-bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.0-rc6
+bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.0
 
 # Optional rollback cleanup
 bash scripts/install/oc-run.sh rollback --target-dir /tmp/zc-install
