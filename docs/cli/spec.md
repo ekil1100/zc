@@ -21,7 +21,7 @@ the binary accepts.
 | `zc reload [--json]` | | Reloads the tracked original source, preserving its CLI port override; current hot reload falls back to the same instance-bound prepared restart. Daemon not running ⇒ `RELOAD_FAILED`, exit 1. Supervised foreground daemon（systemd/容器）拒绝并提示走 supervisor。 |
 | `zc status [--json]` | | Daemon state, uptime, runtime paths, and current node of each select group. Stopped daemon is **still exit 0**（状态在 `data.state`，决策 D5）。 |
 | `zc log [-n <lines>] [-f\|--no-follow] [--json]` | | Follows by default in text mode. `--json` = JSON Lines（每行一个 `{"line":"…"}` 事件），implies `--no-follow` unless `-f`. Default `-n` is 50 when not following. |
-| `zc test [-c <config>] [--port <port>] [--json]` | | Connectivity probes through the configured proxy。文本与 JSON **跑相同探测**；any failed check ⇒ `error.code=CHECKS_FAILED` + per-check `data`, exit 1（决策 D3）。JSON 含 `daemon_state`、`selected_proxies`、`ports`、`checks`、`targets`。 |
+| `zc test [-c <config>] [--port <port>] [--json]` | | Connectivity probes through the configured proxy。文本与 JSON **跑相同探测**；文本模式并发测速，并按实际完成顺序逐项刷新结果。any failed check ⇒ `error.code=CHECKS_FAILED` + per-check `data`, exit 1（决策 D3）。JSON 含 `daemon_state`、`selected_proxies`、`ports`、`checks`、`targets`。 |
 | `zc doctor [-c <config>] [--json]` | | Config/daemon/port/connectivity diagnostics。文本标签冻结为 `Config:`、`Daemon:`、`PID:`、`Port:`、`Connection:`（健康输出含 `OK`/`valid`）。Failed checks ⇒ `CHECKS_FAILED` + `data.checks`, exit 1。JSON 含 `proxy_reachable`、`network_ok`、`config_ok` 与 `config_diagnostics_truncated`；validator 超过 256 条合计或单条 512 bytes 时文本会提示 omitted。 |
 
 Lifecycle commands enforce 决策 D11 like every other tree: unknown flags,

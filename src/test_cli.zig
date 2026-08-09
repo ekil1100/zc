@@ -587,6 +587,7 @@ fn sinkLatencyResult(ctx_ptr: *anyopaque, target: TestTarget, latency: LatencyRe
             try sink.out.print("{s} {s}\n", .{ marker, failureReasonText(reason) });
         },
     }
+    try sink.out.flush();
 }
 
 fn testUrlLatency(allocator: std.mem.Allocator, url: []const u8, proxy_url: []const u8) !LatencyResult {
@@ -850,6 +851,66 @@ test "runConnectivityTest json: not-listening port fails port check without exte
     // 端口都不通时不应跑外网探测：targets 为空。
     try std.testing.expectEqual(@as(usize, 0), data.get("targets").?.array.items.len);
 }
+
+test "text latency result is flushed immediately" {
+    const allocator = std.testing.allocator;
+    var stdout = FlushTrackingWriter{};
+    stdout.init();
+    var stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var out = cli_output.Output.init(
+        .text,
+        "test",
+        false,
+        false,
+        &stdout.interface,
+        &stderr.writer,
+    );
+    var sink = ProbeSink{ .out = &out, .arena = allocator };
+    defer sink.targets.deinit(allocator);
+
+    try sinkLatencyResult(
+        &sink,
+        .{ .name = "fast", .url = "https://fast.example" },
+        .{ .ok = 42 },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), stdout.flush_count);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.flushed(), "fast") != null);
+    try std.testing.expect(std.mem.endsWith(u8, stdout.flushed(), "42ms\n"));
+}
+
+const FlushTrackingWriter = struct {
+    interface: std.Io.Writer = undefined,
+    buffer: [256]u8 = undefined,
+    flushed_buffer: [256]u8 = undefined,
+    flushed_length: usize = 0,
+    flush_count: usize = 0,
+
+    fn init(self: *FlushTrackingWriter) void {
+        self.interface = .{
+            .vtable = &.{
+                .drain = std.Io.Writer.unreachableDrain,
+                .flush = flush,
+            },
+            .buffer = &self.buffer,
+        };
+    }
+
+    fn flushed(self: *const FlushTrackingWriter) []const u8 {
+        return self.flushed_buffer[0..self.flushed_length];
+    }
+
+    fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *FlushTrackingWriter = @alignCast(@fieldParentPtr("interface", writer));
+        const buffered = writer.buffered();
+        std.debug.assert(self.flushed_length + buffered.len <= self.flushed_buffer.len);
+        @memcpy(self.flushed_buffer[self.flushed_length..][0..buffered.len], buffered);
+        self.flushed_length += buffered.len;
+        self.flush_count += 1;
+        writer.end = 0;
+    }
+};
 
 test "latency probes print in completion order" {
     const targets = [_]TestTarget{

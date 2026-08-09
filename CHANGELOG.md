@@ -4,6 +4,7 @@
 
 ### Fixed
 - 修复 Clash 配置兼容准入：存在 mixed listener 时，legacy catalog 迁移与 override materialization 可保留被忽略的 `port` / `socks-port` 声明；standalone listener 仍不支持。
+- 修复 `zc test` 文本输出缓冲：并发测速结果现在按实际完成顺序逐项刷新，不再等全部探测结束后批量显示。
 
 ## [1.0.0-rc6] - 2026-07-20
 
