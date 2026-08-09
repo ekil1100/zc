@@ -4346,10 +4346,7 @@ test "integration: timed out stop is disarmed before the daemon resumes" {
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
-        .timeout = .{ .duration = .{
-            .clock = .awake,
-            .raw = std.Io.Duration.fromSeconds(10),
-        } },
+        .timeout = awakeTimeoutSeconds(cli_awake_timeout_seconds),
     });
     defer allocator.free(stopped.stdout);
     defer allocator.free(stopped.stderr);

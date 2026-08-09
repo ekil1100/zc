@@ -46,10 +46,10 @@ Linux fixture 必须由 `file` 识别为 statically linked。`src/e2e_obfs_oracl
 
 完整 network/installer E2E 有意不挂到普通 `zig build test`；只有 oracle 的 bounded unit seams 同时进入普通测试图：
 
-- pull request：`.github/workflows/ci.yml` 的独立 `e2e` job；
-- version tag：`.github/workflows/release.yml` 的 Linux amd64 release-artifact E2E step；
-- ordinary `main` push：不重复执行；
+- pull request 与 ordinary `main` push：`.github/workflows/ci.yml` 的独立 `e2e` job 运行 `e2e-release`；
+- version tag：`.github/workflows/release.yml` 先确认 tagged commit 已有成功的 `main` CI；
 - 本地：开发者显式运行 `zig build e2e --summary all`。
 
-发布 workflow 在 Linux amd64 上直接对将被打包的 `x86_64-linux-musl` static zc 执行
-该门禁；任一 E2E 或四平台 release matrix 失败都会阻止 publish。
+`main` CI 在 Linux amd64 上直接对 `x86_64-linux-musl` static zc 执行该门禁。发布
+workflow 只重建、校验和打包四平台产物；任一 E2E、主干门禁或 release matrix 失败都会阻止
+publish。

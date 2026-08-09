@@ -119,7 +119,8 @@ bash scripts/install/test-oneline-installer.sh
 ```
 
 常规 install regression 应以 `INSTALL_ALL_RESULT=PASS` 结束。One-line installer E2E 只在
-pull request、version tag 或显式本地执行时运行，并以 `INSTALLER_E2E_RESULT=PASS` 结束。
+pull request、ordinary `main` push 或显式本地执行时运行，并以
+`INSTALLER_E2E_RESULT=PASS` 结束。
 
 ## Release validation
 

@@ -17,6 +17,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate release workflow
+        run: bash scripts/ci/test-release-workflow.sh
+
       - name: Setup Zig
         uses: step-security/setup-zig@v2.2.2
         with:
@@ -34,11 +37,7 @@ jobs:
       - name: Smoke (install regression)
         run: bash scripts/install/run-all-regression.sh
 
-      - name: Full validation
-        run: bash scripts/run-full-validation.sh
-
   e2e:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -54,9 +53,10 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: End-to-end gate
+      - name: End-to-end release gate
         run: >-
-          zig build e2e
+          zig build e2e-release
           -Dtarget=x86_64-linux-musl
+          -Doptimize=ReleaseSafe
           -Dcpu=baseline
           --summary all

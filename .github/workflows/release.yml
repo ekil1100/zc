@@ -6,6 +6,7 @@ on:
       - 'v*'
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -36,9 +37,30 @@ jobs:
             exit 1
           fi
 
+      - name: Verify successful main CI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAGGED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          CI_RUN_ID=$(gh api --method GET \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="$TAGGED_SHA" \
+            -f event=push \
+            -f status=success \
+            -f per_page=1 \
+            --jq '.workflow_runs[0].id // empty')
+          if [[ -z "$CI_RUN_ID" ]]; then
+            echo "No successful main CI run found for tagged commit $TAGGED_SHA" >&2
+            exit 1
+          fi
+          echo "Verified main CI run $CI_RUN_ID for $TAGGED_SHA"
+
   release:
     needs: validate-release
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -98,48 +120,6 @@ jobs:
             echo "Tag/binary version mismatch: expected='$EXPECTED' actual='$ACTUAL'" >&2
             exit 1
           fi
-
-      - name: Test
-        run: >-
-          zig build test
-          -Dtarget=${{ matrix.zig_target }}
-          -Dcpu=baseline
-
-      - name: Smoke (migrator regression)
-        run: bash tools/config-migrator/run-all.sh
-
-      - name: Smoke (install regression)
-        run: bash scripts/install/run-all-regression.sh
-
-      - name: End-to-end release artifact
-        if: matrix.target_os == 'linux' && matrix.target_arch == 'amd64'
-        run: >-
-          zig build e2e-release
-          -Dtarget=${{ matrix.zig_target }}
-          -Doptimize=ReleaseSafe
-          -Dcpu=baseline
-          --summary all
-
-      - name: Rebuild final standalone artifact
-        run: >-
-          zig build
-          -Dtarget=${{ matrix.zig_target }}
-          -Doptimize=ReleaseSafe
-          -Dcpu=baseline
-
-      - name: Verify final artifact
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          file zig-out/bin/zc
-          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
-            file zig-out/bin/zc | grep -q 'statically linked'
-          fi
-          EXPECTED="zc ${RELEASE_TAG#v}"
-          ACTUAL=$(./zig-out/bin/zc --version)
-          [[ "$ACTUAL" == "$EXPECTED" ]]
 
       - name: Package
         env:
