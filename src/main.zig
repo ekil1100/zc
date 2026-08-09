@@ -588,6 +588,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(cli_output.exit_failure);
             };
             try appendPreparedMarker(allocator, &daemon_args);
+            try appendPortForwardArg(allocator, &daemon_args, start_opts.port);
             break :blk prepared.?.path;
         };
 
@@ -4162,8 +4163,19 @@ fn appendStartForwardArgs(
     forward_args: *std.ArrayList([]const u8),
     opts: StartCommandOptions,
 ) !void {
-    if (opts.port) |port| {
-        try forward_args.append(allocator, try std.fmt.allocPrint(allocator, "--port={d}", .{port}));
+    try appendPortForwardArg(allocator, forward_args, opts.port);
+}
+
+fn appendPortForwardArg(
+    allocator: std.mem.Allocator,
+    forward_args: *std.ArrayList([]const u8),
+    port_override: ?u16,
+) !void {
+    if (port_override) |port| {
+        try forward_args.append(
+            allocator,
+            try std.fmt.allocPrint(allocator, "--port={d}", .{port}),
+        );
     }
 }
 
@@ -4350,12 +4362,14 @@ fn preparedListenerPorts(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) !PreparedListenerPorts {
+    var content = try daemon.readPreparedConfig(allocator, path);
+    defer content.deinit();
     var no_override = override.CliOptions{};
     defer no_override.deinit(allocator);
     var loaded = try loadExactRuntimeConfig(
         allocator,
         path,
-        null,
+        content.port_override,
         &no_override,
         "daemon-run",
         .missing_only,
@@ -4572,6 +4586,8 @@ fn runRestartCommand(
 
     const changed = start_opts.config_path != null or
         start_opts.port != null or explicit_override or !was_running;
+    const target_port = start_opts.port orelse
+        (if (tracked) |runtime| runtime.invocation.port else null);
     var prepared: ?daemon.PreparedConfig = null;
     defer if (prepared) |*config_snapshot| config_snapshot.deinit();
     const target_path: []const u8 = if (!changed) blk: {
@@ -4587,8 +4603,6 @@ fn runRestartCommand(
                     runtime.invocation.config_path
             else
                 null);
-        const target_port = start_opts.port orelse
-            (if (tracked) |runtime| runtime.invocation.port else null);
         prepared = try prepareDaemonConfig(
             allocator,
             base_path,
@@ -4603,6 +4617,7 @@ fn runRestartCommand(
     var target_args = std.ArrayList([]const u8).empty;
     defer deinitForwardArgs(allocator, &target_args);
     try appendPreparedMarker(allocator, &target_args);
+    try appendPortForwardArg(allocator, &target_args, target_port);
     var previous_args = std.ArrayList([]const u8).empty;
     defer deinitForwardArgs(allocator, &previous_args);
     if (tracked) |*runtime| {
@@ -4697,6 +4712,11 @@ fn replaceRunningDaemonWithPrepared(
     var target_args = std.ArrayList([]const u8).empty;
     defer deinitForwardArgs(allocator, &target_args);
     try appendPreparedMarker(allocator, &target_args);
+    try appendPortForwardArg(
+        allocator,
+        &target_args,
+        tracked.invocation.port,
+    );
     var previous_args = std.ArrayList([]const u8).empty;
     defer deinitForwardArgs(allocator, &previous_args);
     try tracked.invocation.appendForwardArgs(allocator, &previous_args);
@@ -4772,11 +4792,7 @@ fn observedRuntimeControllerPort(allocator: std.mem.Allocator) ?u16 {
 }
 
 fn applyRuntimePortSelection(cfg: *config.Config, mixed_port_override: ?u16) void {
-    if (mixed_port_override) |port| {
-        cfg.mixed_port = port;
-    } else if (cfg.mixed_port == 0) {
-        cfg.mixed_port = constants.MIXED_PORT;
-    }
+    cfg.mixed_port = mixed_port_override orelse constants.MIXED_PORT;
     cfg.port = 0;
     cfg.socks_port = 0;
 }
@@ -5841,7 +5857,7 @@ test "CLI runtime preflight admits HTTP obfs aliases with UDP and rejects unsafe
     );
 }
 
-test "applyRuntimePortSelection prefers explicit port and keeps mixed mode" {
+test "applyRuntimePortSelection uses explicit port or fixed default" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
@@ -5863,6 +5879,10 @@ test "applyRuntimePortSelection prefers explicit port and keeps mixed mode" {
     try testing.expectEqual(@as(u16, 7901), cfg.mixed_port);
     try testing.expectEqual(@as(u16, 0), cfg.port);
     try testing.expectEqual(@as(u16, 0), cfg.socks_port);
+
+    cfg.mixed_port = 7902;
+    applyRuntimePortSelection(&cfg, null);
+    try testing.expectEqual(constants.MIXED_PORT, cfg.mixed_port);
 }
 
 test "preflightPortCheck rejects mixed-port conflicts without fallback" {

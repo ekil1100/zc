@@ -3,28 +3,29 @@
 ## 前置条件
 
 1. 可用的代理配置文件（含至少一个可连通的代理节点）
-2. 构建完成：`zig build`
-3. 持续运行环境（不会被中断的终端或 tmux 会话）
+2. 一个显式的非生产 `--port`；`7899` 保留给生产 daemon
+3. 构建完成：`zig build`
+4. 持续运行环境（不会被中断的终端或 tmux 会话）
 
 ## 一键启动
 
 ### 24h 长稳
 ```bash
 # 使用默认配置路径（~/.config/zc/config.yaml）
-bash scripts/reliability/run-soak-real.sh 24
+bash scripts/reliability/run-soak-real.sh 24 --port 29001
 
 # 指定配置
-bash scripts/reliability/run-soak-real.sh 24 --config /path/to/config.yaml
+bash scripts/reliability/run-soak-real.sh 24 --port 29001 --config /path/to/config.yaml
 ```
 
 ### 72h 长稳
 ```bash
-bash scripts/reliability/run-soak-real.sh 72 --config /path/to/config.yaml
+bash scripts/reliability/run-soak-real.sh 72 --port 29001 --config /path/to/config.yaml
 ```
 
 ### 在 tmux 中运行（推荐）
 ```bash
-tmux new-session -d -s soak 'bash scripts/reliability/run-soak-real.sh 24 --config ~/.config/zc/config.yaml'
+tmux new-session -d -s soak 'bash scripts/reliability/run-soak-real.sh 24 --port 29001 --config ~/.config/zc/config.yaml'
 tmux attach -t soak  # 查看进度
 ```
 
@@ -46,6 +47,7 @@ tmux attach -t soak  # 查看进度
 
 ## 失败处理
 
+- usage error：提供 `--port <1-65535>`，且不要使用生产端口 `7899`
 - `config-missing`：提供 `--config` 路径
 - `build`：检查 `zig build` 是否通过
 - `start-failed`：运行 `zc doctor -c <config>` 检查配置

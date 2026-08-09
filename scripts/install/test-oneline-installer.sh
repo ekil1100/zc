@@ -465,7 +465,8 @@ rules:
   - MATCH,DIRECT
 EOF
     HOME="$real_home" XDG_RUNTIME_DIR="$real_runtime" \
-        "$install_dir/zc" start -c "$work_root/real.yaml" --json >/dev/null
+        "$install_dir/zc" start -c "$work_root/real.yaml" \
+        --port "$real_port" --json >/dev/null
     real_status="$(HOME="$real_home" XDG_RUNTIME_DIR="$real_runtime" \
         "$install_dir/zc" status --json)"
     real_daemon_pid="$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' \

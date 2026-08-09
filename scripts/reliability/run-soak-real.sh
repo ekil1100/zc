@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Real 24h/72h soak test runner
 # Usage:
-#   bash scripts/reliability/run-soak-real.sh 24 [--config <path>]
-#   bash scripts/reliability/run-soak-real.sh 72 [--config <path>]
+#   bash scripts/reliability/run-soak-real.sh 24 --port <port> [--config <path>]
+#   bash scripts/reliability/run-soak-real.sh 72 --port <port> [--config <path>]
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT_DIR="$ROOT_DIR/docs/perf/reports/history"
@@ -14,15 +14,30 @@ mkdir -p "$OUT_DIR" "$LOG_DIR"
 HOURS="${1:-}"
 shift || true
 CONFIG_PATH=""
+MIXED_PORT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --config) CONFIG_PATH="${2:-}"; shift 2 ;;
+    --config)
+      [[ $# -ge 2 ]] || { echo "Missing value for --config" >&2; exit 2; }
+      CONFIG_PATH="$2"
+      shift 2
+      ;;
+    --port)
+      [[ $# -ge 2 ]] || { echo "Missing value for --port" >&2; exit 2; }
+      MIXED_PORT="$2"
+      shift 2
+      ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ "$HOURS" != "24" && "$HOURS" != "72" ]]; then
-  echo "Usage: bash scripts/reliability/run-soak-real.sh <24|72> [--config <path>]" >&2
+  echo "Usage: bash scripts/reliability/run-soak-real.sh <24|72> --port <port> [--config <path>]" >&2
+  exit 2
+fi
+if [[ ! "$MIXED_PORT" =~ ^[0-9]+$ ]] ||
+  ((10#$MIXED_PORT < 1 || 10#$MIXED_PORT > 65535 || 10#$MIXED_PORT == 7899)); then
+  echo "A non-production --port between 1 and 65535, excluding 7899, is required" >&2
   exit 2
 fi
 
@@ -53,6 +68,7 @@ SAMPLE_INTERVAL=300  # 5 minutes
 
 echo "=== Soak test: ${HOURS}h ==="
 echo "Config: $CONFIG_PATH"
+echo "Port: $MIXED_PORT"
 echo "Log: $SOAK_LOG"
 echo "Start: $TS_START"
 echo ""
@@ -66,7 +82,8 @@ fi
 # Start zc in background. --foreground keeps the daemon as this shell's
 # child so the kill -0 "$ZCLASH_PID" liveness/crash checks below track the
 # real daemon (default `zc start` is fork-and-exit: $! would die immediately).
-"$ROOT_DIR/zig-out/bin/zc" start --foreground -c "$CONFIG_PATH" >> "$SOAK_LOG" 2>&1 &
+"$ROOT_DIR/zig-out/bin/zc" start --foreground -c "$CONFIG_PATH" \
+  --port "$MIXED_PORT" >> "$SOAK_LOG" 2>&1 &
 ZCLASH_PID=$!
 echo "zc started (PID: $ZCLASH_PID)"
 sleep 2
@@ -103,7 +120,8 @@ while [[ $elapsed -lt $DURATION_SEC ]]; do
     crash_count=$((crash_count + 1))
     echo "{\"ts\":\"$sample_ts\",\"elapsed_s\":$elapsed,\"alive\":false,\"crash_count\":$crash_count}" >> "$METRICS_LOG"
     echo "[$sample_ts] CRASH detected (count: $crash_count), restarting..."
-    "$ROOT_DIR/zig-out/bin/zc" start --foreground -c "$CONFIG_PATH" >> "$SOAK_LOG" 2>&1 &
+    "$ROOT_DIR/zig-out/bin/zc" start --foreground -c "$CONFIG_PATH" \
+      --port "$MIXED_PORT" >> "$SOAK_LOG" 2>&1 &
     ZCLASH_PID=$!
     sleep 2
     continue
@@ -148,6 +166,7 @@ cat > "$OUT_FILE" <<EOF
   "crashes": $crash_count,
   "port_failures": $failures,
   "config": "$CONFIG_PATH",
+  "mixed_port": $MIXED_PORT,
   "log": "$SOAK_LOG",
   "metrics": "$METRICS_LOG"
 }

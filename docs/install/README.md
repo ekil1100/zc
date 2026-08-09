@@ -61,7 +61,7 @@ brew upgrade ekil1100/tap/zc
 zc start          # only if it was running before the upgrade
 ```
 
-如果 daemon 由 systemd 或其他 supervisor 管理，应通过 supervisor 先停止、升级，再启动；不要在替换后才调用新二进制的 `restart`。
+如果 daemon 由 systemd 或其他 supervisor 管理，应通过 supervisor 先停止、升级，再启动；不要在替换后才调用新二进制的 `restart`。升级后的 daemon 未携带显式 `--port` 时固定监听 `7899`；配置文件中的其他 `mixed-port` 数值不会保留为运行端口。
 
 发布工作流会为 macOS arm64/amd64 和 Linux arm64/amd64 生成二进制归档；Linux
 归档必须通过 static linkage gate。GitHub Release 成功后会更新

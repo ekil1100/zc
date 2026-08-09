@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
+const constants = @import("constants.zig");
 const daemon = @import("daemon.zig");
 const runtime_descriptor = @import("runtime_descriptor.zig");
 const runtime_dir = @import("runtime_dir.zig");
@@ -428,6 +429,16 @@ fn writeAbsoluteFile(path: []const u8, bytes: []const u8) !void {
     try compat.fileWriteAll(file, bytes);
 }
 
+fn readAbsoluteFileAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    const file = try compat.fs.openFileAbsolute(path, .{});
+    defer file.close(compat.io());
+    return compat.fileReadBoundedAlloc(file, allocator, max_bytes);
+}
+
 fn catalogRootPathAlloc(
     allocator: std.mem.Allocator,
     home: []const u8,
@@ -648,6 +659,10 @@ fn reserveClosedPort() !u16 {
     return port;
 }
 
+fn formatPort(buffer: *[5]u8, port: u16) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{d}", .{port});
+}
+
 // ---------------------------------------------------------------------------
 // 未知/缺失子命令：envelope + exit_usage
 // ---------------------------------------------------------------------------
@@ -850,6 +865,32 @@ test "integration: zc test config-load failure prints error block in text mode" 
     try std.testing.expectEqual(@as(u8, 1), run.code);
     try std.testing.expect(std.mem.indexOf(u8, run.stderr, "PROXY_CONFIG_LOAD_FAILED") != null);
     try std.testing.expect(std.mem.indexOf(u8, run.stdout, "\"ok\":") == null);
+}
+
+test "integration: zc test uses fixed mixed port without CLI override" {
+    const allocator = std.testing.allocator;
+
+    const yaml = try validConfigYaml(allocator, 7892);
+    defer allocator.free(yaml);
+    const cfg_path = try writeTempConfig(
+        allocator,
+        "itest-test-fixed-port.yaml",
+        yaml,
+    );
+    defer allocator.free(cfg_path);
+
+    var run = try runCli(allocator, &.{ "test", "-c", cfg_path, "--json" });
+    defer run.deinit(allocator);
+
+    var parsed = try parseEnvelope(allocator, run.stdout);
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.object;
+    const ports = data.get("ports").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), ports.len);
+    try std.testing.expectEqual(
+        @as(i64, constants.MIXED_PORT),
+        ports[0].object.get("port").?.integer,
+    );
 }
 
 test "integration: zc test --json fails with CHECKS_FAILED when port not listening" {
@@ -3407,6 +3448,8 @@ test "integration: background start accepts a relative config path" {
     defer allocator.free(relative_config_path);
     try std.testing.expect(!compat.fs.path.isAbsolute(relative_config_path));
     const port = try reserveClosedPort();
+    var port_buffer: [5]u8 = undefined;
+    const port_arg = try formatPort(&port_buffer, port);
     const source = try std.fmt.allocPrint(
         allocator,
         "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
@@ -3432,6 +3475,8 @@ test "integration: background start accepts a relative config path" {
             "start",
             "-c",
             relative_config_path,
+            "--port",
+            port_arg,
             "--json",
         },
         .environ_map = &environment,
@@ -3676,6 +3721,8 @@ test "integration: provisional startup is not reported as running" {
     );
     defer allocator.free(script_path);
     const mixed_port = try reserveClosedPort();
+    var mixed_port_buffer: [5]u8 = undefined;
+    const mixed_port_arg = try formatPort(&mixed_port_buffer, mixed_port);
     const source = try std.fmt.allocPrint(
         allocator,
         "mixed-port: {d}\nproxies: []\nrules:\n  - MATCH,DIRECT\n",
@@ -3708,6 +3755,8 @@ test "integration: provisional startup is not reported as running" {
         "start",
         "-c",
         config_path,
+        "--port",
+        mixed_port_arg,
         "--override-script",
         script_path,
         "--json",
@@ -3825,6 +3874,8 @@ test "integration: restart preparation failure keeps the old daemon running" {
     const target_path = try compat.fs.path.join(allocator, &.{ root, "target.yaml" });
     defer allocator.free(target_path);
     const old_port = try reserveClosedPort();
+    var old_port_buffer: [5]u8 = undefined;
+    const old_port_arg = try formatPort(&old_port_buffer, old_port);
     var target_port = try reserveClosedPort();
     while (target_port == old_port) target_port = try reserveClosedPort();
     var unavailable_port = try reserveClosedPort();
@@ -3867,7 +3918,15 @@ test "integration: restart preparation failure keeps the old daemon running" {
     defer stopIsolatedDaemon(allocator, &environment);
 
     const started = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", old_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            old_path,
+            "--port",
+            old_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -3942,8 +4001,12 @@ test "integration: restart never stops a daemon that replaced its captured insta
     const marker_path = try compat.fs.path.join(allocator, &.{ root, "entered" });
     defer allocator.free(marker_path);
     const first_port = try reserveClosedPort();
+    var first_port_buffer: [5]u8 = undefined;
+    const first_port_arg = try formatPort(&first_port_buffer, first_port);
     var second_port = try reserveClosedPort();
     while (second_port == first_port) second_port = try reserveClosedPort();
+    var second_port_buffer: [5]u8 = undefined;
+    const second_port_arg = try formatPort(&second_port_buffer, second_port);
     var target_port = try reserveClosedPort();
     while (target_port == first_port or target_port == second_port) {
         target_port = try reserveClosedPort();
@@ -4000,7 +4063,15 @@ test "integration: restart never stops a daemon that replaced its captured insta
     defer stopIsolatedDaemon(allocator, &environment);
 
     const first = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", first_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            first_path,
+            "--port",
+            first_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -4014,6 +4085,8 @@ test "integration: restart never stops a daemon that replaced its captured insta
         "restart",
         "-c",
         target_path,
+        "--port",
+        first_port_arg,
         "--override-script",
         script_path,
         "--json",
@@ -4048,7 +4121,15 @@ test "integration: restart never stops a daemon that replaced its captured insta
     defer allocator.free(stopped.stderr);
     try std.testing.expectEqual(@as(u8, 0), try exitCode(stopped.term));
     const second = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", second_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            second_path,
+            "--port",
+            second_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -4110,8 +4191,15 @@ test "integration: restart child uses the immutable parent-prepared config" {
     const marker_path = try compat.fs.path.join(allocator, &.{ root, "entered" });
     defer allocator.free(marker_path);
     const old_port = try reserveClosedPort();
+    var old_port_buffer: [5]u8 = undefined;
+    const old_port_arg = try formatPort(&old_port_buffer, old_port);
     var prepared_port = try reserveClosedPort();
     while (prepared_port == old_port) prepared_port = try reserveClosedPort();
+    var prepared_port_buffer: [5]u8 = undefined;
+    const prepared_port_arg = try formatPort(
+        &prepared_port_buffer,
+        prepared_port,
+    );
     var mutated_port = try reserveClosedPort();
     while (mutated_port == old_port or mutated_port == prepared_port) {
         mutated_port = try reserveClosedPort();
@@ -4124,13 +4212,13 @@ test "integration: restart child uses the immutable parent-prepared config" {
     defer allocator.free(old_source);
     const prepared_source = try std.fmt.allocPrint(
         allocator,
-        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        "mixed-port: {d}\nlog-level: warning\nrules:\n  - MATCH,DIRECT\n",
         .{prepared_port},
     );
     defer allocator.free(prepared_source);
     const mutated_source = try std.fmt.allocPrint(
         allocator,
-        "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
+        "mixed-port: {d}\nlog-level: error\nrules:\n  - MATCH,DIRECT\n",
         .{mutated_port},
     );
     defer allocator.free(mutated_source);
@@ -4160,7 +4248,15 @@ test "integration: restart child uses the immutable parent-prepared config" {
     try environment.put("XDG_RUNTIME_DIR", runtime_path);
     defer stopIsolatedDaemon(allocator, &environment);
     const started = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", old_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            old_path,
+            "--port",
+            old_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -4174,6 +4270,8 @@ test "integration: restart child uses the immutable parent-prepared config" {
         "restart",
         "-c",
         target_path,
+        "--port",
+        prepared_port_arg,
         "--override-script",
         script_path,
         "--json",
@@ -4207,6 +4305,35 @@ test "integration: restart child uses the immutable parent-prepared config" {
     const restart_term = try restart.wait(compat.io());
     restart_running = false;
     try std.testing.expectEqual(@as(u8, 0), try exitCode(restart_term));
+    const descriptor_bytes = try tmp.dir.readFileAlloc(
+        compat.io(),
+        "run/" ++ runtime_descriptor.file_name,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(descriptor_bytes);
+    var descriptor = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        descriptor_bytes,
+        .{},
+    );
+    defer descriptor.deinit();
+    const prepared_path = descriptor.value.object.get("invocation").?.object.get(
+        "config_path",
+    ).?.string;
+    const prepared_bytes = try readAbsoluteFileAlloc(
+        allocator,
+        prepared_path,
+        64 * 1024,
+    );
+    defer allocator.free(prepared_bytes);
+    try std.testing.expect(
+        std.mem.indexOf(u8, prepared_bytes, "log-level: \"warning\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, prepared_bytes, "log-level: \"error\"") == null,
+    );
     const prepared_listener = try connectController(prepared_port);
     prepared_listener.close();
     const reloaded = try std.process.run(allocator, compat.io(), .{
@@ -4218,9 +4345,9 @@ test "integration: restart child uses the immutable parent-prepared config" {
     defer allocator.free(reloaded.stdout);
     defer allocator.free(reloaded.stderr);
     try std.testing.expectEqual(@as(u8, 0), try exitCode(reloaded.term));
-    const reloaded_listener = try connectController(mutated_port);
-    reloaded_listener.close();
-    if (connectController(prepared_port)) |unexpected| {
+    const preserved_prepared_port = try connectController(prepared_port);
+    preserved_prepared_port.close();
+    if (connectController(mutated_port)) |unexpected| {
         unexpected.close();
         return error.TestUnexpectedResult;
     } else |_| {}
@@ -4303,6 +4430,8 @@ test "integration: timed out stop is disarmed before the daemon resumes" {
     const config_path = try compat.fs.path.join(allocator, &.{ root, "config.yaml" });
     defer allocator.free(config_path);
     const port = try reserveClosedPort();
+    var port_buffer: [5]u8 = undefined;
+    const port_arg = try formatPort(&port_buffer, port);
     const source = try std.fmt.allocPrint(
         allocator,
         "mixed-port: {d}\nrules:\n  - MATCH,DIRECT\n",
@@ -4322,7 +4451,15 @@ test "integration: timed out stop is disarmed before the daemon resumes" {
     try environment.put("XDG_RUNTIME_DIR", runtime_path);
     defer stopIsolatedDaemon(allocator, &environment);
     const started = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -4403,6 +4540,8 @@ test "integration: startup removes the exact snapshot left by a crashed daemon" 
     const config_path = try compat.fs.path.join(allocator, &.{ root, "config.yaml" });
     defer allocator.free(config_path);
     const port = try reserveClosedPort();
+    var port_buffer: [5]u8 = undefined;
+    const port_arg = try formatPort(&port_buffer, port);
     const source = try std.fmt.allocPrint(
         allocator,
         "mixed-port: {d}\nsecret: crash-secret\nrules:\n  - MATCH,DIRECT\n",
@@ -4423,7 +4562,15 @@ test "integration: startup removes the exact snapshot left by a crashed daemon" 
     defer stopIsolatedDaemon(allocator, &environment);
 
     const first = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -4463,7 +4610,15 @@ test "integration: startup removes the exact snapshot left by a crashed daemon" 
     compat.sleepNs(100 * std.time.ns_per_ms);
 
     const second = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -4508,6 +4663,8 @@ test "integration: background start returns only after listeners are ready" {
     defer allocator.free(config_path);
 
     const mixed_port = try reserveClosedPort();
+    var mixed_port_buffer: [5]u8 = undefined;
+    const mixed_port_arg = try formatPort(&mixed_port_buffer, mixed_port);
     var controller_port = try reserveClosedPort();
     while (controller_port == mixed_port) controller_port = try reserveClosedPort();
     const source = try std.fmt.allocPrint(allocator,
@@ -4560,7 +4717,13 @@ test "integration: background start returns only after listeners are ready" {
     try tmp.dir.deleteFile(compat.io(), "rules.yaml");
 
     const started = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "--port",
+            mixed_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -4669,7 +4832,15 @@ test "integration: background start returns only after listeners are ready" {
     );
 
     const duplicate_start = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            mixed_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -5144,6 +5315,11 @@ test "integration: background start returns only after listeners are ready" {
     initial_missing_follower.kill(compat.io());
 
     const no_controller_port = try reserveClosedPort();
+    var no_controller_port_buffer: [5]u8 = undefined;
+    const no_controller_port_arg = try formatPort(
+        &no_controller_port_buffer,
+        no_controller_port,
+    );
     const no_controller_source = try std.fmt.allocPrint(allocator,
         \\mixed-port: {d}
         \\proxies: []
@@ -5157,7 +5333,15 @@ test "integration: background start returns only after listeners are ready" {
         .data = no_controller_source,
     });
     const no_controller_start = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            no_controller_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -5219,7 +5403,15 @@ test "integration: background start returns only after listeners are ready" {
     }
     try std.testing.expect(exited);
     const replacement_start = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            no_controller_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -5251,7 +5443,15 @@ test "integration: background start returns only after listeners are ready" {
     try tmp.dir.deleteFile(compat.io(), "run/zc.log");
     try tmp.dir.createDir(compat.io(), "run/zc.log", .default_dir);
     const bootstrap_failure = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            no_controller_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -5284,7 +5484,15 @@ test "integration: background start returns only after listeners are ready" {
         allocator,
         compat.io(),
         .{
-            .argv = &.{ zc_binary, "restart", "-c", config_path, "--json" },
+            .argv = &.{
+                zc_binary,
+                "restart",
+                "-c",
+                config_path,
+                "--port",
+                no_controller_port_arg,
+                "--json",
+            },
             .environ_map = &environment,
             .stdout_limit = .limited(max_output),
             .stderr_limit = .limited(max_output),
@@ -5328,6 +5536,8 @@ test "integration: background start returns only after listeners are ready" {
             "--foreground",
             "-c",
             config_path,
+            "--port",
+            no_controller_port_arg,
             "--json",
         },
         .environ_map = &environment,
@@ -5360,7 +5570,15 @@ test "integration: background start returns only after listeners are ready" {
     );
 
     const rejected_background = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ zc_binary, "start", "-c", config_path, "--json" },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "-c",
+            config_path,
+            "--port",
+            no_controller_port_arg,
+            "--json",
+        },
         .environ_map = &environment,
         .stdout_limit = .limited(max_output),
         .stderr_limit = .limited(max_output),
@@ -5420,6 +5638,8 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
     defer allocator.free(config_path);
 
     const mixed_port = try reserveClosedPort();
+    var mixed_port_buffer: [5]u8 = undefined;
+    const mixed_port_arg = try formatPort(&mixed_port_buffer, mixed_port);
     var controller_port = try reserveClosedPort();
     while (controller_port == mixed_port) controller_port = try reserveClosedPort();
     const source = try std.fmt.allocPrint(allocator,
@@ -5461,6 +5681,8 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
             "--foreground",
             "-c",
             config_path,
+            "--port",
+            mixed_port_arg,
             "--json",
         },
         .environ_map = &environment,
@@ -5480,7 +5702,15 @@ test "integration: minimal API isolates idle clients and frames PUT bodies" {
     try tmp.dir.deleteFile(compat.io(), "run/zc.pid");
 
     var child = try std.process.spawn(compat.io(), .{
-        .argv = &.{ zc_binary, "start", "--foreground", "-c", config_path },
+        .argv = &.{
+            zc_binary,
+            "start",
+            "--foreground",
+            "-c",
+            config_path,
+            "--port",
+            mixed_port_arg,
+        },
         .environ_map = &environment,
         .stdout = .ignore,
         .stderr = .ignore,

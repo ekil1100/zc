@@ -25,7 +25,7 @@ zc --version
 
 | 功能 | zc | 与 mihomo 的差异 |
 | --- | --- | --- |
-| Mixed HTTP/SOCKS5 入站 | ✅ 已实现 | `mixed-port` 是唯一实际绑定的代理入口。 |
+| Mixed HTTP/SOCKS5 入站 | ⚠️ 部分实现 | 只有一个 mixed listener；无 `--port` 时固定绑定 `7899`，配置中的 `mixed-port` 数值仅兼容解析。 |
 | SOCKS5 UDP ASSOCIATE | ✅ 已实现 | 仅用于 `udp: true` 的 Shadowsocks classic AEAD 节点。 |
 | 独立 HTTP `port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |
 | 独立 `socks-port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |

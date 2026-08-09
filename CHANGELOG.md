@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- 恢复固定 mixed proxy 端口策略：显式 `--port` 优先，否则运行时统一使用 `7899`；配置、profile 与 override 中的 `mixed-port` 数值仅兼容解析。
+
 ## [1.0.0] - 2026-08-09
 
 ### Added

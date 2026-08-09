@@ -209,7 +209,7 @@ fn populateConfigData(
     var vr = validator.validate(allocator, loaded_cfg) catch {
         data.config_ok = false;
         data.config_source = if (config_path != null) "custom (parse ok, validation failed)" else "default (parse ok, validation failed)";
-        try fillEffectivePorts(allocator, loaded_cfg, daemon_mixed_port, data);
+        try fillEffectivePorts(daemon_mixed_port, data);
         return true;
     };
     defer vr.deinit();
@@ -232,7 +232,7 @@ fn populateConfigData(
         data.config_warnings = warns;
     }
 
-    try fillEffectivePorts(allocator, loaded_cfg, daemon_mixed_port, data);
+    try fillEffectivePorts(daemon_mixed_port, data);
     return false;
 }
 
@@ -384,11 +384,13 @@ fn parseRuntimePortOverrideFromCommand(command: []const u8) ?u16 {
     return null;
 }
 
-fn fillEffectivePorts(allocator: std.mem.Allocator, cfg: *const config.Config, daemon_mixed_port: ?u16, data: *DoctorData) !void {
-    _ = allocator;
+fn fillEffectivePorts(
+    daemon_mixed_port: ?u16,
+    data: *DoctorData,
+) !void {
     data.port_count = 0;
 
-    const mixed_port = daemon_mixed_port orelse if (cfg.mixed_port > 0) cfg.mixed_port else constants.MIXED_PORT;
+    const mixed_port = daemon_mixed_port orelse constants.MIXED_PORT;
     data.ports[0] = .{
         .label = "mixed",
         .port = mixed_port,
@@ -635,23 +637,7 @@ test "doctor network probe timeout stays bounded" {
     try std.testing.expect(network_probe_timeout_ms <= 1000);
 }
 
-test "fillEffectivePorts reports daemon runtime mixed port" {
-    const allocator = std.testing.allocator;
-
-    var cfg = config.Config{
-        .allocator = allocator,
-        .port = 7890,
-        .socks_port = 7891,
-        .mixed_port = 7892,
-        .mode = try allocator.dupe(u8, "rule"),
-        .log_level = try allocator.dupe(u8, "info"),
-        .bind_address = try allocator.dupe(u8, "127.0.0.1"),
-        .proxies = std.ArrayList(config.Proxy).empty,
-        .proxy_groups = std.ArrayList(config.ProxyGroup).empty,
-        .rules = std.ArrayList(config.Rule).empty,
-    };
-    defer cfg.deinit();
-
+test "fillEffectivePorts reports fixed or explicit runtime mixed port" {
     var data = DoctorData{
         .config_ok = true,
         .config_source = "custom",
@@ -661,8 +647,11 @@ test "fillEffectivePorts reports daemon runtime mixed port" {
         .port_count = 0,
     };
 
-    try fillEffectivePorts(allocator, &cfg, 29001, &data);
+    try fillEffectivePorts(29001, &data);
     try std.testing.expectEqual(@as(usize, 1), data.port_count);
     try std.testing.expectEqualStrings("mixed", data.ports[0].label);
     try std.testing.expectEqual(@as(u16, 29001), data.ports[0].port);
+
+    try fillEffectivePorts(null, &data);
+    try std.testing.expectEqual(constants.MIXED_PORT, data.ports[0].port);
 }

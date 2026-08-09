@@ -45,12 +45,12 @@ The TUI documentation has been archived because TUI is removed from the v1.0 rel
 Included:
 
 - daemon lifecycle through CLI: `start` (`up`), `stop` (`down`), `restart`, `reload`, `status`, `log`, `doctor`, with a uniform `--json` envelope on stdout and uniform exit codes (see [`cli/spec.md`](cli/spec.md));
-- default mixed inbound runtime;
+- fixed `7899` mixed inbound runtime, with an explicit CLI override for non-production runs;
 - DIRECT、REJECT、四种 Shadowsocks AEAD cipher 的 TCP，以及 `udp:true` 节点经 mixed SOCKS5 UDP ASSOCIATE 的 classic AEAD UDP；
 - non-production explicit port override via `zc start --port <port>`;
 - core rule matching and rule-provider expansion;
 - minimal REST API for version/proxies/rules/proxy selection;
-- checksum-verified standalone installer、static Linux artifacts、PR/tag-only real E2E and release validation gates.
+- checksum-verified standalone installer、static Linux artifacts、PR/main real E2E and release validation gates.
 
 Not included in v1.0:
 
