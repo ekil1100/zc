@@ -4,11 +4,28 @@ set -euo pipefail
 # Debian 包构建脚本
 # 用法: bash scripts/build-deb.sh [version]
 
-VERSION="${1:-v1.0.0}"
+if [[ $# -gt 1 ]]; then
+  echo "Usage: bash scripts/build-deb.sh [version]" >&2
+  exit 2
+fi
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+PACKAGE_VERSION=$(awk -F'"' '/^[[:space:]]*\.version = / { print $2; exit }' build.zig.zon)
+if [[ ! "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+  echo "Invalid package version in build.zig.zon: $PACKAGE_VERSION" >&2
+  exit 1
+fi
+
+VERSION="${1:-v$PACKAGE_VERSION}"
 PKG_NAME="zc"
 PKG_VERSION="${VERSION#v}"
+if [[ "$PKG_VERSION" != "$PACKAGE_VERSION" ]]; then
+  echo "Requested version $PKG_VERSION does not match package version $PACKAGE_VERSION" >&2
+  exit 2
+fi
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-BUILD_DIR="$(pwd)/build-deb"
+BUILD_DIR="$ROOT_DIR/build-deb"
 
 echo "=== Building .deb package ==="
 echo "Version: $PKG_VERSION"
