@@ -10,6 +10,7 @@ mixed HTTP/SOCKS5、minimal API 和 TCP/TLS/UDP wire 验证行为。测试把 `z
 
 - one-line installer 的 explicit/latest 版本、四平台资产映射、SHA-256、原子替换与失败保留；
 - `config load`、managed identity、`start/status` 与 durable `proxy select`；
+- 独立 CI smoke 使用声明了 `mixed-port: 7892` 的配置执行无 `--port` 的 `start`，并以真实 TCP、`doctor`、`reload` 与 `restart` 证明运行端口始终是 `7899`、配置端口未监听；
 - mixed HTTP 与 SOCKS5 的真实 payload round-trip；
 - DIRECT、REJECT 与错误密码负路径；
 - `aes-128-gcm`、`aes-256-gcm`、`chacha20-poly1305`、
@@ -46,7 +47,7 @@ Linux fixture 必须由 `file` 识别为 statically linked。`src/e2e_obfs_oracl
 
 完整 network/installer E2E 有意不挂到普通 `zig build test`；只有 oracle 的 bounded unit seams 同时进入普通测试图：
 
-- pull request 与 ordinary `main` push：`.github/workflows/ci.yml` 的独立 `e2e` job 运行 `e2e-release`；
+- pull request 与 ordinary `main` push：`.github/workflows/ci.yml` 的独立 `e2e` job 运行 `e2e-release`，随后在一次性 Linux runner 上执行固定 `7899` runtime smoke；该 smoke 在非 CI 环境拒绝运行，避免本地开发占用生产端口；
 - version tag：`.github/workflows/release.yml` 先确认 tagged commit 已有成功的 `main` CI；
 - 本地：开发者显式运行 `zig build e2e --summary all`。
 

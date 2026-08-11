@@ -15,8 +15,12 @@ run_gate() {
   shift
   echo "=== [$name] ==="
   local output
-  output=$("$@" 2>&1) || true
-  local exit_code=${PIPESTATUS[0]:-$?}
+  local exit_code
+  if output=$("$@" 2>&1); then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
   if [[ $exit_code -eq 0 ]]; then
     passed+=("$name")
     echo "  PASS"
@@ -24,7 +28,7 @@ run_gate() {
     failed+=("$name")
     echo "  FAIL"
     echo "  --- failure details ---"
-    echo "$output" | grep -iE "error|fail|FAIL|expected|panic" | head -20 | sed 's/^/  /'
+    echo "$output" | grep -iE "error|fail|FAIL|expected|panic" | head -20 | sed 's/^/  /' || true
     echo "  --- end ---"
   fi
 }

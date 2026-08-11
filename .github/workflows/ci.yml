@@ -20,6 +20,9 @@ jobs:
       - name: Validate release workflow
         run: bash scripts/ci/test-release-workflow.sh
 
+      - name: Validate beta gate
+        run: bash scripts/ci/test-beta-gate.sh
+
       - name: Setup Zig
         uses: step-security/setup-zig@v2.2.2
         with:
@@ -60,3 +63,6 @@ jobs:
           -Doptimize=ReleaseSafe
           -Dcpu=baseline
           --summary all
+
+      - name: Verify default runtime port
+        run: bash scripts/ci/test-default-runtime-port.sh zig-out/bin/zc

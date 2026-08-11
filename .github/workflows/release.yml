@@ -167,10 +167,27 @@ jobs:
       - name: Add version-resolving installer
         run: cp install.sh dist/install.sh
 
+      - name: Prepare release notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          HEADING="## [${VERSION}] - "
+          awk -v heading="$HEADING" '
+            index($0, heading) == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > dist/release-notes.md
+          grep -q '[^[:space:]]' dist/release-notes.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
+          body_path: dist/release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
