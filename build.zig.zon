@@ -1,6 +1,6 @@
 .{
     .name = .zc,
-    .version = "1.0.0",
+    .version = "1.0.1",
     .fingerprint = 0x40b2b361ee9ebbcf,
     .minimum_zig_version = "0.16.0",
     .paths = .{

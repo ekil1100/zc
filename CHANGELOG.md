@@ -2,8 +2,15 @@
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-11
+
 ### Changed
-- 恢复固定 mixed proxy 端口策略：显式 `--port` 优先，否则运行时统一使用 `7899`；配置、profile 与 override 中的 `mixed-port` 数值仅兼容解析。
+- 恢复固定 mixed proxy 端口策略：显式 `--port` 优先，否则运行时统一使用 `7899`；配置、profile 与 override 中的 `mixed-port` 数值仅兼容解析。从 `v1.0.0` 升级且需要保留原端口时，必须在启动命令或 supervisor 中显式传入 `--port <port>`。
+- 将完整测试、migrator、installer 与 ReleaseSafe E2E 固定在 `main` CI，tag 发布只对已通过主干门禁的精确 SHA 构建四平台产物；各平台不再因单个平台失败而被提前取消。
+
+### Fixed
+- 修复后台 `start`、`restart` 与 `reload` 丢失显式端口的问题，并让启动信息、实际 listener 与 `zc doctor` 始终报告同一运行端口。
+- 修复 beta gate 吞掉失败命令退出码、错误报告为通过的问题，并新增无 `--port` 的真实 `7899` 生命周期 smoke。
 
 ## [1.0.0] - 2026-08-09
 

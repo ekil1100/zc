@@ -6,7 +6,7 @@ This directory is the public documentation entry for zc.
 
 ## Current status
 
-v1.0 实现路线图已经完成，`v1.0.0` 是当前正式发布基线。已完成的范围和常规发布验证入口见 [`roadmap/v1.0.md`](roadmap/v1.0.md)；该文件是完成记录，不再作为进行中的任务清单。
+v1.0 实现路线图已经完成，`v1.0.1` 是当前正式发布基线。已完成的范围和常规发布验证入口见 [`roadmap/v1.0.md`](roadmap/v1.0.md)；该文件是完成记录，不再作为进行中的任务清单。
 
 可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。托管下载只自动激活首个 runtime-ready revision；可恢复的 malformed simple-obfs raw revision 保持 inactive，capability 与资源上界错误使用文档化的 `CONFIG_CAPABILITY_UNSUPPORTED` / `CONFIG_*_LIMIT_EXCEEDED`。运行时 outbound manager 是 owned opaque handle，借用的配置及嵌套存储在 handle 销毁前必须保持 immutable/address-stable；准入使用预建 borrowed-key 索引，因此成本按 group 解析深度固定，不随配置节点总数线性增长。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)，错误码见 [`api/error-codes.md`](api/error-codes.md)。
 

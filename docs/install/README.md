@@ -26,7 +26,7 @@ Linux 使用静态 musl ELF；macOS 提供 standalone Mach-O，只依赖系统�
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/ekil1100/zc/main/install.sh \
-  | ZC_VERSION=v1.0.0 ZC_INSTALL_DIR="$HOME/bin" sh
+  | ZC_VERSION=v1.0.1 ZC_INSTALL_DIR="$HOME/bin" sh
 ```
 
 installer 先把 `latest` 解析为 immutable tag，再下载版本化归档及对应 `.sha256`；缺少
@@ -61,7 +61,7 @@ brew upgrade ekil1100/tap/zc
 zc start          # only if it was running before the upgrade
 ```
 
-如果 daemon 由 systemd 或其他 supervisor 管理，应通过 supervisor 先停止、升级，再启动；不要在替换后才调用新二进制的 `restart`。升级后的 daemon 未携带显式 `--port` 时固定监听 `7899`；配置文件中的其他 `mixed-port` 数值不会保留为运行端口。
+如果 daemon 由 systemd 或其他 supervisor 管理，应通过 supervisor 先停止、升级，再启动；不要在替换后才调用新二进制的 `restart`。从 `v1.0.0` 升级后，daemon 未携带显式 `--port` 时固定监听 `7899`；配置文件中的其他 `mixed-port` 数值不会保留为运行端口。升级前应确认 `7899` 可用；需要保留原端口时，在启动命令或 supervisor 中显式传入 `--port <原端口>`。
 
 发布工作流会为 macOS arm64/amd64 和 Linux arm64/amd64 生成二进制归档；Linux
 归档必须通过 static linkage gate。GitHub Release 成功后会更新
@@ -87,7 +87,7 @@ bash scripts/install/oc-run.sh install --target-dir /tmp/zc-install
 bash scripts/install/oc-run.sh verify --target-dir /tmp/zc-install
 
 # Upgrade requires an explicit version
-bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.0
+bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.1
 
 # Optional rollback cleanup
 bash scripts/install/oc-run.sh rollback --target-dir /tmp/zc-install
