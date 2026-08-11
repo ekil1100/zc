@@ -65,4 +65,9 @@ jobs:
           --summary all
 
       - name: Verify default runtime port
-        run: bash scripts/ci/test-default-runtime-port.sh zig-out/bin/zc
+        run: |
+          zig build \
+            -Dtarget=x86_64-linux-musl \
+            -Doptimize=ReleaseSafe \
+            -Dcpu=baseline
+          bash scripts/ci/test-default-runtime-port.sh zig-out/bin/zc
