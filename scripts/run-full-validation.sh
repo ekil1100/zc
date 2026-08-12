@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # 全链路一键验证：install regression + migrator regression + beta gate
-# 用法：bash scripts/run-full-validation.sh
+# 用法：just validate
+# 等价：bash scripts/run-full-validation.sh
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"

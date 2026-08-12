@@ -17,6 +17,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Setup just
+        uses: extractions/setup-just@v3
+
       - name: Validate release workflow
         run: bash scripts/ci/test-release-workflow.sh
 
@@ -29,16 +32,19 @@ jobs:
           version: 0.16.0
 
       - name: Build
-        run: zig build -Dcpu=baseline
+        run: just build
 
       - name: Test
-        run: zig build test -Dcpu=baseline
+        run: just test
 
       - name: Smoke (migrator regression)
-        run: bash tools/config-migrator/run-all.sh
+        run: just migrator-regression
 
       - name: Smoke (install regression)
-        run: bash scripts/install/run-all-regression.sh
+        run: just install-regression
+
+      - name: Eval framework selfcheck
+        run: just eval-selfcheck
 
   e2e:
     runs-on: ubuntu-latest

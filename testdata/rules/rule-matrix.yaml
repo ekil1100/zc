@@ -37,7 +37,8 @@ cases:
 
   - id: geoip_cn
     input:
-      ip: 114.114.114.114
+      # 183.0.0.0/8 is classified CN by in-tree SimpleGeoIp
+      ip: 183.1.2.3
     expect:
       target: DIRECT
       matched_rule: GEOIP,CN

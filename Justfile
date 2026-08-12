@@ -5,8 +5,8 @@ install:
     #!/usr/bin/env bash
     set -euo pipefail
     zig build -Doptimize=ReleaseFast
-    # 必须在替换二进制前使用旧版本停止 daemon。不同版本可能使用不同
-    # runtime 路径；替换后再执行 restart 可能发现不了旧实例并形成双实例。
+    # Stop the daemon with the previously installed binary before replacing it.
+    # Different versions may use different runtime paths; replacing first can leave a second instance.
     installed_zc="$HOME/.local/bin/zc"
     was_running=0
     rollback_needed=0
@@ -41,7 +41,7 @@ install:
         rc=$?
         trap - EXIT
         if [ "$rc" -ne 0 ] && [ "$rollback_needed" -eq 1 ] && [ -n "$backup_path" ]; then
-            echo "安装失败 —— 恢复旧二进制并尝试重启..." >&2
+            echo "install failed — restoring previous binary and attempting restart..." >&2
             "$installed_zc" stop >/dev/null 2>&1 || true
             rollback_stage="$(mktemp "$installed_zc.rollback.XXXXXX")"
             cp "$backup_path" "$rollback_stage"
@@ -55,7 +55,7 @@ install:
     trap rollback_install EXIT
     if [ -x "$installed_zc" ]; then
         old_status="$("$installed_zc" status --json)" || {
-            echo "无法用安装目标中的旧二进制确认 daemon 状态，拒绝替换" >&2
+            echo "unable to confirm daemon status with the installed binary; refusing replace" >&2
             exit 1
         }
         old_state="$(jq -er '.data.state' <<<"$old_status")"
@@ -64,7 +64,7 @@ install:
             old_command="$(ps -ww -o command= -p "$old_pid")"
             old_executable="${old_command%% *}"
             if [ "$old_executable" != "$installed_zc" ]; then
-                echo "运行实例并非由安装目标启动，拒绝自动接管：$old_executable" >&2
+                echo "running instance was not started from the install target; refusing takeover: $old_executable" >&2
                 exit 1
             fi
             pid_file="$(jq -er '.data.paths.pid_file' <<<"$old_status")"
@@ -86,46 +86,142 @@ install:
               || "$old_command" == *" --port "* \
               || "$old_command" == *" --port="* \
               || "$old_command" == *" --override-"* ]]; then
-                echo "旧 daemon 使用 foreground 或自定义启动参数；请通过 supervisor 或手动 stop/install/start 保留参数" >&2
+                echo "old daemon uses foreground or custom flags; stop/install/start manually to preserve them" >&2
                 exit 1
             fi
             was_running=1
             backup_path="$(mktemp "${TMPDIR:-/tmp}/zc-old.XXXXXX")"
             cp "$installed_zc" "$backup_path"
             chmod 755 "$backup_path"
-            echo "zc 之前在运行 —— 替换前先用安装目标中的旧二进制停止..."
+            echo "zc is running — stopping with the installed binary before replace..."
             "$installed_zc" stop
             rollback_needed=1
             stopped_status="$("$installed_zc" status --json)" || exit 1
             if [ "$(jq -er '.data.state' <<<"$stopped_status")" != "stopped" ]; then
-                echo "旧 daemon 未确认停止，拒绝替换二进制" >&2
+                echo "old daemon did not confirm stopped; refusing binary replace" >&2
                 exit 1
             fi
         elif [ "$old_state" != "stopped" ]; then
-            echo "旧 daemon 状态不可判定，拒绝替换二进制" >&2
+            echo "old daemon state is indeterminate; refusing binary replace" >&2
             exit 1
         fi
     fi
     bash scripts/install/local-dev-install.sh
     if [ "$was_running" -eq 1 ]; then
         expected_identity="$(file_identity "$installed_zc")"
-        echo "使用安装目标中的新二进制启动 zc..."
+        echo "starting zc with the newly installed binary..."
         new_start="$("$installed_zc" start --json)"
         [ "$(jq -er '.data.state' <<<"$new_start")" = "running" ]
         new_status="$("$installed_zc" status --json)"
         [ "$(jq -er '.data.state' <<<"$new_status")" = "running" ]
         new_pid="$(jq -er '.data.pid' <<<"$new_status")"
         if [ "$new_pid" = "$old_pid" ]; then
-            echo "新 daemon 未发生 PID 转换，拒绝确认安装成功" >&2
+            echo "new daemon did not change PID; refusing to confirm install success" >&2
             exit 1
         fi
         actual_identity="$(process_executable_identity "$new_pid")" || {
-            echo "无法确认新 daemon 的可执行文件身份" >&2
+            echo "unable to confirm the new daemon executable identity" >&2
             exit 1
         }
         if [ "$actual_identity" != "$expected_identity" ]; then
-            echo "新 daemon 仍在运行被替换的旧 inode，拒绝确认安装成功" >&2
+            echo "new daemon still runs the replaced inode; refusing to confirm install success" >&2
             exit 1
         fi
         rollback_needed=0
     fi
+
+# --- Build / test -----------------------------------------------------------
+
+# Build with baseline CPU (matches CI)
+build:
+    zig build -Dcpu=baseline
+
+# Unit + process + oracle unit tests (matches CI)
+test:
+    zig build test -Dcpu=baseline
+
+# Local real-binary e2e (not the CI e2e-release flavor)
+e2e:
+    zig build e2e --summary all
+
+# CI-style static e2e-release (Linux musl target; may not suit every host)
+e2e-release:
+    zig build e2e-release -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dcpu=baseline --summary all
+
+# --- Eval framework ---------------------------------------------------------
+
+# Fast eval contract checks (CI-safe; no full zig test / e2e / perf)
+eval-selfcheck *args:
+    bash scripts/eval/selfcheck.sh {{args}}
+
+# Full selfcheck including correctness + contract
+eval-selfcheck-full:
+    bash scripts/eval/selfcheck.sh --full
+
+# Show eval orchestrator help
+eval-help:
+    bash scripts/eval/run.sh --help
+
+# Eval suite: just eval <correctness|contract|interop|perf|reliability|all> [-- --with-interop|--run-id ID]
+eval suite *args:
+    bash scripts/eval/run.sh --suite {{suite}} {{args}}
+
+# Alias: correctness suite
+eval-correctness:
+    just eval correctness
+
+eval-contract:
+    just eval contract
+
+eval-interop:
+    just eval interop
+
+eval-perf:
+    just eval perf
+
+eval-all:
+    just eval all
+
+# correctness + contract + interop + perf (clean tree required for perf)
+eval-all-interop:
+    just eval all -- --with-interop
+
+# S1 startup scenario (default binary: zig-out/bin/zc)
+eval-s1 zc="zig-out/bin/zc":
+    bash scripts/eval/scenarios/s1_startup.sh --zc {{zc}}
+
+# S2 rule-matrix scenario (production rule engine)
+eval-s2:
+    bash scripts/eval/scenarios/s2_rule_matrix.sh
+
+# --- Gates / perf / reliability ---------------------------------------------
+
+# Beta gate: build + test + migrator + install regression
+beta-gate:
+    bash scripts/run-beta-gate.sh
+
+# Full validation: install regression + migrator + beta gate
+validate:
+    bash scripts/run-full-validation.sh
+
+# Install regression only
+install-regression:
+    bash scripts/install/run-all-regression.sh
+
+# Migrator regression only
+migrator-regression:
+    bash tools/config-migrator/run-all.sh
+
+# Record control-plane perf facts (clean worktree); e.g. just perf-record -- --samples 9
+perf-record *args:
+    bash scripts/perf/run-control-plane-baseline.sh {{args}}
+
+# Reliability soak harness (see scripts/reliability)
+soak *args:
+    bash scripts/reliability/run-soak.sh {{args}}
+
+soak-real *args:
+    bash scripts/reliability/run-soak-real.sh {{args}}
+
+chaos-round *args:
+    bash scripts/reliability/run-chaos-round.sh {{args}}

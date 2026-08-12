@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Beta 准入一键自检：build + test + migrator + install regression
-# 用法：bash scripts/run-beta-gate.sh
+# 用法：just beta-gate
+# 等价：bash scripts/run-beta-gate.sh
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"

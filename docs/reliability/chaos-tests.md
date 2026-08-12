@@ -206,7 +206,7 @@
   - 磁盘剩余空间满足归档增长（建议 > 2GB）
   - 进程与系统监控可用（CPU/内存/网络）
 - 阈值检查：
-  - 沿用 24h 通过批次阈值（README 第4节）
+  - 沿用 24h 通过批次阈值（见本文件上文判定标准与 `docs/perf/reports/README.md` 中 control-plane 记录说明；placeholder latest 已移除）
   - 若需调整阈值，需先记录原因与回收条件
 - 归档路径检查：
   - `docs/perf/reports/history/` 可写

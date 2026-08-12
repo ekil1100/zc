@@ -63,5 +63,5 @@
 
 ## 归档
 
-- 详细数据: `latest.json`
-- 历史归档: `history/p20-1d-baseline-20260220.json`
+- 详细数据: 旧 placeholder `latest.json` 已删除；权威 control-plane 记录见 `scripts/perf/run-control-plane-baseline.sh`（输出默认在 `.zig-cache/perf/`）
+- 历史归档: `history/`（含 soak 证据）；勿把已删除的 placeholder latest 当作门禁证据

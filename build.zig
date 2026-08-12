@@ -353,6 +353,30 @@ pub fn build(b: *std.Build) void {
     release_e2e_step.dependOn(&run_release_installer_e2e.step);
     release_e2e_step.dependOn(&run_release_core_e2e.step);
 
+    // Test-only rule-matrix eval runner (host-native; not installed).
+    const eval_rule_matrix_mod = b.createModule(.{
+        .root_source_file = b.path("src/eval_rule_matrix_runner.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .Debug,
+    });
+    eval_rule_matrix_mod.link_libc = true;
+    const eval_rule_matrix_exe = b.addExecutable(.{
+        .name = "zc-eval-rule-matrix",
+        .root_module = eval_rule_matrix_mod,
+    });
+    const eval_rule_matrix_cmd = b.addRunArtifact(eval_rule_matrix_exe);
+    if (b.args) |args| {
+        eval_rule_matrix_cmd.addArgs(args);
+    } else {
+        eval_rule_matrix_cmd.addArg(b.pathFromRoot("testdata/rules/rule-matrix.yaml"));
+    }
+    // Do not install this artifact.
+    const eval_rule_matrix_step = b.step(
+        "eval-rule-matrix",
+        "Run frozen rule-matrix cases against the production rule engine",
+    );
+    eval_rule_matrix_step.dependOn(&eval_rule_matrix_cmd.step);
+
     // Fuzz test
     const fuzz_mod = b.createModule(.{
         .root_source_file = b.path("src/fuzz.zig"),

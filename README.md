@@ -17,6 +17,42 @@ export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
 zc --version
 ```
 
+
+## 开发与验证
+
+本地开发与 CI 对齐的入口统一用 [`just`](https://github.com/casey/just)（`just --list` 查看全部）：
+
+```bash
+# Build / test
+just build
+just test
+
+# Eval framework (reports under .zig-cache/eval/)
+just eval-selfcheck          # fast CI-safe contract checks
+just eval-selfcheck-full     # also runs correctness + contract
+just eval correctness        # zig build + zig build test
+just eval contract           # migrator + install regression + S1/S2
+just eval interop            # local zig build e2e
+just eval perf               # control-plane record (clean worktree required)
+just eval all                # correctness -> contract -> perf
+just eval all -- --with-interop
+just eval-s1                 # startup scenario (default zig-out/bin/zc)
+just eval-s2                 # rule-matrix scenario
+just eval-help
+
+# Gates
+just beta-gate
+just validate                # install + migrator + beta-gate
+just install-regression
+just migrator-regression
+
+# Perf / reliability
+just perf-record -- --samples 9
+just e2e
+```
+
+带 `-` 的额外参数用 `--` 隔开，例如：`just eval all -- --run-id my-run`。
+
 ## 与 mihomo 的功能对比
 
 表格区分完整实现、部分实现和未实现能力。未支持的出站协议与代理组会在启动或连接前明确拒绝；仅为配置兼容而接受的字段会单独注明 ignored 或上下文限制。
