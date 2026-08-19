@@ -183,7 +183,7 @@ Use CLI diagnostics instead — every zc command supports `--json` (single
 [`../cli/spec.md`](../cli/spec.md)). The most useful ones:
 
 ```bash
-zc status --json     # data.state / data.selected_proxies / data.paths
+zc status --json     # data.state / data.mixed_port / data.selected_proxies / data.paths
 zc doctor --json     # data.proxy_reachable / data.checks
 zc test --json       # data.daemon_state / data.checks
 zc proxy list --json # data.groups (group type + current node)

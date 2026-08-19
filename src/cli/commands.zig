@@ -87,7 +87,7 @@ pub const table = [_]Command{
     },
     .{
         .path = "status",
-        .summary = "Show daemon status and selected proxies",
+        .summary = "Show daemon status, mixed port, and selected proxies",
         .flags = &.{json_flag},
         .examples = &.{ "zc status", "zc status --json" },
     },

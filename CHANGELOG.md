@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- `zc status` 与 `zc status --json` 显示运行中 daemon 的有效 mixed port。
+
 ## [1.0.1] - 2026-08-11
 
 ### Changed

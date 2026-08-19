@@ -3139,6 +3139,10 @@ test "integration: restart preserves running daemon after active profile deletio
         status_data.get("state").?.string,
     );
     try std.testing.expectEqual(started_pid, status_data.get("pid").?.integer);
+    try std.testing.expectEqual(
+        @as(i64, port),
+        status_data.get("mixed_port").?.integer,
+    );
 
     const replacement_port = try reserveClosedPort();
     var replacement_port_buffer: [16]u8 = undefined;

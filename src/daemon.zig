@@ -121,6 +121,7 @@ const StatusSnapshot = struct {
     active_config: ?[]const u8 = null,
     runtime_state_available: ?bool = null,
     selected_proxies: []runtime_selection.SelectedProxy = &[_]runtime_selection.SelectedProxy{},
+    mixed_port: ?u16 = null,
     pid_file: []const u8,
     lock_file: []const u8,
     log_file: []const u8,
@@ -1949,6 +1950,18 @@ fn collectStatusSnapshotAtPaths(
     };
 }
 
+/// Effective mixed port for a live, PID-matched descriptor.
+/// Missing override still reports the runtime default; a mismatched PID reports nothing.
+fn resolveStatusMixedPort(
+    running_pid: i32,
+    descriptor_pid: u32,
+    port_override: ?u16,
+) ?u16 {
+    if (running_pid <= 0) return null;
+    if (descriptor_pid != @as(u32, @intCast(running_pid))) return null;
+    return port_override orelse constants.MIXED_PORT;
+}
+
 /// 经 cli/output.zig 渲染 status：JSON envelope（stdout，std.json 序列化）
 /// 或人类可读文本（stdout）。字段名为冻结词汇（见 docs/cli/ux-workflow.md 第 3 节）。
 fn emitStatus(allocator: std.mem.Allocator, out: *cli_output.Output, snapshot: *const StatusSnapshot) !void {
@@ -1961,6 +1974,7 @@ fn emitStatus(allocator: std.mem.Allocator, out: *cli_output.Output, snapshot: *
             .uptime_seconds = snapshot.uptime_seconds,
             .active_config = snapshot.active_config,
             .runtime_state_available = snapshot.runtime_state_available,
+            .mixed_port = snapshot.mixed_port,
             .selected_proxies = snapshot.selected_proxies,
             .paths = .{
                 .pid_file = snapshot.pid_file,
@@ -1985,6 +1999,11 @@ fn emitStatus(allocator: std.mem.Allocator, out: *cli_output.Output, snapshot: *
         try out.print("uptime_seconds: {d}\n", .{uptime_seconds});
     } else {
         try out.print("uptime_seconds: (unknown)\n", .{});
+    }
+    if (snapshot.mixed_port) |mixed_port| {
+        try out.print("mixed_port: {d}\n", .{mixed_port});
+    } else {
+        try out.print("mixed_port: (none)\n", .{});
     }
     if (snapshot.runtime_state_available) |available| {
         try out.print("runtime_state_available: {}\n", .{available});
@@ -2692,6 +2711,14 @@ pub fn getStatus(allocator: std.mem.Allocator, out: *cli_output.Output) !void {
                     if (observed.identity) |identity| {
                         snapshot.active_config = try allocator.dupe(u8, identity.key);
                     }
+                    snapshot.mixed_port = resolveStatusMixedPort(
+                        pid,
+                        observed.pid,
+                        if (observed.invocation) |invocation|
+                            invocation.port_override
+                        else
+                            null,
+                    );
                 }
             }
         }
@@ -3162,6 +3189,7 @@ test "collectStatusSnapshot reports stopped state without pid file" {
     try std.testing.expect(snapshot.pid == null);
     try std.testing.expect(snapshot.uptime_seconds == null);
     try std.testing.expect(snapshot.active_config == null);
+    try std.testing.expect(snapshot.mixed_port == null);
     try std.testing.expect(std.mem.endsWith(u8, snapshot.pid_file, "zc.pid"));
     try std.testing.expect(std.mem.endsWith(u8, snapshot.lock_file, "zc.lock"));
     try std.testing.expect(std.mem.endsWith(u8, snapshot.log_file, "zc.log"));
@@ -3559,6 +3587,7 @@ test "status json envelope preserves frozen field names and escapes strings" {
         .uptime_seconds = 42,
         .active_config = try allocator.dupe(u8, "demo"),
         .selected_proxies = selections,
+        .mixed_port = 19081,
         .pid_file = try allocator.dupe(u8, "/tmp/zc.pid"),
         .lock_file = try allocator.dupe(u8, "/tmp/zc.lock"),
         .log_file = try allocator.dupe(u8, "/tmp/zc.log"),
@@ -3590,6 +3619,7 @@ test "status json envelope preserves frozen field names and escapes strings" {
     try std.testing.expectEqual(@as(i64, 321), data.get("pid").?.integer);
     try std.testing.expectEqual(@as(i64, 42), data.get("uptime_seconds").?.integer);
     try std.testing.expectEqualStrings("demo", data.get("active_config").?.string);
+    try std.testing.expectEqual(@as(i64, 19081), data.get("mixed_port").?.integer);
 
     const selected = data.get("selected_proxies").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), selected.len);
@@ -3624,7 +3654,51 @@ test "status text output goes to stdout with state tokens" {
 
     try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "state: stopped") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "detail: stale_pid_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "mixed_port: (none)") != null);
     try std.testing.expectEqualStrings("", err_aw.written());
+}
+
+test "status text output includes mixed port" {
+    const allocator = std.testing.allocator;
+    var snapshot = StatusSnapshot{
+        .state = "running",
+        .pid = 321,
+        .mixed_port = 19081,
+        .pid_file = try allocator.dupe(u8, "/tmp/zc.pid"),
+        .lock_file = try allocator.dupe(u8, "/tmp/zc.lock"),
+        .log_file = try allocator.dupe(u8, "/tmp/zc.log"),
+    };
+    defer snapshot.deinit(allocator);
+
+    var out_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer out_aw.deinit();
+    var err_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer err_aw.deinit();
+    var out = cli_output.Output.init(.text, "status", false, false, &out_aw.writer, &err_aw.writer);
+
+    try emitStatus(allocator, &out, &snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "mixed_port: 19081") != null);
+    try std.testing.expectEqualStrings("", err_aw.written());
+}
+
+test "status mixed port uses descriptor override otherwise default" {
+    try std.testing.expectEqual(
+        @as(?u16, 19081),
+        resolveStatusMixedPort(321, 321, 19081),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, 7899),
+        resolveStatusMixedPort(321, 321, null),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, null),
+        resolveStatusMixedPort(321, 456, 19081),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, null),
+        resolveStatusMixedPort(0, 0, 19081),
+    );
 }
 
 test "parseDaemonStatusJson preserves selection sources" {
