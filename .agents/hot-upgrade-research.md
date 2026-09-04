@@ -1,255 +1,232 @@
-# zc 无缝升级一手资料与代码事实
+# zc 优雅二进制替换一手资料与设计依据
 
-> **状态：** Research note
-> **创建日期：** 2026-08-17
-> **用途：** 为 `.agents/hot-upgrade-plan.md` 提供事实依据；不等同于最终设计决策
-> **基线：** `main@24a15d2`
+> **状态：** Accepted research basis
+> **zc 基线：** `355262eba78455b9b1e3c7c7b0ff0365ded98459`
+> **研究目标：** 运行中的zc更新为新binary时，保留listener与已有连接，失败可判定且不隐藏cold fallback
+> **目标平台：** Linux / macOS，amd64 / arm64
+> **对应方案：** `.agents/hot-upgrade-plan.md`
 
-## 1. 研究范围
+## 1. 结论
 
-本笔记只记录三类内容：
+zc应采用窄化的 **NGINX/HAProxy式old→candidate process replacement**：
 
-1. 当前 zc 源码已经存在的行为和约束；
-2. 上游产品或操作系统官方文档明确描述的机制；
-3. 从前两类事实推导出的设计结论。
+1. Installer先发布immutable candidate artifact，不覆盖running executable；
+2. Old daemon直接spawn candidate，并把同一个listener、daemon/install locks和私有bootstrap/drain socket继承给child；
+3. Candidate用old正在运行的exact prepared invocation完成cold-start等价初始化，但不accept；
+4. Old确认acceptor已quiesce；
+5. 原子切换selected-version pointer；
+6. Candidate开始accept，old只服务已经建立的连接；
+7. Old连接自然结束或到达显式drain deadline后退出。
 
-第三类会明确标记为“设计推论”，避免把建议写成已经实现的事实。
+采用该方向的原因：
 
-## 2. zc 当前源码事实
+- 与成熟proxy一致：candidate先完整准备、listener不rebind、established connections不迁移而是drain；
+- Old本来就是candidate parent，直接spawn inheritance比命名FD broker+`SCM_RIGHTS`更小；owner-only lifecycle socket只承载begin/observe/status/stop，不传FD；
+- Immutable artifact + atomic selected pointer给installer和runtime一个明确、可检查的持久决策；
+- Candidate失败发生在old仍accept时，不需要先停止服务再赌new能启动；
+- 不依赖Linux-only systemd，也不要求macOS用户安装launchd plist。
 
-### 2.1 Reload 目前不是 hot reload
+这不是“永不出错”的绝对保证。它不能覆盖host crash、kernel/OOM kill、backlog耗尽、外部`SIGKILL`或
+磁盘损坏；它能把正常upgrade协议内的失败变成明确的precommit abort或postcommit forward recovery。
 
-- `src/daemon.zig` 的 `reloadDaemon()` 直接返回 `error.HotReloadUnsupported`。
-- `src/main.zig` 的 `reloadOrRestartPrepared()` 在 `.auto` 下捕获 reload 错误，然后调用
-  `replaceRunningDaemonWithPrepared()`。
-- `replaceRunningDaemonWithPrepared()` 最终调用 `daemon.replaceDaemonWithRollback()`。
-- `src/daemon.zig` 的 `replaceDaemonWithOps()` 先调用 old `stop`，再调用 target `start`；启动失败
-  才尝试重新启动 old。
+---
 
-**结论：** 当前 reload 可以在 candidate preparation 失败时保住 old，但正常替换仍是 stop-first，
-不是 old/new overlap。
+## 2. 当前zc事实
 
-### 2.2 Listener 不能在两个 active 进程中重新 bind
+### 2.1 Standalone installer安全，但拒绝running replacement
 
-以下入口都在自己的 accept loop 内调用 `compat.net.listenReuseAddr()`：
+`install.sh`当前已经具备：
 
-- `src/proxy/mixed.zig::startWithReady()`；
-- `src/proxy/http.zig::startWithReady()`；
-- `src/proxy/socks5.zig::startWithReady()`；
-- `src/api/server.zig::startWithAcceptGate()`。
+- GitHub Release immutable tag解析；
+- archive SHA-256验证（当前release只发布archive checksum，不是executable digest）；
+- binary size、regular-file、version self-check；
+- install lock；
+- same-directory staging与atomic rename；
+- publish失败时恢复旧binary。
 
-`src/compat.zig::listenReuseAddr()`：
+但它会调用旧binary的`status --json`并扫描executable identity；只要target仍被进程执行，就直接拒绝
+replace。最终layout是单个`${ZC_INSTALL_DIR}/zc` regular file，也明确拒绝symlink target。
 
-- 创建 IPv4 TCP socket；
-- 只设置 `SO_REUSEADDR`；
-- 明确不设置 `SO_REUSEPORT`；
-- 第二个 active listener bind 同一地址时返回 `error.AddressInUse`；
-- listener 创建后设置 CLOEXEC。
+**结论：** 下载与artifact验证可复用；single-file publication必须替换为immutable versions + selected
+pointer，running拒绝必须替换为显式handoff，而不是删除安全检查。
 
-源码注释明确说明该选择是为了允许 restart 后越过 TIME_WAIT，同时避免 macOS 上两个 daemon
-静默共享同一端口。
+### 2.2 `just install`是cold transaction
 
-**结论：** Candidate 不能通过普通 bind 在 old 仍 active 时接管同一端口；要么共享 old 的
-listener FD，要么改变现有端口排他语义。
-
-### 2.3 当前没有统一 graceful drain
-
-- `src/main.zig::runProxy()` 在观察到 stop request 后调用 `std.process.exit()`。
-- `std.process.exit()` 不运行当前栈上的 defers。
-- Listener thread 与多数 connection thread 使用 `detach()`。
-- `ApiServerOwner` 注释明确说明 transfer 到 process lifetime 后，当前唯一回收点是 process exit。
-- mixed 有局部 `ConnectionLimiter`，记录 TCP active 与 UDP association active；API 有自己的
-  `active_connections`；plain SOCKS/HTTP 没有共享 runtime-level registry。
-- plain HTTP listener 在 accept loop 线程同步调用 `handleConnection()`，长 CONNECT 会占用该
-  listener thread。
-
-**结论：** 当前 runtime 不知道所有被借用的 Config/Engine/OutboundManager 生命周期何时结束，
-也不能先停止 accept、再等待全部 connection worker 归零后正常 deinit。
-
-### 2.4 已有可复用的 replacement 基础
-
-当前代码已经有：
-
-- authenticated immutable prepared config snapshot：`publishPreparedConfig()` /
-  `readPreparedConfig()`；
-- daemon lock FD 继承和 canonical lock inode 校验：`adoptInheritedDaemonLock()` /
-  `validateInheritedDaemonLockIdentity()`；
-- startup nonce、ready=false reservation、listener readiness、ready promotion；
-- runtime descriptor atomic file publication与expected nonce/state CAS；
-- owner-only canonical runtime directory；
-- per-instance stop request；
-- desired selection generation、selection barrier、final desired guard；
-- restart preparation 在停止 old 前完成，candidate preparation 失败不会先中断 old。
-
-**结论：** 无缝替换不需要重写配置authority或selection模型，但需要扩展runtime state以表达
-active/candidate/draining，并把listener/connection ownership提到统一模块。
-
-### 2.5 Runtime authority 当前由多份文件共同表达
-
-- `zc.pid` 记录一个 PID；
-- `zc.lock` 表示 daemon 集合是否存活；
-- `zc.daemon.json` 记录 PID、nonce、ready、endpoint、identity、selection generation 和 invocation；
-- status/stop/start在不同路径同时检查这些信息；
-- descriptor schema v2只允许一个实例。
-
-**结论：** old/new合法重叠后，单PID文件无法完整表达状态。继续双写PID和descriptor会增加
-切换/清理竞态；计划应选择一个唯一authority。
-
-### 2.6 Installer 当前主动拒绝运行中替换
-
-`install.sh` 与 `scripts/install/local-dev-install.sh`：
-
-- 当前target必须是regular file，symlink被拒绝；
-- publication前后检查status和executable identity；
-- 只要存在执行目标logical/physical path的进程就拒绝替换；
-- 使用同目录临时文件、backup和atomic rename；
-- publication/self-check失败恢复old target。
-
-`docs/install/README.md` 明确要求 standalone/Homebrew 升级前先stop daemon。
-
-**结论：** 当前installer的fail-closed行为是为了避免“old inode仍运行、新CLI已发布”的状态。
-若要支持running upgrade，应先引入不可变版本路径和runtime handoff，不能只删除这些检查。
-
-## 3. 成熟产品官方机制
-
-### 3.1 NGINX on-the-fly executable upgrade
-
-NGINX 官方控制文档描述：
-
-1. 先把新 executable 放到旧路径；
-2. 给 old master 发送 `USR2`；
-3. old master 重命名 PID 文件并启动 new executable；
-4. old/new workers 会同时继续接受请求；
-5. 给 old master 发送 `WINCH`，让 old workers graceful shutdown；
-6. old master暂时保留listen sockets，因此new版本不可接受时可重新启动old workers；
-7. 成功后再给old master发送`QUIT`完成退出。
-
-官方文档：<https://nginx.org/en/docs/control.html#upgrade>
-
-**一手资料结论：** NGINX 的binary upgrade不是原地exec，也不是先杀old；它让old/new重叠，
-保留listener和rollback窗口，再drain old workers。
-
-### 3.2 Envoy hot restart
-
-Envoy 官方文档描述：
-
-- new process先完整初始化，包括configuration、service discovery和health checks；
-- old/new通过Unix domain socket RPC通信；
-- new向old请求listener socket copies；
-- new开始监听后通知old进入drain；
-- existing connections不会迁移到new process，而是在old process内完成或在deadline后终止；
-- parent shutdown deadline应大于drain deadline；
-- listener socket options不能在该hot restart中任意改变，部分变化需要full restart；
-- feature不支持Windows。
-
-官方文档：
-<https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/operations/hot_restart>
-
-**一手资料结论：** Envoy把“新连接接管”和“旧连接完成”分离。其无缝含义是listener handoff +
-old drain，而不是连接状态迁移。
-
-### 3.3 systemd socket activation
-
-systemd官方文档说明：
-
-- `.socket` unit独立创建并持有listening socket；
-- matching `.service` 启动时由service manager传入socket FD；
-- daemon通过socket activation接口发现收到的FD；
-- socket lifetime不必与单次service process lifetime相同。
-
-官方文档：
-
-- <https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html>
-- <https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html>
-
-**一手资料结论：** 把listener ownership放到worker之外可以避免restart时销毁accept queue。
-
-**限制性推论：** systemd socket activation本身只保住listening socket/queued connections；如果
-直接杀掉old service，old已接受的connections仍会断。因此zc若使用该adapter，仍需要old worker
-drain或rolling worker overlap。
-
-## 4. 操作系统FD与lock事实
-
-### 4.1 Linux `SCM_RIGHTS`
-
-Linux `unix(7)` 说明，`SCM_RIGHTS` 传递的不是简单数字，而是在receiver进程中安装一个引用同一
-open file description的新file descriptor；语义上类似把FD duplicate到另一个进程。
-
-来源：<https://man7.org/linux/man-pages/man7/unix.7.html>
-
-### 4.2 Linux `flock`
-
-Linux `flock(2)` 说明，`flock` lock关联open file table entry/open file description；由`fork`或
-`dup`产生的duplicate引用同一lock，任意这些FD都可用于修改lock，只有全部相关FD关闭或明确
-unlock后lock才释放。
-
-来源：<https://man7.org/linux/man-pages/man2/flock.2.html>
-
-### 4.3 macOS
-
-Apple/BSD man pages提供Unix-domain ancillary message和`flock`接口；但跨版本zc所需的
-“SCM_RIGHTS received duplicate维持同一flock”组合必须在真实macOS进程测试中确认，不能仅
-用Linux文档外推。
-
-参考：
-
-- <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sendmsg.2.html>
-- <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/recvmsg.2.html>
-- <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html>
-
-### 4.4 Zig 0.16.0 本地标准库
-
-当前本机Zig 0.16.0的`std.Io.File.lock/tryLock`在POSIX Threaded adapter中调用
-`posix.system.flock`：
-
-- `std/Io/File.zig` 定义高层接口；
-- `std/Io/Threaded.zig::fileLock/fileTryLock/fileUnlock` 使用 `LOCK.EX/SH/UN`。
-
-该事实说明当前zc daemon lock在目标平台走`flock`语义，但实现仍必须有真实process contract
-test，避免把本机standard-library实现当成所有release target的永久保证。
-
-## 5. 设计推论
-
-以下均是设计选择，不是当前实现事实：
-
-1. **共享listener FD优于重新bind。** 它保留同一socket和accept queue，也维持当前端口排他性。
-2. **同一个flock FD应被duplicate/transfer而不是unlock/relock。** 这样没有第三进程抢占窗口；
-   代码必须禁止任一共享者显式unlock。
-3. **Candidate必须先完整prepare再quiesce old。** 这把大多数失败留在old仍正常服务的阶段。
-4. **Old必须在finalize前保留listener FD。** Candidate失败时old才能resume accept而不用rebind。
-5. **Accepted connection不迁移。** Old connection worker持有old generation，candidate只处理new。
-6. **Listener option/endpoint变化必须拒绝hot path。** 共享旧FD意味着旧socket属性仍生效；声称新
-   option已应用会是假成功。
-7. **需要统一connection lifetime barrier。** 只有acceptor已join且registry归零后，old才可安全
-   deinit Config/Engine/Manager。
-8. **需要单一runtime authority。** Active/candidate/draining和CAS epoch应在一个原子state中，
-   不再依赖单PID文件表达多代际。
-9. **Installer应发布不可变version path并原子切pointer。** 这让old/new executable identity都可
-   验证，并使runtime rollback和binary pointer rollback可以组成两阶段事务。
-10. **首个支持handoff的版本仍需一次cold bootstrap。** 已发布old daemon不理解未来protocol；
-    installer必须明确拒绝running fallback，而不是偷偷stop/start。
-
-## 6. 研究结论
-
-官方模式与zc代码约束共同指向同一方案：
+`Justfile::install`当前流程为：
 
 ```text
-candidate full prepare
-→ transfer exact listener + lock FD
-→ old quiesce accept/control
-→ atomic active authority cutover
-→ candidate accept/readiness
-→ finalize
-→ old drain accepted connections
+build
+→ verify old runtime/identity
+→ copy old binary backup
+→ zc stop
+→ replace target
+→ zc start
+→ verify new PID and executable inode
+→ failure: restore old binary and attempt old start
 ```
 
-实现风险主要不在download/rename，而在：
+它能避免“新CLI已安装、old inode仍running”的假成功，也能处理new startup failure，但stop-first必然关闭
+现有连接并产生listener空窗。
 
-- listener ownership从protocol线程上移；
-- acceptor确定性quiesce；
-- connection lifetime和normal unwind；
-- selection/control mutation只属于active代际；
-- runtime state CAS和installer pointer的两阶段提交；
-- Linux/macOS真实FD/lock合同测试。
+### 2.3 Runtime尚不具备process handoff seam
 
-详细接口、状态机、任务和验收见 `.agents/hot-upgrade-plan.md`。
+- Mixed listener在`src/proxy/mixed.zig::startWithReady`内部bind，accept loop blocking；
+- API listener在`src/api/server.zig::startWithReady`内部bind；
+- Main把listener threads和connection workers detach；
+- Worker直接借用Config、Engine和`*OutboundManager`；
+- Stop request最终`std.process.exit()`，没有connection drain；
+- `zc.pid`、daemon lock和runtime descriptor都按单active process设计；
+- Mixed limiter当前是每process TCP 128 / UDP 64；
+- Prepared snapshot load仍可能补做provider preparation，不是完全self-contained。
+
+**结论：** Listener ownership、accept quiesce、connection registry、child bootstrap和runtime authority是
+binary replacement前置条件。进程内Config generation swap不能替代这些工作。
+
+---
+
+## 3. 成熟方案对照
+
+### 3.1 NGINX：parent exec new binary，old master保留回退能力
+
+官方binary upgrade流程：替换executable后向old master发送`USR2`；old master重命名PID文件并启动new
+executable。Old master不关闭listen sockets；若new不可接受，可让old重新启动workers并关闭new；成功后
+再`QUIT` old master。
+
+- 官方流程：<https://nginx.org/en/docs/control.html#upgrade>
+- 固定源码：NGINX `release-1.28.0`，commit
+  [`481d28cb4e04c8096b9b6134856891dc52ecc68f`](https://github.com/nginx/nginx/tree/481d28cb4e04c8096b9b6134856891dc52ecc68f)
+- `ngx_exec_new_binary()`把listener FD numbers写入`NGINX`环境并exec new binary：
+  [`src/core/nginx.c`](https://github.com/nginx/nginx/blob/481d28cb4e04c8096b9b6134856891dc52ecc68f/src/core/nginx.c)
+- New binary解析这些numbers并调用`ngx_set_inherited_sockets()`恢复listener metadata：同上文件
+- New child退出时old master恢复PID文件并可restart old workers：
+  [`src/os/unix/ngx_process_cycle.c`](https://github.com/nginx/nginx/blob/481d28cb4e04c8096b9b6134856891dc52ecc68f/src/os/unix/ngx_process_cycle.c)
+
+**zc采用：** parent直接spawn、exact listener inheritance、old connections留在old、old保留precommit
+recovery能力。
+
+**zc不照搬：** NGINX流程主要由operator用signals推进，缺少machine-verifiable readiness ACK。zc自动化
+installer必须增加private`ARMED/ACTIVATE/ACTIVE`handshake、deadline和identity verification。
+
+### 3.2 HAProxy：完整启动new，再soft-stop old；可取回old listeners
+
+HAProxy 3.2 management guide说明：
+
+- `-x <unix_socket>`从old process取回listening sockets并复用，而不是重新bind；master-worker mode通过
+  internal socketpair自动使用该能力；
+- `-sf`在new boot completion后向old发送`SIGUSR1`；old停止listen但继续处理existing connections；
+- 普通pause/rebind路径在高负载下仍可能出现毫秒级失败窗口，说明“graceful”不能等同于任意rebind都无损；
+- `hard-stop-after`为soft-stop提供最大存活时间，避免TCP长连接让old process永久残留。
+
+固定资料：HAProxy `v3.2.0`，commit
+[`e134140d282c006417945d78e7964cc8fa14586a`](https://github.com/haproxy/haproxy/tree/e134140d282c006417945d78e7964cc8fa14586a)：
+
+- [`doc/management.txt`](https://github.com/haproxy/haproxy/blob/e134140d282c006417945d78e7964cc8fa14586a/doc/management.txt)
+- [`doc/configuration.txt`](https://github.com/haproxy/haproxy/blob/e134140d282c006417945d78e7964cc8fa14586a/doc/configuration.txt)
+
+**zc采用：** fully prepared candidate、复用exact listener、old soft drain、显式hard deadline。
+
+**zc不照搬：** Old就是candidate的parent，因此不需要对任意peer开放stats socket或通用`SCM_RIGHTS`
+retrieval interface；也不使用HAProxy普通rebind fallback。
+
+### 3.3 Envoy：full initialization、compatibility version和bounded drain
+
+Envoy hot restart官方说明：
+
+- New process先完成configuration、initial service discovery和health checking；
+- New从old取得listen sockets并开始listen，然后让old drain；
+- Existing connections不传给new，只能在old完成或deadline后关闭；
+- `--drain-time-s`与`--parent-shutdown-time-s`分别控制drain和parent shutdown；
+- `--hot-restart-version`输出opaque compatibility version，供new/old在handoff前比较；
+- Hot restart不支持修改listener socket options，仍使用old socket options。
+
+固定资料：Envoy `v1.39.0`，commit
+[`8eea3285d6bdb89f8ea34632cfe7ce1608a8f374`](https://github.com/envoyproxy/envoy/tree/8eea3285d6bdb89f8ea34632cfe7ce1608a8f374)：
+
+- [`hot_restart.rst`](https://github.com/envoyproxy/envoy/blob/8eea3285d6bdb89f8ea34632cfe7ce1608a8f374/docs/root/intro/arch_overview/operations/hot_restart.rst)
+- 官方CLI文档：<https://www.envoyproxy.io/docs/envoy/latest/operations/cli.html#cmdoption-hot-restart-version>
+
+**zc采用：** binary handoff protocol version、cold-start等价candidate readiness、listener option exactness、
+bounded old drain。
+
+**zc不照搬：** 不迁移stats/shared memory，不引入restart epoch family、counter merge或多代并存；同时最多
+active+candidate或active+draining两代。
+
+### 3.4 systemd / launchd：外部manager长期持有listener
+
+Systemd socket activation由manager创建listener，并把FD duplicates交给service；`Accept=no`时传递的是
+listening sockets themselves。`FlushPending=no`允许pending connections在service restart后继续处理。
+
+固定资料：systemd `v258`，commit
+[`781d9d0789379d1ea1f2ecefb804d41e9c8b6c38`](https://github.com/systemd/systemd/tree/781d9d0789379d1ea1f2ecefb804d41e9c8b6c38)：
+
+- [`man/sd_listen_fds.xml`](https://github.com/systemd/systemd/blob/781d9d0789379d1ea1f2ecefb804d41e9c8b6c38/man/sd_listen_fds.xml)
+- [`man/systemd.socket.xml`](https://github.com/systemd/systemd/blob/781d9d0789379d1ea1f2ecefb804d41e9c8b6c38/man/systemd.socket.xml)
+
+Apple同样建议daemon通过launchd声明Sockets；launchd预注册socket/FD并在启动daemon时交给它：
+<https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html>
+
+**为什么不作为zc standalone主方案：** systemd仅Linux；launchd integration要求plist和不同lifecycle；它们能
+保留listener/backlog，但普通service restart仍不能让old process继续服务established connections。它们适合作为
+未来supervisor adapters，不应成为standalone update的隐式依赖。
+
+### 3.5 POSIX child FD mapping
+
+POSIX `posix_spawn_file_actions_adddup2()`允许parent在spawn时把指定FD映射到child FD table：
+<https://pubs.opengroup.org/onlinepubs/9699919799/functions/posix_spawn_file_actions_adddup2.html>。
+
+Linux `flock(2)`说明lock关联open file description；`fork`/`dup`得到的FD引用同一个lock，且lock跨
+`execve`保留：<https://www.man7.org/linux/man-pages/man2/flock.2.html>。
+
+这为“old直接spawn candidate，继承listener与daemon lock”提供了正确方向，但macOS语义、Zig 0.16
+spawn adapter、CLOEXEC和真实lock exclusivity仍必须由四架构process contract tests证明，不能只靠文档假设。
+
+---
+
+## 4. 被拒绝的方案
+
+| 方案 | 拒绝原因 |
+| --- | --- |
+| stop → overwrite → start | 安装可回滚，但已有连接必断且存在listener空窗；不满足目标 |
+| 单进程`execve` | 用户态Config/Engine/connection state全部消失；无法drain established connections |
+| `SO_REUSEPORT`启动第二listener | 不是同一个accept queue；平台与负载分配语义不同，rollback与排他性更难证明 |
+| close old listener后让new rebind | 引入bind race、端口抢占与`ECONNREFUSED`窗口 |
+| systemd-only socket activation | Linux-only，且单纯restart不保留old established connections |
+| launchd-only lifecycle | macOS-only，改变standalone invocation与installer模型 |
+| 通用`SCM_RIGHTS` handoff framework | Old直接spawn child时不需要peer discovery和通用FD transport；增加攻击面与状态 |
+| 永久master/launcher process | 新增常驻故障域；当前只需upgrade时old临时担任coordinator |
+| 自动cold fallback | 把连接中断伪装成成功，违背可见、可判定目标 |
+| Postcommit自动切回old | Candidate可能已经接收连接；反向切换制造第二次中断与split-brain风险 |
+| 传递established connection | 需要迁移协议/TLS/relay用户态状态，复杂度和收益不匹配；成熟proxy也选择old drain |
+
+---
+
+## 5. 可迁移的成熟不变量
+
+1. Candidate必须在old停止admission前完成cold-start等价初始化。
+2. Binary replacement必须复用同一个kernel listener，而不是兼容性rebind。
+3. Established connections属于old process，不迁移。
+4. Old停止accept后必须有可观测connection drain与hard deadline。
+5. Listener socket options在handoff中保持old实际值；任何预期差异fail closed。
+6. New/old必须在cutover前验证binary handoff compatibility。
+7. 必须把precommit abort与postcommit forward recovery分开。
+8. Installer、runtime和status必须能识别actual binary digest/device/inode，不能只相信version string。
+9. Overlap资源峰值必须按两代process计算并设门禁。
+10. 用户必须看见candidate、serving、draining、deadline与degraded结果；不能用“reload成功”掩盖cold restart。
+
+---
+
+## 6. 对zc方案的直接推论
+
+- Standalone安装布局改为content-addressed immutable artifacts + atomic selected symlink；
+- Selected symlink readback是唯一selection decision；parent-directory sync单独报告durable/uncertain；runtime record只是可重建projection；
+- Old daemon是单次replacement coordinator，不新增永久master；owner-only lifecycle socket是installer/CLI的可达入口；
+- FD transport使用private parent-child spawn manifest，不公开通用RPC；
+- Old在pointer仍指向自己时可以abort/resume；pointer指向candidate后只能forward，不自动rollback；
+- Candidate只加载old的exact prepared invocation，binary replacement不夹带config update；
+- Archive digest只作下载provenance，解包后另算artifact digest并用于version/selected/runtime identity；
+- 首个支持新layout/protocol的版本需要一次明确cold bootstrap；
+- MVP支持standalone managed background + one mixed + no controller + no AnyTLS；unsupported mode在任何pointer mutation前拒绝；
+- 成功返回只等待candidate ACTIVE，不等待old drain完成；status持续展示draining事实；
+- 默认hard drain duration采用15分钟；pointer decision时以boot monotonic clock计算deadline；只有old terminal message存在时才记录exact forced count，否则显示unavailable/degraded。
+
+详细状态机、接口、失败矩阵与任务见`.agents/hot-upgrade-plan.md`。

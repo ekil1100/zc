@@ -1,1292 +1,1150 @@
-# zc 无缝运行代际切换实施方案
+# zc 优雅二进制替换设计方案
 
-> **状态：** Proposed
-> **位置：** 仅放在 `.agents/`，实现前不提升为用户文档
-> **创建日期：** 2026-08-17
-> **基线：** `main@24a15d2`
+> **状态：** Proposed — complete redesign
+> **基线：** `355262eba78455b9b1e3c7c7b0ff0365ded98459`
 > **目标平台：** Linux / macOS，amd64 / arm64，Zig 0.16.0
-> **配套研究：** `.agents/hot-upgrade-research.md`
-> **执行要求：** 先测后改；每个任务有硬验收；一个 commit 只完成一个逻辑变更
+> **目标渠道：** 首个纵切面为standalone managed background daemon
+> **研究依据：** `.agents/hot-upgrade-research.md`
+> **替代关系：** 删除原“进程内配置代际切换”计划；本文件只设计zc binary replacement
+> **工程要求：** TDD、小步commit、真实process tests、性能/资源门禁、用户行为同步文档
 
-## 1. 结论
+## 1. 目标
 
-zc 不应继续把更新建模为“覆盖 `$PATH` 中的二进制，然后停止旧 daemon、启动新 daemon”。
-目标模型是一次**运行代际替换事务**：旧代际与候选代际短暂并存，复用同一个内核监听
-socket；候选代际接管新连接后，旧代际只服务已经接收的连接，直到连接归零或到达有界
-drain deadline。
+用户执行zc版本更新时，系统应当：
 
-本方案选择：
+1. 新binary在old daemon仍正常服务时完成下载、校验和完整初始化；
+2. New process复用old process正在使用的**同一个kernel listener**，不close/rebind；
+3. Cutover后只有new process接收新连接；
+4. Old process继续服务已经建立的TCP/UDP连接，直到完成或到达公开的drain deadline；
+5. Candidate在commit前失败时，old保持原样；
+6. Commit后的失败按selected new version向前恢复，不偷偷切回old；
+7. 用户始终能看到selected、serving、candidate、draining、deadline和失败阶段；
+8. 不把cold stop/start、端口重绑或自动fallback伪装成“优雅更新成功”。
 
-- **旧/新进程点对点 handoff**，不引入永久 supervisor；
-- 通过 owner-only `AF_UNIX` 控制通道和 `SCM_RIGHTS` 传递 listener FD；
-- 传递当前 daemon 的同一个 `flock` FD，不做 unlock/relock；
-- 用单一权威 runtime state 的 CAS 完成 active 代际切换；
-- 用不可变版本目录和原子 symlink 切换发布二进制；
-- `reload` 与 binary upgrade 复用同一个 graceful replacement 模块；
-- 不使用 `SO_REUSEPORT` 作为正确性基础，不做进程内代码热补丁。
+本方案把该行为称为 **binary replacement（版本替换）**。它与`zc reload`、配置下载和进程内配置
+mutation是不同问题，不能共用同一个模糊的“reload”概念。
 
-第一个可用版本先实现“同二进制、同监听集合”的 graceful reload；确认端到端成立后，再接
-版本化安装器。这样先得到一个能运行、能回滚、能证明无监听空窗的最小纵切面，再扩展
-binary upgrade。
+### 1.1 一句话决策
 
----
+采用窄化的 **NGINX/HAProxy式old→candidate handoff**：
 
-## 2. 目标与非目标
+```text
+stage immutable candidate
+→ old spawns candidate with inherited listener + daemon lock
+→ candidate fully initializes and reports ARMED
+→ old quiesces accept/control
+→ atomically select candidate binary
+→ candidate starts accepting
+→ old drains established connections
+```
 
-### 2.1 目标
+### 1.2 这套方案能保证什么
 
-1. **新连接无监听空窗**
-   - 对监听指纹完全相同的替换，旧代际停止 `accept` 到新代际开始 `accept` 期间，至少有
-     一个进程持有同一个 listening socket；内核 accept queue 不被销毁。
-   - 在规定的场景负载和 backlog 内，更新期间 TCP connect failure 必须为 0。
+在支持范围、协议正常执行且host/kernel未发生外部故障时：
 
-2. **已有连接连续**
-   - 已被旧代际接收的 HTTP CONNECT、SOCKS5、mixed、Shadowsocks/Trojan/AnyTLS outbound
-     relay 与 SOCKS5 UDP association 继续由旧代际服务。
-   - 不尝试把已建立连接的用户态状态迁移到新进程。
+- Candidate准备失败不会影响old接流量；
+- Listener FD、bind、accept queue和daemon lock在replacement期间连续；
+- Cutover不会产生close/rebind型`ECONNREFUSED`；短暂未accept时，新连接留在原backlog排队；
+- Old已经接受的连接不会因binary cutover立即关闭；
+- 同时最多存在active+candidate或active+draining两个process generations；
+- Installer/CLI退出或等待超时不会改变已经作出的commit决定；
+- 所有unsupported和failure都明确返回，不自动执行cold fallback。
 
-3. **失败不影响旧流量**
-   - candidate 配置解析、能力校验、FD 校验、线程创建、runtime publication 或健康确认失败
-     时，旧代际恢复或继续接收新连接。
-   - 在 `finalize` 之前允许确定性 rollback；之后不再声称可自动 rollback。
+### 1.3 不能承诺什么
 
-4. **唯一 active authority**
-   - 任意时刻最多一个 active 代际。
-   - MVP 最多一个 candidate 和一个 draining 代际；有未完成 drain 时拒绝第二次替换。
+任何实现都不能诚实承诺“绝对不会出问题”。本方案不保证：
 
-5. **配置和二进制共用同一原语**
-   - 配置 reload：candidate executable 与 active 相同，prepared config 不同。
-   - 二进制 upgrade：candidate executable 不同，prepared config 可以相同或由新版本重新加载。
+- Host crash、kernel panic、OOM killer、外部`SIGKILL`或磁盘损坏时连接连续；
+- Backlog在极端突发流量下永不耗尽；
+- Candidate开始接流量后自身crash仍保住candidate已经接受的连接；
+- 超过drain deadline的old connections永不关闭；
+- 任意历史版本跨越式hot upgrade；
+- Package manager或supervisor绕过zc protocol直接替换文件时仍满足handoff合同。
 
-6. **状态可观察、错误可操作**
-   - `status`、minimal API、日志和 JSON 输出使用相同的 active / replacing / draining 概念。
-   - 所有拒绝都给出明确 code、失败阶段、旧代际是否仍 active、下一步命令。
-
-7. **跨平台行为一致**
-   - Linux/macOS 四个 release target 使用同一事务语义。
-   - 平台能力不足时 fail closed，不静默降级为 stop/start。
-
-### 2.2 非目标
-
-- 不迁移已经建立的 TCP/TLS/AnyTLS 会话到 candidate 进程。
-- 不保证 bind address、端口、listener 类型或 socket option 改变时无缝。
-- MVP 不支持 foreground / systemd supervised daemon 的内部自替换；由 supervisor 管理时明确拒绝。
-- 不支持 Windows。
-- 不做 `dlopen` 插件、内存 patch、函数表热替换。
-- 不在 MVP 中允许多个 draining 代际堆叠。
-- 不用全局 `ps`/`pgrep` 扫描重新收养未知 daemon。
-- 不为旧 runtime descriptor、旧安装布局或旧 handoff protocol 增加长期兼容层。
-- 不自动把 graceful replacement 失败降级成会断连接的 cold restart。
+这些边界必须写进CLI help、install docs和release notes，不能只留在实现注释里。
 
 ---
 
-## 3. 当前实现基线
+## 2. 产品合同
 
-| 现状 | 代码位置 | 影响 |
-| --- | --- | --- |
-| `reloadDaemon()` 固定返回 `HotReloadUnsupported` | `src/daemon.zig` | 当前所谓 reload 实际走 restart fallback |
-| `replaceDaemonWithOps()` 先 stop old，再 start target | `src/daemon.zig` | 监听端口必然存在空窗，旧连接被进程退出切断 |
-| mixed/HTTP/SOCKS/API 各自在 accept 线程内部 bind | `src/proxy/*.zig`、`src/api/server.zig` | 主 runtime 无法统一暂停、传递和验证 listener |
-| listener 只启用 `SO_REUSEADDR`，显式禁用 `SO_REUSEPORT` | `src/compat.zig` | 正确阻止双实例，但新进程无法自行 bind 同端口 |
-| listener 与多数 connection worker detached | `src/main.zig`、`src/proxy/*.zig` | 无法 join；process exit 是当前唯一回收点 |
-| stop request 在主循环调用 `std.process.exit()` | `src/main.zig` | 不运行 defers，不 drain 连接和 manager/pool |
-| mixed 有局部 `ConnectionLimiter`；API 有局部 active count；plain SOCKS/HTTP 未统一 | 对应 listener 文件 | 无全 runtime drain barrier；HTTP listener 还会同步处理长连接 |
-| runtime descriptor 只表达单 pid/nonce/ready | `src/runtime_descriptor.zig` | 无法表达 candidate 与 draining 代际 |
-| pid file、lock、descriptor 同时存在 | `src/daemon.zig`、`src/runtime_dir.zig` | 多份 authority 容易出现错位和清理竞态 |
-| prepared config 已经不可变、带完整 runtime metadata | `src/daemon.zig` | 可直接作为 candidate 的冻结输入 |
-| daemon lock 已支持 FD 继承并校验 inode | `src/daemon.zig` | 可扩展为跨进程 FD transfer，不必重新抢锁 |
-| startup 已有 listener readiness、descriptor ready=false→true、nonce/CAS | `src/main.zig`、`src/runtime_descriptor.zig` | 可复用为 replacement 两阶段 publication |
-| selection 已有 desired generation barrier 与 CAS | `src/main.zig`、`src/proxy/outbound/manager.zig` | candidate cutover 前可复用最终 desired reconcile |
-| installer 原子 rename 单一 regular-file target，运行时拒绝替换 | `install.sh`、`scripts/install/local-dev-install.sh` | 避免覆盖事故，但不能让旧/新版本同时可靠存在 |
+### 2.1 首个支持范围
 
-因此这不是安装脚本的 rename 顺序问题。缺失的是 listener 所有权、可取消 accept、连接
-lifetime barrier、跨进程 FD handoff 和多代际 authority。
+首个端到端版本只支持：
+
+- Standalone versioned install layout；
+- Managed background daemon；
+- Authenticated、self-contained prepared invocation；
+- 当前公开default runtime的一个mixed listener；
+- Owner-only lifecycle Unix socket（只提供replacement/status/stop）；
+- `external-controller == null`；
+- Prepared config不包含AnyTLS proxy；
+- Linux/macOS amd64/arm64；
+- Old/new使用完全相同的config identity、prepared snapshot、port override和listener fingerprint；
+- 同时没有另一笔replacement，也没有未完成的draining generation。
+
+Foreground、systemd/launchd supervised、Homebrew/Debian ownership、unmanaged invocation、controller-enabled
+runtime或AnyTLS config在任何selected-pointer mutation前返回`REPLACE_RUNTIME_UNSUPPORTED`。它们不会静默
+cold restart。
+
+### 2.2 Running install
+
+用户继续使用现有入口，例如：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/ekil1100/zc/main/install.sh | sh
+```
+
+如果daemon正在运行且满足支持范围，installer输出明确阶段：
+
+```text
+Staged zc 1.2.0 (sha256:...)
+Candidate ready (pid ...)
+Replacement committed; zc 1.2.0 is serving
+Previous zc 1.1.0 is draining 3 connections until ...
+```
+
+Installer在candidate成为serving后返回成功，不等待最长15分钟drain。Drain继续由daemon管理并通过
+`zc status`可见。
+
+### 2.3 Stopped install
+
+Daemon stopped时只做artifact publication与selected pointer commit：
+
+```text
+Installed zc 1.2.0
+Daemon remains stopped
+```
+
+禁止installer因为“之前也许运行过”而猜测性启动daemon。
+
+### 2.4 Failure
+
+- Precommit failure：selected仍为old，old继续accept，返回具体错误；
+- Postcommit failure：selected已经是candidate，只允许forward recovery；
+- Outcome无法从selected pointer判定：进入`attention`，不得猜测性accept、rollback或cold start；
+- Installer通过固定owner-only lifecycle socket提交/观察；CLI timeout返回transaction id，重试必须attach同一transaction；
+- Selected入口损坏时，precommit intent、日志与installer输出必须给出old/candidate immutable executable的exact恢复命令；
+- 显式`zc stop`可以终止所有generations，但必须列出将终止的PID并说明连接影响。
+
+### 2.5 Rollback
+
+不增加隐藏的自动rollback：
+
+- Commit前abort/resume old属于同一transaction的正常失败处理；
+- Commit后要回到old version，用户使用old immutable version发起一笔**新的replacement**；
+- Standalone可通过固定旧版本重跑installer；
+- 不提供能在candidate已接流量后反向偷切admission的phase-driving命令。
 
 ---
 
-## 4. 统一术语
+## 3. 为什么采用这个方向
 
-这些是 runtime 实现术语，不改变项目已有的
-`profile / proxy / proxy-group / rule / connection / runtime / health` 领域词汇。
+| 成熟方案 | 已证明的模式 | zc采用 | zc不照搬 |
+| --- | --- | --- | --- |
+| NGINX executable upgrade | Old master启动new executable，传递listen FDs；old保留sockets，可恢复workers；old connections继续 | Parent直接spawn、exact listener inheritance、old drain | 手工signals与operator判断；zc增加机器可判定ACK和identity |
+| HAProxy graceful reload | New boot完成后才`-sf`old；`-x`取回old listeners；`hard-stop-after`限制old寿命 | Full candidate prepare、soft drain、hard deadline | 普通pause/rebind fallback及对任意peer开放的FD retrieval |
+| Envoy hot restart | New full init后取listener；existing connections不迁移；compatibility version与bounded drain | Protocol compatibility、listener option exactness、bounded drain | Shared memory、stats merge、restart epochs和多代管理 |
+| systemd socket activation | Manager长期持有listener，restart期间kernel继续queue | 证明listener owner与daemon生命周期可分离 | Linux-only；普通restart不能保留old established connections |
+| launchd socket activation | launchd预注册socket并传给daemon | 证明macOS同样支持外部socket ownership | 要求plist/supervisor lifecycle，不适合作为standalone默认 |
+| Mihomo `/upgrade` | 覆写binary后hard restart/exec | 只作为“不要这样宣称无缝”的对照 | 无old/new overlap、listener handoff或connection drain |
+
+### 3.1 为什么不是stop/install/start
+
+当前`just install`已有backup、startup verify和rollback，能防止安装损坏，但old必须先停止。它解决的是
+“能否恢复服务”，没有解决“existing connections和listener是否连续”。目标已经明确要求优雅替换，因此
+cold transaction只能保留为用户显式选择，不是成功路径。
+
+### 3.2 为什么不是`execve`当前进程
+
+`execve`可以保留未设置CLOEXEC的FD，但会替换整个address space。Config、Engine、Manager、relay state、
+TLS state和connection workers都会消失，existing connections无法继续正常处理。
+
+### 3.3 为什么不是`SO_REUSEPORT`
+
+`SO_REUSEPORT`创建第二个socket和第二个accept queue；kernel负责流量分配，old/new无法得到明确cutover，
+rollback与高负载行为也更难证明。zc应继承**同一个listener FD/open file description**。
+
+### 3.4 为什么不是通用`SCM_RIGHTS`
+
+HAProxy/Envoy需要与独立process通信，因此使用Unix socket取FD是合理的。zc的old daemon就是candidate的
+parent，可以在一次`posix_spawn`中精确映射FD；额外的命名socket、peer discovery和通用FD transport只会
+增加攻击面与协议状态。
+
+### 3.5 为什么需要immutable versions
+
+如果直接覆写`${ZC_INSTALL_DIR}/zc`：
+
+- Running old inode与磁盘new file容易产生身份错觉；
+- Candidate失败后的old artifact可能已经丢失；
+- Installer publication和runtime activation没有一个清晰的版本决策。
+
+Content-addressed immutable artifact使old/new都保持可执行；一个atomic selected symlink即可表达“下一次CLI
+和cold startup应使用哪个binary”。
+
+---
+
+## 4. 统一模型
 
 | 术语 | 含义 |
 | --- | --- |
-| **Runtime Generation / 运行代际** | 一个进程内不可变的 executable identity、prepared config、Engine、OutboundManager 和 listener/connection runtime |
-| **Active Generation / active 代际** | 唯一允许接收新流量、唯一可接受控制面 mutation 的运行代际 |
-| **Candidate Generation / candidate 代际** | 已加载并准备线程，但 accept gate 尚未提交的候选代际 |
-| **Draining Generation / draining 代际** | 已停止接收新连接，只服务既有 connection 的旧代际 |
-| **Runtime Epoch / runtime epoch** | runtime state 每次 CAS mutation 单调递增的版本；不与 selection generation 混用 |
-| **Selection Generation / selection generation** | 现有持久化选择世代，只属于 active profile 的 desired/applied 状态 |
-| **Listener Fingerprint / listener 指纹** | role、address family、bind address、port、socket type、必要 socket options 的规范化身份 |
-| **Replacement Transaction / 替换事务** | 从 candidate admission 到 finalize/rollback 的单次有 nonce 的状态机 |
-| **Quiesce** | 停止 accept/control mutation，等待 acceptor 确认退出；不关闭既有 connection |
-| **Cutover** | runtime authority 从 old active CAS 到 candidate active 的瞬间 |
-| **Finalize** | 安装指针与 candidate 均确认稳定后，放弃 rollback，允许 old 退出 |
-| **Drain** | old quiesce 后只保留既有 lease；finalize 后开始有界等待其归零的过程 |
+| **Artifact** | 经过checksum/self-check、按SHA-256寻址且发布后不可修改的zc executable |
+| **Selected Version** | `${ZC_INSTALL_DIR}/zc` symlink当前指向的artifact；唯一selection decision判据 |
+| **Serving Process** | 当前负责新connection admission与control mutation的唯一process |
+| **Candidate Process** | 已spawn并准备中，但尚未允许public admission的new process |
+| **Draining Process** | 已不接新连接，只服务自身established connections的old process |
+| **Replacement Transaction** | 一次old→candidate binary replacement，具有唯一transaction id |
+| **Commit** | 本文简写为selected readback exact candidate；只表示selection，不隐含directory durability |
+| **Precommit** | Selected pointer仍exact指向old artifact |
+| **Postcommit** | Selected pointer readback exact指向candidate artifact |
+| **Listener Set** | 可继承的process-owned listening FDs及其immutable fingerprint |
+| **Connection Registry** | 一个process内所有established TCP/UDP lifetimes的owner/count barrier |
+| **Runtime Record** | selected/serving/candidate/draining的可重建观测projection，不是第二个decision vote |
+| **Lifecycle Endpoint** | Runtime dir内owner-only Unix socket；installer/CLI用于begin/observe/status/stop，不传FD或任意path |
+| **Handoff Protocol** | Old/candidate private `HELLO→ARMED→ACTIVATE→ACTIVE→DRAIN_*`协议 |
+| **Selection Durability** | Selected readback决定old/candidate；parent-directory sync单独决定`durable|uncertain` |
 
-代码和 schema 中禁止新增无修饰的 `generation` 字段；必须使用 `runtime_epoch` 或
-`selection_generation`。
+### 4.1 核心不变量
 
----
-
-## 5. 对“无缝”的精确定义
-
-### 5.1 保证范围
-
-当且仅当 old 与 candidate 的 listener 指纹集合完全一致时：
-
-- listener FD 从 old 复制到 candidate，二者引用同一内核 listening socket；
-- 从 old 开始 quiesce 到 candidate acceptor ready，socket 始终打开；
-- 已排队但尚未 `accept` 的连接保留在同一个 accept queue；
-- old 已接收的连接继续由 old 处理；candidate 只处理 cutover 后接收的连接；
-- cutover pause 必须有 deadline，MVP 目标为 **250 ms 内**；超时立即 rollback；
-- 更新本身不得产生 `ECONNREFUSED`、listener disappearance 或端口被第三方抢占。
-
-这不等价于无限负载下绝对零失败。若外部连接速率在 250 ms 内填满固定 backlog，内核仍可
-拒绝连接；场景门禁必须声明连接速率和 backlog，不能把过载与更新正确性混为一谈。
-
-### 5.2 Drain policy
-
-MVP 使用有界 policy：
-
-- data-plane drain deadline：默认 **15 分钟**，与当前 relay idle reap 尺度一致；
-- control-plane request drain deadline：**2 秒**；
-- 到期仍存活的连接被计数、记录并由 old 进程退出强制关闭；
-- `status` 显示 remaining connections 和 deadline；
-- drain 中拒绝新 replacement，避免旧进程无限堆积；
-- 测试通过注入 clock/deadline 使用毫秒级 deadline，不真实等待 15 分钟。
-
-因此对外承诺应写成：**新连接无监听空窗；既有连接在 drain deadline 内允许完成。**
-不能宣传“任何无限长连接永不受影响”。
-
-### 5.3 明确不兼容的变更
-
-以下任一变化使 hot replacement 返回 `REPLACE_LISTENER_INCOMPATIBLE`：
-
-- mixed ↔ split HTTP/SOCKS listener 形态变化；
-- bind address、address family 或 port 变化；
-- controller 增删或 controller port 变化；
-- 影响 listener 的 socket option/fingerprint 变化；
-- listener count 超过固定上界。
-
-用户必须显式执行 `zc restart`。不能在 `reload` 或 installer 中静默 cold fallback。
+1. Selected pointer readback是唯一selection decision；PID file、ACK、runtime record都不是第二个vote；directory sync只记录durability。
+2. Pointer=old时只有old可以admit；pointer=candidate后old永不resume admission。
+3. Candidate在pointer commit前不能accept public traffic或公开control endpoint。
+4. Old quiesce ACK后不能再创建connection registry entry。
+5. Old与candidate持有同一个listener和daemon-lock open file description。
+6. 双方只close自己的lock FD，禁止任何一方显式`LOCK_UN`。
+7. Existing connections不跨process迁移。
+8. Replacement不改变config、profile、listener options或port。
+9. 同时最多两代process；存在draining时拒绝下一笔replacement。
+10. Old只有在candidate接管lifecycle、serving record、terminal result与recovery ownership后才允许退出。
+11. Precommit失败abort；postcommit失败forward；禁止隐式cold fallback。
 
 ---
 
-## 6. 方案比较与决策
-
-### 6.1 仅原子覆盖二进制：拒绝
-
-原子 rename 只影响未来 `exec`，不会替换运行进程。旧 daemon 继续执行旧 inode，而 PATH 中
-CLI 已经变成新版本；runtime schema、路径和 lifecycle 语义一旦变化就会错位。
-
-### 6.2 原地 `execve`：拒绝
-
-listener FD 可以保留，但所有用户态 connection、TLS 状态、relay buffer、outbound pool 和
-selection runtime 都会消失，无法保住既有连接。
-
-### 6.3 `SO_REUSEPORT` 双 bind：拒绝作为主方案
-
-优点是实现快；缺点是：
-
-- 内核会在 old/new listener 间分配流量，cutover ownership 不确定；
-- old 保留 listener 供 rollback 时仍可能收到新连接；
-- Linux/macOS 语义和调度细节不同；
-- 放宽了当前“第二个 active listener 必须失败”的安全不变量；
-- accept queue 与 socket option 不是一个共享对象，故障验证更复杂。
-
-可以在未来作为明确的 platform adapter 研究，但不能成为默认正确性路径。
-
-### 6.4 永久 master/supervisor：MVP 不选
-
-永久 socket owner 能简化 worker replacement，但引入一个始终运行、也需要升级的控制进程和
-长期稳定的 master/worker protocol。对当前单 daemon 架构过重。若 Task 0 证明 macOS/Linux
-FD transfer 或共享 flock 不满足不变量，再重新评估这一方案；不并行实现两套路径。
-
-### 6.5 systemd socket activation：可选 adapter，非默认
-
-Linux supervised 部署可让 systemd 持有 listener，但 standalone macOS/Linux 仍需内建方案，
-且 socket activation 本身不会保留被停止 worker 的既有连接。后续可复用 `ListenerSet.adopt`
-接 systemd adapter，不纳入 MVP。
-
-### 6.6 进程内 RCU config swap：后续优化
-
-RCU/refcount config generation 可以降低 config reload 的双进程开销，但只解决配置，不解决
-binary upgrade；同时 Engine、Manager、selection、pool 和连接 borrow 的 lifetime 重构更深。
-先用 process generation 统一解决两类问题。若后续数据证明进程 replacement 太慢，再在同一个
-`RuntimeGeneration` seam 内增加 in-process adapter。
-
-### 6.7 选择 FD handoff
-
-该方案让复杂度集中在一个 replacement seam，调用者只表达 candidate，而不用知道 socket
-transfer、lock ownership、descriptor CAS、rollback 和 drain。NGINX 与 Envoy 的共同模式也是
-“新进程完整初始化 → listener handoff/继承 → old drain”，不是连接迁移。
-
----
-
-## 7. 目标架构
+## 5. 目标架构
 
 ```text
-                         owner-only runtime directory
-                    ┌──────────────────────────────────┐
-                    │ runtime-state.json (CAS authority)│
-                    │ zc.lock (shared flock description)│
-                    │ replacement request / Unix socket │
-                    └──────────────────────────────────┘
-                               ▲               ▲
-                               │               │
-                  control + FD │               │ state CAS
-                               │               │
-┌──────────────────────┐       │       ┌──────────────────────┐
-│ old active generation│───────┘       │ candidate generation │
-│ executable A         │ SCM_RIGHTS    │ executable A or B    │
-│ listener fd(s)       │──────────────▶│ same listener fd(s)   │
-│ accepted connections │ lock fd       │ accept gate closed   │
-└──────────────────────┘               └──────────────────────┘
-          │                                      │
-          │ quiesce                              │ activate
-          ▼                                      ▼
-┌──────────────────────┐               ┌──────────────────────┐
-│ old draining         │               │ new active           │
-│ no new accepts       │               │ all new accepts      │
-│ old connections only │               │ new connections only │
-└──────────────────────┘               └──────────────────────┘
+                         standalone installer
+                  download → short locked artifact publish
+                                 │
+                    owner-only lifecycle socket
+                                 │ begin(digest) / observe(tx)
+                                 ▼
+┌──────────────────────── old daemon ─────────────────────────┐
+│ BinaryReplacementCoordinator                                │
+│  ├─ VersionStore + inherited install-lock FD                │
+│  ├─ RuntimeRecord                                           │
+│  ├─ ListenerSet ─ mixed + lifecycle listener FDs ─┐         │
+│  ├─ ConnectionRegistry                            │         │
+│  └─ SpawnAdapter ─ daemon-lock/log/control FDs ───┼──┐      │
+└───────────────────────────────────────────────────┘  │      │
+                                                       ▼      │
+                                              candidate daemon│
+                                              full init, gated│
+                                                       │      │
+                  selected symlink decision            │      │
+                           ─────────────────────────────┘      │
+                                  │                           │
+                     candidate accepts new                    │
+                     old drains established                   │
 ```
 
-不新增永久中间进程。替换结束后只剩 candidate/new active；old 在 drain 完成后退出。
+不增加永久master process。只有replacement期间，old daemon临时承担coordinator职责。
 
 ---
 
-## 8. 深模块与 seam
+## 6. 深modules与seams
 
-### 8.1 `RuntimeGeneration` 模块
+### 6.1 `BinaryReplacementCoordinator`
 
-**建议文件：** `src/runtime_generation.zig`
+**建议文件：** `src/binary_replacement.zig`
 
-**接口职责：** 用少量方法管理一个完整运行代际，调用者不直接拼装 Config、Engine、Manager、
-API owner、listener thread 和 connection lifetime。
+这是唯一外部replacement seam。Installer、CLI、main和tests不能自行拼接phases。
 
-概念接口：
+概念interface：
 
 ```zig
-pub const RuntimeGeneration = struct {
-    pub fn prepare(options: PrepareOptions) !RuntimeGeneration;
-    pub fn arm(self: *RuntimeGeneration, source: ListenerSource) !void;
-    pub fn activate(self: *RuntimeGeneration) !void;
-    pub fn quiesce(self: *RuntimeGeneration) !QuiescedGeneration;
-};
+pub const BinaryReplacementCoordinator = opaque {
+    pub fn begin(
+        self: *BinaryReplacementCoordinator,
+        candidate: VerifiedArtifact,
+        options: Options,
+    ) !BeginResult;
 
-pub const QuiescedGeneration = struct {
-    pub fn resume(self: *QuiescedGeneration) !void;
-    pub fn finalize(self: *QuiescedGeneration, policy: DrainPolicy) DrainHandle;
+    pub fn observe(
+        self: *BinaryReplacementCoordinator,
+        transaction_id: TransactionId,
+    ) !ReplacementStatus;
 };
 ```
 
-接口不冻结为最终签名，但必须保持以下不变量：
+Interface必须隐藏：artifact identity、child spawn、FD manifest、protocol deadlines、quiesce、selected-pointer
+decision、forward recovery、runtime projection和drain ownership。
 
-- `prepare` 不 bind、不 accept、不 publication；失败无外部副作用；
-- `arm` 后 acceptor 已创建但 gate 关闭；
-- `activate` 只能调用一次；成功返回时 expected listeners 都能 accept；
-- `quiesce` 先停止控制面 mutation，再停止并 join acceptor，然后返回可 `resume` 或
-  `finalize` 的 typestate；它不能在 cutover 前封死 connection admission 或同步等完长连接；
-- `resume` 只用于 finalize 前 rollback，使用原 ListenerSet 重启 accept/control；
-- `finalize` 是不可逆点：调用 `ConnectionRegistry.beginDrain()` 并返回 `DrainHandle`；
-- `DrainHandle.wait()` 等待 connection lease；finalize 前即使连接已归零，也要保留 old listener
-  和 generation 以支持 rollback；
-- `deinit` 只能发生在 acceptor 已 join 且 connection registry 为 0 时；
-- 强制 deadline 路径不伪装成 clean drain。
+Wire adapter是runtime dir内固定路径的owner-only lifecycle Unix socket；每个background daemon cold start都创建，
+即使当前installation/invocation不支持replacement，也能提供status/stop与明确unsupported结果：
 
-**隐藏的 implementation：** config load、capability validation、desired selection reconcile、Engine、
-OutboundManager、AnyTLS pool、API server lifetime、listener workers、connection registry、日志上下文。
+- 只提供`begin/observe/status/stop`；
+- 以peer credentials、process nonce和transaction id认证；
+- `begin`只接受已经发布到VersionStore的`artifact_digest`，不接受任意path、FD或`SCM_RIGHTS`；
+- Socket listener属于ListenerSet并随candidate继承；existing installer connection可继续由old返回结果，新连接在ACTIVE后由candidate处理；
+- RuntimeRecord损坏时仍可通过live lifecycle endpoint观察/停止；endpoint也失效时，输出中记录的immutable executable是人工恢复入口。
 
-### 8.2 `ListenerSet` 模块
+规则：
+
+- Single-flight；已有transaction时相同candidate attach，不同candidate返回`REPLACE_IN_PROGRESS`；
+- Caller退出不取消transaction；
+- `begin`返回只表示request accepted，不代表commit；
+- Success必须包含selected/serving identity和draining事实；
+- Coordinator不调用普通`stopDaemon*`、`startDaemon()`或restart fallback；
+- Old在candidate确认接管lifecycle、serving record、terminal result与recovery ownership前不得退出。
+
+### 6.2 `VersionStore`
+
+**建议文件：** `src/version_store.zig`
+
+职责：
+
+- 分离`archive_digest`（下载provenance）与`artifact_digest`（解包后executable bytes identity）；
+- 以`artifact_digest`发布content-addressed immutable artifact；
+- 验证regular file、owner、permissions、size、version、OS/arch和handoff capability；
+- 读取并验证selected relative symlink；
+- `select(expected_old, candidate)`执行same-directory temp symlink + atomic rename + parent sync；
+- 返回`selection = old|candidate|unknown`与`durability = durable|uncertain`，不把sync error伪装成rollback；
+- 保护active、candidate和draining artifacts不被删除。
+
+Lock ownership固定为：
+
+1. Installer下载时不持install lock；
+2. VersionStore发布immutable artifact时短暂持stable advisory install lock，sync后释放；
+3. Old收到`begin(digest)`后重新取得同一lock并重验expected selected；
+4. Old把install-lock FD随candidate继承；双方持有到ACTIVE、terminal result和recovery ownership transfer完成后close；
+5. Installer等待/attach期间不持lock；stopped flow由单个VersionStore process持锁完成publish+select。
+
+首版不自动GC旧versions，避免在lifetime证明前加入删除策略。
+
+### 6.3 `ListenerSet`
 
 **建议文件：** `src/listener_set.zig`
 
-存在两个真实 adapter，因此这个 seam 是必要的：
-
-- `FreshListenerSource`：普通 cold start 时创建 socket；
-- `TransferredListenerSource`：replacement 时接收并验证 old 的 socket。
-
-概念接口：
+把public mixed与owner-only lifecycle listener ownership从protocol accept stack提升到process lifetime。每个listener
+明确`source = cold | inherited`：cold path执行bind/preflight，inherited path禁止port availability probe和rebind，只
+验证kernel metadata与frozen fingerprint。
 
 ```zig
-pub const ListenerSet = struct {
-    pub fn open(plan: ListenerPlan, source: ListenerSource) !ListenerSet;
-    pub fn serve(self: *ListenerSet, runtime: ServeRuntime) !Acceptors;
-    pub fn send(self: *const ListenerSet, channel: *HandoffChannel) !void;
+pub const ListenerSet = opaque {
+    pub fn bindCold(...) !*ListenerSet;
+    pub fn adoptInherited(...) !*ListenerSet;
+    pub fn startAccepting(self: *ListenerSet, runtime: *Runtime) !void;
+    pub fn pauseAndJoin(self: *ListenerSet) !void;
+    pub fn resume(self: *ListenerSet) !void;
+    pub fn manifest(self: *const ListenerSet) ListenerManifest;
 };
 ```
 
-模块内部负责：
+Listener固定nonblocking；acceptor等待`poll(listener, pause_notifier)`，二者同时ready时优先处理pause。每次accept
+后再次检查pause，并保证socket要么注册old registry、要么关闭。
 
-- listener role：`mixed | http | socks | controller`；
-- 固定 listener 上界：split proxy + controller 时最多 3 个；加 lock FD 后一次最多传 4 个 FD；
-- listener fingerprint 规范化和 exact-set comparison；
-- received FD 的 `fstat`、`SO_TYPE`、`SO_ACCEPTCONN`、`getsockname`、重复 FD/role 校验；
-- CLOEXEC、nonblocking 和 write-safety policy；
-- `poll(listener, notifier)` 驱动的可取消 accept loop；
-- quiesce notifier、acceptor ACK 和 join；
-- 绝不从 foreign thread 直接 close 一个阻塞在 `accept` 的 FD。
+`pauseAndJoin()`成功的定义：
 
-protocol-specific 模块改为处理已接收 connection，不再自己 bind：
+- Notifier已经唤醒poll，acceptor thread已join；
+- 每个in-flight accepted socket已经注册到ConnectionRegistry或关闭；
+- 返回后old accept/registry count不可能再增加；
+- Listener FD本身仍open且没有`shutdown()`。
 
-```text
-mixed/http/socks/api: bind + accept + lifetime
-                    ↓
-ListenerSet: bind/adopt + accept + control
-protocol modules: accepted connection handling only
-```
+Candidate `adoptInherited()`必须跳过现有bind/port probe，校验role、FD唯一性、`SO_TYPE`、`getsockname`、
+address/port与platform可取得的listener state；任何差异在ARMED前失败。Connection代际以server成功
+`accept()`并取得registry lease为界：quiesce ACK前old已accept的归old；backlog中尚未accept的只由ACTIVE
+candidate取得，不能按client handshake发生在commit前后来推断。
 
-### 8.3 `ConnectionRegistry` 模块
+### 6.4 `ConnectionRegistry`
 
 **建议文件：** `src/connection_registry.zig`
 
-统一替换：
+- Accepted socket在worker spawn前注册；
+- Worker owns一个stable lease；
+- HTTP CONNECT、SOCKS TCP和SOCKS5 UDP association的完整lifetime都在lease内；
+- Spawn失败按逆序release；
+- Old quiesce后registry只减不增；
+- `waitEmpty(deadline)`返回clean或forced count；
+- Count无法确认时status显示`unavailable`，不得伪造0；
+- Last worker只notify drain owner，不inline destroyConfig/Engine/Manager。
 
-- mixed 的局部 `ConnectionLimiter`；
-- API 的局部 `active_connections`；
-- SOCKS/HTTP 未跟踪的 detached worker。
+### 6.5 `RuntimeRecord`
 
-概念接口：
+现有`runtime_descriptor.zig`演进为单一runtime projection，删除`zc.pid`的authority语义。
 
-```zig
-pub const ConnectionRegistry = struct {
-    pub fn tryAcquire(self: *ConnectionRegistry, kind: Kind) ?Lease;
-    pub fn beginDrain(self: *ConnectionRegistry) void;
-    pub fn wait(self: *ConnectionRegistry, deadline_ms: i64) DrainResult;
-};
-```
-
-硬不变量：
-
-- admission 上界仍为现有 TCP 128、UDP association 64；
-- `beginDrain` 后新 acquire 必须失败，且只能在 replacement `finalize` 时调用；
-- acceptor join 发生在 `beginDrain` 之前，避免“最后一个 accept”遗漏，同时保留finalize前
-  rollback所需的`resume`能力；
-- Lease release 必须是 worker 对 generation 最后一次访问；registry 归零后没有线程再借用
-  Config/Engine/Manager/API；
-- worker 可以 detached，但只有满足上一条才能用 active count 作为 join barrier；更优先改成可 join 的
-  bounded worker ownership；
-- plain HTTP CONNECT 必须移出 listener thread，否则一个长连接会阻塞后续 accept 和 quiesce；
-- UDP association 由 control TCP lease 覆盖，并保留独立 UDP count 上界。
-
-### 8.4 `HandoffProtocol` 模块
-
-**建议文件：** `src/handoff_protocol.zig`
-
-外部 seam 只支持 Unix domain socket；内部测试 seam 有真实 socketpair adapter，不创建通用 transport
-框架。
-
-协议要求：
-
-- exact `protocol_version`；版本不一致返回 `REPLACE_PROTOCOL_MISMATCH`，无兼容 fallback；
-- 128-bit transaction nonce；
-- canonical bounded frame，单 frame 最大 64 KiB；
-- metadata frame 与 FD bundle 分离；FD bundle 使用 `sendmsg/recvmsg`，一个 marker byte 携带
-  ancillary data；
-- 接收 FD 数必须与 metadata 完全相等，extra/missing/truncated ancillary data 全部拒绝并关闭；
-- 所有 read/write/phase wait 使用 monotonic absolute deadline 和固定重试上界；
-- peer euid 必须等于当前 euid；Linux 使用 peer credentials，macOS 使用平台等价检查；
-- runtime dir、socket node 和 request file 必须 owner-only、no-follow、canonical；
-- candidate pid、nonce、self executable device/inode/build id 与 request 一致；
-- channel EOF 在 finalize 前触发 rollback 或明确的恢复判定。
-
-### 8.5 `ReplacementCoordinator` 模块
-
-**建议文件：** `src/replacement_coordinator.zig`
-
-这是调用者使用的主要深模块：
-
-```zig
-pub fn replace(options: ReplaceOptions) !ReplaceResult;
-```
-
-`ReplaceOptions` 只表达：candidate executable identity、prepared config、expected active nonce、
-drain policy、是否需要 install pointer commit。内部隐藏：
-
-- admission 和并发替换拒绝；
-- candidate process launch/setsid/log wiring；
-- handoff channel；
-- FD/lock transfer；
-- old quiesce、新 activate；
-- runtime CAS；
-- readiness/stability；
-- rollback；
-- drain/finalize；
-- cleanup。
-
-`reload`、`config update --apply hot` 和 installer 都必须调用该接口，不得各自复制状态机。
-
----
-
-## 9. Runtime authority 重构
-
-### 9.1 单一权威状态
-
-移除 `zc.pid` 作为 authority。新的规则：
-
-- `zc.lock`：证明本环境存在一个 active/candidate/draining 集合，并阻止无关 cold start；
-- `runtime-state.json`：唯一记录 active identity、replacement phase、candidate/draining；
-- active PID 只从 runtime state 读取；
-- lock held 但 state 缺失/损坏时报告 `lock_held_runtime_untracked`，不猜测、不收养；
-- state 存在但 lock 未持有时视为 stale state，只在安全 CAS/identity 验证后清理。
-
-不继续维护 pid file 与 descriptor 两份事实。`status.paths.pid_file` 及相关旧路径直接删除，相关
-文档和测试同步修改。
-
-### 9.2 建议 schema
-
-示意结构：
-
-```json
-{
-  "schema_version": 3,
-  "runtime_epoch": 42,
-  "active": {
-    "pid": 1234,
-    "nonce": "...",
-    "build_id": "v1.1.0+commit",
-    "executable": { "device": 1, "inode": 2 },
-    "ready": true,
-    "identity": { "key": "default", "revision": "..." },
-    "selection_generation": 9,
-    "invocation": {},
-    "listeners": []
-  },
-  "replacement": null,
-  "draining": null
-}
-```
-
-replacement 存在时包含：
-
-```json
-{
-  "transaction": "128-bit nonce",
-  "phase": "preparing|armed|quiesced|cutover|stabilizing|finalizing|rolling_back",
-  "candidate": {},
-  "started_at": "RFC3339"
-}
-```
-
-draining 包含 old descriptor、quiesced_at、可空的 drain deadline、是否已 finalize，以及 last
-observed connection counts。磁盘 schema 只记录恢复所需事实；高频 active count 不每次落盘，
-由 old/new IPC status 提供。
-
-### 9.3 CAS 规则
-
-- 每次 state mutation 都要求 exact `runtime_epoch` 和 expected active nonce；
-- successful mutation 将 `runtime_epoch + 1`，checked overflow fail closed；
-- selection mutation 只允许更新 active 的 `selection_generation`，必须完整保留 replacement/draining；
-- replacement cutover 同时替换 active 并写入 draining，不能分两次 publication；
-- rollback 同时恢复old active，并在candidate已有连接时把candidate原子改写为reverse-draining；
-  没有连接时才直接移除candidate，任何路径都不能留下双active；
-- old drain 完成只可删除与自身 nonce 完全匹配的 draining entry，绝不能删除 new active；
-- `ready=true` 只能从同一 active nonce 的 `ready=false` 单向提升；rollback 使用另一次明确 CAS，
-  不允许 readiness 静默回退。
-
-### 9.4 Daemon lock handoff
-
-Zig 0.16.0 `std.Io.File.lock` 在 POSIX Threaded adapter 中使用 `flock`。MVP 传递同一个打开文件
-描述的 duplicate：
-
-- old 与 candidate 暂时都持有 lock FD；
-- candidate 不调用 unlock，只设置自己的 received descriptor 为 CLOEXEC；
-- old close 后 candidate 的 duplicate 继续维持 lock；
-- rollback 时 candidate close，old 仍维持 lock；
-- 不存在 unlock/relock 窗口，第三个 daemon 无法抢占；
-- canonical lock file inode 在整个事务中不得被 replace。
-
-Task 0 必须用真实进程证明该行为在 Linux/macOS release target 成立，不能只依赖推论。
-
----
-
-## 10. Replacement 状态机
-
-### 10.1 正常路径
-
-| 阶段 | Authority | Old 行为 | Candidate 行为 | 失败处理 |
-| --- | --- | --- | --- | --- |
-| `steady` | old active/ready | 正常 accept/mutation | 不存在 | — |
-| `admission` | old active/ready | 不变 | CLI 校验 candidate 与 exact active nonce | 不改 runtime |
-| `preparing` | old active/ready + replacement | 正常服务 | 加载 prepared config、能力校验、恢复 desired selection，不 bind | abort candidate |
-| `handoff` | old active/ready + replacement | 认证 peer，发送 listener + lock FD，继续 accept | 接收并逐个验证 FD | abort candidate，old 不变 |
-| `armed` | old active/ready + candidate armed | 正常 accept | acceptor threads 已启动但 gate closed | abort candidate |
-| `control_quiesce` | old active/ready | 禁止新 control mutation；等待旧 API request ≤2s | gate closed | old 恢复 control |
-| `listener_quiesce` | old active/ready | notifier 停 accept，join acceptors，仍持 listener FD | gate closed | old resume accept/control |
-| `cutover` | candidate active/ready=false；old draining(unfinalized) | 不 accept，尚未seal registry，保留 listener 供 rollback，继续旧 data connections | authority 已切换，尚未声明 ready | CAS 失败则 old resume |
-| `activate` | candidate active/ready=false | 不 accept | 打开 gate，所有 acceptor ACK | 反向 CAS + old resume |
-| `stabilizing` | candidate active/ready=true；old draining | 保留 rollback 能力 | final desired reconcile；内部 health/stability wait | rollback |
-| `publish_pointer` | 同上 | 等待 | binary upgrade 时 installer 原子切 current symlink | pointer 失败则 rollback |
-| `finalize` | candidate active/ready=true；old draining(finalized) | 放弃 rollback，seal registry并开始bounded drain deadline | 正常服务新连接 | finalize 后不自动回滚 |
-| `retire` | candidate active/ready=true | connection=0 或 deadline 后退出，CAS 删除 draining | 正常服务 | forced count 可观察 |
-| `steady` | candidate active/ready=true | 不存在 | 唯一 daemon | — |
-
-### 10.2 Cutover 顺序不变量
-
-1. Candidate acceptor 必须先 armed 并 ACK gate closed。
-2. Old acceptor quiesce/join 后，才允许 runtime active CAS。
-3. CAS 后 candidate 才打开 gate。
-4. Candidate acceptor 全部 ACK 后，才把 active `ready` 提升为 true。
-5. 从 old quiesce 到 candidate ACK 的总时间超过 250 ms，必须 rollback。
-6. Old 在 finalize 前始终保留 listener FD；“不 accept”不等于 close。
-7. Finalize 前 candidate 失败，old 必须能够用原 FD resume accept。
-
-该顺序允许短暂排队延迟，但没有 socket close/rebind 空窗。
-
-### 10.3 Rollback 路径
-
-#### Cutover 前
-
-- Candidate 关闭 received FD 和 lock duplicate；
-- 删除 transaction request/socket/prepared candidate snapshot；
-- runtime state CAS 回 `steady(old)`；
-- old 未 quiesce则完全不动，已 quiesce则 resume accept/control；
-- installer target 不切换。
-
-#### Cutover 后、finalize 前
-
-1. Candidate 先 quiesce 自己的 acceptor；
-2. CAS：active candidate → old ready=false；移除old的draining身份，并在candidate已有连接时将其
-   写为reverse-draining；
-3. Old resume listener 和 control；
-4. Old ACK 后提升 old ready=true；
-5. Candidate 若已接收连接，则作为reverse-draining generation保留这些连接到归零/deadline；没有
-   connection才立即退出；
-6. 若 binary pointer 已切 candidate，installer 原子切回 old version；
-7. 返回 `REPLACE_FAILED_ROLLED_BACK`，不能输出成功。若candidate是crash而非可控rollback，其
-   已接收连接无法保留，结果必须标记continuity degraded。
-
-#### Finalize 后
-
-不再自动回滚。Candidate crash 按普通 daemon crash 处理。保留一个永久等待 rollback 的 old 进程会
-破坏 bounded resource 不变量，因此 finalize 是明确不可逆点。
-
-### 10.4 Coordinator 异常退出
-
-Candidate/old 不能无限等待 installer/CLI：
-
-- 每阶段有 monotonic deadline；
-- finalization 前 control channel EOF 进入 recovery；
-- binary upgrade 检查原子 current symlink 的 exact executable identity：
-  - 指向 candidate：继续 finalize；
-  - 指向 old：rollback；
-  - missing/第三个 identity：candidate 继续 accept，old 保留 rollback FD，state 标记
-    `operator_intervention`，拒绝新 replacement，不猜测；
-- config reload 无 install pointer，coordinator EOF 默认 rollback。
-
-### 10.5 进程 crash
-
-| Crash 点 | 预期 |
-| --- | --- |
-| Candidate 在 cutover 前 crash | old 一直 active；清理 transaction |
-| Candidate 在 cutover 后、finalize 前 crash | old CAS rollback并resume；candidate已接收连接随crash丢失，明确标记continuity degraded |
-| Old 在 candidate ready 前 crash | candidate 关闭 handoff；按普通 cold recovery重新 bind/start，不伪造 graceful success |
-| Old 在 cutover 后 crash | candidate 已持 listener/lock；继续 ready/finalize；old 既有连接因 crash 已丢失，结果不得标记 full continuity |
-| Candidate 在 finalize 后 crash | runtime health 报 stopped/stale；由显式 start/supervisor恢复 |
-| 两者都 crash | 最后一个 lock FD 关闭；后续 start 清理 stale state并正常 bind |
-
----
-
-## 11. Listener 与 accept loop 重构
-
-### 11.1 Listener creation 移出 protocol 模块
-
-`mixed.startWithReady`、`http.startWithReady`、`socks5.startWithReady` 和
-`ApiServer.startWithAcceptGate` 不再调用 `listenReuseAddr`。它们改为接受已经验证的 listener
-handle/accepted connection source。
-
-`compat.net.ReuseAddrListener` 增加：
-
-- 从 raw FD 构造的受控入口，仅供 `ListenerSet`；
-- `duplicate`/identity validation 所需 helper；
-- poll-ready nonblocking accept；
-- `getsockname`/`SO_TYPE`/`SO_ACCEPTCONN` 查询；
-- Unix FD send/receive 放在独立 handoff helper，而非 net 高层 wrapper。
-
-### 11.2 Acceptor control
-
-每个 acceptor 使用：
+最小字段：
 
 ```text
-poll([listener_fd, control_notifier_fd], absolute_deadline)
-```
-
-control event：
-
-- `activate`：从 armed gate 进入 accepting；
-- `quiesce`：停止调用 accept，发 ACK，线程正常返回；
-- `abort`：candidate 未提交时退出；
-- `shutdown`：fatal/explicit stop。
-
-不使用每 1 ms sleep polling，不依赖 signal handler，不从其他线程 close 阻塞 FD。
-
-### 11.3 Connection ownership
-
-- accept 成功后先拿 `ConnectionRegistry.Lease`，失败则关闭 connection；
-- task 对 Config/Engine/Manager 的 borrow 由 Lease 覆盖；
-- task cleanup 顺序必须保证 Lease release 是最后一个 generation 访问；
-- listener/worker task allocation 失败只影响该 connection，不能杀 daemon；
-- old quiesce 后不再产生新 Lease；
-- registry=0 后才允许 manager/api/config deinit。
-
-### 11.4 Fatal listener error
-
-当前 committed listener fatal 会直接 `process.exit`。重构后：
-
-- fatal error 上报 `RuntimeGeneration` event loop；
-- active generation 将 `ready=false`、停止其他 listener、更新 health；
-- replacement 中 candidate fatal 触发 rollback；
-- normal active fatal 可按现有 fail-fast policy 退出，但必须由 owner event loop统一执行清理；
-- detached thread 不得自行删除 runtime state或直接输出 lifecycle envelope。
-
----
-
-## 12. Control plane 与 selection 一致性
-
-数据连接可以在 old drain；控制面不能同时有两个 writable owner。
-
-Cutover 前执行：
-
-1. old `control_available=false`，新 mutation 返回 503/typed unavailable；
-2. 获取/等待 old `selection_apply_lock` 和所有 active API request，deadline 2s；
-3. candidate 从 authoritative state 再次加载 desired selection；
-4. 复用现有 `FinalDesiredGuard` 与 `reconcileRuntimeDesired`；
-5. runtime state CAS active nonce；
-6. candidate controller accept gate 打开；
-7. candidate `control_available=true`。
-
-任何 selection mutation 都必须 CAS active nonce + runtime epoch + selection generation。旧 controller
-连接即使在 cutover 后继续发送请求，也只能得到 stale-active 拒绝，不能改 old manager 后冒充已应用。
-
-`GET /status`：
-
-- active controller 返回自己的内存 selections/config；
-- CLI 用 runtime state 定位 active endpoint；
-- draining controller 不再接收新请求；
-- status 获取失败时只显示 descriptor facts，不从 durable active profile猜 daemon 内存。
-
----
-
-## 13. 配置 reload 语义
-
-### 13.1 统一行为
-
-`zc reload`：
-
-- active daemon 不存在：返回明确 no-op，不声称 `hot_applied`；
-- managed background daemon + exact listener set：执行 same-binary graceful replacement；
-- foreground/supervised：返回 `REPLACE_SUPERVISED`；
-- listener fingerprint 改变：返回 `REPLACE_LISTENER_INCOMPATIBLE`；
-- transition/drain 已存在：返回 `REPLACE_IN_PROGRESS`；
-- candidate 任一步失败：old 保持 active，返回 rollback/failure facts。
-
-### 13.2 简化 apply mode
-
-当前 `auto|hot|restart` 中 `hot` 实际不可用，`auto` 会静默 fallback。目标行为直接移除过时路径：
-
-- `hot`：只允许 graceful replacement，失败不 fallback；
-- `restart`：明确的 cold stop/start，可能中断 connection；
-- 删除 `auto` 与 `restart_fallback` token；
-- `config update` 默认 `hot`；需要 cold behavior 必须显式 `--apply restart`；
-- JSON 结果区分 `applied=false`、`graceful_applied`、`restart_applied`。
-
-这是用户可感知变化，落地时同步更新 `docs/cli/spec.md`、`docs/cli/ux-workflow.md`、
-`docs/reliability/e2e.md`。
-
-### 13.3 Prepared config
-
-继续复用现有 authenticated immutable prepared snapshot：
-
-- Candidate 只从 snapshot 加载，不在 handoff 中重新读取可变源文件；
-- candidate 仍执行配置语法、能力、资源和进程内listener冲突校验，但对将被handoff的exact endpoint
-  不运行普通`checkPortAvailable`；端口正在被old占用是预期状态，正确性由listener指纹和received FD
-  校验证明；
-- binary candidate 使用自己的 parser/capability gate读取 snapshot；新版本拒绝即在 cutover 前失败；
-- snapshot 只在 active/candidate/draining 都不引用后删除；
-- replacement state 保存 exact snapshot identity，不提供 cwd/source fallback。
-
----
-
-## 14. Binary install / upgrade
-
-### 14.1 版本化布局
-
-Standalone installer 目标布局：
-
-```text
-$ZC_INSTALL_DIR/
-  zc -> .zc/versions/v1.1.0-<sha256>/zc
-  .zc/
-    versions/
-      v1.1.0-<sha256>/zc
-      v1.1.1-<sha256>/zc
-    install.lock/
-    install-state.json
+schema_version
+record_epoch
+installation = versioned { selected_version, artifact_digest, path }
+             | unmanaged
+runtime_snapshot {
+  snapshot_id
+  prepared_path + prepared_identity
+  invocation { foreground, prepared, source_path, port_override, overrides }
+  config_identity { key, revision }
+  effective_mixed_port
+  listener_manifest + listener_fingerprint
+}
+serving  { pid, nonce, version, artifact_digest, device, inode, snapshot_id }
+candidate? { pid, nonce, version, artifact_digest, snapshot_id }
+draining?  { pid, nonce, version, artifact_digest, snapshot_id,
+             connections, deadline_boot, deadline_realtime }
+replacement? { transaction_id, phase, drain_duration, started_at, last_error }
+last_replacement?
 ```
 
 规则：
 
-- `.zc` owner-only；candidate binary 是 regular file、no symlink、owner 正确、group/other 不可写；
-- version directory 名由 immutable tag + verified archive digest 导出；
-- candidate 先 checksum、archive、codesign（macOS）、`--version` 和内部 self-check；
-- `$ZC_INSTALL_DIR/zc` 是 installer 管理的 symlink；临时 symlink 与目标同目录，使用 atomic rename；
-- 不覆盖运行中 executable inode；
-- old version 在 draining 结束前不得 GC；
-- descriptor 存 device/inode/build id，不以可变逻辑路径判断进程版本。
+- Atomic replace + parent sync；
+- Old在precommit写；candidate ACTIVE后取得serving-writer ownership；
+- Epoch/nonce CAS阻止draining old覆盖serving candidate；
+- RuntimeRecord损坏/写失败不能改变selected pointer；
+- Status必须同时呈现selected与serving，禁止假设二者永远相同；
+- Foreground/unmanaged仍能使用普通start/status/stop/restart，只是replacement admission fail closed；
+- Phase A只能从record中的exact immutable runtime snapshot读取scope/invocation/listener facts；
+- Stop定位serving及draining processes，不再把独立PID file当唯一事实。
 
-### 14.2 Running upgrade 正常流程
+### 6.6 Platform `SpawnAdapter`
 
-1. Installer 取得 install lock；
-2. 下载、校验并发布 immutable candidate version directory；
-3. 读取 authoritative runtime state；
-4. 若 stopped：原子切 symlink，完成；不擅自启动；
-5. 若 managed background active：直接执行 candidate binary 的内部 handoff entry；
-6. Candidate 用 active prepared config 完成 replacement 到 ready=true；
-7. Installer 验证 active executable identity 正是 candidate；
-8. 原子切 `$ZC_INSTALL_DIR/zc` symlink；
-9. 重读 symlink和 runtime state，二者都指向 candidate；
-10. 发送 finalize；old drain；
-11. 写最终 install state，释放锁；
-12. old retired 后 GC 无引用版本。
+这是一个真实seam，因为Linux和macOS需要不同implementation/contract tests。
 
-### 14.3 Installer rollback
-
-- Candidate ready 前：target symlink 未改，删除 candidate 或留作 cache，old 不变；
-- Candidate ready 后、symlink 切换失败：请求 runtime rollback，确认 old ready，再失败退出；
-- symlink 已切 candidate、finalize 前 candidate 失败：切回 old symlink，然后 runtime rollback；
-- runtime rollback 失败：保留两个 version，输出 exact active/pointer identity 和人工处理步骤；
-- trap/signal 不删除 descriptor 仍引用的版本；
-- 禁止“status 看起来 running 就算成功”，必须匹配 active nonce、PID、build id、device/inode。
-
-### 14.4 Bootstrap 与 protocol compatibility
-
-现有发布版不理解 handoff protocol，因此引入该能力的第一个版本必须 cold install：
-
-- running legacy daemon 时 installer 明确返回 `INSTALL_HANDOFF_UNSUPPORTED`；
-- 用户先 `zc stop`，再执行新 installer；
-- 安装后直接采用唯一的 versioned layout，不长期维护 regular-file layout分支；
-- 后续版本要求 exact handoff protocol version；不匹配时 fail closed并要求显式 cold upgrade；
-- 不自动 fallback，因为自动 stop/start 会违背用户对无缝升级的预期。
-
-### 14.5 Homebrew
-
-MVP 只保证 standalone installer。Homebrew 仍文档化为 supervisor/cold upgrade，直到有独立验收证明
-Cellar cleanup、symlink切换和 post-upgrade hook 能满足同样事务。不能因为 standalone 已完成就宣称
-Homebrew 无缝。
+- 使用Zig 0.16 build-time C translation引入`<spawn.h>`；不使用deprecated `@cImport`；
+- `posix_spawn` file actions只映射bootstrap socket、daemon lock、install lock、listener set和shared log FD；
+- macOS使用`POSIX_SPAWN_CLOEXEC_DEFAULT`并显式allowlist manifest；
+- Linux所有socket/accept/pipe creation优先使用atomic CLOEXEC；macOS或fallback的`accept→fcntl`路径必须与spawn共用一个短FD-table barrier；
+- 任何CLOEXEC设置失败都hard fail，禁止当前忽略错误的做法进入replacement路径；
+- Child验证manifest后立即为inherited FDs恢复CLOEXEC；
+- 捕获shared log FD前必须取得rotation lease并等rotation loop ACK；lease保持到drain terminal后转给candidate；
+- Child mode只接受private inherited bootstrap capability，直接从shell调用必须失败；
+- 不提供任意path/任意FD的公共spawn interface。
 
 ---
 
-## 15. CLI、minimal API 与日志
+## 7. Install layout与唯一selection decision
 
-### 15.1 `status`
+### 7.1 新layout
 
-保持 `state=running|stopped` 的高层概念，新增而不重复 active facts：
+```text
+${ZC_INSTALL_DIR}/
+├── zc -> .zc/versions/sha256-<digest>/zc
+└── .zc/
+    ├── install.lock
+    └── versions/
+        ├── sha256-<old>/zc
+        └── sha256-<candidate>/zc
+```
+
+Version file不可为symlink，发布后不原地chmod/write/replace。`${ZC_INSTALL_DIR}/zc`必须是owner-owned relative
+symlink，且target必须解析到同一个`.zc/versions`root内。
+
+### 7.2 Artifact publication不是runtime commit
+
+Download、checksum、extract、self-check和version-dir publication都发生在old仍accept时。即使installer在这一步
+退出，也只是多一个未selected artifact，不影响runtime。
+
+### 7.3 唯一selection decision规则
+
+唯一selection decision为：
+
+```text
+readlink(${ZC_INSTALL_DIR}/zc) == exact candidate artifact
+```
+
+Commit操作：
+
+1. 确认coordinator仍持有Phase A取得的long install-lock FD；不得递归acquire；
+2. Readback必须exact等于transaction记录的old target；
+3. 在install dir创建owner-only temp relative symlink；
+4. Atomic rename覆盖`zc`；
+5. Sync install dir；
+6. 再次readback并验证candidate digest/device/inode。
+
+Outcome包含两个正交facts：
+
+| Readback | Selection | 行为 |
+| --- | --- | --- |
+| exact old | Precommit | Abort candidate并resume old |
+| exact candidate | Postcommit | 只forward activate/recover candidate |
+| missing/third-party/unreadable | Attention | 双方不新增admission，保留证据等待同transaction恢复 |
+
+| Parent sync | Durability |
+| --- | --- |
+| success | `durable` |
+| error / 无法确认 | `durability_uncertain`；按readback方向继续，但不能声称durable success |
+
+Rename返回值、directory sync错误、runtime ACK或CLI exit code都不能覆盖readback裁决。Host crash下
+`durability_uncertain`可能改变cold-start结果，因此本方案不把它宣传为持久成功。
+
+---
+
+## 8. 完整replacement流程
+
+### Phase A — Stage与preflight
+
+1. Installer不持install lock地解析latest并下载archive/checksum；
+2. 验证`archive_digest`、size、OS/arch和archive shape，安全解包后单独计算executable `artifact_digest`；
+3. VersionStore短暂取得stable advisory install lock，在`.zc/versions/sha256-<artifact_digest>`发布并sync immutable candidate，然后释放lock；
+4. 执行candidate`--version`与private compatibility probe；
+5. Installer连接old lifecycle endpoint，只提交`artifact_digest`并取得transaction id；
+6. Old coordinator取得install lock，重验selected、serving executable与RuntimeRecord exact snapshot；
+7. 检查scope：managed background、prepared、one mixed、no controller、no AnyTLS、无candidate/draining；
+8. 冻结old exact prepared invocation、listener fingerprint、old/new identities与`drain_duration=15m`；此时不计算绝对deadline；
+9. 原子写precommit transaction intent及old/candidate immutable恢复命令；写/sync失败时不spawn、不quiesce。
+
+### Phase B — Candidate ARMED
+
+10. Old先暂停log rotation并取得rotation lease，然后创建private socketpair；
+11. Old通过SpawnAdapter启动candidate，并继承public/lifecycle listeners、daemon lock、install lock、log FD和bootstrap channel；
+12. Candidate验证bootstrap capability、protocol version、artifact identity和每个inherited FD，并恢复CLOEXEC；
+13. Candidate走`ListenerSource.inherited`，跳过bind和port availability probe；
+14. Candidate从old exact authenticated prepared snapshot构建Config、Engine、Manager及background resources；
+15. Candidate不publish serving runtime、不accept public/lifecycle traffic、不开放controller；
+16. Candidate验证最终listener/config fingerprint后发送`ARMED`；
+17. Exec/init/validation/OOM/timeout发生时candidate退出，old继续accept，双方close install-lock refs，transaction返回precommit error。
+
+### Phase C — Final fence与old quiesce
+
+18. Old进入replacement mutation fence，拒绝新的config/restart/upgrade mutation；
+19. 在StateAuthority guard下重读exact profile/revision与latest desired selection；变化则abort；
+20. Candidate完成final selection reconcile；
+21. Old调用`ListenerSet.pauseAndJoin()`，同时quiescepublic与lifecycle acceptors；已有installer connection保留；
+22. Old确认acceptors已join且public registry从此只减不增；
+23. Old仍持有listeners、daemon/install locks、runtime和existing connections；
+24. Quiesce失败且selected仍为old时，old resume并abort。
+
+### Phase D — Selected pointer decision
+
+25. Coordinator调用`VersionStore.select(expected_old, candidate)`；
+26. Readback=old：candidate退出，old resume；
+27. Readback=unknown：进入attention，只允许可认证的lifecycle recovery，不猜测public admission；
+28. Readback=candidate：replacement进入postcommit，old永不resume public/lifecycle admission；
+29. 以同host `.boot` monotonic clock计算`deadline_boot = now + 15m`，另记录realtime仅用于展示；
+30. 单独记录selection durability；sync error但readback=candidate时forward并携带`durability_uncertain`。
+
+Selected readback是唯一selection decision。此前failure保old；此后failure只向selected candidate收敛。
+
+### Phase E — Candidate ACTIVE与recovery ownership handoff
+
+31. Coordinator发送`ACTIVATE(deadline_boot)`；
+32. Candidate再次readback selected pointer，必须exact指向自身artifact；
+33. Candidate以`activateOnce()`开启public/lifecycle gates；该步骤只做预先准备好的bounded wake操作；
+34. Candidate发送`ACTIVE`，成为唯一serving process；
+35. Candidate以新PID/nonce CAS更新RuntimeRecord：serving=candidate、draining=old；
+36. Candidate把correlated terminal result持久化，并确认lifecycle endpoint已经接管；
+37. Candidate发送`RECOVERY_OWNERSHIP_ACK`；随后old/candidate close各自install-lock FD，installer不持lock；
+38. Old在收到上述四项证明前不得退出；installer确认selected、serving、artifact digest/device/inode与新PID后返回成功；
+39. ACK/result丢失不rollback；重试通过lifecycle endpoint attach相同transaction。
+
+Candidate在ARMED后遇到bootstrap EOF或ACTIVATE timeout时必须readback selected：exact old则退出；exact self则
+幂等`activateOnce()`并接管lifecycle；unknown只开放lifecycle recovery、保持public gate关闭并进入attention。
+Old在drain/finalization期间可对crashed candidate做有界的same-selected forward respawn，但永不恢复old admission。
+
+### Phase F — Old drain
+
+40. Old关闭mutation/control ownership，但继续运行Config、Engine、Manager与existing workers；
+41. Old不再accept，只通过private channel发送有界有序`DRAIN_PROGRESS(count)`；candidate是唯一RuntimeRecord writer；
+42. Registry归零时old发送`DRAIN_DONE(clean, 0)`并退出；candidate记录`completed_clean`；
+43. Old自身和candidate watchdog都使用同一`.boot`deadline；candidate signal old前验证PID/nonce；
+44. Deadline到期且old能报告时发送`DRAIN_DONE(forced, count)`后终止remaining connections；
+45. Old crash/kill未提供terminal count时candidate记录`connections=unavailable`与continuity degraded，绝不伪造exact forced count；
+46. Drain terminal后candidate恢复log rotation并结束transaction；此后candidate crash属于普通stable daemon failure，selected仍new，但不承诺自动forward；
+47. Draining结束前下一次replacement返回`REPLACE_IN_PROGRESS`。
+
+---
+
+## 9. State machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> stable_old
+
+    stable_old --> preparing: artifact + intent
+    preparing --> stable_old: preflight/stage failure
+    preparing --> armed: candidate ARMED
+    preparing --> stable_old: candidate failure
+
+    armed --> quiescing: final fence
+    quiescing --> stable_old: pointer still old + resume
+    quiescing --> attention: resume outcome unknown
+    quiescing --> committing: acceptor joined
+
+    committing --> stable_old: selected readback old
+    committing --> attention: selected unknown
+    committing --> activating: selected readback candidate
+
+    activating --> ownership_handoff: candidate ACTIVE
+    activating --> attention: forward recovery exhausted
+    ownership_handoff --> draining: lifecycle + record + result + recovery ACK
+    ownership_handoff --> attention: ownership proof unavailable
+
+    draining --> stable_new: registry empty
+    draining --> stable_new: 15m deadline + forced close
+
+    stable_new --> [*]
+    attention --> [*]: explicit recovery required
+```
+
+`stable_old`与`stable_new`都是正常stable状态，只是selected/serving artifact不同。
+
+---
+
+## 10. Failure语义
+
+### 10.1 Precommit
+
+| Failure | 必须发生的行为 |
+| --- | --- |
+| Download/archive digest/executable digest/self-check失败 | 不发布candidate，不碰runtime |
+| Artifact publication或intent sync失败 | Old继续accept；不进入quiesce |
+| Protocol/version mismatch | Candidate不启动或立即退出；old不变 |
+| Child exec/FD validation失败 | Old继续accept；candidate清理 |
+| Config/provider/resource/OOM失败 | Old继续accept；返回candidate failed |
+| Final identity/selection变化 | Abort；old保持最新durable state |
+| Quiesce失败 | Selected仍old时resume old；报告rolled back |
+| Pointer operation后readback=old | Candidate退出；old resume；报告not committed |
+
+### 10.2 Postcommit
+
+| Failure | 必须发生的行为 |
+| --- | --- |
+| Directory sync报错但readback=candidate | `selection=candidate,durability=uncertain`并forward；不得宣称durable success |
+| `ACTIVATE`/`ACTIVE` ACK丢失 | Candidate按selected执行`activateOnce()`；不得rollback |
+| Candidate在ACTIVE前退出 | Old只可有界respawn同一个selected artifact；不得恢复old admission |
+| Candidate在ACTIVE后、old drain结束前crash | 记录continuity degraded；old可forward same-selected，但不得resume old admission |
+| Candidate在stable_new后crash | Transaction已结束；selected保持new，走普通显式`zc start`，不承诺自动forward |
+| RuntimeRecord publication失败 | Candidate重试projection；old在recovery handoff前不得退出，selected decision不变 |
+| Old在drain中crash | Candidate继续serving；old connections与count记lost/unavailable |
+| Installer/CLI退出 | Coordinator继续；重试经lifecycle endpoint attach同transaction |
+| Drain deadline | Candidate watchdog验证old identity；有terminal count才记forced count，否则记unavailable/degraded |
+
+### 10.3 Attention
+
+以下情况禁止自动猜测：
+
+- Selected symlink missing；
+- Selected指向versions root外或第三方artifact；
+- Pointer identity无法读取；
+- Runtime record与selected都不足以确定decision；
+- Lock/listener ownership不再能证明。
+
+Attention时public admission保持关闭，但可认证的lifecycle endpoint继续提供observe/status/stop。系统保留artifacts、
+runtime record、logs和FD；precommit intent及installer输出给出old/candidate immutable executable的exact命令，
+避免`${ZC_INSTALL_DIR}/zc`损坏后失去可信入口。禁止偷偷执行cold start。
+
+---
+
+## 11. Listener、connection与资源
+
+### 11.1 Listener continuity
+
+- Old/candidate引用同一组listener open file descriptions：public mixed与owner-only lifecycle；
+- 不close/rebind、不调用`shutdown(listener)`、不改变socket options；
+- Quiesce/activate控制acceptor，不控制listener lifetime；
+- Kernel backlog在短暂无acceptor时继续存在；
+- Listener fingerprint包含role、effective address、port、socket type及所有影响实际socket的options；
+- New binary若期望不同listener semantics，必须在ARMED前拒绝replacement。
+
+### 11.2 Existing connections
+
+- Old已经accepted的TCP socket不传给candidate；
+- HTTP CONNECT、SOCKS TCP、TLS/relay state保持在old worker；
+- SOCKS5 UDP association与其control TCP留在old；
+- Candidate只处理ACTIVE后由自身实际`accept()`取得的admissions；client handshake早于pointer decision但仍在backlog的连接也属于candidate；
+- Old runtime只在registry归零或hard deadline后销毁。
+
+### 11.3 Drain policy
+
+首版固定hard deadline为selection decision后15分钟：
+
+- Precommit intent只记录`drain_duration=15m`；readback=candidate时用`.boot` monotonic clock计算绝对deadline；
+- RuntimeRecord另存realtime值只用于展示，不用于执行；
+- `zc status`展示deadline、remaining connections与age；
+- 归零立即退出，不故意等满15分钟；
+- Candidate是shared projection writer与独立watchdog；old通过private channel发送progress/terminal；
+- Deadline到期只有收到old terminal message才记录exact forced count，否则显示`unavailable/degraded`；
+- 不把15分钟idle timeout误写成connection总寿命；这是replacement独立deadline。
+
+固定deadline避免首版增加配置面；取得生产数据后再决定是否需要可配置。
+
+### 11.4 Resource envelope
+
+Old/new overlap会暂时拥有两份Config/Engine/Manager和各自limiter。为使首版资源上界可证明，AnyTLS
+config在preflight明确unsupported；AnyTLS pool/session/thread/FD取得process-wide硬上界后再纳入：
+
+- New process仍使用TCP 128 / UDP 64；
+- Old只保留cutover时已经存在的最多TCP 128 / UDP 64；
+- 显式峰值上界为TCP 256 / UDP 128及约两份process runtime；
+- 不宣称跨process仍共享单一128/64 quota；
+- 性能门禁必须测无AnyTLS的最大支持配置+最大old connections+candidate startup；
+- 首版不为一个短暂overlap引入shared-memory quota protocol。
+
+### 11.5 Logs
+
+- Candidate继承old已打开的append log FD；
+- 每条upgrade相关日志包含PID、version、transaction id和phase；
+- Overlap期间暂停rotation；
+- Old退出后candidate恢复rotation owner；
+- Rotation lease必须在candidate spawn前取得，不能延后到drain功能阶段；
+- 任一phase的日志失败不能改变selected-version decision。
+
+---
+
+## 12. Compatibility与security
+
+### 12.1 Exact handoff protocol
+
+Candidate提供machine-readable compatibility probe：
 
 ```json
 {
-  "state": "running",
-  "pid": 2002,
-  "nonce": "...",
-  "build_id": "v1.1.1+...",
-  "runtime_epoch": 42,
-  "active_config": "default",
-  "selection_generation": 9,
-  "replacement": null,
-  "draining": {
-    "pid": 1001,
-    "build_id": "v1.1.0+...",
-    "connections": { "tcp": 3, "udp": 1, "api": 0 },
-    "deadline_seconds": 712
-  }
+  "protocol": 1,
+  "runtime_schema": 1,
+  "version": "1.2.0",
+  "build_id": "sha256:..."
 }
 ```
 
-要求：
+- Old/new protocol与runtime schema必须exact匹配；
+- Release CI至少验证previous stable→current；
+- Protocol bump不保留compatibility fallback，明确要求一次cold bootstrap；
+- Arbitrary version skip不承诺；不兼容时old保持运行。
 
-- `pid` 永远是 active PID；
-- replacement phase 单独展示，不把 candidate PID冒充 active；
-- draining 状态不可从 profile/config猜测；优先 old IPC，失联时标记 unavailable；
-- 删除 pid file path；保留 lock/runtime state/log paths；
-- text 和 JSON 使用同一结构化 snapshot。
+### 12.2 Child authentication
 
-### 15.2 `start` / `stop` / `restart` 与replacement并发
+- `--replacement-child`不是公开用户入口；
+- 必须同时具有inherited bootstrap FD、one-time capability和matching transaction id；
+- Bootstrap/drain channel只存在于parent/child，不创建named FD-transport socket；owner-only lifecycle socket是独立的begin/observe/status/stop入口，不传FD；
+- Malformed、duplicate、unknown-role FD立即失败；
+- Candidate不得信任environment中的path/FD number而跳过kernel-level验证。
 
-- `start` 只看RuntimeState active + lock；candidate/draining存在时仍视为已有runtime，不能启动第三实例；
-- `stop` 在pre-finalize replacement中先abort candidate并恢复/确认old authority，再停止old；
-- `stop` 在finalized draining中同时定向通知active和draining nonce，不能只停active后留下old进程；
-- `restart` 是显式cold操作：若有replacement/drain先返回`REPLACE_IN_PROGRESS`，不隐式强杀；用户可
-  先`zc stop`再`zc start`；
-- lifecycle request都绑定exact nonce/runtime epoch；PID复用或代际变化必须返回conflict而不是杀错进程；
-- foreground runtime继续由supervisor语义处理，不进入内部handoff。
+### 12.3 Artifact security
 
-### 15.3 Lifecycle 输出
+- Artifact regular、owner-owned、不可group/world writable、不可symlink；
+- `archive_digest`只证明download provenance；解包后重新计算的`artifact_digest`才用于version path、selected、RuntimeRecord与self-identity；
+- Candidate启动后再次证明自己的device/inode/digest；
+- Selected必须是versions root内relative symlink；
+- Install dir与versions dirs收敛为owner-only；
+- Artifact publish短锁与running replacement长锁不重叠；old/candidate持长锁到recovery ownership handoff，installer等待时不持锁；
+- 不接受runtime request提供的任意executable path。
 
-- stdout：一个最终 envelope/最终文本结果；
-- stderr：prepare/handoff/quiesce/cutover/drain 进度；
-- success 必须包含 old/new PID、build id、replacement result、是否 forced drain；
-- `zero_listener_gap=true` 只在 exact FD handoff 成功时输出；
-- old crash 或 forced connection close 时不得输出 full continuity。
+### 12.4 Daemon lock
 
-### 15.4 建议错误码
-
-| Code | 含义 | 下一步 |
-| --- | --- | --- |
-| `REPLACE_IN_PROGRESS` | candidate/drain 已存在 | `zc status`，等待或显式 stop |
-| `REPLACE_SUPERVISED` | foreground/supervisor-owned | 使用 supervisor rolling restart |
-| `REPLACE_PROTOCOL_MISMATCH` | old/new handoff version 不同 | 显式 cold upgrade |
-| `REPLACE_LISTENER_INCOMPATIBLE` | listener 指纹变化 | `zc restart` |
-| `REPLACE_CANDIDATE_FAILED` | cutover 前 candidate 失败 | 修复配置/二进制后重试；old 仍 active |
-| `REPLACE_FAILED_ROLLED_BACK` | cutover 后失败且已恢复 old | 检查日志后重试 |
-| `REPLACE_ROLLBACK_FAILED` | old 未能恢复 | 立即 `zc status`，按输出 identity处理 |
-| `REPLACE_DRAIN_FORCED` | deadline 到期仍有连接 | 检查连接类型/时长；replacement 已完成 |
-| `INSTALL_HANDOFF_UNSUPPORTED` | 当前 running daemon 无协议能力 | stop 后 cold install |
-| `INSTALL_POINTER_MISMATCH` | runtime active 与 symlink不一致 | 不清理任何版本，按 identity修复 |
-
-### 15.5 日志与指标
-
-每次 transaction 统一带：
-
-- transaction nonce、runtime epoch；
-- old/new pid、nonce、build id；
-- phase 和 phase latency；
-- listener fingerprints；
-- quiesce pause；
-- connection counts by kind；
-- drain duration、forced count；
-- rollback phase/reason；
-- installer pointer before/after identity。
-
-不得记录 bearer secret、proxy credential、prepared config body或完整敏感路径参数。
+- Old锁FD经spawn duplicate后与candidate引用同一个open file description；
+- Old/candidate只能close，绝不能显式unlock；
+- Candidate、cutover和drain期间第三个`zc start`始终失败；
+- Linux/macOS真实process tests是release blocker。
 
 ---
 
-## 16. 故障矩阵
+## 13. CLI、status与可观测性
 
-| 注入点 | 必须观察到的结果 |
-| --- | --- |
-| Candidate config parse/capability fail | old PID/nonce/traffic不变；无 listener/descriptor publication |
-| Candidate OOM during generation prepare | old 不变；candidate无资源泄漏 |
-| Unix peer auth fail | 不发送任何 FD；old 不变 |
-| Ancillary truncated/extra/missing FD | candidate关闭全部已收 FD；old 不变 |
-| Received listener role/address/type不匹配 | candidate拒绝；old 不变 |
-| Lock inode/FD验证失败 | candidate拒绝；第三进程仍无法获取 lock |
-| Candidate acceptor spawn fail | old尚未 quiesce；直接 abort |
-| Old control quiesce timeout | old恢复control；candidate abort |
-| Old acceptor quiesce timeout | old resume；不做 active CAS |
-| Runtime CAS conflict | old resume；candidate abort；不得覆盖第三状态 |
-| Candidate activate/ACK timeout | 反向 CAS，old resume |
-| Final desired reconcile conflict | rollback；selection authority不倒退 |
-| Candidate status/stability fail | rollback；installer symlink仍old；candidate可控时reverse-drain其已接收连接 |
-| Symlink rename/fsync fail | runtime rollback；保留所有 version |
-| Installer SIGTERM/SIGKILL | old/new按pointer identity和deadline收敛；不删除被引用binary |
-| Candidate crash before finalize | old自动恢复accept，runtime active回old |
-| Old crash before finalize | candidate继续服务新连接，但结果标记continuity degraded |
-| Drain deadline | active candidate不受影响；old forced count可见并退出 |
-| Old retire CAS撞上新state | 只重试/报告，绝不删除active candidate |
-| 第二个 reload/upgrade | `REPLACE_IN_PROGRESS`，不创建第二candidate |
+### 13.1 Installer输出
 
----
+Progress写stderr；成功stdout保持单一结果。JSON模式保持单envelope。
 
-## 17. 测试与证据策略
+成功返回不写模糊的`updated`，而是：
 
-### 17.1 Task 0 平台 spike（先于产品重构）
-
-在 Linux/macOS 真实进程测试以下不变量：
-
-1. `SCM_RIGHTS` 传递 listening socket 后，receiver 能从同一 accept queue 接收连接；
-2. sender quiesce但不close时，receiver accept无重新bind；
-3. 传递 flock FD 后 sender close，receiver仍维持lock，第三进程 acquisition失败；
-4. receiver close后、sender仍持有时 lock不释放；最后一个duplicate关闭后才释放；
-5. wrong/truncated ancillary data被完整关闭，无FD leak；
-6. macOS codesigned candidate通过同样路径。
-
-任一 release target失败则停止本方案实现，重新评估永久 socket owner；不得边做边增加
-`SO_REUSEPORT` fallback。
-
-### 17.2 Unit tests
-
-- `RuntimeState` canonical encode/decode、schema严格字段、CAS/epoch overflow、非法phase；
-- replacement 状态转换表的所有合法/非法边；
-- `ListenerFingerprint` canonicalization 和 exact-set diff；
-- adopted FD验证：非socket、connected socket、UDP、not-listening、wrong address、duplicate role；
-- `ConnectionRegistry` admission上界、drain拒绝新lease、最后release唤醒、deadline；
-- lease lifetime与FailingAllocator每个allocation seam，无partial owner；
-- handoff frame长度、protocol version、nonce、FD count、peer mismatch；
-- pointer identity比较，不用路径字符串冒充inode匹配；
-- old retire只删除matching draining nonce；
-- selection CAS在cutover冲突后重试到new active。
-
-### 17.3 Process integration tests
-
-所有测试使用隔离 HOME/XDG_RUNTIME_DIR 和显式非7899端口：
-
-1. **Continuous connect**：更新前后持续建立mixed SOCKS和HTTP连接，failure count=0；
-2. **Long-lived TCP**：更新前建立CONNECT tunnel，cutover后继续双向传输；关闭后old退出；
-3. **UDP association**：更新前建立SOCKS5 UDP association，cutover后仍round-trip；新association由new处理；
-4. **Controller ownership**：old quiesce后mutation被拒，new ready后selection成功且generation单调；
-5. **Config exactness**：new connections使用candidate规则，old connections保持old处理上下文；
-6. **Rollback faults**：故障矩阵每个pre-finalize注入点证明old PID/traffic恢复；
-7. **Kill matrix**：在每个phase SIGKILL old/candidate/coordinator，状态最终可解释且无双active；
-8. **Drain deadline**：持有连接超过测试deadline，old forced退出并报告exact count；
-9. **No stacking**：drain中第二次replace fail closed；
-10. **Lock exclusion**：replacement全程第三个`zc start`不能成功；
-11. **Prepared cleanup**：candidate abort、rollback、retire后只保留仍被引用snapshot；
-12. **Build identity**：A/B两个test build证明cutover后status和新连接来自B，old connection仍在A。
-
-### 17.4 Installer tests
-
-扩展现有 `scripts/install/test-oneline-installer.sh` 与 regression：
-
-- stopped first install/versioned symlink；
-- running handoff success；
-- candidate self-check/checksum/codesign fail；
-- symlink publication race；
-- signal at每个install phase；
-- active/pointer identity mismatch fail closed；
-- rollback保留old版本；
-- drain前GC拒绝、retire后GC；
-- legacy running daemon返回unsupported而非cold fallback；
-- custom install dir和空格路径；
-- Linux static binary、macOS Mach-O四平台资产不回归。
-
-### 17.5 Scenario / soak / chaos
-
-新增真实而非simulated入口，例如：
-
-```text
-scripts/reliability/run-hot-upgrade.sh
+```json
+{
+  "action": "replace",
+  "state": "serving",
+  "transaction_id": "...",
+  "selected": {"version":"1.2.0","artifact_digest":"sha256:...","durability":"durable"},
+  "serving": {"pid":1234,"version":"1.2.0","artifact_digest":"sha256:..."},
+  "draining": {"pid":1200,"version":"1.1.0","connections":3,"deadline":"..."},
+  "continuity": "preserved"
+}
 ```
 
-场景：
+### 13.2 `zc status`
 
-- 100轮same-binary reload，16个持续clients；
-- 20轮A↔B binary handoff；
-- 每轮随机phase fault/kill；
-- 记录connect failure、reset、cutover pause、drain、FD/thread/process count；
-- 最终无old process、无prepared/request/socket leak、lock可重新获取；
-- 缺少平台工具/网络能力是error，不是skip/pass。
+Text固定显示：
 
-### 17.6 性能门禁
+```text
+state: running
+selected: zc 1.2.0 sha256:...
+serving: pid 1234 zc 1.2.0
+replacement: draining
+previous: pid 1200 zc 1.1.0
+connections: 3
+drain_deadline: ...
+continuity: preserved
+```
 
-先记录main baseline，再设阈值，不凭空发明数字：
+无法读取drain count时显示`connections: unavailable`，不能显示0。RuntimeRecord损坏但lifecycle endpoint仍live时，
+status通过endpoint返回内存事实并明确`projection: unavailable`；两者都失效时输出immutable recovery commands。
 
-- 稳态每connection新增一次registry acquire/release的CPU成本；
-- connect throughput和p50/p95/p99 latency；
-- cutover pause distribution；
-- candidate准备时间、memory peak；
-- drain期间old+new总memory和FD；
-- 100轮后resource slope必须为0。
+### 13.3 Stable error codes
 
-硬正确性门禁可以立即固定：connect failure=0、unexpected reset=0、双active=0、leak=0。
-性能阈值在Task 0取得至少30个baseline sample后写回本计划，再开始相关hot-path改动。
+| Code | 含义 |
+| --- | --- |
+| `REPLACE_RUNTIME_UNSUPPORTED` | Invocation/packaging/listener shape或AnyTLS config不支持 |
+| `REPLACE_PROTOCOL_INCOMPATIBLE` | Old/new handoff protocol不匹配 |
+| `REPLACE_ARTIFACT_INVALID` | Candidate checksum/identity/layout无效 |
+| `REPLACE_CANDIDATE_FAILED` | Candidate exec/init/validation失败 |
+| `REPLACE_STALE_RUNTIME` | Config/identity/runtime在prepare期间变化 |
+| `REPLACE_IN_PROGRESS` | 已有candidate或draining generation |
+| `REPLACE_FAILED_ROLLED_BACK` | Precommit failure，old已确认resume |
+| `REPLACE_ROLLBACK_FAILED` | Selected仍old但old无法resume |
+| `REPLACE_WAIT_TIMEOUT` | Caller等待超时；transaction继续 |
+| `REPLACE_OUTCOME_UNKNOWN` | Selected pointer无法裁决，进入attention |
+| `REPLACE_DRAIN_FORCED` | Deadline关闭remaining old connections |
+| `REPLACE_CONTINUITY_DEGRADED` | Candidate/old crash导致连接损失 |
 
----
+### 13.4 Command interaction
 
-## 18. 分阶段任务
-
-每个任务先新增会失败的测试，确认red，再实现green。除Task 0 spike外，一个任务一个Conventional
-Commit；实现分支最终按仓库规范squash + fast-forward集成。
-
-### Task 0 — 冻结契约与平台能力 spike
-
-**范围：** 测试/研究，不改默认daemon行为。
-
-- [ ] 写真实process fixture验证SCM_RIGHTS listener + flock FD语义；
-- [ ] Linux/macOS都运行；
-- [ ] 记录baseline connect/perf/resource样本；
-- [ ] 冻结listener fingerprint字段和protocol v1 bounded layout；
-- [ ] 把验证结果写入`.agents/` evidence note。
-
-**Acceptance：**
-
-- [ ] sender/receiver handoff期间连续connect failure=0；
-- [ ] 第三进程全程无法取得lock；
-- [ ] 最后一个lock FD关闭后能重新acquire；
-- [ ] malformed ancillary tests无FD leak；
-- [ ] 四release targets至少由CI matrix覆盖编译，Linux/macOS各有真实运行证据。
-
-**Commit：** `test(runtime): prove listener and lock fd handoff`
-
-### Task 1 — RuntimeState v3 单一authority
-
-- [ ] 先写schema/CAS/concurrency tests；
-- [ ] 引入active/replacement/draining/runtime_epoch；
-- [ ] selection字段改为`selection_generation`；
-- [ ] stop/status/start只从runtime state取active PID；
-- [ ] 删除pid file读写与旧descriptor schema，不保留dual authority；
-- [ ] 保持现有cold start/stop/restart端到端可用。
-
-**Acceptance：**
-
-- [ ] `zig build test -Dcpu=baseline`；
-- [ ] 并发CAS只提交一个winner；
-- [ ] lock-held missing/corrupt state fail closed；
-- [ ] start/status/stop process tests通过；
-- [ ] 仓库active docs/test不再引用pid file。
-
-**Commit：** `refactor(runtime): make runtime state the sole daemon authority`
-
-### Task 2 — ConnectionRegistry 与worker lifetime
-
-- [ ] 先写lease/drain/OOM tests；
-- [ ] 统一mixed/API/SOCKS/HTTP计数与上界；
-- [ ] plain HTTP改为bounded connection task；
-- [ ] 确保registry归零后无generation borrow；
-- [ ] 默认行为仍是cold lifecycle，不接handoff。
-
-**Acceptance：**
-
-- [ ] TCP 128、UDP 64边界exact/max+1不变；
-- [ ] drain后新acquire全部失败；
-- [ ] 最后lease释放唤醒waiter；
-- [ ] HTTP/SOCKS/mixed/API真实并发tests通过；
-- [ ] ThreadSanitizer不可用时用高迭代race test补证据，不宣称TSAN覆盖。
-
-**Commit：** `refactor(runtime): unify connection lifetime tracking`
-
-### Task 3 — ListenerSet fresh adapter + 可取消accept
-
-- [ ] 先写listener ownership/quiesce tests；
-- [ ] bind从protocol模块移入ListenerSet；
-- [ ] acceptor改poll+notifier并可join；
-- [ ] protocol模块只处理accepted connection；
-- [ ] fatal listener event回到generation owner；
-- [ ] cold start/restart行为不变。
-
-**Acceptance：**
-
-- [ ] quiesce在deadline内停止acceptor且listener FD仍open；
-- [ ] resume/重新serve后queued connection可接收；
-- [ ] 不存在foreign-thread close阻塞accept路径；
-- [ ] `zig build test`和现有`zig build e2e`相关listener场景通过。
-
-**Commit：** `refactor(runtime): centralize listener ownership`
-
-### Task 4 — 正常unwind与graceful drain foundation
-
-- [ ] `runProxy`改为generation owner event loop；
-- [ ] listener threads不再process-lifetime detached；
-- [ ] API owner可在registry归零后正常deinit；
-- [ ] internal retire走quiesce→drain→normal return；
-- [ ] explicit stop语义单独保持清晰，不与replacement drain混淆。
-
-**Acceptance：**
-
-- [ ] 既有长连接在internal retire期间继续传输；
-- [ ] connection close后old process自行退出；
-- [ ] deadline路径报告forced count；
-- [ ] clean drain运行defers，无DebugAllocator leak；
-- [ ] AnyTLS pool/UDP worker teardown不hang。
-
-**Commit：** `feat(runtime): add bounded graceful drain`
-
-### Task 5 — HandoffProtocol 与 transferred listener adapter
-
-- [ ] 先写socketpair/credential/frame/FD validation tests；
-- [ ] 实现owner-only request/channel；
-- [ ] 实现SCM_RIGHTS listener+lock bundle；
-- [ ] 实现TransferredListenerSource；
-- [ ] candidate internal entry仅能由valid transaction启动；
-- [ ] 不接public reload。
-
-**Acceptance：**
-
-- [ ] exact listener set可在第二进程adopt；
-- [ ] wrong peer/version/nonce/fd全部fail closed；
-- [ ] 每个失败路径关闭所有received FD；
-- [ ] lock在old/candidate间无释放窗口；
-- [ ] fuzz/bounded malformed frame无panic/无限loop。
-
-**Commit：** `feat(runtime): transfer listeners between generations`
-
-### Task 6 — ReplacementCoordinator 最小纵切面
-
-- [ ] 先加same-binary mixed+controller process BDD；
-- [ ] 实现prepare→handoff→quiesce→cutover→activate→finalize→drain；
-- [ ] 实现cutover前与cutover后rollback；
-- [ ] 复用prepared config/startup readiness/final desired guard；
-- [ ] 限制一个candidate+一个draining；
-- [ ] 暂不改installer。
-
-**Acceptance：**
-
-- [ ] continuous connect failure=0；
-- [ ] old long-lived TCP/UDP跨cutover可用；
-- [ ] new connection使用candidate config；
-- [ ] 每个pre-finalizefault恢复old active；
-- [ ] replacement期间第三`start`失败；
-- [ ] drain结束只剩new PID，runtime state steady。
-
-**Commit：** `feat(runtime): replace daemon generations gracefully`
-
-### Task 7 — CLI reload/config apply接入
-
-- [ ] `zc reload`调用ReplacementCoordinator；
-- [ ] `config update`删除auto/fallback，默认hot；
-- [ ] restart保留显式cold语义；
-- [ ] foreground/listener-incompatible/in-progress错误可操作；
-- [ ] text/JSON/minimal API/status统一。
-
-**Acceptance：**
-
-- [ ] CLI BDD覆盖help、exit code、envelope和stderr progress；
-- [ ] hot失败绝不调用cold replacement；
-- [ ] daemon stopped不伪报hot applied；
-- [ ] selection race/status active PID tests通过；
-- [ ] 更新`docs/cli/*`、`docs/reliability/e2e.md`。
-
-**Commit：** `feat(cli): make reload a graceful generation switch`
-
-### Task 8 — Binary build identity 与versioned installer
-
-- [ ] 增加compile-time build id和self executable identity；
-- [ ] installer使用immutable version directory+managed symlink；
-- [ ] stopped install先完成；
-- [ ] running install调用candidate handoff；
-- [ ] pointer commit/finalize/rollback/GC；
-- [ ] legacy running daemonfail closed，不cold fallback。
-
-**Acceptance：**
-
-- [ ] A→B升级期间continuous connect failure=0；
-- [ ] old连接继续由A处理，新连接/status为B；
-- [ ] symlink failure恢复A runtime和pointer；
-- [ ] signal matrix不删引用中的version；
-- [ ] installer全regression、one-line E2E、四平台asset gate通过；
-- [ ] 更新`docs/install/README.md`。
-
-**Commit：** `feat(install): hand off running daemons across versions`
-
-### Task 9 — Kill matrix、chaos、soak与性能门禁
-
-- [ ] 实现真实hot-upgrade reliability scenario；
-- [ ] old/candidate/coordinator每phase kill；
-- [ ] 100轮reload与A/B轮换；
-- [ ] FD/thread/process/memory slope；
-- [ ] 把Task 0阈值接入gate；
-- [ ] 纳入full validation/release gate，缺能力fail closed。
-
-**Acceptance：**
-
-- [ ] correctness/contract/interop/reliability全部green；
-- [ ] 100轮connect failure/reset/double-active/leak均为0；
-- [ ] cutover pause满足已冻结阈值；
-- [ ] steady-state性能不越门禁；
-- [ ] release docs明确平台、drain和不兼容listener限制。
-
-**Commit：** `test(runtime): gate graceful upgrades under faults and load`
+- Installer通过lifecycle socket提交digest与观察transaction；不直接驱动phase；
+- Replacement期间新的install/replacement/restart返回`REPLACE_IN_PROGRESS`；
+- `zc status`和`zc log`始终允许；
+- `zc stop`是唯一主动终止所有generations的命令，必须明确连接影响；
+- Config mutation在final fence期间返回busy/retry；
+- Binary replacement不触发`zc reload`，也不改变config revision。
 
 ---
 
-## 19. 预计文件变化
+## 14. Packaging与rollout
+
+### 14.1 Standalone
+
+这是首个完整支持渠道。`install.sh`、`local-dev-install.sh`和`just install`必须共享同一个VersionStore /
+replacement contract，不再各自实现shell stop/copy/start/rollback状态机。
+
+Shell负责download/extract；所有identity、publication、runtime handoff和result裁决由zc binary完成。
+
+### 14.2 首次cold bootstrap
+
+当前已发布binary：
+
+- 不认识handoff protocol；
+- 安装在single regular file；
+- Installer拒绝symlink；
+- Listener/connection没有handoff seam。
+
+因此升级到首个handoff-capable/layout-capable版本必须明确执行一次：
+
+```text
+zc stop
+install new versioned layout
+zc start
+```
+
+Installer必须提前说明连接会中断并要求显式确认/步骤；不能把这次bootstrap宣传为graceful。
+
+之后exact-compatible releases才能使用old→candidate replacement。
+
+### 14.3 Homebrew / Debian / supervisors
+
+首版fail closed，不抢夺package manager ownership。原因：
+
+- Homebrew Cellar symlink publication由brew控制；
+- systemd/launchd对process ownership、socket ownership和restart有各自合同；
+- 外部manager若在zc transaction外替换selected path，会破坏唯一selection decision。
+
+后续只有在有第二个真实adapter和对应E2E后，才增加package/supervisor seam；不提前设计通用framework。
+
+---
+
+## 15. TDD实施任务
+
+每个Task是一个可独立验收的milestone；内部按一个逻辑变更一个commit继续拆分。
+
+### Task 0 — 冻结合同与平台证据
+
+先写红测/探针：
+
+- [ ] Linux/macOS amd64/arm64 `posix_spawn` exact FD mapping；
+- [ ] Same listener/open-file-description与same accept queue；
+- [ ] Inherited`flock`连续、close-only、第三process被拒绝；
+- [ ] Parent/child CLOEXEC allowlist；accept/connect/pipe创建与spawn并发时无unrelated FD leak；
+- [ ] Stable advisory install lock的short-publish/long-replacement ownership与inheritance；
+- [ ] Owner-only lifecycle Unix socket的peer credentials、inheritance与selected-path损坏时可达性；
+- [ ] macOS signed candidate执行与listener metadata验证；
+- [ ] Atomic relative-symlink replace、directory sync、readback selection与durability outcome；
+- [ ] 冻结15分钟deadline、two-generation envelope和stable errors。
+
+**Acceptance：** 任一目标平台无法证明listener/lock合同，则该平台不进入实现；不添加fallback。
+
+### Task 1 — Immutable VersionStore，先支持stopped install
+
+- [ ] 分开测试archive digest与executable artifact digest、same-version/different-artifact、owner/mode/symlink/path traversal；
+- [ ] 实现以artifact digest寻址的publication；
+- [ ] 实现expected-old selected symlink CAS/readback；
+- [ ] 改造stopped installer：只select、不start；
+- [ ] 覆盖每个rename/sync fault与SIGTERM cleanup。
+
+**Acceptance：** Stopped安装幂等；rename前失败保持old，rename后严格按readback分类；sync error不会伪装成old或durable success；不误启动daemon。
+
+### Task 2 — RuntimeRecord替代PID authority
+
+- [ ] 先写`installation=versioned|unmanaged`、exact runtime snapshot、selected/serving/candidate/draining BDD；
+- [ ] 增加restart-preservation、foreground/unmanaged lifecycle与Phase A scope-readback tests；
+- [ ] 实现epoch/nonce CAS和atomic publication；
+- [ ] Stop/status改为RuntimeRecord + lock/process identity；
+- [ ] 删除`zc.pid`authority和兼容路径；
+- [ ] 损坏/stale writer/unknown count fail closed。
+
+**Acceptance：** 单process现有start/status/stop/restart全green；selected与serving可以不同且不会被误报。
+
+### Task 3 — ListenerSet与ConnectionRegistry
+
+- [ ] Mixed与lifecycle listeners从accept stack提升为process owner；
+- [ ] 实现`ListenerSource=cold|inherited`；inherited path跳过bind/port probe；
+- [ ] Listener改为nonblocking`poll(listener, notifier)`，实现pause-first、post-accept recheck、join/resume；
+- [ ] 所有accepted TCP在spawn前注册lease；
+- [ ] SOCKS5 UDP association完整注册；
+- [ ] Fatal accept、spawn failure、slow child、last lease race tests；
+- [ ] 保持cold start行为与TCP 128/UDP 64限制。
+
+**Acceptance：** Quiesce ACK后old registry只减不增；registry=0前runtime绝不析构。
+
+### Task 4 — SpawnAdapter与ARMED-only candidate
+
+- [ ] Build-time translate`<spawn.h>`，实现Linux/macOS adapters；
+- [ ] Private child capability、fixed FD manifest、CLOEXEC-default/atomic-CLOEXEC/FD-table barrier；
+- [ ] Candidate adopt/validate public+lifecycle listeners、daemon/install locks；
+- [ ] Candidate spawn前取得log rotation lease并验证overlap期间不会rotate到不同inode；
+- [ ] 补self-contained prepared tests：candidate build不得读取mutable profile/provider source/cache或network；
+- [ ] Candidate用exact prepared snapshot完整初始化但不accept；
+- [ ] 实现`HELLO→ARMED→ABORT`，尚不做cutover；
+- [ ] Protocol/FD/config/OOM/timeout fault matrix。
+
+**Acceptance：** Candidate ARMED期间old持续正常流量；abort后资源、FD、process恢复baseline。
+
+### Task 5 — BinaryReplacementCoordinator commit纵切面
+
+- [ ] 实现lifecycle`begin(digest)/observe`、single-flight transaction与installer attach；
+- [ ] Old取得/继承long install lock，installer等待期间不持lock；
+- [ ] Final mutation fence、selection reconcile和old quiesce；
+- [ ] 实现selected pointer唯一selection decision与独立durability；
+- [ ] 实现`ACTIVATE→ACTIVE→RECOVERY_OWNERSHIP_ACK`与serving/lifecycle writer transfer；
+- [ ] 实现candidate bootstrap-EOF self-decision、precommit resume、postcommit bounded forward和attention；
+- [ ] 禁止调用普通stop/start/rebind。
+
+**Acceptance：** 真实old/new不同digest/PID/inode；continuous connect在定义负载下无refused；listener identity不变。
+
+### Task 6 — Drain、status与logs
+
+- [ ] Old registry clean drain；
+- [ ] Pointer decision时以`.boot`计算15分钟deadline，realtime只展示；
+- [ ] 实现`DRAIN_PROGRESS/DRAIN_DONE`、candidate watchdog、PID/nonce校验和unavailable count；
+- [ ] Status text/JSON展示selected/serving/candidate/draining；
+- [ ] 补PID/version/tx log tagging与drain terminal后的rotation ownership transfer；
+- [ ] Stop终止所有generations并明确影响；
+- [ ] Draining期间拒绝第二replacement。
+
+**Acceptance：** Long TCP和UDP跨cutover继续；clean/forced/degraded结果可区分且不会伪造count。
+
+### Task 7 — 统一installer UX
+
+- [ ] `install.sh`下载后调用VersionStore/replacement seam；
+- [ ] `local-dev-install.sh`与`just install`删除重复cold orchestration；
+- [ ] Stopped/running/unsupported/first-bootstrap UX；
+- [ ] Progress stderr、stdout/JSON single result；
+- [ ] CLI timeout重试attach相同transaction；
+- [ ] 同步install/CLI/reliability docs和CHANGELOG。
+
+**Acceptance：** Running支持路径无stop/start；unsupported不修改selected；用户能复制执行next step。
+
+### Task 8 — Fault、scenario、performance与release gate
+
+- [ ] 每个phase对installer/old/candidate注入TERM/KILL/EOF；
+- [ ] Rename/sync/readback/runtime publication/control ACK全部fault points；
+- [ ] Continuous connect、long HTTP CONNECT、SOCKS TCP、UDP association；
+- [ ] AnyTLS config在pointer mutation前稳定拒绝；
+- [ ] 无AnyTLS最大支持config + old 128/64 + candidate 128/64 RSS/FD/thread peak；
+- [ ] 100轮clean replacement无process/FD/artifact-reference leak；
+- [ ] Previous stable→current四架构real-binary matrix；
+- [ ] Release gate禁止缺少compatibility fixture的tag。
+
+**Acceptance：** §17全部成立；性能不越冻结阈值；没有hidden cold fallback或unverified platform。
+
+### Task 9 — 后续扩展，不阻塞MVP
+
+- [ ] 把API controller listener纳入ListenerSet后再支持controller-enabled runtime；
+- [ ] 有真实systemd/launchd/Homebrew adapter需求时再设计第二adapter；
+- [ ] 有生产drain数据后再决定deadline是否可配置；
+- [ ] 为AnyTLS建立process-wide pool/session/thread/FD硬上界后再纳入replacement；
+- [ ] 有artifact磁盘压力证据后再设计GC。
+
+这些不是首个纵切面的一部分，不预埋stub或兼容层。
+
+---
+
+## 16. 测试矩阵与门禁
+
+### 16.1 Correctness
+
+- Candidate preflight失败：old PID、listener、selected、traffic完全不变；
+- Quiesce ACK后old新增registry entry=0；
+- Quiesce ACK前old成功accept并注册的连接归old；backlog中未accept的连接只由ACTIVE candidate取得；
+- Listener device/inode/socket identity与local address/port全程一致；
+- Old TCP/UDP连接持续传输到结束或明确deadline；
+- Third daemon start全程失败；
+- Runtime stale writer不能覆盖new serving；
+- Config identity/port/overrides在binary replacement前后完全相同；
+- Installer timeout后重试不spawn第二candidate。
+
+### 16.2 Fault matrix
+
+至少覆盖：
+
+```text
+archive digest / artifact digest / artifact create/write/file sync/dir sync
+install-lock acquire/inherit/release + competing installer
+lifecycle begin/attach/peer credentials + selected CLI path missing
+intent write/sync
+socketpair/spawn/exec + concurrent accept/connect FD creation
+FD manifest read/validation + CLOEXEC failure
+candidate parse/init/OOM
+ARMED send/receive/timeout
+mutation fence/final selection
+acceptor wake/join
+selected symlink create/rename/sync/readback
+ACTIVATE send / bootstrap EOF / candidate exit / ACTIVE or recovery-ownership ACK loss
+runtime record CAS/write/sync
+DRAIN_PROGRESS/DRAIN_DONE loss / old crash / candidate watchdog / deadline
+installer exit before and after every phase
+```
+
+每个fault都必须断言selected readback、admission owner、listener/lock lifetime、process count、artifact ownership和
+用户结果。
+
+### 16.3 Scenario
+
+- 定义rate/backlog/headroom的continuous connect，replacement-induced refused=0；
+- 长时间HTTP CONNECT双向流量；
+- SOCKS TCP双向流量；
+- SOCKS5 UDP association在cutover前建立、cutover后继续；
+- Candidate在ARMED、quiesce、postcommit pre-ACTIVE、ACTIVE和drain各阶段退出；
+- Old在accept、quiesce、postcommit和drain各阶段退出；
+- Installer在每个阶段退出并重试attach；
+- 15分钟deadline用test clock缩短，分别验证reported forced count与unavailable/degraded；
+- Draining期间status、stop和第二replacement。
+
+### 16.4 Performance/resource
+
+先记录baseline再冻结阈值：
+
+- Candidate full-init latency；
+- Old quiesce latency；
+- Pointer selection decision + candidate activation latency；
+- Connect p50/p95/p99与throughput；
+- Max overlap RSS、FD、threads；
+- Drain observation overhead；
+- 100轮replacement终态；
+- Log throughput与rotation恢复。
+
+---
+
+## 17. 总体验收标准
+
+只有全部满足，才能对外称“优雅版本替换”：
+
+1. Running supported install从不调用普通stop/start。
+2. Candidate在old停止accept前完成cold-start等价初始化。
+3. Replacement前后使用同一个listener/open file description和accept queue。
+4. Old quiesce ACK后不再创建connection entry。
+5. Selected symlink readback是唯一selection decision；parent sync单独报告durable/uncertain。
+6. Precommit任何失败保持或确认恢复old admission。
+7. Transaction postcommit failure不自动切回old，只向selected candidate恢复；stable_new后的普通crash不冒充upgrade recovery。
+8. Candidate ACTIVE前不接public mixed traffic；attention只可开放认证lifecycle recovery。
+9. Existing TCP/UDP连接留在old并drain；deadline forced/unavailable结果明确可见。
+10. Daemon与install locks按各自合同连续，第三instance/installer不能干扰cutover。
+11. Config/profile/port/overrides/listener options不随binary replacement变化。
+12. Installer/CLI通过owner-only lifecycle endpoint timeout/reattach，不产生第二transaction。
+13. Status准确显示selected、serving、candidate、draining、deadline和continuity。
+14. Unknown/unavailable不伪造为success/0/clean。
+15. Unsupported mode在pointer mutation前失败且无cold fallback。
+16. 四个平台真实process contracts和previous-stable→current E2E通过。
+17. 定义负载下close/rebind型refused=0，无AnyTLS两代资源峰值不越门禁。
+18. 首次cold bootstrap、MVP范围和非保证项已进入用户文档。
+
+---
+
+## 18. 预计文件变化
 
 ### 新增
 
 ```text
-src/runtime_generation.zig
-src/runtime_generation_test.zig
+src/binary_replacement.zig
+src/binary_replacement_test.zig
+src/version_store.zig
+src/version_store_test.zig
 src/listener_set.zig
 src/listener_set_test.zig
 src/connection_registry.zig
 src/connection_registry_test.zig
-src/handoff_protocol.zig
-src/handoff_protocol_test.zig
-src/replacement_coordinator.zig
-src/replacement_coordinator_test.zig
-scripts/reliability/run-hot-upgrade.sh
+src/replacement_process_test.zig
 ```
-
-文件是否拆分test按现有build/test组织最终决定；模块seam不应因文件数量反向变浅。
 
 ### 主要修改
 
 ```text
 src/main.zig
 src/daemon.zig
-src/runtime_descriptor.zig        # 直接替换为唯一RuntimeState authority，文件名可随后重命名
-src/runtime_dir.zig
-src/compat.zig
+src/runtime_descriptor.zig
 src/proxy/mixed.zig
-src/proxy/http.zig
-src/proxy/socks5.zig
 src/proxy/socks5_udp.zig
-src/api/server.zig
-src/proxy/outbound/manager.zig    # 仅处理必要lifetime/selection seam
+src/api/server.zig        # MVP只改ownership seam，不handoff controller
+src/integration_error_test.zig
+build.zig
 install.sh
 scripts/install/local-dev-install.sh
-scripts/install/*regression*.sh
-build.zig
+scripts/install/*regression*
+Justfile
 ```
 
-### 用户可感知后必须同步
+### 文档
 
 ```text
+README.md
+CHANGELOG.md
 docs/install/README.md
+docs/cli/README.md
 docs/cli/spec.md
 docs/cli/ux-workflow.md
 docs/reliability/e2e.md
-docs/roadmap/v1.0.md              # 若仍描述旧reload语义则更新
-README.md                         # 仅更新公开命令/保证，不复制内部设计
-CHANGELOG.md
+docs/api/error-codes.md
+docs/compat/mihomo-clash.md
 ```
 
 ---
 
-## 20. 风险与对应控制
+## 19. 明确删除的旧方向
 
-| 风险 | 控制 |
-| --- | --- |
-| 多线程daemon内fork不安全 | Candidate由CLI/installer在独立进程路径启动；old不在fork child里分配/执行复杂代码 |
-| SCM_RIGHTS平台差异 | Task 0真实Linux/macOS spike；exact protocol；无fallback |
-| Shared flock误unlock | 只duplicate/close，从不调用unlock；pair assertions+第三进程probe |
-| Acceptor quiesce竞态 | poll+notifier、join ACK、fixed state machine；不foreign close |
-| Registry归零后worker仍借用manager | Lease release强制为最后generation access；专门lifetime tests |
-| Old API在cutover后写selection | 先control quiesce+selection lock，mutation CAS active nonce/epoch |
-| Candidate已active但install pointer未切 | finalization window由transaction表达；pointer identity决定恢复 |
-| 长连接让old常驻 | 15分钟bounded drain；拒绝stacking；status和forced count |
-| 双进程memory峰值 | 最多active+candidate/draining各一；记录peak并设gate |
-| Listener option未来变化 | 指纹不等即拒绝hot；不偷偷沿用旧option并声称已更新 |
-| Homebrew清理old Cellar | 不纳入MVP保证；保持cold docs直到有独立adapter证据 |
-| 旧版本首次无法handoff | 明确一次cold bootstrap；不自动stop/start |
-| Runtime state过度复杂 | 单ReplacementCoordinator写状态；其他caller只能用小接口；状态转换表可执行测试 |
+以下内容不再属于本计划：
 
----
-
-## 21. 总体验收标准
-
-全部满足才可以对外称“无缝更新”：
-
-1. 同listener指纹的reload/binary upgrade全程没有socket close/rebind空窗。
-2. 规定负载下continuous TCP connect failure与unexpected reset均为0。
-3. 更新前建立的HTTP CONNECT、SOCKS5 TCP和UDP association在drain deadline内继续工作。
-4. 更新后新连接只由candidate处理，并能从status/build id/config行为证明。
-5. Candidate在finalize前任一故障都保持或恢复old active；失败命令不输出成功；可控rollback会
-   reverse-drain candidate 已接收连接，进程crash则明确标记continuity degraded。
-6. 任意时刻最多一个active、一个candidate、一个draining；第二replacement fail closed。
-7. Daemon lock在handoff全程不释放，第三start不能成功。
-8. RuntimeState是唯一PID/phase authority；无pid file双写、无全局进程收养。
-9. Installer不覆盖运行inode；active runtime与current symlink identity一致后才finalize。
-10. Old drain完成后进程、FD、thread、prepared snapshot、request/socket和旧版本均按引用精确清理。
-11. 100轮fault/load soak无资源增长、无双active、无不可解释state。
-12. Linux/macOS amd64/arm64构建通过，Linux/macOS至少各有真实handoff运行证据。
-13. steady-state与cutover性能不越Task 0冻结的门禁。
-14. CLI/minimal API/docs对active/replacing/draining、deadline和不兼容listener限制描述一致。
-15. `zc reload`/hot apply从不静默fallback为cold restart。
+- 进程内`RuntimeGeneration`作为更新zc binary的主方案；
+- `zc reload`配置代际切换任务；
+- Config pointer swap、generation lease与single-retired config设计；
+- Binary update继续固定为cold stop/install/start的结论；
+- Running installer只报错而不提供handoff的最终状态；
+- `auto` fallback与把cold restart包装成hot success；
+- `SO_REUSEPORT`、close/rebind、端口自动漂移；
+- 通用`SCM_RIGHTS`/FD broker framework；
+- 永久master process或stable launcher；
+- Established connection migration；
+- 多个draining generations；
+- Postcommit自动rollback；
+- 首版shared-memory quota、stats migration、artifact GC与通用supervisor abstraction。
 
 ---
 
-## 22. 实施前最后检查
+## 20. 实施前Go/No-Go
 
-开始Task 1前必须确认：
+Task 1开始前必须确认：
 
-- [ ] Task 0四项核心FD/lock不变量已有真实证据；
-- [ ] 性能baseline和场景负载已冻结；
-- [ ] protocol v1、listener fingerprint、15分钟drain policy已评审；
-- [ ] 接受删除pid file和`auto/restart_fallback`旧路径；
-- [ ] 接受首个handoff-capable版本需要一次cold bootstrap；
-- [ ] standalone为MVP，Homebrew不宣称无缝；
-- [ ] 每个任务按red→green、小commit、可回滚执行。
+- [ ] 目标是binary replacement，不再把config reload当替代方案；
+- [ ] 接受首个capable版本需要一次显式cold bootstrap；
+- [ ] 接受MVP仅standalone managed background + mixed + no controller；
+- [ ] 接受selected symlink readback是唯一selection decision、durability单独报告，transaction postcommit只forward；
+- [ ] 接受existing connections不迁移，最多drain15分钟；
+- [ ] 接受overlap资源上界暂时为两代process；
+- [ ] Linux/macOS listener/flock/spawn/symlink真实合同已经通过；
+- [ ] Stable error、status schema与failure matrix已经评审；
+- [ ] 团队确认不实现§19中的fallback、兼容层或推测性framework。
 
-未满足这些条件时，不进入产品代码修改。
+任一项未满足，不进入产品代码实现。
