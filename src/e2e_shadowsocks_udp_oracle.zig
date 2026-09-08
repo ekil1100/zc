@@ -9,6 +9,7 @@ const receive_size_max: usize = 65_536;
 const packet_count_max: u32 = 4_096;
 const service_lifetime_ms: i64 = 180_000;
 const probe_lifetime_ms: i64 = 5_000;
+const health_lifetime_ms: i64 = 500;
 const absence_window_ms: i64 = 350;
 const teardown_window_ms: i64 = 1_000;
 const tag_size: usize = 16;
@@ -75,10 +76,18 @@ const InvalidKind = enum {
     truncated,
 };
 
+const TrojanMultiProbeOptions = struct {
+    mixed_port: u16,
+    target_port: u16,
+    nonce: []const u8,
+    deadline: Deadline,
+};
+
 const ProbeKind = enum {
     roundtrip,
     roundtrip_domain,
     roundtrip_ipv6,
+    trojan_multi,
     response_drop_recovery,
     invalid_then_valid,
     source_pin,
@@ -100,6 +109,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, args[1], "echo")) {
         try mainEcho(init.io, args);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "health")) {
+        try mainHealth(init.io, args);
         return;
     }
     if (std.mem.eql(u8, args[1], "probe")) {
@@ -785,6 +798,47 @@ fn mainEcho(io: std.Io, args: []const []const u8) !void {
     try serveEcho(io, family, port);
 }
 
+fn mainHealth(io: std.Io, args: []const []const u8) !void {
+    if (args.len != 4) return error.InvalidArguments;
+    const port = try parsePort(args[2]);
+    const nonce = args[3];
+    if (!validEndpointId(nonce)) return error.InvalidArguments;
+    const deadline = Deadline.after(io, health_lifetime_ms);
+    const fd = try createUdpSocket(0);
+    defer closeFd(fd);
+    var request_buffer: [96]u8 = undefined;
+    const request = try std.fmt.bufPrint(
+        &request_buffer,
+        "ZC_E2E_UDP_HEALTH:{s}",
+        .{nonce},
+    );
+    try sendDatagram(
+        io,
+        fd,
+        request,
+        .{ .ip = .{ 127, 0, 0, 1 }, .port = port },
+        deadline,
+    );
+    const events = try waitFd(io, fd, std.posix.POLL.IN, deadline);
+    if (events == 0) return error.DeadlineExceeded;
+    var response_buffer: [96]u8 = undefined;
+    const received = try receiveDatagram(fd, &response_buffer);
+    if (!std.meta.eql(
+        received.sender,
+        Endpoint4{ .ip = .{ 127, 0, 0, 1 }, .port = port },
+    )) return error.UnexpectedPeer;
+    var expected_buffer: [96]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buffer,
+        "ZC_E2E_UDP_READY:{s}",
+        .{nonce},
+    );
+    if (!std.mem.eql(u8, response_buffer[0..received.size], expected)) {
+        return error.InvalidHealthResponse;
+    }
+    try printLine(io, "E2E_SS_UDP_HEALTH_PASS={s}\n", .{nonce});
+}
+
 fn mainProbe(io: std.Io, args: []const []const u8) ![]const u8 {
     if (args.len < 4) return error.InvalidArguments;
     const deadline = Deadline.after(io, probe_lifetime_ms);
@@ -793,6 +847,7 @@ fn mainProbe(io: std.Io, args: []const []const u8) ![]const u8 {
         .roundtrip,
         .roundtrip_domain,
         .roundtrip_ipv6,
+        .trojan_multi,
         .response_drop_recovery,
         .source_pin,
         .client_ip,
@@ -825,6 +880,12 @@ fn mainProbe(io: std.Io, args: []const []const u8) ![]const u8 {
                     args[5],
                     deadline,
                 ),
+                .trojan_multi => try probeTrojanMulti(io, .{
+                    .mixed_port = mixed_port,
+                    .target_port = target_port,
+                    .nonce = args[5],
+                    .deadline = deadline,
+                }),
                 .response_drop_recovery => try probeResponseDropRecovery(
                     io,
                     mixed_port,
@@ -920,6 +981,7 @@ fn parseProbeKind(text: []const u8) ?ProbeKind {
     if (std.mem.eql(u8, text, "roundtrip")) return .roundtrip;
     if (std.mem.eql(u8, text, "roundtrip-domain")) return .roundtrip_domain;
     if (std.mem.eql(u8, text, "roundtrip-ipv6")) return .roundtrip_ipv6;
+    if (std.mem.eql(u8, text, "trojan-multi")) return .trojan_multi;
     if (std.mem.eql(u8, text, "response-drop-recovery")) {
         return .response_drop_recovery;
     }
@@ -1032,8 +1094,8 @@ fn serveOracle(
         .truncated_tag_once => .truncated_tag,
     };
 
-    var packet_count: u32 = 0;
-    while (packet_count < packet_count_max) : (packet_count += 1) {
+    var protocol_packet_count: u32 = 0;
+    for (0..packet_count_max) |_| {
         const events = try waitFd(
             io,
             fd,
@@ -1045,7 +1107,32 @@ fn serveOracle(
             if (packetIoRecoverable(err)) continue;
             return err;
         };
-        const raw_count = packet_count + 1;
+        const packet = receive_buffer[0..received.size];
+        const health_prefix = "ZC_E2E_UDP_HEALTH:";
+        if (std.mem.startsWith(u8, packet, health_prefix)) {
+            const nonce = packet[health_prefix.len..];
+            if (!validEndpointId(nonce)) continue;
+            var health_response_buffer: [96]u8 = undefined;
+            const health_response = try std.fmt.bufPrint(
+                &health_response_buffer,
+                "ZC_E2E_UDP_READY:{s}",
+                .{nonce},
+            );
+            try sendDatagram(
+                io,
+                fd,
+                health_response,
+                received.sender,
+                lifetime_deadline,
+            );
+            continue;
+        }
+        protocol_packet_count = std.math.add(
+            u32,
+            protocol_packet_count,
+            1,
+        ) catch return error.PacketLimitExceeded;
+        const raw_count = protocol_packet_count;
         try printLine(
             io,
             "E2E_SS_UDP_ORACLE_RAW={s}:{d}\n",
@@ -2356,6 +2443,37 @@ fn probeRoundtripIpv6(
         },
         nonce,
         deadline,
+    );
+}
+
+fn probeTrojanMulti(
+    io: std.Io,
+    options: TrojanMultiProbeOptions,
+) !void {
+    const association = try openAssociation(
+        io,
+        options.mixed_port,
+        options.deadline,
+    );
+    defer closeFd(association.fd);
+    const udp_fd = try createUdpSocket(0);
+    defer closeFd(udp_fd);
+
+    try sendAndExpectIpv4(
+        io,
+        udp_fd,
+        association.relay.?,
+        .{ .ip = .{ 127, 0, 0, 1 }, .port = options.target_port },
+        options.nonce,
+        options.deadline,
+    );
+    try sendAndExpectDomain(
+        io,
+        udp_fd,
+        association.relay.?,
+        options.target_port,
+        options.nonce,
+        options.deadline,
     );
 }
 

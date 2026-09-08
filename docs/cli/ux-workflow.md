@@ -10,7 +10,7 @@
 ### JSON 模式（`--json`，全命令支持）
 
 - 成功：`{"ok":true,"command":"<path>","data":{...}}`，单行，**stdout**，exit 0。
-- 失败：`{"ok":false,"command":"<path>","error":{"code":"...","message":"...","hint":"..."}}`，**stdout**，exit ≠ 0。诊断类命令（`test` / `doctor`）失败时可附带 `"data"`（逐项检查结果）。
+- 失败：`{"ok":false,"command":"<path>","error":{"code":"...","message":"...","hint":"..."}}`，**stdout**，exit ≠ 0。诊断类命令（`test` / `doctor`）失败时可附带 `"data"`（逐项检查结果）；validator 产生的语义 `CONFIG_LOAD_INVALID` 附带有界的 `config_errors` / `config_warnings` / `config_diagnostics_truncated`，encoding/parser 失败不附带 `data`。
 - 每次调用 stdout 上**恰好一个** JSON 文档；流式命令（`zc log --json`）使用 JSON Lines（每行一个事件对象）。
 - 全部经 `std.json` 序列化（真实转义），禁止手拼 JSON 字符串。
 - 唯一例外：`zc config dump` 输出裸文档（YAML / `--json` 时裸 JSON 对象，不包 envelope），可直接 `| yq` / `| jq`；失败仍走 envelope。

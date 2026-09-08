@@ -22,6 +22,8 @@ origin_ready="$work_root/origin.ready"
 origin_log="$work_root/origin.log"
 fallback_ready="$work_root/fallback.ready"
 fallback_log="$work_root/fallback.log"
+eof_origin_ready="$work_root/eof-origin.ready"
+eof_origin_log="$work_root/eof-origin.log"
 obfs_oracle_obfs_log="$work_root/obfs-oracle-obfs.log"
 obfs_oracle_obfs_error_log="$work_root/obfs-oracle-obfs.error.log"
 obfs_oracle_local_log="$work_root/obfs-oracle-obfs-local.log"
@@ -45,6 +47,7 @@ export XDG_RUNTIME_DIR="$runtime_dir"
 export NO_PROXY=''
 export no_proxy=''
 target_host="127-0-0-1.sslip.io"
+eof_target_host="$target_host"
 
 cleanup() {
     local exit_code=$?
@@ -203,6 +206,31 @@ terminate_fixture_attempt() {
     wait "$process_id" >/dev/null 2>&1 || true
 }
 
+remove_process_id() {
+    local target="$1"
+    local process_index
+    for process_index in "${!process_ids[@]}"; do
+        if [ "${process_ids[$process_index]}" = "$target" ]; then
+            unset "process_ids[$process_index]"
+            return 0
+        fi
+    done
+    return 0
+}
+
+remove_ss_udp_registration() {
+    local endpoint_id="$1"
+    local oracle_index
+    for oracle_index in "${!ss_udp_oracle_ids[@]}"; do
+        if [ "${ss_udp_oracle_ids[$oracle_index]}" = "$endpoint_id" ]; then
+            unset "ss_udp_oracle_ids[$oracle_index]"
+            unset "ss_udp_oracle_logs[$oracle_index]"
+            return 0
+        fi
+    done
+    return 0
+}
+
 start_ssserver() {
     local cipher="$1"
     local log_path="$2"
@@ -210,13 +238,12 @@ start_ssserver() {
     local pid_variable="$4"
     local attempt=0
     while [ "$attempt" -lt 20 ]; do
-        local port process_id process_index
+        local port process_id
         port="$(reserve_port)"
         # shadowsocks-rust v1.24.0: -U is TCP_AND_UDP; -u is UDP_ONLY.
         "$ssserver_bin" -U -s "127.0.0.1:$port" -k e2e-password \
             -m "$cipher" -v --log-without-time >"$log_path" 2>&1 &
         process_id=$!
-        process_index="${#process_ids[@]}"
         process_ids+=("$process_id")
         if wait_for_process_log \
             "$log_path" 'shadowsocks udp server listening on' \
@@ -226,7 +253,7 @@ start_ssserver() {
             return 0
         fi
         terminate_fixture_attempt "$process_id"
-        unset "process_ids[$process_index]"
+        remove_process_id "$process_id"
         attempt=$((attempt + 1))
     done
     echo "Unable to start dual TCP/UDP shadowsocks-rust fixture" >&2
@@ -431,23 +458,155 @@ start_ss_udp_oracle() {
         "$endpoint_id" "$requested_port" >"$log_path" 2>"$error_path" &
     last_ss_udp_pid=$!
     process_ids+=("$last_ss_udp_pid")
-    wait_for_file "$log_path"
+    if ! wait_for_process_log \
+        "$log_path" \
+        "^E2E_SS_UDP_ORACLE_READY=${endpoint_id}:" \
+        "$last_ss_udp_pid"; then
+        echo "UDP oracle exited before readiness: $endpoint_id" >&2
+        cat "$error_path" >&2 || true
+        terminate_fixture_attempt "$last_ss_udp_pid"
+        remove_process_id "$last_ss_udp_pid"
+        return 1
+    fi
     last_ss_udp_port="$(awk -F: \
         -v id="$endpoint_id" \
         '$1 == "E2E_SS_UDP_ORACLE_READY=" id { print $2 }' \
         "$log_path")"
-    test -n "$last_ss_udp_port"
-    test "$last_ss_udp_port" != "7899"
-    if [ "$requested_port" -ne 0 ]; then
-        test "$last_ss_udp_port" = "$requested_port"
+    local validation_error=""
+    if ! [[ "$last_ss_udp_port" =~ ^[0-9]+$ ]]; then
+        validation_error="invalid ready port '$last_ss_udp_port'"
+    elif [ "$last_ss_udp_port" -eq 0 ] || \
+        [ "$last_ss_udp_port" -gt 65535 ] || \
+        [ "$last_ss_udp_port" -eq 7899 ]; then
+        validation_error="out-of-contract ready port '$last_ss_udp_port'"
+    elif [ "$requested_port" -ne 0 ] && \
+        [ "$last_ss_udp_port" -ne "$requested_port" ]; then
+        validation_error="requested port $requested_port, got $last_ss_udp_port"
+    elif ! kill -0 "$last_ss_udp_pid" >/dev/null 2>&1; then
+        validation_error="process exited after readiness"
+    elif [ "$(ss_udp_oracle_raw_count "$log_path" "$endpoint_id")" -ne 0 ] || \
+        [ "$(ss_udp_oracle_verified_count "$log_path" "$endpoint_id")" -ne 0 ] || \
+        [ "$(ss_udp_oracle_response_count "$log_path" "$endpoint_id")" -ne 0 ]; then
+        validation_error="initial counters are not zero"
     fi
-    kill -0 "$last_ss_udp_pid"
-    test "$(ss_udp_oracle_raw_count "$log_path" "$endpoint_id")" = "0"
-    test "$(ss_udp_oracle_verified_count "$log_path" "$endpoint_id")" = "0"
-    test "$(ss_udp_oracle_response_count "$log_path" "$endpoint_id")" = "0"
+    local stability_attempt=0
+    while [ -z "$validation_error" ] && \
+        [ "$stability_attempt" -lt 5 ]; do
+        sleep 0.05
+        if ! kill -0 "$last_ss_udp_pid" >/dev/null 2>&1; then
+            validation_error="process exited during readiness stability check"
+            break
+        fi
+        stability_attempt=$((stability_attempt + 1))
+    done
+    if [ -z "$validation_error" ]; then
+        local health_nonce="zc-${last_ss_udp_pid}"
+        local health_output=""
+        if ! health_output="$(
+            "$ss_udp_oracle_bin" health \
+                "$last_ss_udp_port" "$health_nonce" \
+                2>>"$error_path"
+        )"; then
+            validation_error="UDP nonce challenge failed"
+        elif ! grep -qx \
+            "E2E_SS_UDP_HEALTH_PASS=${health_nonce}" \
+            <<<"$health_output"; then
+            validation_error="UDP nonce challenge response is invalid"
+        elif ! kill -0 "$last_ss_udp_pid" >/dev/null 2>&1; then
+            validation_error="process exited after UDP nonce challenge"
+        fi
+    fi
+    stability_attempt=0
+    while [ -z "$validation_error" ] && \
+        [ "$stability_attempt" -lt 5 ]; do
+        sleep 0.05
+        if ! kill -0 "$last_ss_udp_pid" >/dev/null 2>&1; then
+            validation_error="process exited after health stability check"
+            break
+        fi
+        stability_attempt=$((stability_attempt + 1))
+    done
+    if [ -n "$validation_error" ]; then
+        echo "Invalid UDP oracle readiness for $endpoint_id: $validation_error" >&2
+        cat "$error_path" >&2 || true
+        terminate_fixture_attempt "$last_ss_udp_pid"
+        remove_process_id "$last_ss_udp_pid"
+        return 1
+    fi
     ss_udp_oracle_logs+=("$log_path")
     ss_udp_oracle_ids+=("$endpoint_id")
     last_ss_udp_log="$log_path"
+}
+
+start_obfs_udp_pair() {
+    local upstream_port="$1"
+    local host="$2"
+    local oracle_mode="$3"
+    local endpoint_id="$4"
+    local tcp_log="$5"
+    local tcp_error_log="$6"
+    local port_variable="$7"
+    local tcp_pid_variable="$8"
+    local udp_pid_variable="$9"
+    local udp_log_variable="${10}"
+    local attempt=0
+
+    while [ "$attempt" -lt 20 ]; do
+        : >"$tcp_log"
+        : >"$tcp_error_log"
+        "$obfs_oracle_bin" "$upstream_port" "$host" \
+            "$expected_initial_body_bytes" "$oracle_mode" "$endpoint_id" \
+            >"$tcp_log" 2>"$tcp_error_log" &
+        local tcp_pid=$!
+        process_ids+=("$tcp_pid")
+        if ! wait_for_process_log \
+            "$tcp_log" \
+            "^E2E_OBFS_ORACLE_READY=${endpoint_id}:" \
+            "$tcp_pid"; then
+            cat "$tcp_error_log" >&2 || true
+            terminate_fixture_attempt "$tcp_pid"
+            remove_process_id "$tcp_pid"
+            attempt=$((attempt + 1))
+            continue
+        fi
+        local port
+        port="$(awk -F: \
+            -v id="$endpoint_id" \
+            '$1 == "E2E_OBFS_ORACLE_READY=" id { print $2 }' \
+            "$tcp_log")"
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || \
+            [ "$port" -eq 0 ] || \
+            [ "$port" -gt 65535 ] || \
+            [ "$port" -eq 7899 ]; then
+            terminate_fixture_attempt "$tcp_pid"
+            remove_process_id "$tcp_pid"
+            attempt=$((attempt + 1))
+            continue
+        fi
+        if start_ss_udp_oracle \
+            aes-128-gcm normal "udp-${endpoint_id}" "$port"; then
+            if ! kill -0 "$tcp_pid" >/dev/null 2>&1 || \
+                ! kill -0 "$last_ss_udp_pid" >/dev/null 2>&1; then
+                terminate_fixture_attempt "$tcp_pid"
+                remove_process_id "$tcp_pid"
+                terminate_fixture_attempt "$last_ss_udp_pid"
+                remove_process_id "$last_ss_udp_pid"
+                remove_ss_udp_registration "udp-${endpoint_id}"
+                attempt=$((attempt + 1))
+                continue
+            fi
+            printf -v "$port_variable" '%s' "$port"
+            printf -v "$tcp_pid_variable" '%s' "$tcp_pid"
+            printf -v "$udp_pid_variable" '%s' "$last_ss_udp_pid"
+            printf -v "$udp_log_variable" '%s' "$last_ss_udp_log"
+            return 0
+        fi
+        terminate_fixture_attempt "$tcp_pid"
+        remove_process_id "$tcp_pid"
+        attempt=$((attempt + 1))
+    done
+    echo "Unable to start paired TCP/UDP obfs oracle: $endpoint_id" >&2
+    return 1
 }
 
 assert_ss_udp_response_sequence() {
@@ -497,6 +656,115 @@ probe_ss_udp_no_oracle_or_echo() {
     local output
     output="$("$ss_udp_oracle_bin" probe "$@")"
     grep -q '^E2E_SS_UDP_PROBE_PASS=' <<<"$output"
+    assert_udp_packet_counts_stable \
+        "$expected_ss_udp_oracle_raw_total" \
+        "$expected_udp_echo_packet_total"
+}
+
+probe_udp_echo() {
+    local family="$1"
+    shift
+    local ipv4_before ipv6_before output
+    ipv4_before="$(echo_packet_count "$udp_echo_ipv4_log" ipv4)"
+    ipv6_before="$(echo_packet_count "$udp_echo_ipv6_log" ipv6)"
+    expected_udp_echo_packet_total=$((expected_udp_echo_packet_total + 1))
+    output="$("$ss_udp_oracle_bin" probe "$@")"
+    grep -q '^E2E_SS_UDP_PROBE_PASS=' <<<"$output"
+    wait_for_echo_total "$expected_udp_echo_packet_total"
+    assert_udp_packet_counts_stable \
+        "$expected_ss_udp_oracle_raw_total" \
+        "$expected_udp_echo_packet_total"
+    case "$family" in
+        ipv4)
+            test "$(echo_packet_count "$udp_echo_ipv4_log" ipv4)" = \
+                "$((ipv4_before + 1))"
+            test "$(echo_packet_count "$udp_echo_ipv6_log" ipv6)" = \
+                "$ipv6_before"
+            ;;
+        ipv6)
+            test "$(echo_packet_count "$udp_echo_ipv4_log" ipv4)" = \
+                "$ipv4_before"
+            test "$(echo_packet_count "$udp_echo_ipv6_log" ipv6)" = \
+                "$((ipv6_before + 1))"
+            ;;
+        either) ;;
+        *) return 1 ;;
+    esac
+}
+
+probe_trojan_udp() {
+    local family="$1"
+    shift
+    local connection_before outbound_before inbound_before
+    connection_before="$(log_match_count \
+        "$work_root/trojan.log" 'trojan udp connection')"
+    outbound_before="$(log_match_count \
+        "$work_root/trojan.log" 'udp packet remote')"
+    inbound_before="$(log_match_count \
+        "$work_root/trojan.log" 'udp packet from')"
+
+    probe_udp_echo "$family" "$@"
+
+    wait_for_log_growth "$work_root/trojan.log" \
+        'trojan udp connection' "$connection_before" \
+        "trojan-go UDP association"
+    wait_for_log_growth "$work_root/trojan.log" \
+        'udp packet remote' "$outbound_before" \
+        "trojan-go outbound UDP frame"
+    wait_for_log_growth "$work_root/trojan.log" \
+        'udp packet from' "$inbound_before" \
+        "trojan-go inbound UDP frame"
+    test "$(log_match_count \
+        "$work_root/trojan.log" 'trojan udp connection')" = \
+        "$((connection_before + 1))"
+    test "$(log_match_count \
+        "$work_root/trojan.log" 'udp packet remote')" = \
+        "$((outbound_before + 1))"
+    test "$(log_match_count \
+        "$work_root/trojan.log" 'udp packet from')" = \
+        "$((inbound_before + 1))"
+}
+
+probe_trojan_udp_multi() {
+    local connection_before outbound_before inbound_before log_line_before
+    local output new_log
+    connection_before="$(log_match_count \
+        "$work_root/trojan.log" 'trojan udp connection')"
+    outbound_before="$(log_match_count \
+        "$work_root/trojan.log" 'udp packet remote')"
+    inbound_before="$(log_match_count \
+        "$work_root/trojan.log" 'udp packet from')"
+    log_line_before="$(wc -l <"$work_root/trojan.log")"
+
+    expected_udp_echo_packet_total=$((expected_udp_echo_packet_total + 2))
+    output="$("$ss_udp_oracle_bin" probe trojan-multi \
+        "$mixed_port" "$udp_echo_port" trojan-multi)"
+    grep -q '^E2E_SS_UDP_PROBE_PASS=trojan-multi$' <<<"$output"
+    wait_for_echo_total "$expected_udp_echo_packet_total"
+    wait_for_log_growth "$work_root/trojan.log" \
+        'trojan udp connection' "$connection_before" \
+        "trojan-go multi-frame association"
+    wait_for_log_growth "$work_root/trojan.log" \
+        'udp packet remote' "$outbound_before" \
+        "trojan-go multi-frame outbound"
+    wait_for_log_growth "$work_root/trojan.log" \
+        'udp packet from' "$inbound_before" \
+        "trojan-go multi-frame inbound"
+
+    test "$(log_match_count \
+        "$work_root/trojan.log" 'trojan udp connection')" = \
+        "$((connection_before + 1))"
+    test "$(log_match_count \
+        "$work_root/trojan.log" 'udp packet remote')" = \
+        "$((outbound_before + 2))"
+    test "$(log_match_count \
+        "$work_root/trojan.log" 'udp packet from')" = \
+        "$((inbound_before + 2))"
+    new_log="$(tail -n "+$((log_line_before + 1))" \
+        "$work_root/trojan.log")"
+    test "$(grep 'udp packet from' <<<"$new_log" | \
+        grep -c "metadata 127.0.0.1:${udp_echo_port}")" = "2"
+    ! grep 'udp packet from' <<<"$new_log" | grep -qi 'metadata localhost'
     assert_udp_packet_counts_stable \
         "$expected_ss_udp_oracle_raw_total" \
         "$expected_udp_echo_packet_total"
@@ -741,7 +1009,20 @@ wait_for_file "$fallback_ready"
 trojan_fallback_port="$(awk -F= '/^E2E_ORIGIN_PORT=/ { print $2 }' "$fallback_ready")"
 test -n "$trojan_fallback_port"
 test "$trojan_fallback_port" != "7899"
-printf '%s\n%s\n' "$origin_port" "$trojan_fallback_port" >"$reserved_port_file"
+"$origin_bin" eof-response >"$eof_origin_ready" 2>"$eof_origin_log" &
+eof_origin_pid=$!
+process_ids+=("$eof_origin_pid")
+wait_for_file "$eof_origin_ready"
+eof_origin_port="$(awk -F= \
+    '/^E2E_EOF_ORIGIN_PORT=/ { print $2 }' \
+    "$eof_origin_ready")"
+test -n "$eof_origin_port"
+test "$eof_origin_port" != "7899"
+printf '%s\n%s\n%s\n' \
+    "$origin_port" \
+    "$trojan_fallback_port" \
+    "$eof_origin_port" \
+    >"$reserved_port_file"
 
 mixed_port="$(reserve_port)"
 controller_port="$(reserve_port)"
@@ -759,6 +1040,7 @@ start_ssserver chacha20-ietf-poly1305 "$work_root/ss-chacha.log" \
 cat >"$work_root/trojan.json" <<EOF
 {
   "run_type": "server",
+  "log_level": 0,
   "local_addr": "127.0.0.1",
   "local_port": $trojan_port,
   "remote_addr": "127.0.0.1",
@@ -786,24 +1068,28 @@ obfs_local_host="obfs-local-alias.example.test"
 expected_initial_body_bytes=$((16 + 18 + 1 + 1 + ${#target_host} + 2 + 16))
 test "$expected_initial_body_bytes" = "72"
 
-"$obfs_oracle_bin" "$ss_aes128_port" "$obfs_host" \
-    "$expected_initial_body_bytes" fragmented_header obfs \
-    >"$obfs_oracle_obfs_log" 2>"$obfs_oracle_obfs_error_log" &
-obfs_oracle_obfs_pid=$!
-process_ids+=("$obfs_oracle_obfs_pid")
-"$obfs_oracle_bin" "$ss_aes128_port" "$obfs_local_host" \
-    "$expected_initial_body_bytes" same_write_tail obfs-local \
-    >"$obfs_oracle_local_log" 2>"$obfs_oracle_local_error_log" &
-obfs_oracle_local_pid=$!
-process_ids+=("$obfs_oracle_local_pid")
-wait_for_file "$obfs_oracle_obfs_log"
-wait_for_file "$obfs_oracle_local_log"
-obfs_oracle_port="$(awk -F: \
-    '/^E2E_OBFS_ORACLE_READY=obfs:/ { print $2 }' \
-    "$obfs_oracle_obfs_log")"
-obfs_oracle_local_port="$(awk -F: \
-    '/^E2E_OBFS_ORACLE_READY=obfs-local:/ { print $2 }' \
-    "$obfs_oracle_local_log")"
+start_obfs_udp_pair \
+    "$ss_aes128_port" \
+    "$obfs_host" \
+    fragmented_header \
+    obfs \
+    "$obfs_oracle_obfs_log" \
+    "$obfs_oracle_obfs_error_log" \
+    obfs_oracle_port \
+    obfs_oracle_obfs_pid \
+    udp_oracle_obfs_pid \
+    udp_oracle_obfs_log
+start_obfs_udp_pair \
+    "$ss_aes128_port" \
+    "$obfs_local_host" \
+    same_write_tail \
+    obfs-local \
+    "$obfs_oracle_local_log" \
+    "$obfs_oracle_local_error_log" \
+    obfs_oracle_local_port \
+    obfs_oracle_local_pid \
+    udp_oracle_obfs_local_pid \
+    udp_oracle_obfs_local_log
 test -n "$obfs_oracle_port"
 test -n "$obfs_oracle_local_port"
 test "$obfs_oracle_port" != "$obfs_oracle_local_port"
@@ -963,15 +1249,6 @@ start_ss_udp_oracle aes-128-gcm truncated-tag-once udp-short-tag 0
 udp_oracle_short_tag_port="$last_ss_udp_port"
 udp_oracle_short_tag_pid="$last_ss_udp_pid"
 udp_oracle_short_tag_log="$last_ss_udp_log"
-start_ss_udp_oracle aes-128-gcm normal udp-obfs \
-    "$obfs_oracle_port"
-udp_oracle_obfs_pid="$last_ss_udp_pid"
-udp_oracle_obfs_log="$last_ss_udp_log"
-start_ss_udp_oracle aes-128-gcm normal udp-obfs-local \
-    "$obfs_oracle_local_port"
-udp_oracle_obfs_local_pid="$last_ss_udp_pid"
-udp_oracle_obfs_local_log="$last_ss_udp_log"
-
 test "$(ss_udp_oracle_total_raw_count)" = "0"
 
 udp_echo_ipv4_log="$work_root/udp-echo-ipv4.log"
@@ -1138,6 +1415,7 @@ proxies:
     password: e2e-password
     sni: localhost.localdomain
     skip-cert-verify: true
+    udp: true
   - name: trojan-wrong-password
     type: trojan
     server: 127.0.0.1
@@ -1321,6 +1599,12 @@ probe_ss_udp_rust ipv4 "$work_root/ss-chacha.log" \
     roundtrip "$mixed_port" "$udp_echo_port" rust-chacha-alias-v4
 echo "E2E_SS_UDP_SHADOWSOCKS_RUST_V1_24_0_THREE_CIPHER=PASS"
 
+select_proxy trojan
+probe_trojan_udp_multi
+probe_trojan_udp ipv6 roundtrip-ipv6 "$mixed_port" \
+    "$udp_echo_port" trojan-v6
+echo "E2E_TROJAN_GO_V0_10_6_UDP=PASS"
+
 select_proxy udp-oracle-aes128
 probe_ss_udp_no_oracle_or_echo capacity "$mixed_port"
 select_proxy DIRECT
@@ -1359,6 +1643,28 @@ for proxy_name in ss-aes128 ss-aes256 ss-chacha ss-chacha-ietf trojan; do
         probe_connect_success "$mixed_port" "$origin_port" connect-trojan
         wait_for_log_growth "$fixture_log" "$fixture_pattern" \
             "$fixture_count" connect-trojan
+        eof_fixture_pattern=" tunneling to ${eof_target_host}:${eof_origin_port} closed"
+        eof_fixture_count="$(log_match_count \
+            "$work_root/trojan.log" "$eof_fixture_pattern")"
+        eof_probe_output="$(
+            "$origin_bin" socks-eof-probe \
+                "$mixed_port" \
+                "$eof_origin_port" \
+                "$eof_target_host"
+        )"
+        grep -qx 'E2E_TROJAN_TCP_EOF_TERMINATION=PASS' \
+            <<<"$eof_probe_output"
+        wait_for_log_growth \
+            "$work_root/trojan.log" \
+            "$eof_fixture_pattern" \
+            "$eof_fixture_count" \
+            trojan-tcp-eof-tunnel
+        wait_for_log_growth \
+            "$eof_origin_ready" \
+            '^E2E_EOF_ORIGIN_RESPONSE=PASS$' \
+            0 \
+            trojan-tcp-half-close
+        printf '%s\n' "$eof_probe_output"
     fi
     echo "E2E_PROXY_${proxy_name}=PASS"
 done

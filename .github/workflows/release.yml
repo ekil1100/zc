@@ -132,7 +132,7 @@ jobs:
           PKG_DIR="dist/${PKG_NAME}"
           mkdir -p "$PKG_DIR"
           cp ./zig-out/bin/zc "$PKG_DIR/"
-          cp ./README.md ./LICENSE "$PKG_DIR/"
+          cp ./README.md ./LICENSE ./THIRD_PARTY_NOTICES.md "$PKG_DIR/"
           tar -czf "dist/${PKG_NAME}.tar.gz" -C dist "$PKG_NAME"
           if command -v shasum >/dev/null 2>&1; then
             (cd dist && shasum -a 256 "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256")

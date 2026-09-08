@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_identity = @import("config_identity.zig");
+const safe_text = @import("safe_text.zig");
 
 pub const max_catalog_bytes = 4 * 1024 * 1024;
 pub const persisted_selection_count_max: usize = 1024;
@@ -302,15 +303,11 @@ pub fn isManagedKey(key: []const u8) bool {
 }
 
 pub fn isPortableManagedKey(key: []const u8) bool {
-    return key.len <= max_portable_key_bytes and isManagedKey(key);
+    if (key.len > max_portable_key_bytes) return false;
+    return isManagedKey(key);
 }
 
 fn isNonemptyText(text: []const u8) bool {
     if (text.len == 0) return false;
-    var view = std.unicode.Utf8View.init(text) catch return false;
-    var iterator = view.iterator();
-    while (iterator.nextCodepoint()) |codepoint| {
-        if (codepoint <= 0x1f or (codepoint >= 0x7f and codepoint <= 0x9f)) return false;
-    }
-    return true;
+    return safe_text.isDisplaySafe(text);
 }

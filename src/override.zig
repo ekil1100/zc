@@ -261,6 +261,9 @@ fn applyPatchImpl(
 ) !void {
     const trimmed = std.mem.trim(u8, patch_text, " \t\r\n");
     if (trimmed.len == 0) return;
+    if (!std.unicode.utf8ValidateSlice(trimmed)) {
+        return Errors.OverrideOutputInvalid;
+    }
     var root = yaml.parseDocument(allocator, trimmed) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return Errors.OverrideOutputInvalid,
@@ -839,7 +842,7 @@ fn writeYamlScalar(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value:
         .null => try out.appendSlice(allocator, "null"),
         .boolean => |b| try out.appendSlice(allocator, if (b) "true" else "false"),
         .integer => |n| try out.print(allocator, "{d}", .{n}),
-        .string => |s| try writeYamlQuotedString(out, allocator, s),
+        .string => |s| try writeYAMLQuotedString(out, allocator, s),
         .array, .map => return Errors.OverrideOutputInvalid,
     }
 }
@@ -850,7 +853,11 @@ fn writeYamlValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
             var it = m.iterator();
             while (it.next()) |entry| {
                 try appendIndent(out, allocator, indent);
-                try out.appendSlice(allocator, entry.key_ptr.*);
+                try writeYAMLQuotedString(
+                    out,
+                    allocator,
+                    entry.key_ptr.*,
+                );
                 switch (entry.value_ptr.*) {
                     .array, .map => {
                         if (emptyCollectionMarker(entry.value_ptr)) |marker| {
@@ -908,19 +915,108 @@ fn emptyCollectionMarker(value: *const yaml.YamlValue) ?[]const u8 {
     };
 }
 
-fn writeYamlQuotedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try out.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, c),
+fn writeYAMLQuotedString(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !void {
+    try output.append(allocator, '"');
+    var input_byte_index: usize = 0;
+    for (0..input.len) |_| {
+        if (input_byte_index == input.len) break;
+        const byte = input[input_byte_index];
+        if (byte < 0x80) {
+            switch (byte) {
+                '\\' => try output.appendSlice(allocator, "\\\\"),
+                '"' => try output.appendSlice(allocator, "\\\""),
+                '\n' => try output.appendSlice(allocator, "\\n"),
+                '\r' => try output.appendSlice(allocator, "\\r"),
+                '\t' => try output.appendSlice(allocator, "\\t"),
+                0...8, 11, 12, 14...31, 127 => try appendYAMLByteEscape(
+                    output,
+                    allocator,
+                    byte,
+                ),
+                else => try output.append(allocator, byte),
+            }
+            input_byte_index += 1;
+            continue;
         }
+
+        const utf8_sequence_byte_count = std.unicode.utf8ByteSequenceLength(byte) catch {
+            try appendYAMLByteEscape(output, allocator, byte);
+            input_byte_index += 1;
+            continue;
+        };
+        if (input_byte_index + utf8_sequence_byte_count > input.len) {
+            try appendYAMLByteEscape(output, allocator, byte);
+            input_byte_index += 1;
+            continue;
+        }
+        const utf8_sequence_end =
+            input_byte_index + utf8_sequence_byte_count;
+        const utf8_sequence = input[input_byte_index..utf8_sequence_end];
+        const codepoint = std.unicode.utf8Decode(utf8_sequence) catch {
+            try appendYAMLByteEscape(output, allocator, byte);
+            input_byte_index += 1;
+            continue;
+        };
+        if (isUnsafeYAMLCodepoint(codepoint)) {
+            try appendYAMLCodepointEscape(output, allocator, codepoint);
+        } else {
+            try output.appendSlice(allocator, utf8_sequence);
+        }
+        input_byte_index += utf8_sequence_byte_count;
     }
-    try out.append(allocator, '"');
+    std.debug.assert(input_byte_index == input.len);
+    try output.append(allocator, '"');
+}
+
+fn appendYAMLByteEscape(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    byte: u8,
+) !void {
+    const hex = "0123456789abcdef";
+    try output.appendSlice(allocator, "\\x");
+    try output.append(allocator, hex[byte >> 4]);
+    try output.append(allocator, hex[byte & 0x0f]);
+}
+
+fn appendYAMLCodepointEscape(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    codepoint: u21,
+) !void {
+    const hex = "0123456789abcdef";
+    const hex_digit_count: usize = if (codepoint <= 0xffff) 4 else 8;
+    try output.appendSlice(
+        allocator,
+        if (hex_digit_count == 4) "\\u" else "\\U",
+    );
+    for (0..hex_digit_count) |digit_index| {
+        const shift_bit_count = (hex_digit_count - digit_index - 1) * 4;
+        try output.append(
+            allocator,
+            hex[@intCast((codepoint >> @intCast(shift_bit_count)) & 0xf)],
+        );
+    }
+}
+
+fn isUnsafeYAMLCodepoint(codepoint: u21) bool {
+    if (codepoint >= 0x80) {
+        if (codepoint <= 0x9f) return true;
+    }
+    if (codepoint == 0x061c) return true;
+    if (codepoint == 0x200e) return true;
+    if (codepoint == 0x200f) return true;
+    if (codepoint >= 0x2028) {
+        if (codepoint <= 0x202e) return true;
+    }
+    if (codepoint >= 0x2066) {
+        if (codepoint <= 0x2069) return true;
+    }
+    return codepoint == 0xfeff;
 }
 
 fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
@@ -935,29 +1031,29 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
     try out.appendSlice(allocator, "allow-lan: ");
     try out.appendSlice(allocator, if (cfg.allow_lan) "true\n" else "false\n");
     try out.appendSlice(allocator, "bind-address: ");
-    try writeYamlQuotedString(&out, allocator, cfg.bind_address);
+    try writeYAMLQuotedString(&out, allocator, cfg.bind_address);
     try out.append(allocator, '\n');
     try out.appendSlice(allocator, "mode: ");
-    try writeYamlQuotedString(&out, allocator, cfg.mode);
+    try writeYAMLQuotedString(&out, allocator, cfg.mode);
     try out.append(allocator, '\n');
     try out.appendSlice(allocator, "log-level: ");
-    try writeYamlQuotedString(&out, allocator, cfg.log_level);
+    try writeYAMLQuotedString(&out, allocator, cfg.log_level);
     try out.append(allocator, '\n');
     try out.appendSlice(allocator, "ipv6: ");
     try out.appendSlice(allocator, if (cfg.ipv6) "true\n" else "false\n");
     if (cfg.external_controller) |value| {
         try out.appendSlice(allocator, "external-controller: ");
-        try writeYamlQuotedString(&out, allocator, value);
+        try writeYAMLQuotedString(&out, allocator, value);
         try out.append(allocator, '\n');
     }
     if (cfg.external_ui) |value| {
         try out.appendSlice(allocator, "external-ui: ");
-        try writeYamlQuotedString(&out, allocator, value);
+        try writeYAMLQuotedString(&out, allocator, value);
         try out.append(allocator, '\n');
     }
     if (cfg.secret) |value| {
         try out.appendSlice(allocator, "secret: ");
-        try writeYamlQuotedString(&out, allocator, value);
+        try writeYAMLQuotedString(&out, allocator, value);
         try out.append(allocator, '\n');
     }
     try out.print(allocator, "idle-session-check-interval: {d}\n", .{cfg.idle_session_check_interval});
@@ -970,21 +1066,25 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
         try out.appendSlice(allocator, "rule-providers:\n");
         for (cfg.rule_providers.items) |provider| {
             try out.appendSlice(allocator, "  ");
-            try writeYamlQuotedString(&out, allocator, provider.name);
+            try writeYAMLQuotedString(&out, allocator, provider.name);
             try out.appendSlice(allocator, ":\n");
             try out.appendSlice(allocator, "    type: ");
-            try writeYamlQuotedString(&out, allocator, provider.provider_type);
+            try writeYAMLQuotedString(&out, allocator, provider.provider_type);
             try out.append(allocator, '\n');
             try out.appendSlice(allocator, "    behavior: ");
-            try writeYamlQuotedString(&out, allocator, ruleProviderBehaviorString(provider.behavior));
+            try writeYAMLQuotedString(
+                &out,
+                allocator,
+                ruleProviderBehaviorString(provider.behavior),
+            );
             try out.append(allocator, '\n');
             if (provider.url) |url| {
                 try out.appendSlice(allocator, "    url: ");
-                try writeYamlQuotedString(&out, allocator, url);
+                try writeYAMLQuotedString(&out, allocator, url);
                 try out.append(allocator, '\n');
             }
             try out.appendSlice(allocator, "    path: ");
-            try writeYamlQuotedString(&out, allocator, provider.path);
+            try writeYAMLQuotedString(&out, allocator, provider.path);
             try out.append(allocator, '\n');
             try out.print(allocator, "    interval: {d}\n", .{provider.interval});
         }
@@ -996,30 +1096,30 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
         try out.appendSlice(allocator, "proxies:\n");
         for (cfg.proxies.items) |proxy| {
             try out.appendSlice(allocator, "  - name: ");
-            try writeYamlQuotedString(&out, allocator, proxy.name);
+            try writeYAMLQuotedString(&out, allocator, proxy.name);
             try out.append(allocator, '\n');
             try out.appendSlice(allocator, "    type: ");
-            try writeYamlQuotedString(&out, allocator, proxyTypeString(proxy.proxy_type));
+            try writeYAMLQuotedString(&out, allocator, proxyTypeString(proxy.proxy_type));
             try out.append(allocator, '\n');
             if (proxy.proxy_type != .direct and proxy.proxy_type != .reject) {
                 try out.appendSlice(allocator, "    server: ");
-                try writeYamlQuotedString(&out, allocator, proxy.server);
+                try writeYAMLQuotedString(&out, allocator, proxy.server);
                 try out.append(allocator, '\n');
                 try out.print(allocator, "    port: {d}\n", .{proxy.port});
             }
             if (proxy.password) |value| {
                 try out.appendSlice(allocator, "    password: ");
-                try writeYamlQuotedString(&out, allocator, value);
+                try writeYAMLQuotedString(&out, allocator, value);
                 try out.append(allocator, '\n');
             }
             if (proxy.cipher) |value| {
                 try out.appendSlice(allocator, "    cipher: ");
-                try writeYamlQuotedString(&out, allocator, value);
+                try writeYAMLQuotedString(&out, allocator, value);
                 try out.append(allocator, '\n');
             }
             if (proxy.uuid) |value| {
                 try out.appendSlice(allocator, "    uuid: ");
-                try writeYamlQuotedString(&out, allocator, value);
+                try writeYAMLQuotedString(&out, allocator, value);
                 try out.append(allocator, '\n');
             }
             if (proxy.alter_id != 0) try out.print(allocator, "    alterId: {d}\n", .{proxy.alter_id});
@@ -1028,8 +1128,16 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
             if (proxy.udp) try out.appendSlice(allocator, "    udp: true\n");
             if (proxy.sni) |value| {
                 try out.appendSlice(allocator, "    sni: ");
-                try writeYamlQuotedString(&out, allocator, value);
+                try writeYAMLQuotedString(&out, allocator, value);
                 try out.append(allocator, '\n');
+            }
+            if (proxy.network) |value| {
+                try out.appendSlice(allocator, "    network: ");
+                try writeYAMLQuotedString(&out, allocator, value);
+                try out.append(allocator, '\n');
+            }
+            if (proxy.grpc) {
+                try out.appendSlice(allocator, "    grpc-opts: {}\n");
             }
             if (proxy.ws or proxy.ws_path != null or proxy.ws_host != null) {
                 if (proxy.ws_path == null and proxy.ws_host == null) {
@@ -1039,18 +1147,18 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
                 }
                 if (proxy.ws_path) |value| {
                     try out.appendSlice(allocator, "      path: ");
-                    try writeYamlQuotedString(&out, allocator, value);
+                    try writeYAMLQuotedString(&out, allocator, value);
                     try out.append(allocator, '\n');
                 }
                 if (proxy.ws_host) |value| {
                     try out.appendSlice(allocator, "      headers:\n        Host: ");
-                    try writeYamlQuotedString(&out, allocator, value);
+                    try writeYAMLQuotedString(&out, allocator, value);
                     try out.append(allocator, '\n');
                 }
             }
             if (proxy.plugin) |value| {
                 try out.appendSlice(allocator, "    plugin: ");
-                try writeYamlQuotedString(&out, allocator, value);
+                try writeYAMLQuotedString(&out, allocator, value);
                 try out.append(allocator, '\n');
             }
             if (proxy.semantic_state == .malformed or
@@ -1067,12 +1175,12 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
                     try out.appendSlice(allocator, "    plugin-opts:\n");
                     if (proxy.obfs_mode) |value| {
                         try out.appendSlice(allocator, "      mode: ");
-                        try writeYamlQuotedString(&out, allocator, value);
+                        try writeYAMLQuotedString(&out, allocator, value);
                         try out.append(allocator, '\n');
                     }
                     if (proxy.obfs_host) |value| {
                         try out.appendSlice(allocator, "      host: ");
-                        try writeYamlQuotedString(&out, allocator, value);
+                        try writeYAMLQuotedString(&out, allocator, value);
                         try out.append(allocator, '\n');
                     }
                 }
@@ -1086,10 +1194,10 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
         try out.appendSlice(allocator, "proxy-groups:\n");
         for (cfg.proxy_groups.items) |group| {
             try out.appendSlice(allocator, "  - name: ");
-            try writeYamlQuotedString(&out, allocator, group.name);
+            try writeYAMLQuotedString(&out, allocator, group.name);
             try out.append(allocator, '\n');
             try out.appendSlice(allocator, "    type: ");
-            try writeYamlQuotedString(&out, allocator, proxyGroupTypeString(group.group_type));
+            try writeYAMLQuotedString(&out, allocator, proxyGroupTypeString(group.group_type));
             try out.append(allocator, '\n');
             if (group.proxies.items.len == 0) {
                 try out.appendSlice(allocator, "    proxies: []\n");
@@ -1097,13 +1205,13 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
                 try out.appendSlice(allocator, "    proxies:\n");
                 for (group.proxies.items) |item| {
                     try out.appendSlice(allocator, "      - ");
-                    try writeYamlQuotedString(&out, allocator, item);
+                    try writeYAMLQuotedString(&out, allocator, item);
                     try out.append(allocator, '\n');
                 }
             }
             if (group.url) |url| {
                 try out.appendSlice(allocator, "    url: ");
-                try writeYamlQuotedString(&out, allocator, url);
+                try writeYAMLQuotedString(&out, allocator, url);
                 try out.append(allocator, '\n');
             }
             try out.print(allocator, "    interval: {d}\n", .{group.interval});
@@ -1121,7 +1229,7 @@ fn dumpEffectiveConfigYaml(allocator: std.mem.Allocator, cfg: *const config.Conf
             const text = try ruleToText(allocator, rule);
             defer allocator.free(text);
             try out.appendSlice(allocator, "  - ");
-            try writeYamlQuotedString(&out, allocator, text);
+            try writeYAMLQuotedString(&out, allocator, text);
             try out.append(allocator, '\n');
         }
     }
@@ -1166,27 +1274,27 @@ fn dumpConfigYamlWithOptions(
     try out.print(allocator, "allow-lan: {s}\n", .{if (cfg.allow_lan) "true" else "false"});
     try out.print(allocator, "ipv6: {s}\n", .{if (cfg.ipv6) "true" else "false"});
     try out.appendSlice(allocator, "bind-address: ");
-    try writeYamlQuotedString(&out, allocator, cfg.bind_address);
+    try writeYAMLQuotedString(&out, allocator, cfg.bind_address);
     try out.append(allocator, '\n');
     try out.appendSlice(allocator, "mode: ");
-    try writeYamlQuotedString(&out, allocator, cfg.mode);
+    try writeYAMLQuotedString(&out, allocator, cfg.mode);
     try out.append(allocator, '\n');
     try out.appendSlice(allocator, "log-level: ");
-    try writeYamlQuotedString(&out, allocator, cfg.log_level);
+    try writeYAMLQuotedString(&out, allocator, cfg.log_level);
     try out.append(allocator, '\n');
     if (cfg.external_controller) |ec| {
         try out.appendSlice(allocator, "external-controller: ");
-        try writeYamlQuotedString(&out, allocator, ec);
+        try writeYAMLQuotedString(&out, allocator, ec);
         try out.append(allocator, '\n');
     }
     if (cfg.external_ui) |ui| {
         try out.appendSlice(allocator, "external-ui: ");
-        try writeYamlQuotedString(&out, allocator, ui);
+        try writeYAMLQuotedString(&out, allocator, ui);
         try out.append(allocator, '\n');
     }
     if (cfg.secret) |secret| {
         try out.appendSlice(allocator, "secret: ");
-        try writeYamlQuotedString(
+        try writeYAMLQuotedString(
             &out,
             allocator,
             if (options.redact_secrets) "******" else secret,
@@ -1209,21 +1317,25 @@ fn dumpConfigYamlWithOptions(
         try out.appendSlice(allocator, "rule-providers:\n");
         for (cfg.rule_providers.items) |provider| {
             try out.appendSlice(allocator, "  ");
-            try out.appendSlice(allocator, provider.name);
+            try writeYAMLQuotedString(&out, allocator, provider.name);
             try out.appendSlice(allocator, ":\n");
             try out.appendSlice(allocator, "    type: ");
-            try writeYamlQuotedString(&out, allocator, provider.provider_type);
+            try writeYAMLQuotedString(&out, allocator, provider.provider_type);
             try out.append(allocator, '\n');
             try out.appendSlice(allocator, "    behavior: ");
-            try writeYamlQuotedString(&out, allocator, ruleProviderBehaviorString(provider.behavior));
+            try writeYAMLQuotedString(
+                &out,
+                allocator,
+                ruleProviderBehaviorString(provider.behavior),
+            );
             try out.append(allocator, '\n');
             if (provider.url) |url| {
                 try out.appendSlice(allocator, "    url: ");
-                try writeYamlQuotedString(&out, allocator, url);
+                try writeYAMLQuotedString(&out, allocator, url);
                 try out.append(allocator, '\n');
             }
             try out.appendSlice(allocator, "    path: ");
-            try writeYamlQuotedString(&out, allocator, provider.path);
+            try writeYAMLQuotedString(&out, allocator, provider.path);
             try out.append(allocator, '\n');
             try out.print(allocator, "    interval: {d}\n", .{provider.interval});
         }
@@ -1236,18 +1348,18 @@ fn dumpConfigYamlWithOptions(
     }
     for (cfg.proxies.items) |proxy| {
         try out.appendSlice(allocator, "  - name: ");
-        try writeYamlQuotedString(&out, allocator, proxy.name);
+        try writeYAMLQuotedString(&out, allocator, proxy.name);
         try out.append(allocator, '\n');
         try out.appendSlice(allocator, "    type: ");
-        try writeYamlQuotedString(&out, allocator, proxyTypeString(proxy.proxy_type));
+        try writeYAMLQuotedString(&out, allocator, proxyTypeString(proxy.proxy_type));
         try out.append(allocator, '\n');
         try out.appendSlice(allocator, "    server: ");
-        try writeYamlQuotedString(&out, allocator, proxy.server);
+        try writeYAMLQuotedString(&out, allocator, proxy.server);
         try out.append(allocator, '\n');
         try out.print(allocator, "    port: {d}\n", .{proxy.port});
         if (proxy.password) |password| {
             try out.appendSlice(allocator, "    password: ");
-            try writeYamlQuotedString(
+            try writeYAMLQuotedString(
                 &out,
                 allocator,
                 if (options.redact_secrets) "******" else password,
@@ -1256,12 +1368,12 @@ fn dumpConfigYamlWithOptions(
         }
         if (proxy.cipher) |cipher| {
             try out.appendSlice(allocator, "    cipher: ");
-            try writeYamlQuotedString(&out, allocator, cipher);
+            try writeYAMLQuotedString(&out, allocator, cipher);
             try out.append(allocator, '\n');
         }
         if (proxy.uuid) |uuid| {
             try out.appendSlice(allocator, "    uuid: ");
-            try writeYamlQuotedString(
+            try writeYAMLQuotedString(
                 &out,
                 allocator,
                 if (options.redact_secrets) "******" else uuid,
@@ -1273,12 +1385,20 @@ fn dumpConfigYamlWithOptions(
         if (proxy.skip_cert_verify) try out.appendSlice(allocator, "    skip-cert-verify: true\n");
         if (proxy.sni) |sni| {
             try out.appendSlice(allocator, "    sni: ");
-            try writeYamlQuotedString(
+            try writeYAMLQuotedString(
                 &out,
                 allocator,
                 if (options.redact_secrets) "******" else sni,
             );
             try out.append(allocator, '\n');
+        }
+        if (proxy.network) |network| {
+            try out.appendSlice(allocator, "    network: ");
+            try writeYAMLQuotedString(&out, allocator, network);
+            try out.append(allocator, '\n');
+        }
+        if (proxy.grpc) {
+            try out.appendSlice(allocator, "    grpc-opts: {}\n");
         }
         if (proxy.udp) try out.appendSlice(allocator, "    udp: true\n");
         if (proxy.ws) {
@@ -1288,20 +1408,20 @@ fn dumpConfigYamlWithOptions(
                 try out.appendSlice(allocator, "    ws-opts:\n");
                 if (proxy.ws_path) |ws_path| {
                     try out.appendSlice(allocator, "      path: ");
-                    try writeYamlQuotedString(&out, allocator, ws_path);
+                    try writeYAMLQuotedString(&out, allocator, ws_path);
                     try out.append(allocator, '\n');
                 }
                 if (proxy.ws_host) |ws_host| {
                     try out.appendSlice(allocator, "      headers:\n");
                     try out.appendSlice(allocator, "        Host: ");
-                    try writeYamlQuotedString(&out, allocator, ws_host);
+                    try writeYAMLQuotedString(&out, allocator, ws_host);
                     try out.append(allocator, '\n');
                 }
             }
         }
         if (proxy.plugin) |plugin| {
             try out.appendSlice(allocator, "    plugin: ");
-            try writeYamlQuotedString(&out, allocator, plugin);
+            try writeYAMLQuotedString(&out, allocator, plugin);
             try out.append(allocator, '\n');
         }
         if (proxy.semantic_state == .malformed or
@@ -1318,12 +1438,12 @@ fn dumpConfigYamlWithOptions(
                 try out.appendSlice(allocator, "    plugin-opts:\n");
                 if (proxy.obfs_mode) |obfs_mode| {
                     try out.appendSlice(allocator, "      mode: ");
-                    try writeYamlQuotedString(&out, allocator, obfs_mode);
+                    try writeYAMLQuotedString(&out, allocator, obfs_mode);
                     try out.append(allocator, '\n');
                 }
                 if (proxy.obfs_host) |obfs_host| {
                     try out.appendSlice(allocator, "      host: ");
-                    try writeYamlQuotedString(&out, allocator, obfs_host);
+                    try writeYAMLQuotedString(&out, allocator, obfs_host);
                     try out.append(allocator, '\n');
                 }
             }
@@ -1337,20 +1457,20 @@ fn dumpConfigYamlWithOptions(
     }
     for (cfg.proxy_groups.items) |group| {
         try out.appendSlice(allocator, "  - name: ");
-        try writeYamlQuotedString(&out, allocator, group.name);
+        try writeYAMLQuotedString(&out, allocator, group.name);
         try out.append(allocator, '\n');
         try out.appendSlice(allocator, "    type: ");
-        try writeYamlQuotedString(&out, allocator, proxyGroupTypeString(group.group_type));
+        try writeYAMLQuotedString(&out, allocator, proxyGroupTypeString(group.group_type));
         try out.append(allocator, '\n');
         try out.appendSlice(allocator, "    proxies:\n");
         for (group.proxies.items) |item| {
             try out.appendSlice(allocator, "      - ");
-            try writeYamlQuotedString(&out, allocator, item);
+            try writeYAMLQuotedString(&out, allocator, item);
             try out.append(allocator, '\n');
         }
         if (group.url) |url| {
             try out.appendSlice(allocator, "    url: ");
-            try writeYamlQuotedString(&out, allocator, url);
+            try writeYAMLQuotedString(&out, allocator, url);
             try out.append(allocator, '\n');
         }
         try out.print(allocator, "    interval: {d}\n", .{group.interval});
@@ -1368,7 +1488,7 @@ fn dumpConfigYamlWithOptions(
         const as_text = try ruleToText(allocator, rule);
         defer allocator.free(as_text);
         try out.appendSlice(allocator, "  - ");
-        try writeYamlQuotedString(&out, allocator, as_text);
+        try writeYAMLQuotedString(&out, allocator, as_text);
         try out.append(allocator, '\n');
     }
 
@@ -1381,7 +1501,16 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    var js: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .minified } };
+    var js: std.json.Stringify = .{
+        .writer = &aw.writer,
+        .options = .{
+            .whitespace = .minified,
+            .emit_null_optional_fields = true,
+            .emit_strings_as_arrays = false,
+            .escape_unicode = true,
+            .emit_nonportable_numbers_as_strings = false,
+        },
+    };
     try js.beginObject();
 
     try js.objectField("port");
@@ -1398,8 +1527,10 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
     try js.write(cfg.mode);
     try js.objectField("log-level");
     try js.write(cfg.log_level);
-    try js.objectField("external-controller");
-    try js.write(cfg.external_controller);
+    if (cfg.external_controller) |controller| {
+        try js.objectField("external-controller");
+        try js.write(controller);
+    }
 
     try js.objectField("rule-providers");
     try js.beginObject();
@@ -1410,8 +1541,10 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try js.write(provider.provider_type);
         try js.objectField("behavior");
         try js.write(ruleProviderBehaviorString(provider.behavior));
-        try js.objectField("url");
-        try js.write(provider.url);
+        if (provider.url) |url| {
+            try js.objectField("url");
+            try js.write(url);
+        }
         try js.objectField("path");
         try js.write(provider.path);
         try js.objectField("interval");
@@ -1432,6 +1565,18 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
         try js.write(proxy.server);
         try js.objectField("port");
         try js.write(proxy.port);
+        if (proxy.tls) {
+            try js.objectField("tls");
+            try js.write(true);
+        }
+        if (proxy.skip_cert_verify) {
+            try js.objectField("skip-cert-verify");
+            try js.write(true);
+        }
+        if (proxy.udp) {
+            try js.objectField("udp");
+            try js.write(true);
+        }
         if (proxy.password != null) {
             try js.objectField("password");
             try js.write("******");
@@ -1471,6 +1616,37 @@ pub fn dumpConfigJson(allocator: std.mem.Allocator, cfg: *const config.Config) !
         if (proxy.sni != null) {
             try js.objectField("sni");
             try js.write("******");
+        }
+        if (proxy.network) |network| {
+            try js.objectField("network");
+            try js.write(network);
+        }
+        if (proxy.grpc) {
+            try js.objectField("grpc-opts");
+            try js.beginObject();
+            try js.endObject();
+        }
+        const has_websocket_options = if (proxy.ws)
+            true
+        else if (proxy.ws_path != null)
+            true
+        else
+            proxy.ws_host != null;
+        if (has_websocket_options) {
+            try js.objectField("ws-opts");
+            try js.beginObject();
+            if (proxy.ws_path) |path| {
+                try js.objectField("path");
+                try js.write(path);
+            }
+            if (proxy.ws_host) |host| {
+                try js.objectField("headers");
+                try js.beginObject();
+                try js.objectField("Host");
+                try js.write(host);
+                try js.endObject();
+            }
+            try js.endObject();
         }
         try js.endObject();
     }
@@ -1720,10 +1896,48 @@ test "runtime YAML snapshot preserves secrets and omits provider declarations" {
     );
 }
 
+test "YAML quoted strings escape controls and special mapping keys" {
+    // Apply or render the focused override fixture and parse the result to
+    // verify preservation and escaping.
+    const allocator = std.testing.allocator;
+    const key = "foo: bar\x1b\xc2\x9b\xe2\x80\xae";
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(allocator);
+    try writeYAMLQuotedString(&rendered, allocator, key);
+    try rendered.appendSlice(allocator, ": \"value\"\n");
+
+    try std.testing.expect(std.mem.indexOfScalar(
+        u8,
+        rendered.items,
+        0x1b,
+    ) == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "\\x1b") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "\\u009b") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "\\u202e") != null,
+    );
+
+    var parsed = try yaml.parseDocument(allocator, rendered.items);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "value",
+        parsed.map.get(key).?.string,
+    );
+}
+
 test "dumpConfigJson emits parseable std.json with escaping and masked secrets" {
     const allocator = std.testing.allocator;
     const content =
         \\port: 7890
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: rules.yaml
         \\proxies:
         \\  - name: node "HK" 线路
         \\    type: ss
@@ -1735,6 +1949,15 @@ test "dumpConfigJson emits parseable std.json with escaping and masked secrets" 
         \\    plugin_opts:
         \\      mode: http
         \\      host: cdn.example.com
+        \\  - name: trojan-udp
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    tls: true
+        \\    skip-cert-verify: true
+        \\    udp: true
+        \\    network: tcp
         \\proxy-groups:
         \\  - name: Proxy
         \\    type: select
@@ -1753,6 +1976,12 @@ test "dumpConfigJson emits parseable std.json with escaping and masked secrets" 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, dumped, .{});
     defer parsed.deinit();
 
+    try std.testing.expect(
+        parsed.value.object.get("external-controller") == null,
+    );
+    const local_provider = parsed.value.object.get("rule-providers").?.object
+        .get("local").?.object;
+    try std.testing.expect(local_provider.get("url") == null);
     const proxy = parsed.value.object.get("proxies").?.array.items[0].object;
     try std.testing.expectEqualStrings("node \"HK\" 线路", proxy.get("name").?.string);
     try std.testing.expectEqualStrings("******", proxy.get("password").?.string);
@@ -1765,7 +1994,74 @@ test "dumpConfigJson emits parseable std.json with escaping and masked secrets" 
         plugin_options.get("host").?.string,
     );
     try std.testing.expect(proxy.get("plugin_opts") == null);
+    const trojan_proxy = parsed.value.object.get("proxies").?.array
+        .items[1].object;
+    try std.testing.expect(trojan_proxy.get("tls").?.bool);
+    try std.testing.expect(trojan_proxy.get("skip-cert-verify").?.bool);
+    try std.testing.expect(trojan_proxy.get("udp").?.bool);
+    try std.testing.expectEqualStrings(
+        "tcp",
+        trojan_proxy.get("network").?.string,
+    );
     try std.testing.expectEqualStrings("MATCH,DIRECT", parsed.value.object.get("rules").?.array.items[0].string);
+}
+
+test "dumpConfigJson escapes Unicode controls without changing values" {
+    // Apply or render the focused override fixture and parse the result to
+    // verify preservation and escaping.
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(
+        allocator,
+        \\mixed-port: 7890
+        \\rules:
+        \\  - "DOMAIN-KEYWORD,safe\u202eevil,DIRECT"
+        \\  - MATCH,DIRECT
+        ,
+    );
+    defer cfg.deinit();
+
+    const dumped = try dumpConfigJson(allocator, &cfg);
+    defer allocator.free(dumped);
+    try std.testing.expect(std.mem.indexOf(u8, dumped, "\\u202e") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        dumped,
+        "\xe2\x80\xae",
+    ) == null);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        dumped,
+        .{
+            .duplicate_field_behavior = .@"error",
+            .ignore_unknown_fields = false,
+            .max_value_len = dumped.len,
+            .allocate = .alloc_if_needed,
+            .parse_numbers = true,
+        },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "DOMAIN-KEYWORD,safe\xe2\x80\xaeevil,DIRECT",
+        parsed.value.object.get("rules").?.array.items[0].string,
+    );
+}
+
+test "override rejects non-UTF-8 patch output" {
+    // Return invalid UTF-8 from a focused patch and verify applyPatch rejects
+    // it before replacing the live configuration.
+    const allocator = std.testing.allocator;
+    var cfg = try config.parseDocument(
+        allocator,
+        "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n",
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(
+        Errors.OverrideOutputInvalid,
+        applyPatch(allocator, &cfg, "log-level: \"bad\x80\"\n"),
+    );
 }
 
 test "override materialization preserves runtime secrets in owner-only effective bytes" {
@@ -2031,6 +2327,34 @@ test "override materialization rejects plugin metadata on non-Shadowsocks proxie
             \\    plugin-opts: "obfs=http"
         , ""),
     );
+}
+
+test "override preserves unsupported gRPC capability across unrelated patches" {
+    // Apply an unrelated patch to a gRPC proxy, then verify transport metadata
+    // survives and the unsupported-capability gate remains fail closed.
+    const allocator = std.testing.allocator;
+    const source =
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: grpc-trojan
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    network: tcp
+        \\    grpc-opts: {}
+    ;
+    const patches = [_][]const u8{
+        "",
+        "log-level: info\n",
+        "mode: global\n",
+    };
+    for (patches) |patch| {
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            materializeSource(allocator, source, patch),
+        );
+    }
 }
 
 test "override materialization rejects malformed and unsupported obfs semantics" {

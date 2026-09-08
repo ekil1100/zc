@@ -1,7 +1,7 @@
-//! Bounded RFC 1928 UDP codec, association state, and classic relay wiring.
+//! Bounded RFC 1928 UDP codec, association state, and outbound relay wiring.
 //!
-//! The relay owns one client socket and one optional Shadowsocks UDP session;
-//! it deliberately provides neither fragment reassembly nor an application queue.
+//! The relay owns one client socket and one protocol-independent datagram
+//! session; it provides neither fragment reassembly nor an application queue.
 
 const std = @import("std");
 const compat = @import("../compat.zig");
@@ -274,7 +274,7 @@ const SystemAssociationOps = struct {
 };
 
 const ManagerOpener = struct {
-    const Session = shadowsocks_udp.Session;
+    const Session = outbound.DatagramSession;
 
     manager: *OutboundManager,
 
@@ -284,7 +284,7 @@ const ManagerOpener = struct {
         absolute_deadline_ms: i64,
         cancel_fd: std.posix.fd_t,
     ) !*Session {
-        return self.manager.connectUdp(
+        return self.manager.connectUDP(
             proxy_name,
             absolute_deadline_ms,
             cancel_fd,
@@ -474,7 +474,7 @@ fn relayUsing(
                                 deadline_ms,
                                 control.handle,
                             ) catch return;
-                            compat.checkCancelFd(control.handle) catch |err| {
+                            compat.checkCancelFD(control.handle) catch |err| {
                                 opened.destroy();
                                 if (err == error.Canceled) return;
                                 return err;
@@ -505,15 +505,17 @@ fn relayUsing(
                 if (session_events & std.posix.POLL.NVAL != 0) {
                     return error.InvalidSessionSocket;
                 }
-                if (session_events & std.posix.POLL.HUP != 0) {
-                    return error.SessionSocketClosed;
-                }
-                if (session_events & (std.posix.POLL.IN |
-                    std.posix.POLL.ERR) != 0)
-                {
+                const should_receive = session_events & (std.posix.POLL.IN |
+                    std.posix.POLL.ERR) != 0;
+                if (should_receive) {
                     const result = try value.receive();
                     switch (result) {
-                        .would_block, .dropped => {},
+                        .eof => return,
+                        .would_block, .dropped => {
+                            if (session_events & std.posix.POLL.HUP != 0) {
+                                return error.SessionSocketClosed;
+                            }
+                        },
                         .datagram => |datagram| {
                             const client = association.clientEndpoint() orelse
                                 continue;
@@ -535,6 +537,10 @@ fn relayUsing(
                             );
                         },
                     }
+                } else if (session_events & (std.posix.POLL.HUP |
+                    std.posix.POLL.ERR) != 0)
+                {
+                    return error.SessionSocketClosed;
                 }
             }
         }
@@ -551,6 +557,16 @@ fn classifyPacketIoError(err: anyerror) PacketIoClassification {
         error.WouldBlock,
         error.PacketDropped,
         error.DatagramTooLarge,
+        error.AddressResolutionFailed,
+        error.AddressResolutionResultLimitExceeded,
+        error.InvalidAddress,
+        error.InvalidHostName,
+        error.InvalidPort,
+        error.NameServerFailure,
+        error.NoAddressReturned,
+        error.UnknownHostName,
+        error.AddressResolutionTimeout,
+        error.DeadlineExceeded,
         => .drop,
         else => .{ .fatal = err },
     };
@@ -1803,6 +1819,29 @@ test "SOCKS5 UDP association pins the first valid matching sender" {
     try std.testing.expectError(
         error.ClientPortMismatch,
         association.acceptDatagram(other_port, test_valid_datagram),
+    );
+}
+
+test "SOCKS5 UDP treats target name failures as packet-local drops" {
+    // Send focused datagrams through the association seam and inspect
+    // packet-local drop and recovery behavior.
+    const errors = [_]anyerror{
+        error.AddressResolutionFailed,
+        error.AddressResolutionResultLimitExceeded,
+        error.InvalidHostName,
+        error.NameServerFailure,
+        error.NoAddressReturned,
+        error.UnknownHostName,
+        error.AddressResolutionTimeout,
+        error.DeadlineExceeded,
+    };
+    for (errors) |err| {
+        try std.testing.expect(
+            classifyPacketIoError(err) == .drop,
+        );
+    }
+    try std.testing.expect(
+        classifyPacketIoError(error.ConnectionResetByPeer) == .fatal,
     );
 }
 

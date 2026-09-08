@@ -19,6 +19,7 @@ const socket_options = @import("../socket_options.zig");
 const connection_task_stack_size: usize = 1024 * 1024;
 const max_connections: u32 = 128;
 const max_udp_associations: u32 = 64;
+const pending_record_count_max: u16 = 1024;
 const handshake_timeout_ms: i64 = 5_000;
 
 comptime {
@@ -444,7 +445,7 @@ fn handleSocks5(
             );
             return;
         };
-        if (!manager.canAssociateUdp()) {
+        if (!manager.canAssociateUDP()) {
             try conn.stream.writeAll(
                 &.{ 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 },
             );
@@ -1286,29 +1287,50 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
         if (target_read_open and (poll_fds[1].revents & std.posix.POLL.IN != 0)) {
             // Accepted blocking-path limitation (M5): for Trojan, poll() only
             // guarantees ciphertext readiness, so this read can still wait for
-            // the rest of an in-flight TLS record. Shadowsocks instead yields
-            // WouldBlock after one transport read when an AEAD frame is partial.
+            // the rest of the current TLS record. A complete control-only record
+            // yields WouldBlock instead of waiting for a later application record.
             const n = target_stream.read(&buf) catch |err| {
                 // A buffered protocol (e.g. shadowsocks) returns WouldBlock when
                 // only part of a frame is in yet. Don't tear down — go back to
                 // poll() so the other direction keeps flowing.
                 if (err == error.WouldBlock) continue;
                 if (targetReadClosedBy(err)) {
-                    closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
+                    logTargetCloseIfDetailed(
+                        err,
+                        target_stream,
+                        .{
+                            .down_byte_count = down_bytes,
+                            .up_byte_count = up_bytes,
+                        },
+                    );
+                    closeTargetReadSide(
+                        &target_read_open,
+                        client_stream,
+                        &client_write_shutdown,
+                    );
                     continue;
                 }
                 // Genuinely unexpected target error: the error unwinds out of
                 // relay() and the handler's defers close both sockets abruptly.
                 // Rare now that truncation/RST are classified as orderly closes;
                 // logged because it shouldn't normally happen.
-                relayLog("target read FATAL (unexpected, abrupt close): {} tls_err={?} down={}B up={}B", .{ err, target_stream.lastTlsReadError(), down_bytes, up_bytes });
+                relayLog(
+                    "target read FATAL (unexpected, abrupt close): " ++
+                        "{} tls_err={?} down={}B up={}B",
+                    .{
+                        err,
+                        target_stream.lastTLSReadError(),
+                        down_bytes,
+                        up_bytes,
+                    },
+                );
                 return err;
             };
             if (n == 0) {
                 // Quiet on a normal clean EOF; leave a single breadcrumb only when
                 // the upstream truncated mid-stream (TLS close_notify never came) —
                 // the shape behind a downstream curl "unexpected eof".
-                if (target_stream.lastTlsReadError()) |tls_err| {
+                if (target_stream.lastTLSReadError()) |tls_err| {
                     relayLog("target upstream-truncated (graceful half-close): {} down={}B up={}B", .{ tls_err, down_bytes, up_bytes });
                 }
                 closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
@@ -1352,8 +1374,67 @@ fn relay(client_stream: net.Stream, target_stream: *ProxyStream) !void {
             (poll_fds[1].revents & std.posix.POLL.IN) == 0 and
             !target_stream.hasPendingRead())
         {
-            relayLog("Target poll error/hup", .{});
-            closeTargetReadSide(&target_read_open, client_stream, &client_write_shutdown);
+            // Force one final protocol read. For Trojan this classifies a
+            // userspace-buffered partial TLS record as truncation instead of
+            // discarding it merely because the raw fd reached HUP.
+            const read_byte_count = target_stream.read(&buf) catch |err| {
+                if (err == error.WouldBlock) {
+                    if (target_stream.hasPendingRead()) {
+                        try drainTargetPending(
+                            client_stream,
+                            target_stream,
+                            &buf,
+                            &down_bytes,
+                            &client_read_open,
+                            &target_read_open,
+                            &client_write_shutdown,
+                            &target_write_shutdown,
+                            &last_activity_ms,
+                        );
+                        continue;
+                    }
+                    closeTargetReadSide(
+                        &target_read_open,
+                        client_stream,
+                        &client_write_shutdown,
+                    );
+                    continue;
+                }
+                if (targetReadClosedBy(err)) {
+                    closeTargetReadSide(
+                        &target_read_open,
+                        client_stream,
+                        &client_write_shutdown,
+                    );
+                    continue;
+                }
+                relayLog(
+                    "target terminal read FATAL: {} tls_err={?}",
+                    .{ err, target_stream.lastTLSReadError() },
+                );
+                return err;
+            };
+            if (read_byte_count == 0) {
+                closeTargetReadSide(
+                    &target_read_open,
+                    client_stream,
+                    &client_write_shutdown,
+                );
+            } else {
+                const delivered = try writeClientChunk(
+                    client_stream,
+                    buf[0..read_byte_count],
+                    target_stream,
+                    &client_read_open,
+                    &target_read_open,
+                    &client_write_shutdown,
+                    &target_write_shutdown,
+                );
+                if (delivered) {
+                    down_bytes += read_byte_count;
+                    last_activity_ms = compat.milliTimestamp();
+                }
+            }
         }
     }
     relayFlushStats(&up_bytes, &down_bytes, true);
@@ -1383,9 +1464,8 @@ fn shutdownClientWrite(stream: net.Stream, already_shutdown: *bool) void {
 fn shutdownTargetWrite(target_stream: *ProxyStream, already_shutdown: *bool) void {
     if (already_shutdown.*) return;
     already_shutdown.* = true;
-    // ProxyStream.shutdownWrite half-closes correctly per type: anytls sends a
-    // per-stream cmdFIN (keeping reads open); every other type does
-    // compat.shutdownWrite(getHandle()) exactly as this code did before (§14).
+    // ProxyStream.shutdownWrite half-closes per transport: AnyTLS sends cmdFIN,
+    // Trojan sends TLS close_notify, and plain transports use SHUT_WR.
     target_stream.shutdownWrite() catch |err| {
         relayLog("target shutdown(send) ignored: {}", .{err});
     };
@@ -1402,11 +1482,15 @@ fn drainTargetPending(
     target_write_shutdown: *bool,
     last_activity_ms: *i64,
 ) !void {
-    while (target_stream.hasPendingRead()) {
+    for (0..pending_record_count_max) |_| {
+        if (!target_stream.hasPendingRead()) return;
         const n = target_stream.read(buf) catch |err| {
-            // Partial frame buffered (e.g. shadowsocks): stop draining and let
-            // the poll loop wait for the rest instead of tearing down.
-            if (err == error.WouldBlock) return;
+            // A complete TLS control record can reveal another complete record
+            // already buffered in userspace. Drain it before polling the raw fd.
+            if (err == error.WouldBlock) {
+                if (target_stream.hasPendingRead()) continue;
+                return;
+            }
             if (targetReadClosedBy(err)) {
                 closeTargetReadSide(target_read_open, client_stream, client_write_shutdown);
                 return;
@@ -1414,10 +1498,21 @@ fn drainTargetPending(
             // Genuinely unexpected error while draining buffered records (same
             // abrupt-teardown path as relay()); rare now that truncation/RST are
             // orderly closes. tls_err disambiguates the cause.
-            relayLog("drainTargetPending FATAL (unexpected, abrupt close): {} tls_err={?} down={}B", .{ err, target_stream.lastTlsReadError(), down_bytes.* });
+            relayLog(
+                "drainTargetPending FATAL (unexpected, abrupt close): " ++
+                    "{} tls_err={?} down={}B",
+                .{ err, target_stream.lastTLSReadError(), down_bytes.* },
+            );
             return err;
         };
-        if (n == 0) break;
+        if (n == 0) {
+            closeTargetReadSide(
+                target_read_open,
+                client_stream,
+                client_write_shutdown,
+            );
+            return;
+        }
         const delivered = try writeClientChunk(
             client_stream,
             buf[0..n],
@@ -1430,6 +1525,9 @@ fn drainTargetPending(
         if (!delivered) return;
         down_bytes.* += n;
         last_activity_ms.* = compat.milliTimestamp();
+    }
+    if (target_stream.hasPendingRead()) {
+        return error.PendingRecordLimitExceeded;
     }
 }
 
@@ -2080,8 +2178,10 @@ test "relay treats client-side reset errors as graceful close" {
 }
 
 test "relay treats target-side reset errors as graceful close" {
+    // Classify concrete socket-writer failures through the relay close policy.
     try std.testing.expect(targetWriteClosedBy(error.ConnectionResetByPeer));
     try std.testing.expect(targetWriteClosedBy(error.BrokenPipe));
+    try std.testing.expect(targetWriteClosedBy(error.SocketUnconnected));
     try std.testing.expect(!targetWriteClosedBy(error.NotOpenForReading));
 }
 
@@ -2150,6 +2250,31 @@ test "buildForwardRequestHead rewrites absolute-form request line and forces con
     try std.testing.expect(std.mem.indexOf(u8, rewritten, "Connection: close\r\n") != null);
 }
 
+const TargetCloseTraffic = struct {
+    down_byte_count: usize,
+    up_byte_count: usize,
+};
+
+fn logTargetCloseIfDetailed(
+    err: anyerror,
+    target_stream: *const ProxyStream,
+    traffic: TargetCloseTraffic,
+) void {
+    const detail = target_stream.lastTLSReadError();
+    if (err != error.ConnectionResetByPeer) {
+        if (detail == null) return;
+    }
+    relayLog(
+        "target read closed: {} tls_err={?} down={}B up={}B",
+        .{
+            err,
+            detail,
+            traffic.down_byte_count,
+            traffic.up_byte_count,
+        },
+    );
+}
+
 fn targetReadClosedBy(err: anyerror) bool {
     return switch (err) {
         error.ConnectionClosed => true,
@@ -2186,6 +2311,7 @@ fn targetWriteClosedBy(err: anyerror) bool {
         error.ConnectionResetByPeer => true,
         error.BrokenPipe => true,
         error.NotOpenForWriting => true,
+        error.SocketUnconnected => true,
         else => false,
     };
 }

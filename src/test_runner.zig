@@ -8,6 +8,7 @@ test "include zc test modules" {
     _ = @import("catalog_commands_test.zig");
     _ = @import("catalog_service_test.zig");
     _ = @import("cli/commands.zig");
+    _ = @import("cli/config_diagnostics.zig");
     _ = @import("cli/output.zig");
     _ = @import("config_test.zig");
     _ = @import("config_bundle_test.zig");
@@ -34,6 +35,7 @@ test "include zc test modules" {
     _ = @import("perf_stats.zig");
     _ = @import("runtime_selection.zig");
     _ = @import("runtime_capability.zig");
+    _ = @import("safe_text.zig");
     _ = @import("runtime_dir.zig");
     _ = @import("runtime_descriptor_test.zig");
     _ = @import("selection_state_test.zig");
@@ -47,7 +49,10 @@ test "include zc test modules" {
     _ = @import("dns/client_test.zig");
     _ = @import("dns/protocol.zig");
     _ = @import("dns/protocol_test.zig");
+    _ = @import("protocol/TLSClient.zig");
+    _ = @import("protocol/tls_server_name.zig");
     _ = @import("protocol/trojan.zig");
+    _ = @import("protocol/trojan_udp.zig");
     _ = @import("protocol/anytls.zig");
     _ = @import("protocol/socks_address.zig");
     _ = @import("protocol/vless.zig");
@@ -62,6 +67,7 @@ test "include zc test modules" {
     _ = @import("proxy/outbound/shadowsocks.zig");
     _ = @import("proxy/outbound/shadowsocks_test.zig");
     _ = @import("proxy/outbound/shadowsocks_udp_test.zig");
+    _ = @import("proxy/outbound/trojan_udp.zig");
     _ = @import("proxy/outbound/simple_obfs_http_test.zig");
     _ = @import("proxy/proxy_test.zig");
     _ = @import("proxy/smart_group_test.zig");

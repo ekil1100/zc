@@ -170,8 +170,10 @@ pub const Proxy = struct {
     alter_id: u16 = 0, // VMess
     tls: bool = false,
     skip_cert_verify: bool = false,
-    udp: bool = false, // Enables classic Shadowsocks UDP on mixed ingress.
+    udp: bool = false, // Enables supported UDP outbound on mixed ingress.
     sni: ?[]const u8 = null,
+    network: ?[]const u8 = null,
+    grpc: bool = false,
     ws: bool = false, // WebSocket
     ws_path: ?[]const u8 = null,
     ws_host: ?[]const u8 = null,
@@ -190,6 +192,7 @@ pub const Proxy = struct {
         if (self.cipher) |c| allocator.free(c);
         if (self.uuid) |u| allocator.free(u);
         if (self.sni) |s| allocator.free(s);
+        if (self.network) |network| allocator.free(network);
         if (self.ws_path) |p| allocator.free(p);
         if (self.ws_host) |h| allocator.free(h);
         if (self.plugin) |p| allocator.free(p);
@@ -469,6 +472,7 @@ const ParseMode = enum {
 
 /// Lenient parser retained only for explicit legacy inspection and tests.
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
+    try requireValidConfigEncoding(content);
     var root = try yaml.parse(allocator, content);
     defer root.deinit(allocator);
     return parseRoot(allocator, &root, .legacy);
@@ -478,6 +482,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
 /// This entry point rejects duplicate keys, malformed tails, and malformed
 /// simple-obfs structures.
 pub fn parseDocument(allocator: std.mem.Allocator, content: []const u8) !Config {
+    try requireValidConfigEncoding(content);
     var root = try yaml.parseDocument(allocator, content);
     defer root.deinit(allocator);
     return parseRoot(allocator, &root, .runtime);
@@ -490,9 +495,16 @@ pub fn parseCatalogDocument(
     allocator: std.mem.Allocator,
     content: []const u8,
 ) !Config {
+    try requireValidConfigEncoding(content);
     var root = try yaml.parseDocument(allocator, content);
     defer root.deinit(allocator);
     return parseRoot(allocator, &root, .catalog_capture);
+}
+
+fn requireValidConfigEncoding(content: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(content)) {
+        return error.InvalidConfigEncoding;
+    }
 }
 
 fn replaceOwnedString(
@@ -1019,6 +1031,16 @@ fn parseProxy(
             proxy.sni = try allocator.dupe(u8, v.string);
         } else if (managed) return error.InvalidProxyFormat;
     }
+    if (map.get("network")) |v| {
+        if (v == .string) {
+            proxy.network = try allocator.dupe(u8, v.string);
+        } else if (managed) return error.InvalidProxyFormat;
+    }
+    if (map.get("grpc-opts")) |v| {
+        if (v == .map) {
+            proxy.grpc = true;
+        } else if (managed) return error.InvalidProxyFormat;
+    }
     if (map.get("ws-opts")) |v| {
         if (v == .map) {
             proxy.ws = true;
@@ -1149,6 +1171,25 @@ fn pluginMetadataMalformed(proxy: *const Proxy) bool {
         if (byte == '\r' or byte == '\n' or byte == 0) return true;
     }
     return proxy.semantic_state == .malformed;
+}
+
+test "config parsers reject invalid UTF-8 before YAML diagnostics" {
+    // Feed malformed bytes through the public parser and verify rejection occurs
+    // before semantic parsing.
+    const allocator = std.testing.allocator;
+    const invalid = "mixed-port: 7890\nmode: bad\x80value\n";
+    try std.testing.expectError(
+        error.InvalidConfigEncoding,
+        parse(allocator, invalid),
+    );
+    try std.testing.expectError(
+        error.InvalidConfigEncoding,
+        parseDocument(allocator, invalid),
+    );
+    try std.testing.expectError(
+        error.InvalidConfigEncoding,
+        parseCatalogDocument(allocator, invalid),
+    );
 }
 
 test "managed parser normalizes both plugin option map aliases" {
@@ -1389,10 +1430,7 @@ fn parseProxyGroup(
                     continue;
                 }
                 // Skip dangling references to dropped info-nodes.
-                if (isSubscriptionInfoNodeName(item.string)) {
-                    std.log.scoped(.config).info("proxy-group '{s}': skipping subscription info-node reference '{s}'", .{ name.string, item.string });
-                    continue;
-                }
+                if (isSubscriptionInfoNodeName(item.string)) continue;
                 const proxy_name = try allocator.dupe(u8, item.string);
                 errdefer allocator.free(proxy_name);
                 try group.proxies.append(allocator, proxy_name);
@@ -2520,6 +2558,9 @@ fn appendRuleProviderEntriesOfflineWithBudget(
     content: []const u8,
     budget: *RuleProviderEntryBudget,
 ) !void {
+    if (!std.unicode.utf8ValidateSlice(content)) {
+        return error.InvalidRuleProviderEncoding;
+    }
     const inspected = if (std.mem.startsWith(u8, content, "\xEF\xBB\xBF")) content[3..] else content;
     if (provider.behavior == .classical and looksLikeRawClassicalProvider(inspected)) {
         return appendRuleProviderEntriesLegacy(
@@ -5508,6 +5549,24 @@ test "downloaded candidate validation cleans every failing allocation" {
         downloadedCandidateAllocationFixture,
         .{},
     );
+}
+
+test "rule-provider parser rejects non-UTF-8 before YAML fallback" {
+    // Feed malformed bytes through the public parser and verify rejection occurs
+    // before semantic parsing.
+    const allocator = std.testing.allocator;
+    var provider = testRuleProvider(.domain);
+    defer deinitTestRuleProviderEntries(allocator, &provider);
+
+    try std.testing.expectError(
+        error.InvalidRuleProviderEncoding,
+        appendRuleProviderEntriesOffline(
+            allocator,
+            &provider,
+            "payload:\n  - bad\x80.example\n",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), provider.entries.items.len);
 }
 
 test "rule-provider parser propagates YAML entry and nesting resource boundaries without legacy fallback" {

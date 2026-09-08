@@ -138,7 +138,7 @@ pub fn cancelFdTriggered(fd: std.posix.fd_t) !bool {
 
 /// Turns an optional cancellation descriptor into the shared control-flow
 /// error used by DNS, session creation, and the classic relay.
-pub fn checkCancelFd(cancel_fd: ?std.posix.fd_t) !void {
+pub fn checkCancelFD(cancel_fd: ?std.posix.fd_t) !void {
     const fd = cancel_fd orelse return;
     if (try cancelFdTriggered(fd)) return error.Canceled;
 }
@@ -453,6 +453,21 @@ pub fn udpConnectedReceive(fd: std.posix.fd_t, buffer: []u8) !usize {
 
 pub fn shutdownWrite(fd: std.posix.fd_t) !void {
     if (std.c.shutdown(fd, std.c.SHUT.WR) < 0) return error.InputOutput;
+}
+
+/// Shuts down both socket directions before another thread is joined.
+pub fn shutdownReadWrite(fd: std.posix.fd_t) !void {
+    const syscall_attempt_count_max: u8 = 8;
+    for (0..syscall_attempt_count_max) |_| {
+        const result = std.c.shutdown(fd, std.c.SHUT.RDWR);
+        if (result == 0) return;
+        switch (std.c.errno(result)) {
+            .INTR => continue,
+            .NOTCONN => return,
+            else => return error.InputOutput,
+        }
+    }
+    return error.SyscallRetryLimitExceeded;
 }
 
 /// A cross-platform, level-triggered readiness primitive a relay can `poll()`.
@@ -1128,7 +1143,7 @@ pub const net = struct {
         }
     };
 
-    const darwin_address_result_count_max: usize = 64;
+    pub const address_result_count_max: usize = 64;
     const DarwinDnsServiceRef = ?*anyopaque;
     const DarwinDnsFlags = u32;
     const DarwinDnsProtocol = u32;
@@ -1267,7 +1282,7 @@ pub const net = struct {
             context.callback_error = error.AddressResolutionFailed;
             return;
         };
-        if (context.addresses.items.len >= darwin_address_result_count_max) {
+        if (context.addresses.items.len >= address_result_count_max) {
             context.callback_error = error.AddressResolutionResultLimitExceeded;
             return;
         }
@@ -1296,7 +1311,7 @@ pub const net = struct {
         timeout_ms: u32,
         cancel_fd: ?std.posix.fd_t,
     ) !AddressList {
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
         if (timeout_ms == 0) return error.AddressResolutionTimeout;
 
         // Keep the test seam fail-closed too: DNSService accepts a C string and
@@ -1308,13 +1323,13 @@ pub const net = struct {
             monotonicMilliTimestamp(),
             @intCast(timeout_ms),
         ) catch std.math.maxInt(i64);
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
         const hostname = try allocator.dupeZ(u8, host);
         defer allocator.free(hostname);
         if (monotonicMilliTimestamp() >= deadline_ms) {
             return error.AddressResolutionTimeout;
         }
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
 
         var context = DarwinAddressContext{
             .allocator = allocator,
@@ -1328,13 +1343,13 @@ pub const net = struct {
             darwinAddressCallback,
             &context,
         ) catch |err| {
-            try checkCancelFd(cancel_fd);
+            try checkCancelFD(cancel_fd);
             return err;
         };
         std.debug.assert(sd_ref != null);
         defer ops.deallocate(sd_ref);
         const fd = ops.socketFd(sd_ref) catch |err| {
-            try checkCancelFd(cancel_fd);
+            try checkCancelFD(cancel_fd);
             return err;
         };
 
@@ -1357,7 +1372,7 @@ pub const net = struct {
                 descriptors[0..descriptor_count],
                 deadline_ms,
             ) catch |err| {
-                try checkCancelFd(cancel_fd);
+                try checkCancelFD(cancel_fd);
                 return err;
             };
             if (ready == 0) return error.AddressResolutionTimeout;
@@ -1384,13 +1399,13 @@ pub const net = struct {
                 continue;
             }
             ops.process(sd_ref) catch |err| {
-                try checkCancelFd(cancel_fd);
+                try checkCancelFD(cancel_fd);
                 return err;
             };
-            try checkCancelFd(cancel_fd);
+            try checkCancelFD(cancel_fd);
             if (context.callback_error) |err| return err;
         }
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
         if (context.callback_error) |err| return err;
         if (context.addresses.items.len == 0) return error.UnknownHostName;
         var addresses = AddressList{
@@ -1398,7 +1413,7 @@ pub const net = struct {
             .allocator = allocator,
         };
         errdefer addresses.deinit();
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
         return addresses;
     }
 
@@ -1503,6 +1518,20 @@ pub const net = struct {
             monotonicMilliTimestamp(),
             @intCast(timeout_ms),
         ) catch std.math.maxInt(i64);
+        return tcpConnectToAddressWithDeadlineCancelFD(
+            address,
+            deadline_ms,
+            null,
+        );
+    }
+
+    pub fn tcpConnectToAddressWithDeadlineCancelFD(
+        address: Address,
+        deadline_ms: i64,
+        cancel_fd: ?std.posix.fd_t,
+    ) !Stream {
+        try checkCancelFD(cancel_fd);
+        if (monotonicMilliTimestamp() >= deadline_ms) return error.Timeout;
 
         const fd = switch (address) {
             .in => std.c.socket(
@@ -1537,13 +1566,35 @@ pub const net = struct {
         if (connect_result < 0) switch (std.c.errno(connect_result)) {
             .INPROGRESS, .ALREADY, .AGAIN, .INTR => {
                 while (true) {
-                    var descriptors = [_]std.posix.pollfd{.{
-                        .fd = fd,
-                        .events = std.posix.POLL.OUT,
-                        .revents = 0,
-                    }};
-                    const ready = try pollUntil(&descriptors, deadline_ms);
+                    var descriptors = [_]std.posix.pollfd{
+                        .{
+                            .fd = fd,
+                            .events = std.posix.POLL.OUT,
+                            .revents = 0,
+                        },
+                        .{
+                            .fd = cancel_fd orelse -1,
+                            .events = std.posix.POLL.IN,
+                            .revents = 0,
+                        },
+                    };
+                    const descriptor_count: usize =
+                        if (cancel_fd == null) 1 else 2;
+                    const ready = try pollUntil(
+                        descriptors[0..descriptor_count],
+                        deadline_ms,
+                    );
                     if (ready == 0) return error.Timeout;
+                    if (descriptor_count == 2) {
+                        const cancel_events = descriptors[1].revents;
+                        if (cancel_events & (std.posix.POLL.IN |
+                            std.posix.POLL.HUP |
+                            std.posix.POLL.ERR |
+                            std.posix.POLL.NVAL) != 0)
+                        {
+                            return error.Canceled;
+                        }
+                    }
                     const revents = descriptors[0].revents;
                     if (revents & std.posix.POLL.NVAL != 0) {
                         return error.InvalidSocket;
@@ -1574,6 +1625,7 @@ pub const net = struct {
             else => |err| return tcpConnectError(err),
         };
 
+        try checkCancelFD(cancel_fd);
         if (monotonicMilliTimestamp() >= deadline_ms) return error.Timeout;
         try setBlocking(fd);
         return .{ .handle = fd };
@@ -1653,7 +1705,7 @@ pub const net = struct {
         port: u16,
         timeout_ms: u32,
     ) !AddressList {
-        return getAddressListWithTimeoutCancelFd(
+        return getAddressListWithTimeoutCancelFD(
             allocator,
             host,
             port,
@@ -1665,31 +1717,31 @@ pub const net = struct {
     /// Resolves a host while treating readability or termination on cancel_fd
     /// as authoritative cancellation. All Select tasks are owned, canceled,
     /// joined, and drained before return; no resolver or watcher is detached.
-    pub fn getAddressListWithTimeoutCancelFd(
+    pub fn getAddressListWithTimeoutCancelFD(
         allocator: std.mem.Allocator,
         host: []const u8,
         port: u16,
         timeout_ms: u32,
         cancel_fd: ?std.posix.fd_t,
     ) !AddressList {
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
         if (timeout_ms == 0) return error.AddressResolutionTimeout;
 
         // Numeric literals never enter either asynchronous resolver. Check
         // cancellation immediately before allocation, then once again after it
         // so a simultaneous control close remains authoritative.
         if (Address.parseIp4(host, port)) |address| {
-            try checkCancelFd(cancel_fd);
+            try checkCancelFD(cancel_fd);
             var addresses = try singleAddressList(allocator, address);
             errdefer addresses.deinit();
-            try checkCancelFd(cancel_fd);
+            try checkCancelFD(cancel_fd);
             return addresses;
         } else |_| {}
         if (Address.parseIp6(host, port)) |address| {
-            try checkCancelFd(cancel_fd);
+            try checkCancelFD(cancel_fd);
             var addresses = try singleAddressList(allocator, address);
             errdefer addresses.deinit();
-            try checkCancelFd(cancel_fd);
+            try checkCancelFD(cancel_fd);
             return addresses;
         } else |_| {}
 
@@ -1697,7 +1749,7 @@ pub const net = struct {
         // Darwin's DNSService C-string API must reject exactly the same
         // embedded-NUL, invalid-label, and overlong inputs as std's resolver.
         _ = try ionet.HostName.init(host);
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
 
         if (comptime builtin.os.tag.isDarwin()) {
             var ops = DarwinDnsApi{};
@@ -1717,7 +1769,7 @@ pub const net = struct {
         // cancellable awake sleep, so it neither consumes the borrowed fd nor
         // leaves Select waiting on a raw blocking poll task.
         var resolver = SystemAddressListResolver.init(timeout_ms);
-        return getAddressListWithTimeoutUsing(
+        var addresses = try getAddressListWithTimeoutUsing(
             SystemAddressListResolver,
             &resolver,
             allocator,
@@ -1726,6 +1778,11 @@ pub const net = struct {
             timeout_ms,
             cancel_fd,
         );
+        errdefer addresses.deinit();
+        if (addresses.addrs.len > address_result_count_max) {
+            return error.AddressResolutionResultLimitExceeded;
+        }
+        return addresses;
     }
 
     fn getAddressListWithTimeoutUsing(
@@ -1737,7 +1794,7 @@ pub const net = struct {
         timeout_ms: u32,
         cancel_fd: ?std.posix.fd_t,
     ) !AddressList {
-        try checkCancelFd(cancel_fd);
+        try checkCancelFD(cancel_fd);
         if (timeout_ms == 0) return error.AddressResolutionTimeout;
 
         const Workers = struct {
@@ -2105,7 +2162,7 @@ test "Darwin DNSService resolver returns bounded localhost addresses with the re
 
     try std.testing.expect(addresses.addrs.len > 0);
     try std.testing.expect(
-        addresses.addrs.len <= net.darwin_address_result_count_max,
+        addresses.addrs.len <= net.address_result_count_max,
     );
     for (addresses.addrs) |address| {
         try std.testing.expectEqual(@as(u16, 4242), address.getPort());

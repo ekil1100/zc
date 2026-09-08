@@ -4,6 +4,14 @@
 
 ### Added
 - `zc status` 与 `zc status --json` 显示运行中 daemon 的有效 mixed port。
+- 实现 Trojan UDP ASSOCIATE：`udp:true` 节点可经 mixed SOCKS5 转发 IPv4、domain 和 IPv6 datagram；使用严格有界的 TLS stream frame codec，并通过固定 `trojan-go v0.10.6` 真实 E2E。
+- `config load` 校验失败会在文本模式直接列出具体错误，在 JSON failure envelope 的 `data.config_errors` / `config_warnings` 中返回有界诊断。
+
+### Fixed
+- Trojan TLS 现在分离 SNI 与证书身份校验、正确响应 TLS 1.3 requested KeyUpdate，并由单一可取消 I/O owner 处理有界 UDP 收发队列；上游读写背压或 control close 不再产生 TLS state 竞争或占死 association slot。
+- 修复 TLS writer 在最小容量边界丢弃未加密尾部的问题；初始 handshake 增加固定 record/message/byte 预算并支持跨 record 大证书，record sequence 原子提交且耗尽会在 nonce 重用前失败；最终正常关闭会 flush `close_notify`，fatal/cancel 路径显式 abort。Trojan TCP 本地写侧 EOF 会 flush 一次方向性的 TLS `close_notify`，避免连接悬挂；固定 `trojan-go v0.10.6` 会随即结束双向 tunnel，因此依赖传输 EOF 后才返回数据的目标协议不能透明保留该响应。
+- override 往返会保留 `grpc-opts`，不支持的 Trojan gRPC/WebSocket transport 不再因无关 patch 或 metadata 组合静默降级为原生 TCP。
+- 配置、override、local rule-provider 与 CLI 输出统一执行 UTF-8/终端控制符防护；确定性的 parser、RULE-SET 与 provider 语义错误不再误报为文件权限失败。
 
 ## [1.0.1] - 2026-08-11
 

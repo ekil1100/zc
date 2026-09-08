@@ -99,13 +99,13 @@
 |---|---|---|
 | `CONFIG_LOAD_PATH_REQUIRED` | missing `<path>` for config load | use `zc config load <path>` |
 | `CONFIG_LOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `config load` | use `zc config load <path>` |
-| `CONFIG_LOAD_INVALID` | local config is invalid | fix the config and retry |
+| `CONFIG_LOAD_INVALID` | local config is invalid | fix listed validator errors, YAML structure/field types/rule ordering, or keep file-provider paths relative and inside the config source directory |
 | `CONFIG_LOAD_TOO_LARGE` | local config exceeds the 16 MiB limit | reduce the complete config source to 16 MiB or less and retry |
 | `CONFIG_LOAD_LIMIT_EXCEEDED` | config exceeds a fixed YAML/proxy/rule-provider/expanded-rule resource limit | remove unused collections, providers, provider entries, repeated references, or long targets and retry |
 | `CONFIG_CAPABILITY_UNSUPPORTED` | config revision cannot be activated because it uses an unsupported runtime capability | follow the command-specific recovery hint described below |
 | `CONFIG_LOAD_FAILED` | failed to load local config | check the path, local dependencies, and file permissions |
 | `CONFIG_ALREADY_EXISTS` | a config with this name already exists | rename the file or delete the existing config first |
-| `CONFIG_NAME_INVALID` | invalid config name | use 1-250 bytes of UTF-8 without control characters, `/` or `\` |
+| `CONFIG_NAME_INVALID` | invalid config name | after removing one `.yaml` suffix, use 1-250 bytes of valid UTF-8; not `.`/`..`; exclude control/bidirectional characters, `/` and `\` |
 | `CONFIG_LIST_FAILED` | failed to list configs | ensure the config directory exists and is readable |
 | `CONFIG_LIST_ARGUMENT_INVALID` | unknown or unexpected argument for `config list` | use `zc config list [--json]` |
 | `CONFIG_DOWNLOAD_URL_REQUIRED` | missing <url> for config download | use `zc config download <url> [-n <name>] [-d]` |
@@ -131,12 +131,15 @@
 | `CONFIG_SWITCH_FAILED` | failed to switch active config | verify file permission and retry |
 | `CONFIG_DUMP_ARGUMENT_INVALID` | unknown or unexpected argument for `config dump` | use `zc config dump [-c <config>] [--no-override]` |
 | `CONFIG_DUMP_FAILED` | failed to dump merged config | check config path/override script and retry |
+| `CONFIG_DUMP_UNSAFE_TERMINAL` | raw config contains unsafe terminal controls | redirect stdout to a file to preserve raw bytes |
 | `CONFIG_OVERRIDE_ARGUMENT_INVALID` | invalid config override arguments | use `zc config override <script.lua>` / `--clear` |
 | `CONFIG_OVERRIDE_NO_ACTIVE` | no active config found for override | run `zc config use <name>` first |
 | `CONFIG_OVERRIDE_SCRIPT_NOT_FOUND` | override script file not found | check script path and retry |
 | `CONFIG_OVERRIDE_FAILED` | failed to update persisted config override | check config state and retry |
 | `CONFIG_OVERRIDE_APPLY_FAILED` | override persisted but failed to apply running daemon | check logs and run `zc restart` |
 | `CONFIG_SUBCOMMAND_UNKNOWN` | unknown config subcommand | use `zc config --help` to list config subcommands |
+
+`CONFIG_LOAD_INVALID` 是 validator 完成后的语义失败：文本 stderr 在错误块后列出具体 errors/warnings；JSON failure envelope 附带 `data.config_errors`、`data.config_warnings`、`data.config_diagnostics_truncated`。errors 优先于 warnings，占满 256 条共享上界时仍至少保留一条可操作 error。parser/I/O/resource-limit/name 错误不伪造这些字段。
 
 YAML source 的 `CONFIG_{LOAD,DOWNLOAD,UPDATE}_LIMIT_EXCEEDED` 覆盖底层
 `YamlCollectionEntryLimitExceeded`、proxy/group limits，以及

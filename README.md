@@ -62,7 +62,7 @@ just e2e
 | 功能 | zc | 与 mihomo 的差异 |
 | --- | --- | --- |
 | Mixed HTTP/SOCKS5 入站 | ⚠️ 部分实现 | 只有一个 mixed listener；无 `--port` 时固定绑定 `7899`，配置中的 `mixed-port` 数值仅兼容解析。 |
-| SOCKS5 UDP ASSOCIATE | ✅ 已实现 | 仅用于 `udp: true` 的 Shadowsocks classic AEAD 节点。 |
+| SOCKS5 UDP ASSOCIATE | ✅ 已实现 | 用于 `udp: true` 的 Shadowsocks classic AEAD 或原生 TLS Trojan 节点。 |
 | 独立 HTTP `port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |
 | 独立 `socks-port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |
 | TUN | ❌ 未实现 | 不创建 TUN 设备。 |
@@ -80,7 +80,8 @@ just e2e
 | Shadowsocks AEAD-2022 | ❌ 未实现 | 配置准入阶段拒绝。 |
 | Shadowsocks 通用 SIP003 外部插件 | ❌ 未实现 | 不启动外部 plugin；simple-obfs TLS 也不支持。 |
 | Trojan TCP/TLS | ✅ 已实现 | 支持 `password`、`server`、`port`、`sni`、`skip-cert-verify`。 |
-| Trojan UDP / WebSocket / gRPC | ❌ 未实现 | 仅支持 TCP/TLS CONNECT。 |
+| Trojan UDP | ✅ 已实现 | `udp:true` 经 mixed SOCKS5 UDP ASSOCIATE；TLS stream framing，支持 IPv4/domain/IPv6。 |
+| Trojan WebSocket / gRPC | ❌ 未实现 | 仅支持原生 TCP/TLS transport。 |
 | HTTP outbound | ❌ 未实现 | 配置准入阶段拒绝。 |
 | SOCKS5 outbound | ❌ 未实现 | 配置准入阶段拒绝。 |
 | VMess | ❌ 未实现 | 未通过标准 wire 与互操作验证。 |

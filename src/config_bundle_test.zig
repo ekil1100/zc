@@ -528,6 +528,10 @@ test "ConfigBundle rejects escaped local providers but never authorizes remote p
     tmp.dir.symLink(compat.io(), "../outside.yaml", "root/escape.yaml", .{}) catch return error.SkipZigTest;
     const local_source =
         \\rule-providers:
+        \\  early-missing:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: '!absent.yaml'
         \\  escaped:
         \\    type: http
         \\    behavior: domain
@@ -536,7 +540,239 @@ test "ConfigBundle rejects escaped local providers but never authorizes remote p
     try writeFile(tmp.dir, "root/config.yaml", local_source);
     const path = try realPath(allocator, tmp.dir, "root/config.yaml");
     defer allocator.free(path);
-    try testing.expectError(error.PathOutsideSourceRoot, ConfigBundle.capture(allocator, path, .{}));
+    try testing.expectError(
+        error.PathOutsideSourceRoot,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    try tmp.dir.createDir(compat.io(), "outside", .default_dir);
+    tmp.dir.symLink(
+        compat.io(),
+        "../outside",
+        "root/escape-dir",
+        .{ .is_directory = true },
+    ) catch return error.SkipZigTest;
+    const missing_leaf_source =
+        \\rule-providers:
+        \\  early-missing:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: '!absent.yaml'
+        \\  escaped:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: escape-dir/missing.yaml
+    ;
+    try writeFile(tmp.dir, "root/config.yaml", missing_leaf_source);
+    try testing.expectError(
+        error.PathOutsideSourceRoot,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    tmp.dir.symLink(
+        compat.io(),
+        "../outside/missing.yaml",
+        "root/dangling.yaml",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const dangling_leaf_source =
+        \\rule-providers:
+        \\  early-missing:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: '!absent.yaml'
+        \\  escaped:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: dangling.yaml
+    ;
+    try writeFile(tmp.dir, "root/config.yaml", dangling_leaf_source);
+    try testing.expectError(
+        error.PathOutsideSourceRoot,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    const root_path = compat.fs.path.dirname(path).?;
+    const absolute_missing = try compat.fs.path.join(
+        allocator,
+        &.{ root_path, "absolute-missing.yaml" },
+    );
+    defer allocator.free(absolute_missing);
+    tmp.dir.symLink(
+        compat.io(),
+        absolute_missing,
+        "root/absolute-link.yaml",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const absolute_link_source =
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: absolute-link.yaml
+    ;
+    try writeFile(tmp.dir, "root/config.yaml", absolute_link_source);
+    try testing.expectError(
+        error.FileNotFound,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    try writeFile(tmp.dir, "root/absolute-rules.yaml", "payload: []\n");
+    const absolute_rules = try compat.fs.path.join(
+        allocator,
+        &.{ root_path, "absolute-rules.yaml" },
+    );
+    defer allocator.free(absolute_rules);
+    tmp.dir.symLink(
+        compat.io(),
+        absolute_rules,
+        "root/absolute-existing.yaml",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const absolute_existing_source =
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: absolute-existing.yaml
+    ;
+    try writeFile(tmp.dir, "root/config.yaml", absolute_existing_source);
+    var absolute_existing = try ConfigBundle.capture(
+        allocator,
+        path,
+        .{},
+    );
+    absolute_existing.deinit();
+
+    const outside_path = try tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "outside",
+        allocator,
+    );
+    defer allocator.free(outside_path);
+    const outside_missing = try compat.fs.path.join(
+        allocator,
+        &.{ outside_path, "missing.yaml" },
+    );
+    defer allocator.free(outside_missing);
+    tmp.dir.symLink(
+        compat.io(),
+        outside_missing,
+        "root/absolute-outside.yaml",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const absolute_outside_source =
+        \\rule-providers:
+        \\  escaped:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: absolute-outside.yaml
+    ;
+    try writeFile(tmp.dir, "root/config.yaml", absolute_outside_source);
+    try testing.expectError(
+        error.PathOutsideSourceRoot,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    try tmp.dir.createDir(compat.io(), "root/x", .default_dir);
+    try tmp.dir.createDir(compat.io(), "root/deep", .default_dir);
+    try tmp.dir.createDir(compat.io(), "root/inside", .default_dir);
+    tmp.dir.symLink(
+        compat.io(),
+        "../deep",
+        "root/x/y",
+        .{ .is_directory = true },
+    ) catch return error.SkipZigTest;
+    tmp.dir.symLink(
+        compat.io(),
+        "../../outside/missing.yaml",
+        "root/deep/leaf",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const chained_source =
+        \\rule-providers:
+        \\  escaped:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: x/y/leaf
+    ;
+    try writeFile(tmp.dir, "root/config.yaml", chained_source);
+    try testing.expectError(
+        error.PathOutsideSourceRoot,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    try tmp.dir.deleteFile(compat.io(), "root/deep/leaf");
+    tmp.dir.symLink(
+        compat.io(),
+        "../inside/missing.yaml",
+        "root/deep/leaf",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    try testing.expectError(
+        error.FileNotFound,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    try tmp.dir.createDir(compat.io(), "outside/child", .default_dir);
+    tmp.dir.symLink(
+        compat.io(),
+        "../outside/child",
+        "root/jump",
+        .{ .is_directory = true },
+    ) catch return error.SkipZigTest;
+    tmp.dir.symLink(
+        compat.io(),
+        "jump/../missing.yaml",
+        "root/alias",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const symlink_before_parent_source =
+        \\rule-providers:
+        \\  escaped:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: alias
+    ;
+    try writeFile(
+        tmp.dir,
+        "root/config.yaml",
+        symlink_before_parent_source,
+    );
+    try testing.expectError(
+        error.PathOutsideSourceRoot,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
+
+    try tmp.dir.createDir(compat.io(), "root/deep/child", .default_dir);
+    tmp.dir.symLink(
+        compat.io(),
+        "deep/child",
+        "root/jump-inside",
+        .{ .is_directory = true },
+    ) catch return error.SkipZigTest;
+    tmp.dir.symLink(
+        compat.io(),
+        "jump-inside/../missing.yaml",
+        "root/alias-inside",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const symlink_before_parent_inside_source =
+        \\rule-providers:
+        \\  missing:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: alias-inside
+    ;
+    try writeFile(
+        tmp.dir,
+        "root/config.yaml",
+        symlink_before_parent_inside_source,
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        ConfigBundle.capture(allocator, path, .{}),
+    );
 
     const remote_source =
         \\rule-providers:
@@ -582,16 +818,12 @@ test "ConfigBundle rejects root-prefix siblings using platform path separators" 
     try tmp.dir.createDir(compat.io(), "root\\escape", .default_dir);
     try writeFile(tmp.dir, "root-other/rules.yaml", "payload: []\n");
     try writeFile(tmp.dir, "root\\escape/rules.yaml", "payload: []\n");
-    const sibling = try realPath(allocator, tmp.dir, "root-other/rules.yaml");
-    defer allocator.free(sibling);
-    const backslash_sibling = try realPath(allocator, tmp.dir, "root\\escape/rules.yaml");
-    defer allocator.free(backslash_sibling);
-
-    for ([_][]const u8{ sibling, backslash_sibling }) |outside| {
+    for ([_][]const u8{ "root-other", "root\\escape" }) |sibling| {
         const source = try std.fmt.allocPrint(
             allocator,
-            "rule-providers:\n  escaped:\n    type: file\n    behavior: domain\n    path: {s}\n",
-            .{outside},
+            "rule-providers:\n  escaped:\n    type: file\n" ++
+                "    behavior: domain\n    path: ../{s}/rules.yaml\n",
+            .{sibling},
         );
         defer allocator.free(source);
         try writeFile(tmp.dir, "root/config.yaml", source);

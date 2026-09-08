@@ -5,6 +5,7 @@ const config = @import("config.zig");
 const config_bundle = @import("config_bundle.zig");
 const config_catalog = @import("config_catalog.zig");
 const config_identity = @import("config_identity.zig");
+const config_validator = @import("config_validator.zig");
 const legacy_bootstrap = @import("legacy_catalog_bootstrap.zig");
 const state_authority = @import("state_authority.zig");
 
@@ -23,7 +24,18 @@ pub const Receipt = struct {
     }
 };
 
-pub fn loadDefault(allocator: std.mem.Allocator, source_path: []const u8) !Receipt {
+pub const LoadOutcome = union(enum) {
+    loaded: Receipt,
+    invalid_config: config_validator.ValidationResult,
+};
+
+pub fn loadDefault(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+) !LoadOutcome {
+    const validated_key = try deriveKey(allocator, source_path);
+    allocator.free(validated_key);
+
     const root_path = try config.getDefaultConfigDir(allocator) orelse return error.NoConfigDir;
     defer allocator.free(root_path);
     if (!compat.fs.path.isAbsolute(root_path)) return error.NoConfigDir;
@@ -41,7 +53,7 @@ pub const Importer = struct {
         return .{ .allocator = allocator, .root = root };
     }
 
-    pub fn load(self: Importer, source_path: []const u8) !Receipt {
+    pub fn load(self: Importer, source_path: []const u8) !LoadOutcome {
         const key = try deriveKey(self.allocator, source_path);
         errdefer self.allocator.free(key);
         var bundle = try config_bundle.ConfigBundle.capture(self.allocator, source_path, .{});
@@ -51,7 +63,33 @@ pub const Importer = struct {
         }
         var loaded = try bundle.loadOffline(self.allocator);
         defer loaded.deinit();
-        if (!loaded.validation.isValid()) return error.InvalidConfig;
+        if (!loaded.validation.isValid()) {
+            self.allocator.free(key);
+            return .{ .invalid_config = loaded.takeValidation() };
+        }
+        std.debug.assert(
+            loaded.config.rules.items.len <= config.expanded_rule_count_max,
+        );
+        var remote_provider_names = std.StringHashMap(void).init(
+            self.allocator,
+        );
+        defer remote_provider_names.deinit();
+        for (0..config.expanded_rule_count_max) |rule_index| {
+            if (rule_index == loaded.config.rules.items.len) break;
+            const rule = loaded.config.rules.items[rule_index];
+            if (rule.rule_type != .rule_set) continue;
+            if (remote_provider_names.contains(rule.payload)) continue;
+            try remote_provider_names.put(rule.payload, {});
+            try loaded.validation.addError(
+                "RULE-SET provider '{s}' is remote and has no locally captured " ++
+                    "content; download it or replace it with type:file before loading",
+                .{rule.payload},
+            );
+        }
+        if (!loaded.validation.isValid()) {
+            self.allocator.free(key);
+            return .{ .invalid_config = loaded.takeValidation() };
+        }
 
         const migration = try legacy_bootstrap.LegacyCatalogBootstrap.init(self.allocator, self.root).ensure();
         switch (migration) {
@@ -86,13 +124,15 @@ pub const Importer = struct {
             switch (outcome) {
                 .conflict => continue,
                 .applied => |published| return .{
-                    .key = key,
-                    .revision = published.revision,
-                    .active = true,
-                    // A successful later publication rewrites and syncs both
-                    // authority and mirror, superseding bootstrap health.
-                    .state_sync_error = published.receipt.state_sync_error,
-                    .mirror_error = published.receipt.mirror_error,
+                    .loaded = .{
+                        .key = key,
+                        .revision = published.revision,
+                        .active = true,
+                        // A successful later publication rewrites and syncs both
+                        // authority and mirror, superseding bootstrap health.
+                        .state_sync_error = published.receipt.state_sync_error,
+                        .mirror_error = published.receipt.mirror_error,
+                    },
                 },
             }
         }

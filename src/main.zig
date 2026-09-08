@@ -30,6 +30,8 @@ const doctor_cli = @import("doctor_cli.zig");
 const override = @import("override.zig");
 const override_materialization = @import("override_materialization.zig");
 const cli_output = @import("cli/output.zig");
+const config_diagnostics = @import("cli/config_diagnostics.zig");
+const safe_text = @import("safe_text.zig");
 const cli_commands = @import("cli/commands.zig");
 const build_options = @import("build_options");
 const UpdateApplyMode = daemon.ApplyMode;
@@ -199,8 +201,15 @@ var gpa_holder: ?*std.heap.DebugAllocator(.{}) = null;
 
 // Canonical command path for the JSON envelope ("command" field) and the
 // global color switch; both set once in main() before dispatch.
+const cli_token_input_bytes_max: usize = 256;
+const cli_token_truncated_suffix = "...[truncated]";
+const cli_token_output_bytes_max =
+    cli_token_input_bytes_max * safe_text.escape_expansion_factor_max +
+    cli_token_truncated_suffix.len;
+const cli_command_bytes_max = cli_token_output_bytes_max + 32;
+
 var g_cli_command: []const u8 = "";
-var g_cmd_buf: [64]u8 = undefined;
+var g_cmd_buf: [cli_command_bytes_max]u8 = undefined;
 var g_no_color: bool = false;
 var g_startup_token: ?runtime_descriptor.Nonce = null;
 var g_runtime_nonce: ?runtime_descriptor.Nonce = null;
@@ -977,8 +986,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // 未知命令
-    var unknown_buf: [128]u8 = undefined;
-    const unknown_msg = std.fmt.bufPrint(&unknown_buf, "unknown command: {s}", .{cmd}) catch "unknown command";
+    var escaped_command_buffer: [cli_token_output_bytes_max]u8 = undefined;
+    const escaped_command = escapeCLIToken(cmd, &escaped_command_buffer);
+    var unknown_buf: [cli_command_bytes_max]u8 = undefined;
+    const unknown_msg = std.fmt.bufPrint(
+        &unknown_buf,
+        "unknown command: {s}",
+        .{escaped_command},
+    ) catch "unknown command";
     printCliError(json_output, "COMMAND_UNKNOWN", unknown_msg, "use `zc help` to list supported commands");
     std.process.exit(cli_output.exit_failure);
 }
@@ -997,6 +1012,34 @@ fn printCliError(json_output: bool, code: []const u8, message: []const u8, hint:
         &stderr_writer.interface,
     );
     out.fail(code, message, hint) catch {};
+}
+
+const ConfigValidationFailure = struct {
+    code: []const u8,
+    message: []const u8,
+    hint: []const u8,
+};
+
+fn printConfigValidationFailure(
+    json_output: bool,
+    failure: ConfigValidationFailure,
+    validation: *const validator.ValidationResult,
+) !void {
+    var streams = StdStreams{};
+    var output = streams.output(json_output);
+    if (json_output) {
+        var storage: config_diagnostics.Storage = undefined;
+        storage.init(validation);
+        try output.failWithData(
+            failure.code,
+            failure.message,
+            failure.hint,
+            storage.view(),
+        );
+        return;
+    }
+    try output.fail(failure.code, failure.message, failure.hint);
+    try config_diagnostics.renderText(&output, validation);
 }
 
 /// 按流判定颜色：payload 看 stdout 的 TTY，诊断看 stderr 的 TTY
@@ -1041,6 +1084,25 @@ const StdStreams = struct {
     }
 };
 
+fn escapeCLIToken(input: []const u8, output: []u8) []const u8 {
+    std.debug.assert(output.len >= cli_token_output_bytes_max);
+    const input_byte_count = @min(input.len, cli_token_input_bytes_max);
+    const input_prefix = input[0..input_byte_count];
+    const escaped_capacity =
+        input_byte_count * safe_text.escape_expansion_factor_max;
+    const escaped = safe_text.escape(
+        input_prefix,
+        output[0..escaped_capacity],
+    );
+    if (input.len == input_byte_count) return escaped;
+
+    @memcpy(
+        output[escaped.len..][0..cli_token_truncated_suffix.len],
+        cli_token_truncated_suffix,
+    );
+    return output[0 .. escaped.len + cli_token_truncated_suffix.len];
+}
+
 fn setCliCommand(canonical_top: []const u8, args: []const []const u8) void {
     for (&cli_commands.groups) |*group| {
         // flag（`-...`）不是子命令：`zc diag -c x` 的 command 是 "diag"，
@@ -1048,15 +1110,31 @@ fn setCliCommand(canonical_top: []const u8, args: []const []const u8) void {
         if (std.mem.eql(u8, group.name, canonical_top) and args.len >= 3 and
             args[2].len > 0 and args[2][0] != '-')
         {
-            const joined = std.fmt.bufPrint(&g_cmd_buf, "{s} {s}", .{ canonical_top, args[2] }) catch {
+            var escaped_subcommand_buffer: [cli_token_output_bytes_max]u8 =
+                undefined;
+            const escaped_subcommand = escapeCLIToken(
+                args[2],
+                &escaped_subcommand_buffer,
+            );
+            const joined = std.fmt.bufPrint(
+                &g_cmd_buf,
+                "{s} {s}",
+                .{ canonical_top, escaped_subcommand },
+            ) catch {
                 g_cli_command = canonical_top;
                 return;
             };
-            g_cli_command = if (cli_commands.find(joined)) |c| c.path else joined;
+            g_cli_command = if (cli_commands.find(joined)) |command|
+                command.path
+            else
+                joined;
             return;
         }
     }
-    g_cli_command = if (cli_commands.find(canonical_top)) |c| c.path else canonical_top;
+    g_cli_command = if (cli_commands.find(canonical_top)) |command|
+        command.path
+    else
+        escapeCLIToken(canonical_top, &g_cmd_buf);
 }
 
 fn printShortUsage() void {
@@ -1512,7 +1590,8 @@ fn printInvalidConfigName(json_output: bool) void {
         json_output,
         "CONFIG_NAME_INVALID",
         "invalid config name",
-        "use 1-250 bytes of UTF-8 without control characters, '/' or '\\'",
+        "after removing one `.yaml` suffix, use 1-250 bytes of valid UTF-8; " ++
+            "not `.` or `..`; no control/bidirectional characters, '/' or '\\'",
     );
 }
 
@@ -1702,13 +1781,17 @@ fn renderCatalogListing(
     noteCatalogHealth(out, health);
     try out.print("Available configs:\n\n", .{});
     for (listing.entries) |entry| {
+        var display_buffer: [cli_token_output_bytes_max]u8 = undefined;
+        const display = escapeCLIToken(entry.display, &display_buffer);
         if (entry.active) {
-            try out.print("  * {s}", .{entry.display});
+            try out.print("  * {s}", .{display});
         } else {
-            try out.print("    {s}", .{entry.display});
+            try out.print("    {s}", .{display});
         }
         if (!std.mem.eql(u8, entry.display, entry.key)) {
-            try out.print(" ({s})", .{entry.key});
+            var key_buffer: [cli_token_output_bytes_max]u8 = undefined;
+            const key = escapeCLIToken(entry.key, &key_buffer);
+            try out.print(" ({s})", .{key});
         }
         if (entry.active) try out.print(" (active)", .{});
         try out.print("\n", .{});
@@ -1774,15 +1857,70 @@ fn tryReadMalformedManagedSource(
 fn writeRawConfigDocument(
     json_output: bool,
     source: []const u8,
-) void {
+) !void {
     std.debug.assert(!json_output);
+    const stdout_is_terminal = std.c.isatty(std.posix.STDOUT_FILENO) == 1;
+    if (stdout_is_terminal) {
+        if (!safe_text.isDocumentDisplaySafe(source)) {
+            return error.UnsafeTerminalDocument;
+        }
+    }
     var streams = StdStreams{};
     var out = streams.output(false);
-    out.print("{s}", .{source}) catch {};
-    if (source.len == 0 or source[source.len - 1] != '\n') {
-        out.print("\n", .{}) catch {};
-    }
-    out.flush() catch {};
+    try out.print("{s}", .{source});
+    try out.flush();
+}
+
+const remote_provider_unsupported_message =
+    "a remote RULE-SET provider cannot be activated before its content " ++
+    "is captured locally";
+
+fn configParseErrorMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.InvalidYamlDocument => "YAML syntax is invalid",
+        error.YamlNestingTooDeep => "YAML nesting is too deep",
+        error.DuplicateKey => "YAML contains a duplicate mapping key",
+        error.InvalidConfig => "config structure or semantics are invalid",
+        error.MissingProxyName => "a proxy entry is missing required field 'name'",
+        error.MissingProxyType => "a proxy entry is missing required field 'type'",
+        error.MissingProxyServer => "a proxy entry is missing required field 'server'",
+        error.MissingProxyPort => "a proxy entry is missing required field 'port'",
+        error.MissingProxyUuid => "a proxy entry is missing required field 'uuid'",
+        error.UnknownProxyType => "a proxy entry uses an unknown type",
+        error.InvalidProxyFormat,
+        error.InvalidProxyPort,
+        error.InvalidAlterId,
+        => "a proxy field has an invalid type or value",
+        error.MissingGroupName => "a proxy-group entry is missing required field 'name'",
+        error.MissingGroupType => "a proxy-group entry is missing required field 'type'",
+        error.UnknownGroupType => "a proxy-group entry uses an unknown type",
+        error.InvalidGroupFormat,
+        error.InvalidGroupInterval,
+        error.InvalidGroupTolerance,
+        => "a proxy-group field has an invalid type or value",
+        error.MissingRuleProviderType => "a rule-provider is missing required field 'type'",
+        error.MissingRuleProviderBehavior => "a rule-provider is missing required field 'behavior'",
+        error.MissingRuleProviderPath => "a rule-provider is missing required field 'path'",
+        error.AbsoluteAssetPathNotAllowed => "a file rule-provider path must be relative to " ++
+            "the config source",
+        error.PathOutsideSourceRoot => "a file rule-provider path escapes the config " ++
+            "source directory",
+        error.InvalidRuleProviderPath => "a rule-provider path is invalid or unsafe",
+        error.InvalidRuleProviderFormat,
+        error.InvalidRuleProviderBehavior,
+        => "a rule-provider field has an invalid type or value",
+        error.InvalidRuleProviderEncoding => "a rule-provider file is not valid UTF-8",
+        error.InvalidRuleProviderDocument => "a rule-provider document has an invalid structure",
+        error.InvalidRuleProviderEntry => "a rule-provider contains an invalid entry",
+        error.RuleProviderNotFound => "a RULE-SET rule references an undeclared provider",
+        error.ManagedRemoteRuleProviderUnsupported => remote_provider_unsupported_message,
+        error.InvalidRule => "a rule has an invalid format or ordering",
+        error.UnknownRuleType => "a rule uses an unknown type",
+        error.InvalidPluginOptions,
+        error.AmbiguousPluginOptions,
+        => "proxy plugin options are malformed or ambiguous",
+        else => null,
+    };
 }
 
 /// config 命令树 dispatch。错误统一走 printCliError（envelope/error block）
@@ -1815,10 +1953,26 @@ fn runConfigCommand(
             printCliError(json_output, "CONFIG_LOAD_ARGUMENT_INVALID", "unknown or unexpected argument for `config load`", "use `zc config load <path>`");
             std.process.exit(cli_output.exit_usage);
         }
-        var receipt = config_import.loadDefault(allocator, args[3]) catch |err| {
-            switch (err) {
+        const load_outcome = config_import.loadDefault(
+            allocator,
+            args[3],
+        ) catch |err| {
+            if (configParseErrorMessage(err)) |message| {
+                printCliError(
+                    json_output,
+                    "CONFIG_LOAD_INVALID",
+                    message,
+                    "fix the YAML structure and field values, then retry",
+                );
+            } else switch (err) {
                 error.ManagedProfileAlreadyExists => printCliError(json_output, "CONFIG_ALREADY_EXISTS", "a config with this name already exists", "rename the file or delete the existing config first"),
-                error.InvalidConfig, error.InvalidConfigKey => printCliError(json_output, "CONFIG_LOAD_INVALID", "local config is invalid", "fix the config and retry"),
+                error.InvalidConfigEncoding => printCliError(
+                    json_output,
+                    "CONFIG_LOAD_INVALID",
+                    "local config is not valid UTF-8",
+                    "save the YAML as UTF-8 and retry",
+                ),
+                error.InvalidConfigKey => printInvalidConfigName(json_output),
                 error.ConfigTooLarge,
                 error.SourceTooLarge,
                 error.MaterializedSourceTooLarge,
@@ -1849,6 +2003,26 @@ fn runConfigCommand(
                 else => printCliError(json_output, "CONFIG_LOAD_FAILED", "failed to load local config", "check the path, local dependencies, and file permissions"),
             }
             std.process.exit(cli_output.exit_failure);
+        };
+        var receipt = switch (load_outcome) {
+            .loaded => |loaded| loaded,
+            .invalid_config => |validation_value| {
+                var validation = validation_value;
+                printConfigValidationFailure(
+                    json_output,
+                    .{
+                        .code = "CONFIG_LOAD_INVALID",
+                        .message = "local config is invalid",
+                        .hint = "fix the listed configuration errors and retry",
+                    },
+                    &validation,
+                ) catch |err| {
+                    validation.deinit();
+                    return err;
+                };
+                validation.deinit();
+                std.process.exit(cli_output.exit_failure);
+            },
         };
         defer receipt.deinit(allocator);
         var streams = StdStreams{};
@@ -1986,9 +2160,28 @@ fn runConfigCommand(
             .activate = dl.set_default,
         }) catch |err| {
             out.note("config catalog publish failed: {s}\n", .{@errorName(err)}) catch {};
-            switch (err) {
+            if (err == error.InvalidConfigEncoding) {
+                printCliError(
+                    json_output,
+                    "CONFIG_DOWNLOAD_FAILED",
+                    "downloaded config is not valid UTF-8",
+                    "fix the subscription source encoding and retry",
+                );
+            } else if (configParseErrorMessage(err)) |message| {
+                printCliError(
+                    json_output,
+                    "CONFIG_DOWNLOAD_FAILED",
+                    message,
+                    "fix the subscription source config and retry",
+                );
+            } else switch (err) {
                 error.ManagedProfileAlreadyExists => printCliError(json_output, "CONFIG_ALREADY_EXISTS", "a config with this name already exists", "use `zc config update`, or choose another name"),
-                error.InvalidConfig, error.InvalidConfigKey => printCliError(json_output, "CONFIG_DOWNLOAD_FAILED", "downloaded config is invalid", "fix the source config and retry"),
+                error.InvalidConfigKey => printCliError(
+                    json_output,
+                    "CONFIG_DOWNLOAD_FAILED",
+                    "downloaded config is invalid",
+                    "fix the source config and retry",
+                ),
                 error.ProfileNotRuntimeReady => printConfigCapabilityUnsupported(
                     json_output,
                     .download_activate,
@@ -2131,8 +2324,21 @@ fn runConfigCommand(
             .override_runner = process_runner.runner(),
         }) catch |err| {
             out.note("config catalog update failed: {s}\n", .{@errorName(err)}) catch {};
-            switch (err) {
-                error.InvalidConfig => printCliError(json_output, "CONFIG_UPDATE_FAILED", "updated config is invalid", "fix the subscription source and retry"),
+            if (err == error.InvalidConfigEncoding) {
+                printCliError(
+                    json_output,
+                    "CONFIG_UPDATE_FAILED",
+                    "updated config is not valid UTF-8",
+                    "fix the subscription source encoding and retry",
+                );
+            } else if (configParseErrorMessage(err)) |message| {
+                printCliError(
+                    json_output,
+                    "CONFIG_UPDATE_FAILED",
+                    message,
+                    "fix the subscription source config and retry",
+                );
+            } else switch (err) {
                 error.SourceTooLarge,
                 error.MaterializedSourceTooLarge,
                 => printCliError(
@@ -2367,7 +2573,22 @@ fn runConfigCommand(
                 };
                 if (malformed_source) |*source| {
                     defer source.deinit();
-                    writeRawConfigDocument(json_output, source.bytes);
+                    writeRawConfigDocument(
+                        json_output,
+                        source.bytes,
+                    ) catch |err| {
+                        if (err == error.UnsafeTerminalDocument) {
+                            printCliError(
+                                false,
+                                "CONFIG_DUMP_UNSAFE_TERMINAL",
+                                "raw config contains unsafe terminal controls",
+                                "redirect stdout to a file to preserve raw bytes",
+                            );
+                        } else {
+                            printConfigDumpError(json_output, err);
+                        }
+                        std.process.exit(cli_output.exit_failure);
+                    };
                     return;
                 }
             }
@@ -2493,6 +2714,15 @@ fn runConfigCommand(
 
         switch (action) {
             .set => |script_path| {
+                if (!safe_text.isDisplaySafe(script_path)) {
+                    printCliError(
+                        json_output,
+                        "CONFIG_OVERRIDE_ARGUMENT_INVALID",
+                        "override script path contains unsafe display characters",
+                        "rename the script and retry",
+                    );
+                    std.process.exit(cli_output.exit_usage);
+                }
                 const key = snapshot.key orelse {
                     printConfigOverrideError(json_output, error.NoActiveConfig);
                     std.process.exit(cli_output.exit_failure);
@@ -2542,17 +2772,20 @@ fn runConfigCommand(
                 };
 
                 if (json_output) {
-                    out.success(.{
+                    try out.success(.{
                         .action = "config_override_set",
                         .profile = profile_name,
                         .enabled = true,
                         .script = script_path,
                         .durability_uncertain = health.durabilityUncertain(),
                         .mirror_out_of_sync = health.mirrorOutOfSync(),
-                    }) catch {};
+                    });
                 } else {
-                    out.print("Persisted override set for config {s}: {s}\n", .{ profile_name, script_path }) catch {};
-                    out.flush() catch {};
+                    try out.print(
+                        "Persisted override set for config {s}: {s}\n",
+                        .{ profile_name, script_path },
+                    );
+                    try out.flush();
                 }
             },
             .clear => {
@@ -2592,20 +2825,26 @@ fn runConfigCommand(
 
                 noteCatalogHealth(&out, health);
                 if (json_output) {
-                    out.success(.{
+                    try out.success(.{
                         .action = "config_override_clear",
                         .profile = profile_name,
                         .enabled = false,
                         .cleared = had_override,
                         .durability_uncertain = health.durabilityUncertain(),
                         .mirror_out_of_sync = health.mirrorOutOfSync(),
-                    }) catch {};
+                    });
                 } else if (had_override) {
-                    out.print("Cleared persisted override for config {s}\n", .{profile_name}) catch {};
-                    out.flush() catch {};
+                    try out.print(
+                        "Cleared persisted override for config {s}\n",
+                        .{profile_name},
+                    );
+                    try out.flush();
                 } else {
-                    out.print("No persisted override set for config {s}\n", .{profile_name}) catch {};
-                    out.flush() catch {};
+                    try out.print(
+                        "No persisted override set for config {s}\n",
+                        .{profile_name},
+                    );
+                    try out.flush();
                 }
             },
             .show => {
@@ -2614,30 +2853,42 @@ fn runConfigCommand(
                 if (!json_output) noteCatalogHealth(&out, health);
                 if (json_output) {
                     if (current_script) |script| {
-                        out.success(.{
+                        try out.success(.{
                             .action = "config_override_get",
                             .profile = profile_name,
                             .enabled = true,
                             .script = script,
                             .durability_uncertain = health.durabilityUncertain(),
                             .mirror_out_of_sync = health.mirrorOutOfSync(),
-                        }) catch {};
+                        });
                     } else {
-                        out.success(.{
+                        try out.success(.{
                             .action = "config_override_get",
                             .profile = profile_name,
                             .enabled = false,
                             .script = null,
                             .durability_uncertain = health.durabilityUncertain(),
                             .mirror_out_of_sync = health.mirrorOutOfSync(),
-                        }) catch {};
+                        });
                     }
                 } else if (current_script) |script| {
-                    out.print("Config {s} persisted override: {s}\n", .{ profile_name, script }) catch {};
-                    out.flush() catch {};
+                    var escaped_script_buffer: [cli_token_output_bytes_max]u8 =
+                        undefined;
+                    const escaped_script = escapeCLIToken(
+                        script,
+                        &escaped_script_buffer,
+                    );
+                    try out.print(
+                        "Config {s} persisted override: {s}\n",
+                        .{ profile_name, escaped_script },
+                    );
+                    try out.flush();
                 } else {
-                    out.print("Config {s} persisted override: (none)\n", .{profile_name}) catch {};
-                    out.flush() catch {};
+                    try out.print(
+                        "Config {s} persisted override: (none)\n",
+                        .{profile_name},
+                    );
+                    try out.flush();
                 }
             },
         }

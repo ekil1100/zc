@@ -113,6 +113,8 @@ test "ConfigCatalog grandfathers persisted keys but reserves new filename space"
     try testing.expect(!catalog.isPortableManagedKey(grandfathered_key));
     try testing.expect(catalog.isManagedKey(grandfathered_key));
     try testing.expect(!catalog.isManagedKey(oversized_key));
+    try testing.expect(!catalog.isManagedKey("unsafe\x1bname"));
+    try testing.expect(!catalog.isManagedKey("unsafe\xe2\x80\xaename"));
     const profiles = [_]catalog.Profile{.{
         .key = grandfathered_key,
         .storage_id = identity.StorageId.derive(grandfathered_key),

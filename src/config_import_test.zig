@@ -7,10 +7,27 @@ const catalog_runtime_gate = @import("catalog_runtime_gate.zig");
 const config_identity = @import("config_identity.zig");
 const revision_store = @import("revision_store.zig");
 
+const test_directory_options: std.Io.Dir.OpenOptions = .{
+    .access_sub_paths = true,
+    .iterate = false,
+    .follow_symlinks = true,
+};
+
 fn writeFile(dir: std.Io.Dir, path: []const u8, bytes: []const u8) !void {
     const file = try dir.createFile(compat.io(), path, .{});
     defer file.close(compat.io());
     try file.writeStreamingAll(compat.io(), bytes);
+}
+
+fn expectLoaded(outcome: config_import.LoadOutcome) !config_import.Receipt {
+    return switch (outcome) {
+        .loaded => |receipt| receipt,
+        .invalid_config => |validation_value| {
+            var validation = validation_value;
+            validation.deinit();
+            return error.ExpectedLoadedConfig;
+        },
+    };
 }
 
 test "config load imports a local bundle, assets, and active mirror" {
@@ -25,7 +42,9 @@ test "config load imports a local bundle, assets, and active mirror" {
     const source_path = try source.dir.realPathFileAlloc(compat.io(), "Home.yaml", allocator);
     defer allocator.free(source_path);
 
-    var receipt = try config_import.Importer.init(allocator, root.dir).load(source_path);
+    var receipt = try expectLoaded(
+        try config_import.Importer.init(allocator, root.dir).load(source_path),
+    );
     defer receipt.deinit(allocator);
     try testing.expectEqualStrings("Home", receipt.key);
     try testing.expect(receipt.active);
@@ -49,6 +68,67 @@ test "config load imports a local bundle, assets, and active mirror" {
     defer loaded.deinit();
     try config.prepareRuleProvidersForRuntime(allocator, &loaded, config_path);
     try testing.expectEqualStrings("example.com", loaded.rules.items[0].payload);
+}
+
+test "config load returns concrete validation diagnostics before publication" {
+    // Load a focused bundle through Importer, then inspect publication,
+    // diagnostics, and persisted state.
+    const allocator = testing.allocator;
+    var root = testing.tmpDir(test_directory_options);
+    defer root.cleanup();
+    var source = testing.tmpDir(test_directory_options);
+    defer source.cleanup();
+    try writeFile(
+        source.dir,
+        "Invalid.yaml",
+        "mixed-port: 7890\nlog-level: verbose\nrules:\n  - MATCH,missing\n",
+    );
+    const source_path = try source.dir.realPathFileAlloc(
+        compat.io(),
+        "Invalid.yaml",
+        allocator,
+    );
+    defer allocator.free(source_path);
+
+    const outcome = try config_import.Importer.init(
+        allocator,
+        root.dir,
+    ).load(source_path);
+    switch (outcome) {
+        .loaded => |receipt_value| {
+            var receipt = receipt_value;
+            receipt.deinit(allocator);
+            return error.ExpectedInvalidConfig;
+        },
+        .invalid_config => |validation_value| {
+            var validation = validation_value;
+            defer validation.deinit();
+            try testing.expect(!validation.isValid());
+            try testing.expectEqual(@as(usize, 2), validation.errors.items.len);
+            try testing.expect(
+                std.mem.indexOf(
+                    u8,
+                    validation.errors.items[0].message,
+                    "Unknown log level",
+                ) != null,
+            );
+            try testing.expect(
+                std.mem.indexOf(
+                    u8,
+                    validation.errors.items[1].message,
+                    "undefined target 'missing'",
+                ) != null,
+            );
+        },
+    }
+    try testing.expectError(
+        error.FileNotFound,
+        root.dir.statFile(
+            compat.io(),
+            "state-v2.json",
+            .{ .follow_symlinks = true },
+        ),
+    );
 }
 
 test "config load persists and authoritatively reloads an exact 16 MiB local provider" {
@@ -81,10 +161,10 @@ test "config load persists and authoritatively reloads an exact 16 MiB local pro
     );
     defer allocator.free(exact_path);
 
-    var receipt = try config_import.Importer.init(
+    var receipt = try expectLoaded(try config_import.Importer.init(
         allocator,
         root.dir,
-    ).load(exact_path);
+    ).load(exact_path));
     defer receipt.deinit(allocator);
     try catalog_runtime_gate.ensureIdentityRuntimeReady(
         allocator,
@@ -152,6 +232,48 @@ test "config load persists and authoritatively reloads an exact 16 MiB local pro
         ),
     );
     // The external +1 mutation cannot affect the exact immutable revision.
+    try catalog_runtime_gate.ensureIdentityRuntimeReady(
+        allocator,
+        root.dir,
+        receipt.key,
+        receipt.revision,
+    );
+}
+
+test "config load admits a Trojan subscription that declares udp:true" {
+    // Load a focused bundle through Importer, then inspect publication,
+    // diagnostics, and persisted state.
+    const allocator = testing.allocator;
+    var root = testing.tmpDir(test_directory_options);
+    defer root.cleanup();
+    var source = testing.tmpDir(test_directory_options);
+    defer source.cleanup();
+    try writeFile(source.dir, "Flower_Trojan.yaml",
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: HK-1
+        \\    type: trojan
+        \\    server: 127.0.0.1
+        \\    port: 443
+        \\    password: secret
+        \\    sni: localhost
+        \\    udp: true
+        \\rules:
+        \\  - MATCH,HK-1
+    );
+    const source_path = try source.dir.realPathFileAlloc(
+        compat.io(),
+        "Flower_Trojan.yaml",
+        allocator,
+    );
+    defer allocator.free(source_path);
+
+    var receipt = try expectLoaded(
+        try config_import.Importer.init(allocator, root.dir).load(source_path),
+    );
+    defer receipt.deinit(allocator);
+    try testing.expectEqualStrings("Flower_Trojan", receipt.key);
+    try testing.expect(receipt.active);
     try catalog_runtime_gate.ensureIdentityRuntimeReady(
         allocator,
         root.dir,

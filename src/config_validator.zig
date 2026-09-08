@@ -4,6 +4,8 @@ const compat = @import("compat.zig");
 const controller_endpoint = @import("controller_endpoint.zig");
 const controller_auth = @import("controller_auth.zig");
 const runtime_capability = @import("runtime_capability.zig");
+const safe_text = @import("safe_text.zig");
+const tls_server_name = @import("protocol/tls_server_name.zig");
 const Config = @import("config.zig").Config;
 const RuleType = @import("config.zig").RuleType;
 
@@ -12,14 +14,70 @@ pub const validation_diagnostic_count_max: usize = 256;
 /// Each retained diagnostic owns at most this many rendered bytes.
 pub const validation_diagnostic_bytes_max: usize = 512;
 
-const diagnostic_error_too_long =
-    "Validation error detail omitted: diagnostic exceeded the byte limit";
-const diagnostic_warning_too_long =
-    "Validation warning detail omitted: diagnostic exceeded the byte limit";
+const diagnostic_truncated_suffix = " ... [truncated]";
 comptime {
     std.debug.assert(validation_diagnostic_count_max > 0);
-    std.debug.assert(diagnostic_error_too_long.len <= validation_diagnostic_bytes_max);
-    std.debug.assert(diagnostic_warning_too_long.len <= validation_diagnostic_bytes_max);
+    std.debug.assert(
+        diagnostic_truncated_suffix.len < validation_diagnostic_bytes_max,
+    );
+}
+
+fn renderTruncatedDiagnosticTemplate(
+    output: []u8,
+    comptime fmt: []const u8,
+) []const u8 {
+    comptime std.debug.assert(std.unicode.utf8ValidateSlice(fmt));
+    var input_index: usize = 0;
+    var output_byte_count: usize = 0;
+    for (0..output.len) |_| {
+        if (input_index >= fmt.len) break;
+        if (output_byte_count >= output.len) break;
+        if (fmt[input_index] == '{') {
+            if (input_index + 1 < fmt.len) {
+                if (fmt[input_index + 1] == '{') {
+                    output[output_byte_count] = '{';
+                    output_byte_count += 1;
+                    input_index += 2;
+                    continue;
+                }
+            }
+            const close_offset = std.mem.indexOfScalar(
+                u8,
+                fmt[input_index + 1 ..],
+                '}',
+            ) orelse break;
+            const replacement = "...";
+            const available = @min(replacement.len, output.len - output_byte_count);
+            @memcpy(
+                output[output_byte_count..][0..available],
+                replacement[0..available],
+            );
+            output_byte_count += available;
+            input_index += close_offset + 2;
+            continue;
+        }
+        if (fmt[input_index] == '}') {
+            if (input_index + 1 < fmt.len) {
+                if (fmt[input_index + 1] == '}') {
+                    output[output_byte_count] = '}';
+                    output_byte_count += 1;
+                    input_index += 2;
+                    continue;
+                }
+            }
+        }
+        output[output_byte_count] = fmt[input_index];
+        output_byte_count += 1;
+        input_index += 1;
+    }
+    const utf8_trailing_byte_count_max: u8 = 3;
+    for (0..utf8_trailing_byte_count_max) |_| {
+        if (std.unicode.utf8ValidateSlice(output[0..output_byte_count])) break;
+        std.debug.assert(output_byte_count > 0);
+        output_byte_count -= 1;
+    }
+    std.debug.assert(std.unicode.utf8ValidateSlice(output[0..output_byte_count]));
+    return output[0..output_byte_count];
 }
 
 /// 校验错误类型
@@ -42,13 +100,6 @@ pub const ValidationResult = struct {
     const DiagnosticKind = enum {
         err,
         warning,
-
-        fn oversizedMessage(kind: DiagnosticKind) []const u8 {
-            return switch (kind) {
-                .err => diagnostic_error_too_long,
-                .warning => diagnostic_warning_too_long,
-            };
-        }
     };
 
     pub fn init(allocator: std.mem.Allocator) ValidationResult {
@@ -76,7 +127,7 @@ pub const ValidationResult = struct {
         return !self.has_errors;
     }
 
-    fn addError(
+    pub fn addError(
         self: *ValidationResult,
         comptime fmt: []const u8,
         args: anytype,
@@ -102,9 +153,17 @@ pub const ValidationResult = struct {
     ) !void {
         const diagnostic_count = self.errors.items.len +
             self.warnings.items.len;
-        if (diagnostic_count >= validation_diagnostic_count_max) {
-            self.diagnostics_truncated = true;
-            return;
+        const storage_full =
+            diagnostic_count >= validation_diagnostic_count_max;
+        const error_can_replace_warning = if (kind == .err)
+            self.warnings.items.len > 0
+        else
+            false;
+        if (storage_full) {
+            if (!error_can_replace_warning) {
+                self.diagnostics_truncated = true;
+                return;
+            }
         }
 
         var buffer: [validation_diagnostic_bytes_max]u8 = undefined;
@@ -114,11 +173,31 @@ pub const ValidationResult = struct {
             args,
         ) catch blk: {
             self.diagnostics_truncated = true;
-            break :blk kind.oversizedMessage();
+            const template = renderTruncatedDiagnosticTemplate(
+                buffer[0 .. buffer.len - diagnostic_truncated_suffix.len],
+                fmt,
+            );
+            @memcpy(
+                buffer[template.len..][0..diagnostic_truncated_suffix.len],
+                diagnostic_truncated_suffix,
+            );
+            const truncated = buffer[0 .. template.len +
+                diagnostic_truncated_suffix.len];
+            std.debug.assert(std.unicode.utf8ValidateSlice(truncated));
+            break :blk truncated;
         };
         const message = try self.allocator.dupe(u8, rendered);
         errdefer self.allocator.free(message);
-        try destination.append(self.allocator, .{ .message = message });
+        try destination.ensureUnusedCapacity(self.allocator, 1);
+
+        if (storage_full) {
+            std.debug.assert(error_can_replace_warning);
+            const warning_index = self.warnings.items.len - 1;
+            self.allocator.free(self.warnings.items[warning_index].message);
+            self.warnings.items.len = warning_index;
+            self.diagnostics_truncated = true;
+        }
+        destination.appendAssumeCapacity(.{ .message = message });
     }
 };
 
@@ -257,15 +336,15 @@ fn addProxyCapabilityError(
                 "zc v1.0",
             .{ proxy.name, cipher },
         ),
+        .unsupported_transport => |transport| try result.addError(
+            "Proxy '{s}': transport '{s}' is not supported for type '{s}'; " ++
+                "use native tcp transport",
+            .{ proxy.name, transport.transport, @tagName(transport.proxy_type) },
+        ),
         .websocket_not_supported => |proxy_type| try result.addError(
             "Proxy '{s}': ws-opts is not supported for type '{s}' in " ++
                 "zc v1.0",
             .{ proxy.name, @tagName(proxy_type) },
-        ),
-        .trojan_udp_not_supported => try result.addError(
-            "Proxy '{s}': udp:true is not supported for type 'trojan' in " ++
-                "zc v1.0",
-            .{proxy.name},
         ),
         else => unreachable,
     }
@@ -453,6 +532,21 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
             continue;
         }
 
+        if (!safe_text.isDisplaySafe(proxy.name)) {
+            try result.addError(
+                "Proxy #{d}: name contains terminal control characters",
+                .{i + 1},
+            );
+        }
+        if (proxy.server.len > 0) {
+            if (!safe_text.isDisplaySafe(proxy.server)) {
+                try result.addError(
+                    "Proxy #{d}: server contains terminal control characters",
+                    .{i + 1},
+                );
+            }
+        }
+
         // 检查名称是否重复
         if (name_set.contains(proxy.name)) {
             try result.addError("Duplicate proxy name: '{s}'", .{proxy.name});
@@ -484,6 +578,14 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
             .ss => {
                 if (proxy.server.len == 0) {
                     try result.addError("Shadowsocks proxy '{s}': server cannot be empty", .{proxy.name});
+                } else {
+                    tls_server_name.validateServer(proxy.server) catch {
+                        try result.addError(
+                            "Shadowsocks proxy '{s}': server must be a valid " ++
+                                "IP literal or RFC hostname",
+                            .{proxy.name},
+                        );
+                    };
                 }
                 if (!isValidPort(proxy.port)) {
                     try result.addError("Shadowsocks proxy '{s}': invalid port {d}", .{ proxy.name, proxy.port });
@@ -517,6 +619,33 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
                 }
                 if (proxy.password == null or proxy.password.?.len == 0) {
                     try result.addError("Trojan proxy '{s}': password is required", .{proxy.name});
+                }
+                if (proxy.server.len > 0) {
+                    tls_server_name.validateServer(proxy.server) catch {
+                        try result.addError(
+                            "Trojan proxy '{s}': server must be a valid " ++
+                                "IP literal or RFC hostname (1-{d} bytes)",
+                            .{ proxy.name, tls_server_name.bytes_max },
+                        );
+                    };
+                }
+                if (proxy.sni) |sni| {
+                    tls_server_name.validateSNI(sni) catch {
+                        try result.addError(
+                            "Trojan proxy '{s}': sni must be a valid RFC hostname " ++
+                                "(1-{d} bytes; no IP, wildcard, whitespace, " ++
+                                "or control characters)",
+                            .{ proxy.name, tls_server_name.bytes_max },
+                        );
+                    };
+                } else if (!proxy.skip_cert_verify) {
+                    if (tls_server_name.isIPLiteral(proxy.server)) {
+                        try result.addError(
+                            "Trojan proxy '{s}': verified IP server " ++
+                                "requires an explicit hostname sni",
+                            .{proxy.name},
+                        );
+                    }
                 }
                 // Disabling cert verification is a real security downgrade;
                 // keep it visible even when another capability check rejects the
@@ -557,12 +686,34 @@ fn validateProxies(allocator: std.mem.Allocator, config: *const Config, result: 
 fn validateProxyGroups(allocator: std.mem.Allocator, config: *const Config, result: *ValidationResult) !void {
     var name_set = std.StringHashMap(void).init(allocator);
     defer name_set.deinit();
+    var proxy_names = std.StringHashMap(void).init(allocator);
+    defer proxy_names.deinit();
+    std.debug.assert(config.proxies.items.len <= config_mod.proxy_count_max);
+    for (0..config_mod.proxy_count_max) |proxy_index| {
+        if (proxy_index == config.proxies.items.len) break;
+        const proxy = config.proxies.items[proxy_index];
+        if (proxy.name.len > 0) try proxy_names.put(proxy.name, {});
+    }
 
     for (config.proxy_groups.items, 0..) |group, i| {
         // 检查名称是否为空
         if (group.name.len == 0) {
             try result.addError("Proxy group #{d}: name cannot be empty", .{i + 1});
             continue;
+        }
+
+        if (!safe_text.isDisplaySafe(group.name)) {
+            try result.addError(
+                "Proxy group #{d}: name contains terminal control characters",
+                .{i + 1},
+            );
+        }
+
+        if (proxy_names.contains(group.name)) {
+            try result.addError(
+                "Policy name '{s}' is used by both a proxy and a proxy group",
+                .{group.name},
+            );
         }
 
         // 检查名称是否重复
@@ -582,7 +733,10 @@ fn validateProxyGroups(allocator: std.mem.Allocator, config: *const Config, resu
             if (group.url == null or group.url.?.len == 0) {
                 try result.addError("Proxy group '{s}' ({s}): url is required", .{ group.name, @tagName(group.group_type) });
             } else if (!isValidURL(group.url.?)) {
-                try result.addWarning("Proxy group '{s}': url '{s}' may be invalid", .{ group.name, group.url.? });
+                try result.addWarning(
+                    "Proxy group '{s}': configured health-check URL may be invalid",
+                    .{group.name},
+                );
             }
         }
     }
@@ -647,6 +801,12 @@ fn validateReferences(allocator: std.mem.Allocator, config: *const Config, resul
     defer provider_names.deinit();
 
     for (config.rule_providers.items) |provider| {
+        if (!safe_text.isDisplaySafe(provider.name)) {
+            try result.addError(
+                "Rule provider name contains terminal control characters",
+                .{},
+            );
+        }
         try provider_names.put(provider.name, {});
     }
 
@@ -784,14 +944,24 @@ pub fn printResult(result: *const ValidationResult) void {
     if (result.errors.items.len > 0) {
         std.debug.print("\n=== Configuration Errors ===\n", .{});
         for (result.errors.items, 1..) |err, i| {
-            std.debug.print("  [{d}] {s}\n", .{ i, err.message });
+            var escaped_buffer: [
+                validation_diagnostic_bytes_max *
+                    safe_text.escape_expansion_factor_max
+            ]u8 = undefined;
+            const escaped = safe_text.escape(err.message, &escaped_buffer);
+            std.debug.print("  [{d}] {s}\n", .{ i, escaped });
         }
     }
 
     if (result.warnings.items.len > 0) {
         std.debug.print("\n=== Configuration Warnings ===\n", .{});
         for (result.warnings.items, 1..) |warn, i| {
-            std.debug.print("  [{d}] {s}\n", .{ i, warn.message });
+            var escaped_buffer: [
+                validation_diagnostic_bytes_max *
+                    safe_text.escape_expansion_factor_max
+            ]u8 = undefined;
+            const escaped = safe_text.escape(warn.message, &escaped_buffer);
+            std.debug.print("  [{d}] {s}\n", .{ i, escaped });
         }
     }
 
@@ -966,24 +1136,56 @@ test "manual proxy group member overflow stops every validator before allocation
     }
 }
 
-test "diagnostic storage cap preserves invalid status after warnings fill it" {
-    // Fill the shared storage with warnings, then prove an omitted error still
-    // controls validity without allocating a 257th diagnostic.
+test "diagnostic storage cap keeps an actionable error after warnings fill it" {
+    // Errors outrank warnings so an invalid result always retains at least one
+    // concrete reason even after warnings consume the shared diagnostic cap.
     var result = ValidationResult.init(std.testing.allocator);
     defer result.deinit();
 
     for (0..validation_diagnostic_count_max) |index| {
         try result.addWarning("warning {d}", .{index});
     }
-    try result.addError("error omitted after warnings", .{});
+    try result.addError("error retained after warnings", .{});
 
     try std.testing.expectEqual(
         validation_diagnostic_count_max,
         result.errors.items.len + result.warnings.items.len,
     );
-    try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "error retained after warnings",
+        result.errors.items[0].message,
+    );
+    try std.testing.expectEqual(
+        validation_diagnostic_count_max - 1,
+        result.warnings.items.len,
+    );
     try std.testing.expect(result.diagnostics_truncated);
     try std.testing.expect(!result.isValid());
+}
+
+test "oversized Unicode diagnostics remain actionable UTF-8 strings" {
+    // Send a multibyte message through bounded diagnostic rendering and verify
+    // truncation preserves UTF-8 plus the actionable template and suffix.
+    var result = ValidationResult.init(std.testing.allocator);
+    defer result.deinit();
+    try result.addError(
+        "Duplicate proxy name: '{s}'",
+        .{"界" ** 200},
+    );
+
+    const message = result.errors.items[0].message;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(message));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        message,
+        "Duplicate proxy name: '...",
+    ));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        message,
+        diagnostic_truncated_suffix,
+    ));
 }
 
 test "long group diagnostics stay bounded at maximum member count" {
@@ -1033,20 +1235,35 @@ test "long group diagnostics stay bounded at maximum member count" {
             validation_diagnostic_count_max,
             result.errors.items.len + result.warnings.items.len,
         );
-        var oversized_detail_omitted = false;
+        var actionable_truncated_detail = false;
         for (result.errors.items) |diagnostic| {
             try std.testing.expect(
                 diagnostic.message.len <= validation_diagnostic_bytes_max,
             );
-            if (std.mem.eql(
+            const has_truncated_suffix = std.mem.endsWith(
                 u8,
                 diagnostic.message,
-                diagnostic_error_too_long,
-            )) {
-                oversized_detail_omitted = true;
+                diagnostic_truncated_suffix,
+            );
+            const has_group_prefix = std.mem.startsWith(
+                u8,
+                diagnostic.message,
+                "Proxy group '",
+            );
+            const has_undefined_reference = std.mem.indexOf(
+                u8,
+                diagnostic.message,
+                "references undefined",
+            ) != null;
+            if (has_truncated_suffix) {
+                if (has_group_prefix) {
+                    if (has_undefined_reference) {
+                        actionable_truncated_detail = true;
+                    }
+                }
             }
         }
-        try std.testing.expect(oversized_detail_omitted);
+        try std.testing.expect(actionable_truncated_detail);
         for (result.warnings.items) |diagnostic| {
             try std.testing.expect(
                 diagnostic.message.len <= validation_diagnostic_bytes_max,
@@ -1841,8 +2058,50 @@ fn hasErrorContaining(result: *const ValidationResult, needle: []const u8) bool 
     return false;
 }
 
-test "v1 capability gate rejects Trojan udp" {
-    // An unsupported transport declaration must fail before runtime traffic.
+fn hasWarningContaining(result: *const ValidationResult, needle: []const u8) bool {
+    for (result.warnings.items) |warning| {
+        if (std.mem.indexOf(u8, warning.message, needle) != null) return true;
+    }
+    return false;
+}
+
+test "Trojan UDP rejects non-native transport without fallback" {
+    // Parse Trojan UDP fixtures with unsupported transport metadata and verify
+    // capability validation rejects them instead of falling back to native TCP.
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: grpc-trojan
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    udp: true
+        \\    network: grpc
+        \\    grpc-opts: { grpc-service-name: edge }
+        \\  - name: ws-trojan
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    udp: true
+        \\    network: ws
+    ;
+    var cfg = try config_mod.parseDocument(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 2), result.errors.items.len);
+    try std.testing.expect(hasErrorContaining(&result, "transport 'grpc'"));
+    try std.testing.expect(hasErrorContaining(&result, "transport 'ws'"));
+}
+
+test "v1 capability gate admits Trojan udp:true" {
+    // Parse a minimal native-TLS Trojan UDP proxy, run capability validation,
+    // and verify that the validator emits no unsupported-transport error.
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
@@ -1859,13 +2118,8 @@ test "v1 capability gate rejects Trojan udp" {
     var result = try validateRuntimeCapabilities(allocator, &cfg);
     defer result.deinit();
 
-    try std.testing.expect(!result.isValid());
-    try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
-    try std.testing.expectEqualStrings(
-        "Proxy 'trojan-udp': udp:true is not supported for type 'trojan' " ++
-            "in zc v1.0",
-        result.errors.items[0].message,
-    );
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
 }
 
 test "trojan proxy without udp stays valid" {
@@ -1886,11 +2140,36 @@ test "trojan proxy without udp stays valid" {
 
     // Guards against the udp check firing on the default udp=false.
     try std.testing.expect(result.isValid());
-    try std.testing.expect(!hasErrorContaining(&result, "udp:true is not supported"));
+    try std.testing.expect(!hasWarningContaining(&result, "udp:true"));
+    try std.testing.expect(!hasErrorContaining(&result, "udp:true"));
 }
 
-test "Trojan UDP subscriptions fail closed and retain TLS warnings" {
-    // Every unsupported node is rejected while independent TLS risks stay visible.
+test "Trojan udp:true is a supported capability without warnings" {
+    // Parse a native Trojan UDP fixture and verify validation admits the
+    // implemented capability without producing warnings.
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: trojan-udp
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    udp: true
+    ;
+    var cfg = try config_mod.parse(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), result.warnings.items.len);
+}
+
+test "Trojan UDP subscriptions stay valid and retain TLS warnings" {
+    // Airport templates set udp:true on every Trojan node. UDP support must not
+    // hide the independent skip-cert-verify security warning.
     const allocator = std.testing.allocator;
     const yaml_config =
         \\mixed-port: 7899
@@ -1917,10 +2196,11 @@ test "Trojan UDP subscriptions fail closed and retain TLS warnings" {
     var result = try validate(allocator, &cfg);
     defer result.deinit();
 
-    try std.testing.expect(!result.isValid());
-    try std.testing.expectEqual(@as(usize, 2), result.errors.items.len);
-    try std.testing.expect(hasErrorContaining(&result, "HK-1"));
-    try std.testing.expect(hasErrorContaining(&result, "JP-1"));
+    try std.testing.expect(result.isValid());
+    try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
+    try std.testing.expect(hasWarningContaining(&result, "HK-1"));
+    try std.testing.expect(hasWarningContaining(&result, "JP-1"));
+    try std.testing.expect(!hasWarningContaining(&result, "udp:true"));
     try std.testing.expectEqual(@as(usize, 2), countTrojanCertWarnings(&result));
 }
 
@@ -1933,6 +2213,74 @@ fn countTrojanCertWarnings(result: *const ValidationResult) usize {
         if (std.mem.indexOf(u8, w.message, "skip-cert-verify") != null) c += 1;
     }
     return c;
+}
+
+test "validator rejects terminal controls in display names" {
+    // Parse hostile proxy and group names, then verify display-name validation
+    // rejects terminal controls before they can reach CLI output.
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - name: "proxy\e[31m"
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\  - name: unsafe-server
+        \\    type: ss
+        \\    server: "safe\e[31m"
+        \\    port: 8388
+        \\    cipher: aes-128-gcm
+        \\    password: secret
+        \\proxy-groups:
+        \\  - { name: "group\u202e", type: select, proxies: [DIRECT] }
+        \\rule-providers:
+        \\  "provider\u009b": { type: file, behavior: domain, path: missing.yaml }
+        \\rules:
+        \\  - MATCH,DIRECT
+    );
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(
+        &result,
+        "name contains terminal control characters",
+    ));
+    try std.testing.expect(hasErrorContaining(
+        &result,
+        "server contains terminal control characters",
+    ));
+    try std.testing.expect(hasErrorContaining(
+        &result,
+        "Rule provider name contains terminal control characters",
+    ));
+}
+
+test "validator rejects proxy and proxy-group policy name collisions" {
+    // Parse colliding proxy and group declarations and verify policy lookup
+    // ambiguity is rejected during validation.
+    const allocator = std.testing.allocator;
+    var cfg = try config_mod.parseDocument(allocator,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - { name: edge, type: trojan, server: edge.example.com, port: 443, password: secret }
+        \\proxy-groups:
+        \\  - { name: edge, type: select, proxies: [DIRECT] }
+        \\rules:
+        \\  - MATCH,edge
+    );
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(
+        &result,
+        "used by both a proxy and a proxy group",
+    ));
 }
 
 test "validator-hardening: trojan happy-path validates clean with no skip-cert warning" {
@@ -1953,6 +2301,101 @@ test "validator-hardening: trojan happy-path validates clean with no skip-cert w
 
     try std.testing.expect(result.isValid());
     try std.testing.expectEqual(@as(usize, 0), countTrojanCertWarnings(&result));
+}
+
+test "validator rejects oversized Trojan SNI before runtime" {
+    // Build an SNI beyond the TLS identity bound, parse it, and verify the
+    // validator rejects it before runtime allocation or dialing.
+    const allocator = std.testing.allocator;
+    const yaml_config = try std.fmt.allocPrint(
+        allocator,
+        "mixed-port: 7899\nproxies:\n" ++
+            "  - {{ name: long-sni, type: trojan, server: edge.example.com, " ++
+            "port: 443, password: secret, sni: '{s}', udp: true }}\n",
+        .{"a" ** (tls_server_name.bytes_max + 1)},
+    );
+    defer allocator.free(yaml_config);
+    var cfg = try config_mod.parseDocument(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(hasErrorContaining(
+        &result,
+        "sni must be a valid RFC hostname",
+    ));
+}
+
+test "validator rejects invalid Trojan TLS identities" {
+    // Parse malformed Trojan server and SNI identities and verify each invalid
+    // endpoint shape receives a validation error.
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: wildcard
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    sni: "*.example.com"
+        \\  - name: whitespace
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    sni: "edge example.com"
+        \\  - name: unicode-control
+        \\    type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        \\    sni: "edge\u0085example.com"
+        \\  - name: verified-ip
+        \\    type: trojan
+        \\    server: 192.0.2.1
+        \\    port: 443
+        \\    password: secret
+    ;
+    var cfg = try config_mod.parseDocument(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqual(@as(usize, 4), result.errors.items.len);
+    try std.testing.expect(hasErrorContaining(
+        &result,
+        "sni must be a valid RFC hostname",
+    ));
+    try std.testing.expect(hasErrorContaining(
+        &result,
+        "verified IP server requires an explicit hostname sni",
+    ));
+}
+
+test "validator accepts an unverified IP Trojan server without SNI" {
+    // Parse an IP endpoint with certificate verification disabled and verify
+    // omission of hostname SNI remains valid while retaining its warning.
+    const allocator = std.testing.allocator;
+    const yaml_config =
+        \\mixed-port: 7899
+        \\proxies:
+        \\  - name: ip
+        \\    type: trojan
+        \\    server: 192.0.2.1
+        \\    port: 443
+        \\    password: secret
+        \\    skip-cert-verify: true
+        \\    udp: true
+    ;
+    var cfg = try config_mod.parseDocument(allocator, yaml_config);
+    defer cfg.deinit();
+    var result = try validate(allocator, &cfg);
+    defer result.deinit();
+
+    try std.testing.expect(result.isValid());
 }
 
 test "validator-hardening: trojan empty server produces error" {

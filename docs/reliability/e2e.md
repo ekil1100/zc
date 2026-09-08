@@ -22,8 +22,8 @@ mixed HTTP/SOCKS5、minimal API 和 TCP/TLS/UDP wire 验证行为。测试把 `z
 - simple-obfs `tls`、未知 plugin/mode、缺 options/host 与 CRLF host 在 mixed listener bind 和 oracle dial 前失败，两个 TCP oracle 的 raw/verified counter 都保持不变；
 - Shadowsocks UDP 三种算法与 `chacha20-poly1305` alias 经真实 mixed SOCKS5 UDP ASSOCIATE 完成 IPv4/domain/IPv6 round-trip；固定 `shadowsocks-rust v1.24.0 -U`、dual-stack echo 与独立 oracle counter 共同证明双向互操作；
 - UDP 负路径覆盖 bad tag、截短 salt/tag、RSV/FRAG/ATYP/长度、65507/max+1、client IP/source port pin、control close、64+1 capacity 与 slot release；`udp:false` 在 allocation 前返回 REP 07，DIRECT、group→DIRECT 与非 UDP leaf 都 teardown 且不 fallback；
-- simple-obfs UDP probe 只增长同 host/port 的 UDP oracle counter，两个 TCP obfs counter 均不变，证明 SIP003 仍为 TCP-only；
-- Trojan TCP/TLS 对独立服务端的互操作；
+- simple-obfs UDP probe 只增长同 host/port 的 UDP oracle counter，两个 TCP obfs counter 均不变，证明 SIP003 仍为 TCP-only；TCP/UDP 同号 fixture 使用有界重试配对，且每个 UDP readiness 都必须通过带 nonce 的真实 datagram challenge；
+- Trojan TCP/TLS（包括 domain target 经 trojan-go 收到方向性 TLS close 后，EOF-origin 与客户端均在 deadline 内结束且不误走 DIRECT；trojan-go 不保留 EOF 后生成的反向响应），以及 `udp:true` 经 mixed SOCKS5 UDP ASSOCIATE 对固定 `trojan-go v0.10.6` 的 IPv4/domain/IPv6 双向互操作；专用 UDP probe 在同一 association 连续发送 IPv4 与 domain，要求 trojan-go association 仅增长 1、双向 frame 各增长 2，并断言 trojan-go 请求方向的 `udp packet from` metadata 已从 domain 变为 IP；IPv6 probe 另行锁定 dual-stack wire，避免 DIRECT/fallback、单帧 association 或 domain 透传假阳性；
 - controller Bearer 鉴权与 unmanaged selection；
 - reload preparation 失败时旧 daemon 继续转发，恢复后 reload 成功；
 - rule-provider/resource focused tests 覆盖 4096/+1 declarations、跨 provider aggregate count/bytes、单 provider 多次引用、多个 provider 累计、长 target byte 放大、所有 exact/max+1 边界，以及 remote local-only `RULE-SET` 保留为一条；

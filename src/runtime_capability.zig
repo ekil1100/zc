@@ -24,8 +24,11 @@ pub const Failure = union(enum) {
     unsupported_proxy_type: config.ProxyType,
     shadowsocks: shadowsocks.Failure,
     unsupported_shadowsocks_cipher: []const u8,
+    unsupported_transport: struct {
+        proxy_type: config.ProxyType,
+        transport: []const u8,
+    },
     websocket_not_supported: config.ProxyType,
-    trojan_udp_not_supported,
     unsupported_proxy_group_type: config.ProxyGroupType,
 };
 
@@ -77,8 +80,8 @@ pub const CapabilityError = error{
     InvalidSimpleObfsHost,
     SimpleObfsHostTooLong,
     UnsupportedShadowsocksCipher,
+    UnsupportedTransport,
     WebSocketNotSupported,
-    TrojanUdpNotSupported,
     UnsupportedProxyGroupType,
 };
 
@@ -99,8 +102,42 @@ pub fn assessProxy(proxy: *const config.Proxy) ProxyAssessment {
     if (config.isReservedProxyName(proxy.name)) {
         result.findings.append(.reserved_proxy_name);
     }
-    if (proxy.proxy_type != .ss and config.hasPluginMetadata(proxy)) {
-        result.findings.append(.plugin_metadata_requires_shadowsocks);
+    if (proxy.proxy_type != .ss) {
+        if (config.hasPluginMetadata(proxy)) {
+            result.findings.append(.plugin_metadata_requires_shadowsocks);
+        }
+    }
+    if (proxy.ws) {
+        result.findings.append(.{
+            .websocket_not_supported = proxy.proxy_type,
+        });
+    }
+    if (proxy.network) |network| {
+        const native = std.mem.eql(u8, network, "tcp");
+        const websocket_reported = if (proxy.ws)
+            std.mem.eql(u8, network, "ws")
+        else
+            false;
+        if (!native) {
+            if (!websocket_reported) {
+                result.findings.append(.{ .unsupported_transport = .{
+                    .proxy_type = proxy.proxy_type,
+                    .transport = network,
+                } });
+            }
+        }
+    }
+    if (proxy.grpc) {
+        const native_transport = if (proxy.network) |network|
+            std.mem.eql(u8, network, "tcp")
+        else
+            true;
+        if (native_transport) {
+            result.findings.append(.{ .unsupported_transport = .{
+                .proxy_type = proxy.proxy_type,
+                .transport = "grpc",
+            } });
+        }
     }
 
     switch (proxy.proxy_type) {
@@ -142,20 +179,8 @@ pub fn assessProxy(proxy: *const config.Proxy) ProxyAssessment {
                     });
                 }
             }
-            if (proxy.ws) {
-                result.findings.append(.{ .websocket_not_supported = .ss });
-            }
         },
-        .trojan => {
-            if (proxy.udp) {
-                result.findings.append(.trojan_udp_not_supported);
-            }
-            if (proxy.ws) {
-                result.findings.append(.{
-                    .websocket_not_supported = .trojan,
-                });
-            }
-        },
+        .trojan => {},
     }
 
     return result;
@@ -268,8 +293,8 @@ pub fn failureToError(failure: Failure) CapabilityError {
             .obfs_host_too_long => error.SimpleObfsHostTooLong,
         },
         .unsupported_shadowsocks_cipher => error.UnsupportedShadowsocksCipher,
+        .unsupported_transport => error.UnsupportedTransport,
         .websocket_not_supported => error.WebSocketNotSupported,
-        .trojan_udp_not_supported => error.TrojanUdpNotSupported,
         .unsupported_proxy_group_type => error.UnsupportedProxyGroupType,
     };
 }
@@ -332,15 +357,35 @@ test "shared proxy assessment covers the complete v1 capability matrix" {
     proxy.udp = true;
     proxy.ws = true;
     assessment = assessProxy(&proxy);
-    try std.testing.expectEqual(@as(usize, 2), assessment.items().len);
-    try std.testing.expect(hasFailureTag(
-        &assessment,
-        .trojan_udp_not_supported,
-    ));
+    try std.testing.expectEqual(@as(usize, 1), assessment.items().len);
     try std.testing.expect(hasFailureTag(
         &assessment,
         .websocket_not_supported,
     ));
+}
+
+test "WebSocket metadata is rejected for every proxy type" {
+    // Validate focused proxy metadata and inspect the capability-gate result.
+    var proxy = testProxy(.direct);
+    proxy.network = "ws";
+    proxy.ws = true;
+
+    const assessment = assessProxy(&proxy);
+    try std.testing.expectEqual(@as(usize, 1), assessment.items().len);
+    try std.testing.expect(hasFailureTag(
+        &assessment,
+        .websocket_not_supported,
+    ));
+}
+
+test "Trojan udp:true is an admitted UDP capability" {
+    // Validate focused proxy metadata and inspect the capability-gate result.
+    var proxy = testProxy(.trojan);
+    proxy.udp = true;
+
+    const assessment = assessProxy(&proxy);
+    try std.testing.expectEqual(@as(usize, 0), assessment.items().len);
+    try std.testing.expectEqual(Capability.trojan, try requireProxy(&proxy));
 }
 
 test "classic Shadowsocks UDP is admitted independently of TCP transport" {

@@ -3,172 +3,710 @@ const compat = @import("../compat.zig");
 const net = compat.net;
 const crypto = std.crypto;
 const tls = std.crypto.tls;
+const TLSClient = @import("TLSClient.zig");
 const Certificate = std.crypto.Certificate;
 const socket_options = @import("../socket_options.zig");
+const tls_server_name = @import("tls_server_name.zig");
 
 /// Trojan 命令类型
 pub const Command = enum(u8) {
     connect = 0x01,
-    /// Defined-but-unwired: this client is CONNECT-only. handshake() always
-    /// sends Command.connect (see buildRequest call below); Trojan UDP ASSOCIATE
-    /// is not implemented, and config_validator rejects udp:true for trojan.
-    /// The variant is kept (no other references) to mirror the protocol spec.
     udp_associate = 0x03,
 };
 
-/// Trojan 配置
-pub const Config = struct {
-    password: []const u8, // Trojan 密码 (SHA-224 哈希)
-    address: []const u8, // 服务器地址
-    port: u16, // 服务器端口 (通常是 443)
-    sni: ?[]const u8 = null, // TLS SNI
-    skip_cert_verify: bool = false,
+pub const CertificateStore = struct {
+    allocator: std.mem.Allocator,
+    bundle: Certificate.Bundle,
+    lock: std.Io.RwLock,
+    reference_mutex: std.Io.Mutex,
+    reference_count: u32,
+
+    pub fn create(allocator: std.mem.Allocator) !*CertificateStore {
+        const store = try allocator.create(CertificateStore);
+        errdefer allocator.destroy(store);
+        store.* = .{
+            .allocator = allocator,
+            .bundle = .empty,
+            .lock = .init,
+            .reference_mutex = .init,
+            .reference_count = 1,
+        };
+        errdefer store.bundle.deinit(allocator);
+        try store.bundle.rescan(
+            allocator,
+            compat.io(),
+            std.Io.Timestamp.now(compat.io(), .real),
+        );
+        return store;
+    }
+
+    pub fn acquire(store: *CertificateStore) *CertificateStore {
+        std.Io.Threaded.mutexLock(&store.reference_mutex);
+        defer std.Io.Threaded.mutexUnlock(&store.reference_mutex);
+        std.debug.assert(store.reference_count > 0);
+        std.debug.assert(store.reference_count < std.math.maxInt(u32));
+        store.reference_count += 1;
+        return store;
+    }
+
+    pub fn release(store: *CertificateStore) void {
+        std.Io.Threaded.mutexLock(&store.reference_mutex);
+        std.debug.assert(store.reference_count > 0);
+        store.reference_count -= 1;
+        const finalize = store.reference_count == 0;
+        std.Io.Threaded.mutexUnlock(&store.reference_mutex);
+        if (finalize) {
+            store.bundle.deinit(store.allocator);
+            store.allocator.destroy(store);
+        }
+    }
 };
 
-/// Trojan 客户端
+/// Configuration borrowed for the lifetime of one Trojan client.
+pub const Config = struct {
+    password: []const u8,
+    address: []const u8,
+    port: u16,
+    sni: ?[]const u8 = null,
+    skip_cert_verify: bool = false,
+    certificate_store: ?*CertificateStore = null,
+};
+
+/// Owns one Trojan transport connection and its authentication state.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
     password_hash: [56]u8, // SHA-224 hex string (28 bytes * 2)
-    tls_conn: ?*TlsConnection = null,
+    tls_conn: ?*TLSConnection = null,
+    write_closed: bool = false,
+    close_notify_sent: bool = false,
+    failed: bool = false,
 
-    const TlsConnection = struct {
+    pub const RecordReadResult = union(enum) {
+        data_byte_count: usize,
+        control,
+        would_block,
+        eof,
+    };
+
+    const TLSConnection = struct {
         stream: net.Stream,
         stream_reader: net.Stream.Reader,
         stream_writer: net.Stream.Writer,
-        tls_client: tls.Client,
-        socket_read_buffer: [tls.Client.min_buffer_len]u8,
-        socket_write_buffer: [tls.Client.min_buffer_len]u8,
-        tls_read_buffer: [tls.Client.min_buffer_len]u8,
-        tls_write_buffer: [tls.Client.min_buffer_len]u8,
+        tls_client: TLSClient,
+        allow_truncation_attacks: bool,
+        socket_read_buffer: [TLSClient.min_buffer_len]u8,
+        socket_write_buffer: [TLSClient.min_buffer_len]u8,
+        tls_read_buffer: [TLSClient.min_buffer_len]u8,
+        tls_write_buffer: [TLSClient.min_buffer_len]u8,
     };
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
-        // 计算密码的 SHA-224 哈希
+    const ConnectStreamOptions = struct {
+        target_host: []const u8,
+        target_port: u16,
+        command: Command,
+        allow_truncation_attacks: bool,
+        close_stream_on_error: bool,
+    };
+
+    const UDPConnectTask = struct {
+        client: *Client,
+        stream: net.Stream,
+        done: *compat.Notifier,
+        error_value: ?anyerror = null,
+        succeeded: bool = false,
+
+        fn run(self: *UDPConnectTask) void {
+            const connected_stream = self.client.connectStreamImpl(
+                self.stream,
+                .{
+                    .target_host = "0.0.0.0",
+                    .target_port = 0,
+                    .command = .udp_associate,
+                    .allow_truncation_attacks = false,
+                    .close_stream_on_error = false,
+                },
+            ) catch |err| {
+                self.error_value = err;
+                self.done.signal();
+                return;
+            };
+            std.debug.assert(connected_stream.handle == self.stream.handle);
+            self.succeeded = true;
+            self.done.signal();
+        }
+    };
+
+    const WriteErrorSources = struct {
+        tls_error: ?anyerror,
+        transport_error: ?anyerror,
+    };
+    const ReadErrorSources = struct {
+        tls_error: ?anyerror,
+        transport_error: ?anyerror,
+    };
+    const HostOptions = @FieldType(TLSClient.Options, "host");
+    const ConnectWaitResult = struct {
+        completed: bool,
+        canceled: bool,
+        timed_out: bool,
+    };
+
+    pub fn init(
+        target: *Client,
+        allocator: std.mem.Allocator,
+        config: Config,
+    ) !void {
+        tls_server_name.validateServer(config.address) catch {
+            return error.InvalidServerName;
+        };
+        if (config.sni) |sni| {
+            tls_server_name.validateSNI(sni) catch return error.InvalidSNI;
+        } else if (!config.skip_cert_verify) {
+            const server_host = tls_server_name.stripRootDot(config.address);
+            if (tls_server_name.isIPLiteral(server_host)) {
+                return error.SNIRequiredForVerifiedIP;
+            }
+        }
+
+        target.allocator = allocator;
+        target.config = config;
+        if (config.certificate_store) |store| {
+            target.config.certificate_store = store.acquire();
+        }
+        target.tls_conn = null;
+        target.write_closed = false;
+        target.close_notify_sent = false;
+        target.failed = false;
+
+        // Trojan authenticates with the lowercase SHA-224 hex form, not the
+        // raw password bytes.
         var hash: [28]u8 = undefined;
         var sha = crypto.hash.sha2.Sha224.init(.{});
         sha.update(config.password);
         sha.final(&hash);
 
-        // 转换为 hex string (手动实现)
-        var password_hash: [56]u8 = undefined;
+        // Writing into caller-owned storage avoids copying authentication
+        // material through a temporary Client value.
         const hex_chars = "0123456789abcdef";
         for (hash, 0..) |byte, i| {
-            password_hash[i * 2] = hex_chars[byte >> 4];
-            password_hash[i * 2 + 1] = hex_chars[byte & 0x0f];
+            target.password_hash[i * 2] = hex_chars[byte >> 4];
+            target.password_hash[i * 2 + 1] = hex_chars[byte & 0x0f];
         }
-
-        return .{
-            .allocator = allocator,
-            .config = config,
-            .password_hash = password_hash,
-        };
     }
 
     pub fn deinit(self: *Client) void {
         if (self.tls_conn) |conn| {
-            _ = conn.tls_client.end() catch {};
-            conn.stream.close();
-            self.allocator.destroy(conn);
+            self.closeTLSConnection(conn, !self.failed);
             self.tls_conn = null;
+        }
+        std.crypto.secureZero(u8, &self.password_hash);
+        self.releaseCertificateStore();
+    }
+
+    /// Aborts without close_notify; callers may first shutdown a socket that
+    /// another thread owns to unblock and join that owner.
+    pub fn abort(self: *Client) void {
+        if (self.tls_conn) |conn| {
+            self.closeTLSConnection(conn, false);
+            self.tls_conn = null;
+        }
+        std.crypto.secureZero(u8, &self.password_hash);
+        self.releaseCertificateStore();
+    }
+
+    fn releaseCertificateStore(self: *Client) void {
+        if (self.config.certificate_store) |store| {
+            self.config.certificate_store = null;
+            store.release();
         }
     }
 
-    /// 连接到 Trojan 服务器
-    pub fn connect(self: *Client, target_host: []const u8, target_port: u16) !net.Stream {
+    /// Connects one Trojan TCP byte stream.
+    pub fn connect(
+        self: *Client,
+        target_host: []const u8,
+        target_port: u16,
+    ) !net.Stream {
         if (self.tls_conn != null) return error.AlreadyConnected;
+        const stream = try net.tcpConnectToHost(
+            self.allocator,
+            self.config.address,
+            self.config.port,
+        );
+        return self.connectStream(
+            stream,
+            target_host,
+            target_port,
+            .connect,
+            true,
+        );
+    }
 
-        // 1. 建立 TCP 连接
-        const stream = try net.tcpConnectToHost(self.allocator, self.config.address, self.config.port);
-        try socket_options.configureConnectedStream(stream);
+    /// Opens one Trojan UDP ASSOCIATE stream. DNS, TCP candidates, and TLS share
+    /// one absolute deadline and observe cancel_fd while in flight. TLS itself
+    /// remains subject to the documented partial-record blocking limit.
+    pub fn connectUDP(
+        self: *Client,
+        absolute_deadline_ms: i64,
+        cancel_fd: ?std.posix.fd_t,
+    ) !net.Stream {
+        if (self.tls_conn != null) return error.AlreadyConnected;
+        try compat.checkCancelFD(cancel_fd);
+        const remaining_ms = try deadlineRemainingMs(absolute_deadline_ms);
+        var addresses = compat.net.getAddressListWithTimeoutCancelFD(
+            self.allocator,
+            self.config.address,
+            self.config.port,
+            remaining_ms,
+            cancel_fd,
+        ) catch |err| {
+            try compat.checkCancelFD(cancel_fd);
+            if (err == error.AddressResolutionTimeout) {
+                return error.DeadlineExceeded;
+            }
+            if (deadlineExpired(absolute_deadline_ms)) {
+                return error.DeadlineExceeded;
+            }
+            return err;
+        };
+        defer addresses.deinit();
+        if (addresses.addrs.len == 0) {
+            try compat.checkCancelFD(cancel_fd);
+            if (deadlineExpired(absolute_deadline_ms)) {
+                return error.DeadlineExceeded;
+            }
+            return error.UnknownHostName;
+        }
 
-        // 2. 在 TCP 之上建立 TLS 会话
-        const conn = self.initTlsConnection(stream) catch |err| {
+        std.debug.assert(
+            addresses.addrs.len <= compat.net.address_result_count_max,
+        );
+        var last_error: anyerror = error.ConnectFailed;
+        for (0..compat.net.address_result_count_max) |address_index| {
+            if (address_index == addresses.addrs.len) break;
+            const address = addresses.addrs[address_index];
+            try compat.checkCancelFD(cancel_fd);
+            const stream = compat.net.tcpConnectToAddressWithDeadlineCancelFD(
+                address,
+                absolute_deadline_ms,
+                cancel_fd,
+            ) catch |err| {
+                try compat.checkCancelFD(cancel_fd);
+                if (err == error.Timeout) return error.DeadlineExceeded;
+                if (deadlineExpired(absolute_deadline_ms)) {
+                    return error.DeadlineExceeded;
+                }
+                last_error = err;
+                continue;
+            };
+            return self.connectStreamCancelable(
+                stream,
+                absolute_deadline_ms,
+                cancel_fd,
+            );
+        }
+        try compat.checkCancelFD(cancel_fd);
+        if (deadlineExpired(absolute_deadline_ms)) {
+            return error.DeadlineExceeded;
+        }
+        return last_error;
+    }
+
+    fn waitForConnectTask(
+        done: *compat.Notifier,
+        cancel_fd: ?std.posix.fd_t,
+        absolute_deadline_ms: i64,
+    ) !ConnectWaitResult {
+        var descriptors = [_]std.posix.pollfd{
+            .{
+                .fd = done.handle(),
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = cancel_fd orelse -1,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const descriptor_count: usize = if (cancel_fd == null) 1 else 2;
+        const ready_count = try compat.pollAbsolute(
+            descriptors[0..descriptor_count],
+            absolute_deadline_ms,
+        );
+        var canceled = false;
+        if (descriptor_count == 2) {
+            const cancel_events = descriptors[1].revents;
+            canceled = cancel_events & (std.posix.POLL.IN |
+                std.posix.POLL.HUP |
+                std.posix.POLL.ERR |
+                std.posix.POLL.NVAL) != 0;
+        }
+        const completion_events = descriptors[0].revents;
+        const completed = completion_events & (std.posix.POLL.IN |
+            std.posix.POLL.HUP |
+            std.posix.POLL.ERR |
+            std.posix.POLL.NVAL) != 0;
+        return .{
+            .completed = completed,
+            .canceled = canceled,
+            .timed_out = ready_count == 0,
+        };
+    }
+
+    fn shutdownConnectSocketOrPanic(stream: net.Stream) void {
+        compat.shutdownReadWrite(stream.handle) catch |err| {
+            std.debug.panic(
+                "socket shutdown before TLS join failed: {s}",
+                .{@errorName(err)},
+            );
+        };
+    }
+
+    fn closeRejectedConnect(
+        self: *Client,
+        stream: net.Stream,
+        task: *const UDPConnectTask,
+    ) void {
+        if (task.succeeded) {
+            self.abort();
+        } else {
+            stream.close();
+        }
+    }
+
+    fn connectStreamCancelable(
+        self: *Client,
+        stream: net.Stream,
+        absolute_deadline_ms: i64,
+        cancel_fd: ?std.posix.fd_t,
+    ) !net.Stream {
+        compat.checkCancelFD(cancel_fd) catch |err| {
             stream.close();
             return err;
         };
-        errdefer self.deinitTlsConnection(conn);
+        if (deadlineExpired(absolute_deadline_ms)) {
+            stream.close();
+            return error.DeadlineExceeded;
+        }
 
-        // 3. 在 TLS 通道中发送 Trojan 握手
-        try self.handshake(conn, target_host, target_port);
+        var done = compat.Notifier.init() catch |err| {
+            stream.close();
+            return err;
+        };
+        defer done.deinit();
+        var task = UDPConnectTask{
+            .client = self,
+            .stream = stream,
+            .done = &done,
+        };
+        var thread = std.Thread.spawn(
+            .{
+                .stack_size = 512 * 1024,
+                .allocator = null,
+            },
+            UDPConnectTask.run,
+            .{&task},
+        ) catch |err| {
+            stream.close();
+            return err;
+        };
+        var joined = false;
+        defer if (!joined) {
+            shutdownConnectSocketOrPanic(stream);
+            thread.join();
+            self.closeRejectedConnect(stream, &task);
+        };
+
+        const wait_result = try waitForConnectTask(
+            &done,
+            cancel_fd,
+            absolute_deadline_ms,
+        );
+        const interrupted = if (wait_result.timed_out)
+            true
+        else
+            wait_result.canceled;
+        if (interrupted) {
+            if (!wait_result.completed) shutdownConnectSocketOrPanic(stream);
+            thread.join();
+            joined = true;
+            self.closeRejectedConnect(stream, &task);
+            try compat.checkCancelFD(cancel_fd);
+            if (wait_result.canceled) return error.Canceled;
+            return error.DeadlineExceeded;
+        }
+
+        std.debug.assert(wait_result.completed);
+        thread.join();
+        joined = true;
+        done.drain();
+        compat.checkCancelFD(cancel_fd) catch |err| {
+            self.closeRejectedConnect(stream, &task);
+            return err;
+        };
+        if (deadlineExpired(absolute_deadline_ms)) {
+            self.closeRejectedConnect(stream, &task);
+            return error.DeadlineExceeded;
+        }
+        if (task.error_value) |err| {
+            stream.close();
+            return err;
+        }
+        std.debug.assert(task.succeeded);
+        return self.tls_conn.?.stream;
+    }
+
+    fn connectStream(
+        self: *Client,
+        stream: net.Stream,
+        target_host: []const u8,
+        target_port: u16,
+        command: Command,
+        allow_truncation_attacks: bool,
+    ) !net.Stream {
+        return self.connectStreamImpl(
+            stream,
+            .{
+                .target_host = target_host,
+                .target_port = target_port,
+                .command = command,
+                .allow_truncation_attacks = allow_truncation_attacks,
+                .close_stream_on_error = true,
+            },
+        );
+    }
+
+    fn connectStreamImpl(
+        self: *Client,
+        stream: net.Stream,
+        options: ConnectStreamOptions,
+    ) !net.Stream {
+        if (self.tls_conn != null) return error.AlreadyConnected;
+        socket_options.configureUpstreamProxySocket(stream.handle) catch |err| {
+            if (options.close_stream_on_error) stream.close();
+            return err;
+        };
+
+        const conn = self.initTLSConnection(
+            stream,
+            options.allow_truncation_attacks,
+        ) catch |err| {
+            if (options.close_stream_on_error) stream.close();
+            return err;
+        };
+        self.handshake(
+            conn,
+            options.command,
+            options.target_host,
+            options.target_port,
+        ) catch |err| {
+            const surfaced_error = surfaceWriteError(conn, err);
+            self.failed = true;
+            if (options.close_stream_on_error) {
+                self.deinitTLSConnection(conn);
+            } else {
+                std.crypto.secureZero(u8, std.mem.asBytes(conn));
+                self.allocator.destroy(conn);
+            }
+            return surfaced_error;
+        };
 
         self.tls_conn = conn;
         return conn.stream;
     }
 
     pub fn write(self: *Client, data: []const u8) !void {
+        if (self.write_closed) return error.StreamClosed;
         const conn = self.tls_conn orelse return error.NotConnected;
-        try conn.tls_client.writer.writeAll(data);
-        try flushTlsAndSocket(conn);
+        conn.tls_client.writer.writeAll(data) catch |err| {
+            self.failed = true;
+            return surfaceWriteError(conn, err);
+        };
+        flushTLSAndSocket(conn) catch |err| {
+            self.failed = true;
+            return surfaceWriteError(conn, err);
+        };
+    }
+
+    pub fn shutdownWrite(self: *Client) !void {
+        if (self.write_closed) return;
+        if (self.failed) return error.StreamClosed;
+        const conn = self.tls_conn orelse return error.NotConnected;
+        self.write_closed = true;
+        TLSClient.end(&conn.tls_client) catch |err| {
+            self.failed = true;
+            return surfaceWriteError(conn, err);
+        };
+        self.close_notify_sent = true;
+        conn.stream_writer.interface.flush() catch |err| {
+            self.failed = true;
+            return surfaceWriteError(conn, err);
+        };
     }
 
     pub fn read(self: *Client, buf: []u8) !usize {
         const conn = self.tls_conn orelse return error.NotConnected;
-        // handshake() already flushed the Trojan request, so the server has it
-        // before we ever block here — a server-speaks-first peer is not stalled.
-        return readTlsApplicationData(&conn.tls_client.reader, buf) catch |err| {
-            // TLS truncation without close_notify is a clean EOF for trojan tunnels.
-            // Fatal TLS errors (bad record MAC, alert) still propagate.
-            //
-            // Residual M1 exposure: a trojan tunnel carries an UNFRAMED byte stream,
-            // so at the byte level this read CANNOT distinguish a malicious on-path
-            // truncation (attacker injects FIN/RST mid-record) from a legitimate
-            // close — both surface here as a clean 0-length EOF. This is a deliberate
-            // tradeoff: see initTlsConnection's `.allow_truncation_attacks = true`
-            // note for why we accept it (the brew-download mid-record-drop case).
-            // The abnormal close is NOT lost, though: the underlying TlsConnectionTruncated
-            // stays observable out-of-band via lastReadError() here and
-            // ProxyStream.lastTlsReadError() in the relay, which logs it as an
-            // "upstream-truncated (graceful half-close)" breadcrumb. Contrast anytls:
-            // its framed payloads let it reject a short final frame, which an
-            // unframed trojan tunnel structurally cannot do.
-            if (isTruncationEof(err, conn.tls_client.read_err)) return 0;
+        const result = self.readOneRecord(buf) catch |err| {
+            // Residual M1 exposure: an unframed Trojan TCP stream cannot
+            // distinguish an injected truncation from a legitimate close.
+            if (conn.allow_truncation_attacks) {
+                if (isTruncationEOF(err, conn.tls_client.read_error)) {
+                    return 0;
+                }
+            }
             return err;
+        };
+        return switch (result) {
+            .data_byte_count => |read_byte_count| read_byte_count,
+            .control, .would_block => error.WouldBlock,
+            .eof => 0,
         };
     }
 
-    /// Pure M1 decision: should a readTlsApplicationData failure be treated as a
+    pub fn readBlocking(self: *Client, buf: []u8) !usize {
+        const conn = self.tls_conn orelse return error.NotConnected;
+        return readTLSApplicationData(&conn.tls_client.reader, buf) catch |err| {
+            self.failed = true;
+            const surfaced_error = surfaceReadError(conn, err);
+            if (conn.allow_truncation_attacks) {
+                if (isTruncationEOF(
+                    surfaced_error,
+                    conn.tls_client.read_error,
+                )) {
+                    return 0;
+                }
+            }
+            return surfaced_error;
+        };
+    }
+
+    fn surfaceWriteError(conn: *const TLSConnection, err: anyerror) anyerror {
+        return selectWriteError(err, .{
+            .tls_error = conn.tls_client.write_error,
+            .transport_error = conn.stream_writer.err,
+        });
+    }
+
+    fn surfaceTLSInitError(
+        conn: *const TLSConnection,
+        err: anyerror,
+    ) anyerror {
+        if (err == error.WriteFailed) {
+            return conn.stream_writer.err orelse err;
+        }
+        if (err == error.ReadFailed) {
+            return conn.stream_reader.err orelse err;
+        }
+        return err;
+    }
+
+    fn selectWriteError(
+        err: anyerror,
+        sources: WriteErrorSources,
+    ) anyerror {
+        if (err != error.WriteFailed) return err;
+        if (sources.tls_error != null) return err;
+        return sources.transport_error orelse err;
+    }
+
+    fn surfaceReadError(conn: *const TLSConnection, err: anyerror) anyerror {
+        return selectReadError(err, .{
+            .tls_error = conn.tls_client.read_error,
+            .transport_error = conn.stream_reader.err,
+        });
+    }
+
+    fn selectReadError(
+        err: anyerror,
+        sources: ReadErrorSources,
+    ) anyerror {
+        if (err != error.ReadFailed) return err;
+        if (sources.tls_error != null) return err;
+        return sources.transport_error orelse err;
+    }
+
+    /// Pure M1 decision: should a readTLSApplicationData failure be treated as a
     /// clean EOF (return 0) or propagated? Only an unframed TLS truncation —
-    /// surfaced as `error.ReadFailed` with `read_err == TlsConnectionTruncated` —
+    /// surfaced as `error.ReadFailed` with `read_error == TLSConnectionTruncated` —
     /// maps to EOF; any other failure (bad record MAC, alert, or a ReadFailed with
-    /// no recorded tls read_err) propagates. Extracting this keeps the
+    /// no recorded tls read_error) propagates. Extracting this keeps the
     /// security-relevant discrimination in one tested place: an accidental
     /// inversion (swallowing a fatal alert as EOF, or propagating a benign
     /// truncation) fails a unit test instead of slipping through to the relay.
-    fn isTruncationEof(err: anyerror, read_err: ?anyerror) bool {
+    fn isTruncationEOF(err: anyerror, read_error: ?anyerror) bool {
         if (err != error.ReadFailed) return false;
-        const tls_err = read_err orelse return false;
-        return tls_err == error.TlsConnectionTruncated;
+        const tls_err = read_error orelse return false;
+        return tls_err == error.TLSConnectionTruncated;
+    }
+
+    pub fn readOneRecord(
+        self: *Client,
+        buf: []u8,
+    ) !RecordReadResult {
+        const conn = self.tls_conn orelse return error.NotConnected;
+        const event = conn.tls_client.readOneRecord() catch |err| {
+            self.failed = true;
+            return surfaceReadError(conn, err);
+        };
+        return switch (event) {
+            .application_data => blk: {
+                const buffered = conn.tls_client.reader.buffered();
+                std.debug.assert(buffered.len > 0);
+                const read_byte_count = @min(buf.len, buffered.len);
+                @memcpy(buf[0..read_byte_count], buffered[0..read_byte_count]);
+                conn.tls_client.reader.seek += read_byte_count;
+                break :blk .{ .data_byte_count = read_byte_count };
+            },
+            .control => .control,
+            .need_more => .would_block,
+            .eof => .eof,
+        };
     }
 
     pub fn hasPendingRead(self: *const Client) bool {
         if (self.tls_conn) |conn| {
-            return hasPendingBufferedRead(
-                conn.tls_client.reader.bufferedLen(),
-                conn.stream_reader.interface.bufferedLen(),
+            if (conn.tls_client.reader.bufferedLen() > 0) return true;
+            return hasCompleteTLSRecord(
+                conn.stream_reader.interface.buffered(),
             );
         }
         return false;
     }
 
-    fn hasPendingBufferedRead(tls_buffered: usize, socket_buffered: usize) bool {
-        return tls_buffered > 0 or socket_buffered > 0;
+    pub fn pollHandle(self: *const Client) std.posix.fd_t {
+        const conn = self.tls_conn orelse return -1;
+        return conn.stream.handle;
+    }
+
+    fn hasCompleteTLSRecord(buffered: []const u8) bool {
+        const header_size: usize = 5;
+        if (buffered.len < header_size) return false;
+        const payload_size = std.mem.readInt(u16, buffered[3..5], .big);
+        if (payload_size > tls.max_ciphertext_len) return true;
+        return buffered.len >= header_size + payload_size;
     }
 
     /// Diagnostic: the most recent underlying std.crypto.tls read error, if any.
     /// A relay teardown surfaces only `error.ReadFailed`; this exposes the real
-    /// cause so logs can tell a benign `TlsConnectionTruncated` (upstream dropped
+    /// cause so logs can tell a benign `TLSConnectionTruncated` (upstream dropped
     /// the TCP mid-record without close_notify — the suspected brew-download
     /// failure) apart from a genuinely fatal `TlsBadRecordMac`/`TlsAlert`.
     pub fn lastReadError(self: *const Client) ?anyerror {
         if (self.tls_conn) |conn| {
-            if (conn.tls_client.read_err) |e| return e;
+            if (conn.tls_client.read_error) |read_error| return read_error;
+            if (conn.stream_reader.err) |transport_error| return transport_error;
         }
         return null;
     }
 
-    fn initTlsConnection(self: *Client, stream: net.Stream) !*TlsConnection {
-        const conn = try self.allocator.create(TlsConnection);
+    fn initTLSConnection(
+        self: *Client,
+        stream: net.Stream,
+        allow_truncation_attacks: bool,
+    ) !*TLSConnection {
+        const conn = try self.allocator.create(TLSConnection);
         errdefer self.allocator.destroy(conn);
 
         conn.stream = stream;
@@ -180,88 +718,95 @@ pub const Client = struct {
         conn.stream_writer = conn.stream.writer(&conn.socket_write_buffer);
         conn.tls_client = undefined;
 
-        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        var entropy: [TLSClient.Options.entropy_len]u8 = undefined;
         compat.randomBytes(&entropy);
+        defer std.crypto.secureZero(u8, &entropy);
         const now = std.Io.Timestamp.now(compat.io(), .real);
-        var root_bundle: Certificate.Bundle = .empty;
-        defer root_bundle.deinit(self.allocator);
-        var ca_lock: std.Io.RwLock = .init;
-        var options = tls.Client.Options{
-            .host = if (self.shouldOmitSni()) .{ .no_verification = {} } else .{ .explicit = self.tlsHost() },
+        var options = TLSClient.Options{
+            .host = self.hostOption(),
+            .server_name = self.serverName(),
             .ca = .{ .no_verification = {} },
-            // Deliberate (M1): tell std.crypto.tls NOT to raise TlsConnectionTruncated
-            // as fatal when the peer drops the TCP mid-record without close_notify.
-            // This accepts a residual on-path truncation exposure — an attacker who
-            // can inject FIN/RST truncates an unframed trojan tunnel and it reads as a
-            // clean EOF (see read()) — in exchange for tolerating benign mid-record
-            // drops, the brew-download truncation case the recent commits targeted.
-            // The abnormal close is NOT swallowed silently: it stays visible via
-            // read_err / lastReadError() / ProxyStream.lastTlsReadError(). Contrast
-            // anytls's framed model, which can reject a short final frame; an unframed
-            // trojan tunnel cannot. Do NOT flip this flag — that regresses the case above.
-            .allow_truncation_attacks = true,
             .read_buffer = &conn.tls_read_buffer,
             .write_buffer = &conn.tls_write_buffer,
             .entropy = &entropy,
             .realtime_now = now,
+            .ssl_key_log = null,
+            .alert = null,
         };
 
-        // Build the verifying CA value (rescanning the real root bundle) only when
-        // verification is enabled; the pure `caOption` seam then selects between it
-        // and `.no_verification` so the branch is testable in isolation.
-        var ca_value: CaOptions = .{ .no_verification = {} };
         if (!self.config.skip_cert_verify) {
-            try root_bundle.rescan(self.allocator, compat.io(), now);
-            ca_value = .{ .bundle = .{
+            const store = self.config.certificate_store orelse
+                return error.CertificateStoreRequired;
+            options.ca = .{ .bundle = .{
                 .gpa = self.allocator,
                 .io = compat.io(),
-                .lock = &ca_lock,
-                .bundle = &root_bundle,
+                .lock = &store.lock,
+                .bundle = &store.bundle,
             } };
         }
-        options.ca = caOption(self.config.skip_cert_verify, ca_value);
 
-        conn.tls_client = try tls.Client.init(
+        TLSClient.init(
+            &conn.tls_client,
             &conn.stream_reader.interface,
             &conn.stream_writer.interface,
             options,
-        );
+        ) catch |err| return surfaceTLSInitError(conn, err);
+        // TCP preserves the accepted M1 truncation tradeoff. UDP frames reject
+        // truncation, while both paths retain the underlying TLS diagnostic.
+        conn.allow_truncation_attacks = allow_truncation_attacks;
 
         return conn;
     }
 
-    fn tlsHost(self: *const Client) []const u8 {
-        return self.config.sni orelse self.config.address;
+    fn certificateHost(self: *const Client) []const u8 {
+        if (self.config.sni) |sni| return sni;
+        return tls_server_name.stripRootDot(self.config.address);
     }
 
-    /// The anonymous `union(enum)` of `tls.Client.Options.ca` — there is no public
-    /// type name for it, so it must be referenced via `@FieldType`.
-    const CaOptions = @FieldType(tls.Client.Options, "ca");
-
-    /// Pure CA-options decision: when `skip_cert_verify` is set, return
-    /// `.no_verification`; otherwise return the caller-built `bundle` value
-    /// (which carries the live allocator/io/lock/bundle pointers).
-    /// Extracting this branch makes an accidental inversion — silently disabling
-    /// TLS verification — fail a test instead of slipping through unnoticed.
-    fn caOption(skip_cert_verify: bool, bundle: CaOptions) CaOptions {
-        return if (skip_cert_verify) .{ .no_verification = {} } else bundle;
+    fn hostOption(self: *const Client) HostOptions {
+        return if (self.config.skip_cert_verify)
+            .{ .no_verification = {} }
+        else
+            .{ .explicit = self.certificateHost() };
     }
 
-    /// Decide whether to omit the SNI extension and skip hostname verification.
-    /// Mirrors anytls's shouldOmitSni but gated by the stricter trojan intent:
-    /// omit only when tlsHost() is a raw-IP literal AND no explicit sni was set.
-    /// Sending an IP as the SNI is a fingerprint and forces hostname matching
-    /// against an IP string (breaks domain-only certs). Keeping config.sni guards
-    /// real hostnames and any explicitly-configured sni (which keep .explicit).
-    /// CA-chain verification is unaffected — it is driven independently by options.ca.
-    fn shouldOmitSni(self: *const Client) bool {
-        return self.config.sni == null and isIpLiteral(self.config.address);
+    fn serverName(self: *const Client) ?[]const u8 {
+        if (self.config.sni) |sni| return sni;
+        const certificate_host = self.certificateHost();
+        if (tls_server_name.isIPLiteral(certificate_host)) return null;
+        return certificate_host;
     }
 
-    fn deinitTlsConnection(self: *Client, conn: *TlsConnection) void {
-        _ = conn.tls_client.end() catch {};
+    fn closeTLSConnection(
+        self: *Client,
+        conn: *TLSConnection,
+        send_close_notify: bool,
+    ) void {
+        if (send_close_notify) {
+            if (!self.close_notify_sent) {
+                if (conn.tls_client.end()) |_| {
+                    self.close_notify_sent = true;
+                    conn.stream_writer.interface.flush() catch |err| {
+                        std.log.debug(
+                            "Trojan TLS close_notify flush failed: {s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                } else |err| {
+                    std.log.debug(
+                        "Trojan TLS close_notify encoding failed: {s}",
+                        .{@errorName(err)},
+                    );
+                }
+            }
+        }
         conn.stream.close();
+        std.crypto.secureZero(u8, std.mem.asBytes(conn));
         self.allocator.destroy(conn);
+    }
+
+    fn deinitTLSConnection(self: *Client, conn: *TLSConnection) void {
+        self.closeTLSConnection(conn, !self.failed);
     }
 
     /// Build the exact Trojan request wire frame into a caller-supplied buffer.
@@ -289,11 +834,17 @@ pub const Client = struct {
 
     /// Trojan 握手协议
     /// 格式: [密码哈希(56)]\r\n [命令(1)] [地址类型(1)] [地址] [端口(2)]\r\n
-    fn handshake(self: *Client, conn: *TlsConnection, target_host: []const u8, target_port: u16) !void {
+    fn handshake(
+        self: *Client,
+        conn: *TLSConnection,
+        command: Command,
+        target_host: []const u8,
+        target_port: u16,
+    ) !void {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
-        try self.buildRequest(&buf, .connect, target_host, target_port);
+        try self.buildRequest(&buf, command, target_host, target_port);
 
         // Flush the request onto the wire before connect() returns. The relay
         // only read()s the target once poll() reports it readable, and a
@@ -304,10 +855,10 @@ pub const Client = struct {
         // longer coalesce it with the first payload), which is the correct
         // trade for not hanging server-first tunnels.
         try conn.tls_client.writer.writeAll(buf.items);
-        try flushTlsAndSocket(conn);
+        try flushTLSAndSocket(conn);
     }
 
-    fn flushTlsAndSocket(conn: *TlsConnection) !void {
+    fn flushTLSAndSocket(conn: *TLSConnection) !void {
         try conn.tls_client.writer.flush();
         try conn.stream_writer.interface.flush();
     }
@@ -323,7 +874,7 @@ pub const Client = struct {
     // rearchitecture is performance-gated per AGENTS.md, so we document rather than
     // rewrite, mirroring anytls's recorded "mid-frame blocking read" residual risk
     // (docs/anytls/session-multiplexing-design.md §18.1).
-    fn readTlsApplicationData(reader: *std.Io.Reader, out: []u8) !usize {
+    fn readTLSApplicationData(reader: *std.Io.Reader, out: []u8) !usize {
         if (out.len == 0) return 0;
 
         while (reader.bufferedLen() == 0) {
@@ -365,6 +916,24 @@ pub const Client = struct {
         try buf.appendSlice(self.allocator, host);
     }
 };
+
+fn deadlineExpired(absolute_deadline_ms: i64) bool {
+    return compat.monotonicMilliTimestamp() >= absolute_deadline_ms;
+}
+
+fn deadlineRemainingMs(absolute_deadline_ms: i64) !u32 {
+    const now_ms = compat.monotonicMilliTimestamp();
+    if (now_ms >= absolute_deadline_ms) return error.DeadlineExceeded;
+    const remaining_ms = std.math.sub(
+        i64,
+        absolute_deadline_ms,
+        now_ms,
+    ) catch return error.DeadlineExceeded;
+    return @intCast(@min(
+        remaining_ms,
+        @as(i64, std.math.maxInt(u32)),
+    ));
+}
 
 /// 解析 IPv4 地址
 fn parseIpv4(str: []const u8, out: *[4]u8) bool {
@@ -495,16 +1064,6 @@ fn parseHextet(part: []const u8) ?u16 {
     return std.fmt.parseInt(u16, part, 16) catch null;
 }
 
-/// Returns true when `host` is a raw IPv4 or IPv6 literal (not a hostname).
-/// Reuses the existing parseIpv4/parseIpv6 parsers.
-fn isIpLiteral(host: []const u8) bool {
-    var ipv4: [4]u8 = undefined;
-    if (parseIpv4(host, &ipv4)) return true;
-    var ipv6: [16]u8 = undefined;
-    if (parseIpv6(host, &ipv6)) return true;
-    return false;
-}
-
 /// 测试
 const testing = std.testing;
 
@@ -516,10 +1075,12 @@ test "Trojan password hash" {
     // just its 56-byte length: a fabricated/placeholder hash would silently send
     // the wrong credential. "password123" mixes hex nibbles both >9 (d,9,b,e,f)
     // and <9 (3,4,0,1,2,5), exercising both arms of the init() hex loop.
-    const client = try Client.init(allocator, .{
+    var client: Client = undefined;
+    try Client.init(&client, allocator, .{
         .password = "password123",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
     try testing.expectEqualStrings(
         "3d45597256050bb1e93bd9c10aee4c8716f8774f5a48c995bf0cf860",
@@ -527,10 +1088,12 @@ test "Trojan password hash" {
     );
 
     // Second vector, independently verified, re-exercises the hex loop.
-    const client2 = try Client.init(allocator, .{
+    var client2: Client = undefined;
+    try Client.init(&client2, allocator, .{
         .password = "Test",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
     try testing.expectEqualStrings(
         "3606346815fd4d491a92649905a40da025d8cf15f095136b19f37923",
@@ -538,19 +1101,266 @@ test "Trojan password hash" {
     );
 }
 
+test "Trojan certificate store survives owner release while a client lease exists" {
+    // Simulate manager teardown before an active handshake releases its lease,
+    // and let the final lease perform the only bundle destruction.
+    const allocator = testing.allocator;
+    const store = try allocator.create(CertificateStore);
+    store.* = .{
+        .allocator = allocator,
+        .bundle = .empty,
+        .lock = .init,
+        .reference_mutex = .init,
+        .reference_count = 1,
+    };
+    const client_lease = store.acquire();
+    store.release();
+    try testing.expectEqual(
+        @as(u32, 1),
+        client_lease.reference_count,
+    );
+    client_lease.release();
+}
+
+test "Trojan client deinit clears the authentication hash" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
+    var client: Client = undefined;
+    try Client.init(&client, testing.allocator, .{
+        .password = "secret",
+        .address = "edge.example.com",
+        .port = 443,
+    });
+    client.deinit();
+    try testing.expectEqualSlices(
+        u8,
+        &([_]u8{0} ** 56),
+        &client.password_hash,
+    );
+}
+
+test "Trojan client rejects unsafe TLS names before hashing or dialing" {
+    // Initialize focused endpoint identities and verify rejection occurs before
+    // authentication hashing or network access.
+    const allocator = testing.allocator;
+    var invalid_server_name_client: Client = undefined;
+    try testing.expectError(error.InvalidServerName, Client.init(
+        &invalid_server_name_client,
+        allocator,
+        .{
+            .password = "test",
+            .address = "a" ** (tls_server_name.bytes_max + 1),
+            .port = 443,
+        },
+    ));
+    var numeric_root_client: Client = undefined;
+    try testing.expectError(error.InvalidServerName, Client.init(
+        &numeric_root_client,
+        allocator,
+        .{
+            .password = "test",
+            .address = "127.0.0.1.",
+            .port = 443,
+            .skip_cert_verify = true,
+        },
+    ));
+    var invalid_sni_client: Client = undefined;
+    try testing.expectError(error.InvalidSNI, Client.init(
+        &invalid_sni_client,
+        allocator,
+        .{
+            .password = "test",
+            .address = "edge.example.com",
+            .port = 443,
+            .sni = "bad\nname",
+        },
+    ));
+}
+
+test "Trojan UDP TLS handshake cancellation closes the upstream stream" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
+    const allocator = testing.allocator;
+    const listen_address = try net.Address.parseIp4("127.0.0.1", 0);
+    var server = try net.listenReuseAddr(listen_address);
+    var server_open = true;
+    defer if (server_open) server.deinit();
+    var accepted = try compat.Notifier.init();
+    defer accepted.deinit();
+
+    const ServerContext = struct {
+        server: *net.ReuseAddrListener,
+        accepted: *compat.Notifier,
+        eof: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const connection = self.server.accept() catch |err| {
+                self.failure = err;
+                self.accepted.signal();
+                return;
+            };
+            defer connection.stream.close();
+            self.accepted.signal();
+            const deadline_ms = compat.monotonicMilliTimestamp() + 5_000;
+            var buffer: [4096]u8 = undefined;
+            const read_attempt_count_max: u16 = 256;
+            for (0..read_attempt_count_max) |_| {
+                var descriptors = [_]std.posix.pollfd{.{
+                    .fd = connection.stream.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = compat.pollAbsolute(
+                    &descriptors,
+                    deadline_ms,
+                ) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (ready == 0) {
+                    self.failure = error.TestServerTimeout;
+                    return;
+                }
+                const count = connection.stream.read(&buffer) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (count == 0) {
+                    self.eof.store(true, .release);
+                    return;
+                }
+            }
+            self.failure = error.TestReadIterationLimitExceeded;
+        }
+    };
+    var server_context = ServerContext{
+        .server = &server,
+        .accepted = &accepted,
+    };
+    const server_thread = try std.Thread.spawn(
+        .{
+            .stack_size = std.Thread.SpawnConfig.default_stack_size,
+            .allocator = null,
+        },
+        ServerContext.run,
+        .{&server_context},
+    );
+    var server_joined = false;
+    defer if (!server_joined) {
+        if (server_open) {
+            server.deinit();
+            server_open = false;
+        }
+        server_thread.join();
+    };
+
+    var cancel_fds: [2]c_int = undefined;
+    if (std.c.socketpair(
+        std.c.AF.UNIX,
+        std.c.SOCK.STREAM,
+        0,
+        &cancel_fds,
+    ) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer {
+        std.debug.assert(std.c.close(cancel_fds[0]) == 0);
+    }
+    defer {
+        std.debug.assert(std.c.close(cancel_fds[1]) == 0);
+    }
+
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
+        .password = "secret",
+        .address = "127.0.0.1",
+        .port = server.listen_address.getPort(),
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+    const ClientContext = struct {
+        client: *Client,
+        cancel_fd: std.posix.fd_t,
+        error_value: ?anyerror = null,
+        succeeded: bool = false,
+
+        fn run(self: *@This()) void {
+            const stream = self.client.connectUDP(
+                compat.monotonicMilliTimestamp() + 5_000,
+                self.cancel_fd,
+            ) catch |err| {
+                self.error_value = err;
+                return;
+            };
+            std.debug.assert(stream.handle == self.client.pollHandle());
+            self.succeeded = true;
+        }
+    };
+    var client_context = ClientContext{
+        .client = &client,
+        .cancel_fd = cancel_fds[0],
+    };
+    const client_thread = try std.Thread.spawn(
+        .{
+            .stack_size = std.Thread.SpawnConfig.default_stack_size,
+            .allocator = null,
+        },
+        ClientContext.run,
+        .{&client_context},
+    );
+    var client_joined = false;
+    defer if (!client_joined) {
+        compat.shutdownReadWrite(cancel_fds[1]) catch |err| {
+            std.debug.panic(
+                "test cancellation shutdown failed: {s}",
+                .{@errorName(err)},
+            );
+        };
+        client_thread.join();
+    };
+
+    var accepted_descriptors = [_]std.posix.pollfd{.{
+        .fd = accepted.handle(),
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const accepted_ready = try compat.pollAbsolute(
+        &accepted_descriptors,
+        compat.monotonicMilliTimestamp() + 2_000,
+    );
+    try testing.expectEqual(@as(usize, 1), accepted_ready);
+    const cancel_byte = [_]u8{1};
+    try testing.expectEqual(
+        @as(isize, 1),
+        std.c.write(cancel_fds[1], &cancel_byte, cancel_byte.len),
+    );
+
+    client_thread.join();
+    client_joined = true;
+    server_thread.join();
+    server_joined = true;
+    try testing.expect(!client_context.succeeded);
+    try testing.expectEqual(error.Canceled, client_context.error_value.?);
+    try testing.expect(server_context.failure == null);
+    try testing.expect(server_context.eof.load(.acquire));
+}
+
 test "Trojan connect rejects an already-connected client" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
 
     // Simulate a client that has already established a TLS session: the guard at
     // the top of connect() (`if (self.tls_conn != null) return error.AlreadyConnected`)
     // must fire BEFORE touching any field, so this stub never needs valid buffers.
-    const stub = try testing.allocator.create(Client.TlsConnection);
+    const stub = try testing.allocator.create(Client.TLSConnection);
     stub.* = undefined;
     client.tls_conn = stub;
 
@@ -566,10 +1376,13 @@ test "Trojan connect rejects an already-connected client" {
 test "Trojan encodeAddress IPv4" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
 
     var buf = std.ArrayList(u8).empty;
@@ -669,10 +1482,13 @@ test "Trojan parseIpv6 rejects >8 groups around :: without OOB write" {
 test "Trojan encodeAddress domain and IPv6" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
 
     // Domain branch: 0x03, length prefix, raw host bytes.
@@ -696,89 +1512,150 @@ test "Trojan encodeAddress domain and IPv6" {
 test "Trojan TLS host prefers configured sni" {
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "server.example.com",
         .port = 443,
         .sni = "m.ctrip.com",
     });
 
-    try testing.expectEqualStrings("m.ctrip.com", client.tlsHost());
+    try testing.expectEqualStrings("m.ctrip.com", client.certificateHost());
 }
 
 test "Trojan TLS host falls back to server address when sni is absent" {
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "server.example.com",
         .port = 443,
     });
 
-    try testing.expectEqualStrings("server.example.com", client.tlsHost());
+    try testing.expectEqualStrings("server.example.com", client.certificateHost());
 }
 
-test "Trojan omits SNI for IP-literal server without explicit sni" {
+test "Trojan strips a DNS root dot from derived SNI and identity" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
+    var client: Client = undefined;
+    try Client.init(&client, testing.allocator, .{
+        .password = "test",
+        .address = "edge.example.com.",
+        .port = 443,
+    });
+    try testing.expectEqualStrings("edge.example.com", client.certificateHost());
+    try testing.expectEqualStrings(
+        "edge.example.com",
+        client.serverName().?,
+    );
+}
+
+test "Trojan omits SNI for unverified IP-literal server" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
     const allocator = testing.allocator;
 
-    const v4 = try Client.init(allocator, .{
+    var v4: Client = undefined;
+
+    try Client.init(&v4, allocator, .{
         .password = "test",
         .address = "192.168.1.2",
         .port = 443,
+        .skip_cert_verify = true,
     });
-    try testing.expect(v4.shouldOmitSni());
+    try testing.expect(v4.serverName() == null);
 
-    const v6 = try Client.init(allocator, .{
+    var v6: Client = undefined;
+
+    try Client.init(&v6, allocator, .{
         .password = "test",
         .address = "2001:db8::1",
         .port = 443,
+        .skip_cert_verify = true,
     });
-    try testing.expect(v6.shouldOmitSni());
+    try testing.expect(v6.serverName() == null);
 }
 
-test "Trojan keeps SNI for hostname server" {
+test "Trojan sends SNI for hostname server" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "server.example.com",
         .port = 443,
     });
 
-    try testing.expect(!client.shouldOmitSni());
+    try testing.expectEqualStrings(
+        "server.example.com",
+        client.serverName().?,
+    );
 }
 
 test "Trojan keeps explicit sni even when address is an IP" {
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "8.8.8.8",
         .port = 443,
         .sni = "m.ctrip.com",
     });
 
-    try testing.expect(!client.shouldOmitSni());
-    try testing.expectEqualStrings("m.ctrip.com", client.tlsHost());
+    try testing.expectEqualStrings("m.ctrip.com", client.serverName().?);
+    try testing.expectEqualStrings("m.ctrip.com", client.certificateHost());
 }
 
-test "Trojan isIpLiteral classifies literals vs hostnames" {
-    try testing.expect(isIpLiteral("8.8.8.8"));
-    try testing.expect(isIpLiteral("::1"));
-    try testing.expect(isIpLiteral("::ffff:192.168.0.1"));
-    try testing.expect(!isIpLiteral("example.com"));
-    try testing.expect(!isIpLiteral("localhost"));
+test "Trojan skip-cert-verify keeps SNI while disabling identity checks" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
+    var client: Client = undefined;
+    try Client.init(&client, testing.allocator, .{
+        .password = "test",
+        .address = "192.0.2.1",
+        .port = 443,
+        .sni = "mismatch.example.com",
+        .skip_cert_verify = true,
+    });
+    try testing.expectEqual(
+        std.meta.Tag(Client.HostOptions).no_verification,
+        std.meta.activeTag(client.hostOption()),
+    );
+    try testing.expectEqualStrings(
+        "mismatch.example.com",
+        client.serverName().?,
+    );
+}
+
+test "Trojan requires sni when verifying an IP-literal server" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
+    var client: Client = undefined;
+    try testing.expectError(
+        error.SNIRequiredForVerifiedIP,
+        Client.init(&client, testing.allocator, .{
+            .password = "test",
+            .address = "8.8.8.8",
+            .port = 443,
+        }),
+    );
 }
 
 test "Trojan lastReadError is null before any TLS connection" {
     const allocator = testing.allocator;
-    const client = try Client.init(allocator, .{
+    var client: Client = undefined;
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
     // tls_conn stays null until connect() dials, so there is no underlying
-    // read_err to surface. This pins the breadcrumb the M1/M5 docs lean on:
+    // read_error to surface. This pins the breadcrumb the M1/M5 docs lean on:
     // a regression that always returned a non-null/garbage error would fail here.
     try testing.expectEqual(@as(?anyerror, null), client.lastReadError());
 }
@@ -786,7 +1663,9 @@ test "Trojan lastReadError is null before any TLS connection" {
 test "Trojan hasPendingRead returns false when not connected" {
     const allocator = testing.allocator;
 
-    const client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "server.example.com",
         .port = 443,
@@ -795,66 +1674,113 @@ test "Trojan hasPendingRead returns false when not connected" {
     try testing.expect(!client.hasPendingRead());
 }
 
-test "Trojan pending read flags buffered TLS or socket bytes" {
-    // hasPendingBufferedRead is the pure decision behind hasPendingRead():
-    // a relay must drain either buffer before yielding the connection.
-    try testing.expect(Client.hasPendingBufferedRead(1, 0));
-    try testing.expect(Client.hasPendingBufferedRead(0, 1));
-    try testing.expect(Client.hasPendingBufferedRead(1, 1));
-    try testing.expect(!Client.hasPendingBufferedRead(0, 0));
+test "Trojan socket readiness requires one complete TLS record" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
+    try testing.expect(!Client.hasCompleteTLSRecord(""));
+    try testing.expect(!Client.hasCompleteTLSRecord("\x17\x03\x03\x00"));
+    try testing.expect(!Client.hasCompleteTLSRecord(
+        "\x17\x03\x03\x00\x03ab",
+    ));
+    try testing.expect(Client.hasCompleteTLSRecord(
+        "\x17\x03\x03\x00\x03abc",
+    ));
+    try testing.expect(Client.hasCompleteTLSRecord(
+        "\x17\x03\x03\xff\xff",
+    ));
 }
 
 test "Trojan read uses TLS buffered short-read semantics" {
-    // Drive readTlsApplicationData (the helper read() delegates to) against an
+    // Drive readTLSApplicationData (the helper read() delegates to) against an
     // injectable fixed reader: it returns up to out.len buffered bytes per call
     // (a short read), advancing the reader, never blocking for a full fill.
     var r = std.Io.Reader.fixed("abcdef");
 
     var out: [4]u8 = undefined;
-    try testing.expectEqual(@as(usize, 4), try Client.readTlsApplicationData(&r, &out));
+    try testing.expectEqual(@as(usize, 4), try Client.readTLSApplicationData(&r, &out));
     try testing.expectEqualStrings("abcd", &out);
 
     // Second call returns the remainder even though the destination is larger.
     var rest: [8]u8 = undefined;
-    try testing.expectEqual(@as(usize, 2), try Client.readTlsApplicationData(&r, &rest));
+    try testing.expectEqual(@as(usize, 2), try Client.readTLSApplicationData(&r, &rest));
     try testing.expectEqualStrings("ef", rest[0..2]);
 
     // Stream fully drained -> clean EOF (0), not an error.
-    try testing.expectEqual(@as(usize, 0), try Client.readTlsApplicationData(&r, &rest));
+    try testing.expectEqual(@as(usize, 0), try Client.readTLSApplicationData(&r, &rest));
 }
 
-test "Trojan isTruncationEof maps only a TLS truncation to EOF" {
+test "Trojan write errors surface transport failures when TLS has no detail" {
+    // Simulate Writer error channels and verify a reset replaces only an
+    // otherwise-unclassified WriteFailed error.
+    try testing.expectEqual(
+        error.ConnectionResetByPeer,
+        Client.selectWriteError(error.WriteFailed, .{
+            .tls_error = null,
+            .transport_error = error.ConnectionResetByPeer,
+        }),
+    );
+    try testing.expectEqual(
+        error.WriteFailed,
+        Client.selectWriteError(error.WriteFailed, .{
+            .tls_error = error.TLSSequenceOverflow,
+            .transport_error = error.ConnectionResetByPeer,
+        }),
+    );
+}
+
+test "Trojan read errors surface transport failures when TLS has no detail" {
+    // Simulate the nested Reader error channels and verify a transport reset
+    // replaces only an otherwise-unclassified ReadFailed error.
+    try testing.expectEqual(
+        error.ConnectionResetByPeer,
+        Client.selectReadError(error.ReadFailed, .{
+            .tls_error = null,
+            .transport_error = error.ConnectionResetByPeer,
+        }),
+    );
+    try testing.expectEqual(
+        error.ReadFailed,
+        Client.selectReadError(error.ReadFailed, .{
+            .tls_error = error.TlsBadRecordMac,
+            .transport_error = error.ConnectionResetByPeer,
+        }),
+    );
+}
+
+test "Trojan isTruncationEOF maps only a TLS truncation to EOF" {
     // The M1 decision read()'s catch arm relies on: a truncation (ReadFailed with
-    // read_err == TlsConnectionTruncated) is a clean EOF; everything else
+    // read_error == TLSConnectionTruncated) is a clean EOF; everything else
     // propagates. Pinned so an inversion fails here instead of in the relay.
-    try testing.expect(Client.isTruncationEof(error.ReadFailed, error.TlsConnectionTruncated));
+    try testing.expect(Client.isTruncationEOF(error.ReadFailed, error.TLSConnectionTruncated));
     // Fatal TLS errors must propagate, NOT be swallowed as EOF.
-    try testing.expect(!Client.isTruncationEof(error.ReadFailed, error.TlsBadRecordMac));
-    try testing.expect(!Client.isTruncationEof(error.ReadFailed, error.TlsAlert));
-    // ReadFailed with no recorded tls read_err -> cannot prove truncation -> propagate.
-    try testing.expect(!Client.isTruncationEof(error.ReadFailed, null));
+    try testing.expect(!Client.isTruncationEOF(error.ReadFailed, error.TlsBadRecordMac));
+    try testing.expect(!Client.isTruncationEOF(error.ReadFailed, error.TlsAlert));
+    // ReadFailed with no recorded tls read_error -> cannot prove truncation -> propagate.
+    try testing.expect(!Client.isTruncationEOF(error.ReadFailed, null));
     // A non-ReadFailed error is never EOF, even if a truncation was also recorded.
-    try testing.expect(!Client.isTruncationEof(error.ConnectionResetByPeer, error.TlsConnectionTruncated));
-    try testing.expect(!Client.isTruncationEof(error.WouldBlock, null));
+    try testing.expect(!Client.isTruncationEOF(
+        error.ConnectionResetByPeer,
+        error.TLSConnectionTruncated,
+    ));
+    try testing.expect(!Client.isTruncationEOF(error.WouldBlock, null));
 }
 
-test "Trojan readTlsApplicationData reports drained/empty stream as EOF" {
+test "Trojan readTLSApplicationData reports drained/empty stream as EOF" {
     // An empty fixed reader yields error.EndOfStream from fillMore, which
-    // readTlsApplicationData translates into a clean 0-length read. This 0-return
-    // is the mechanism read() relies on: when the underlying tls.Client surfaces
-    // error.TlsConnectionTruncated (TCP dropped mid-record without close_notify),
-    // read() maps it to EOF too. That TlsConnectionTruncated->0 translation needs
-    // a live tls.Client and stays integration-only; the EOF semantics it builds on
+    // readTLSApplicationData translates into a clean 0-length read. This 0-return
+    // is the mechanism read() relies on: when the underlying TLSClient surfaces
+    // error.TLSConnectionTruncated (TCP dropped mid-record without close_notify),
+    // read() maps it to EOF too. That TLSConnectionTruncated->0 translation needs
+    // a live TLSClient and stays integration-only; the EOF semantics it builds on
     // are pinned here.
     var empty = std.Io.Reader.fixed("");
     var out: [4]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), try Client.readTlsApplicationData(&empty, &out));
+    try testing.expectEqual(@as(usize, 0), try Client.readTLSApplicationData(&empty, &out));
 
     // Zero-length destination short-circuits without touching the reader.
     var r = std.Io.Reader.fixed("xyz");
-    try testing.expectEqual(@as(usize, 0), try Client.readTlsApplicationData(&r, out[0..0]));
+    try testing.expectEqual(@as(usize, 0), try Client.readTLSApplicationData(&r, out[0..0]));
     // ...and the reader is left untouched: the next real read still sees "xyz".
-    try testing.expectEqual(@as(usize, 3), try Client.readTlsApplicationData(&r, &out));
+    try testing.expectEqual(@as(usize, 3), try Client.readTLSApplicationData(&r, &out));
     try testing.expectEqualStrings("xyz", out[0..3]);
 }
 
@@ -892,10 +1818,13 @@ test "Trojan parseIpv4 strict: rejects empty octet, leading zero, trailing dot" 
 test "Trojan encodeAddress: malformed quad falls through to domain" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
 
     var buf = std.ArrayList(u8).empty;
@@ -914,10 +1843,13 @@ test "Trojan encodeAddress: malformed quad falls through to domain" {
 test "Trojan encodeAddress rejects over-long domain" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "127.0.0.1",
         .port = 443,
+        .skip_cert_verify = true,
     });
 
     var buf = std.ArrayList(u8).empty;
@@ -935,39 +1867,12 @@ test "Trojan encodeAddress rejects over-long domain" {
     try testing.expectEqual(@as(u8, 255), buf2.items[1]);
 }
 
-test "Trojan caOption uses real bundle when verification is enabled" {
-    var lock: std.Io.RwLock = .init;
-    var empty_bundle: Certificate.Bundle = .empty;
-    // Tag-only inspection: no rescan/allocation, so nothing to deinit.
-    const dummy_bundle: Client.CaOptions = .{ .bundle = .{
-        .gpa = testing.allocator,
-        .io = compat.io(),
-        .lock = &lock,
-        .bundle = &empty_bundle,
-    } };
-
-    const result = Client.caOption(false, dummy_bundle);
-    try testing.expectEqual(std.meta.Tag(Client.CaOptions).bundle, std.meta.activeTag(result));
-}
-
-test "Trojan caOption disables verification only when skip_cert_verify is set" {
-    var lock: std.Io.RwLock = .init;
-    var empty_bundle: Certificate.Bundle = .empty;
-    const dummy_bundle: Client.CaOptions = .{ .bundle = .{
-        .gpa = testing.allocator,
-        .io = compat.io(),
-        .lock = &lock,
-        .bundle = &empty_bundle,
-    } };
-
-    const result = Client.caOption(true, dummy_bundle);
-    try testing.expectEqual(std.meta.Tag(Client.CaOptions).no_verification, std.meta.activeTag(result));
-}
-
 test "Trojan buildRequest emits exact wire frame for IPv4 target" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "server.example.com",
         .port = 443,
@@ -997,7 +1902,9 @@ test "Trojan buildRequest emits exact wire frame for IPv4 target" {
 test "Trojan buildRequest emits exact wire frame for IPv6 target" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "server.example.com",
         .port = 443,
@@ -1024,10 +1931,46 @@ test "Trojan buildRequest emits exact wire frame for IPv6 target" {
     try testing.expectEqual(@as(usize, 80), buf.items.len);
 }
 
+test "Trojan buildRequest emits UDP ASSOCIATE sentinel request" {
+    // Drive the Trojan client or wire seam with focused input and inspect the observable result.
+    const allocator = testing.allocator;
+    var client: Client = undefined;
+    try Client.init(&client, allocator, .{
+        .password = "test",
+        .address = "server.example.com",
+        .port = 443,
+    });
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    try client.buildRequest(
+        &buffer,
+        .udp_associate,
+        "0.0.0.0",
+        0,
+    );
+
+    try testing.expectEqualSlices(
+        u8,
+        &client.password_hash,
+        buffer.items[0..56],
+    );
+    try testing.expectEqualSlices(u8, "\r\n", buffer.items[56..58]);
+    try testing.expectEqual(@as(u8, 0x03), buffer.items[58]);
+    try testing.expectEqualSlices(
+        u8,
+        "\x01\x00\x00\x00\x00\x00\x00\r\n",
+        buffer.items[59..68],
+    );
+    try testing.expectEqual(@as(usize, 68), buffer.items.len);
+}
+
 test "Trojan buildRequest emits exact wire frame for domain target" {
     const allocator = testing.allocator;
 
-    var client = try Client.init(allocator, .{
+    var client: Client = undefined;
+
+    try Client.init(&client, allocator, .{
         .password = "test",
         .address = "server.example.com",
         .port = 443,

@@ -50,6 +50,9 @@ pub fn shouldUseColor(stdout_is_tty: bool, no_color_flag: bool, no_color_env: bo
 const stringify_options: std.json.Stringify.Options = .{
     .whitespace = .minified,
     .emit_null_optional_fields = false,
+    .emit_strings_as_arrays = false,
+    .escape_unicode = true,
+    .emit_nonportable_numbers_as_strings = false,
 };
 
 pub const Output = struct {

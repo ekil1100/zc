@@ -28,6 +28,9 @@ pub const ReceiveResult = union(enum) {
     datagram: Datagram,
     would_block,
     dropped: DropReason,
+    /// Connected UDP sockets do not produce stream EOF; this keeps the
+    /// datagram-session interface uniform with stream-framed adapters.
+    eof,
 };
 
 const ReceiveWireLengthClassification = enum {
@@ -122,7 +125,7 @@ pub const Session = opaque {
         cancel_fd: ?std.posix.fd_t,
     ) !*Session {
         // A preclosed control fd must not allocate even for a numeric server.
-        try compat.checkCancelFd(cancel_fd);
+        try compat.checkCancelFD(cancel_fd);
 
         const value = try allocator.create(Impl);
         errdefer allocator.destroy(value);
@@ -131,7 +134,7 @@ pub const Session = opaque {
         errdefer crypto.destroy();
 
         const dns_timeout_ms = try deadlineRemainingMs(absolute_deadline_ms);
-        var addresses = compat.net.getAddressListWithTimeoutCancelFd(
+        var addresses = compat.net.getAddressListWithTimeoutCancelFD(
             allocator,
             server,
             port,
@@ -140,7 +143,7 @@ pub const Session = opaque {
         ) catch |err| {
             // Cancellation is control flow and must never be rewritten as a
             // timeout merely because both boundaries became ready together.
-            try compat.checkCancelFd(cancel_fd);
+            try compat.checkCancelFD(cancel_fd);
             if (err == error.Canceled) return err;
             if (err == error.AddressResolutionTimeout) {
                 return error.DeadlineExceeded;
@@ -152,7 +155,7 @@ pub const Session = opaque {
         };
         defer addresses.deinit();
 
-        try compat.checkCancelFd(cancel_fd);
+        try compat.checkCancelFD(cancel_fd);
         if (deadlineExpired(absolute_deadline_ms)) {
             return error.DeadlineExceeded;
         }
@@ -160,7 +163,7 @@ pub const Session = opaque {
 
         var last_error: anyerror = error.ConnectFailed;
         for (addresses.addrs) |address| {
-            try compat.checkCancelFd(cancel_fd);
+            try compat.checkCancelFD(cancel_fd);
             if (deadlineExpired(absolute_deadline_ms)) {
                 return error.DeadlineExceeded;
             }
@@ -170,13 +173,13 @@ pub const Session = opaque {
             ) catch |err| {
                 // Recheck after every attempted connect so control closure wins
                 // over a simultaneous per-address network failure.
-                try compat.checkCancelFd(cancel_fd);
+                try compat.checkCancelFD(cancel_fd);
                 if (err == error.DeadlineExceeded) return err;
                 last_error = err;
                 continue;
             };
             errdefer compat.posixClose(fd);
-            try compat.checkCancelFd(cancel_fd);
+            try compat.checkCancelFD(cancel_fd);
 
             value.allocator = allocator;
             value.fd = fd;
@@ -190,7 +193,7 @@ pub const Session = opaque {
             }
             return @ptrCast(value);
         }
-        try compat.checkCancelFd(cancel_fd);
+        try compat.checkCancelFD(cancel_fd);
         return last_error;
     }
 

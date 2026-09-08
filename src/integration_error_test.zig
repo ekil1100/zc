@@ -21,6 +21,11 @@ const selection_state = @import("selection_state.zig");
 const state_authority = @import("state_authority.zig");
 
 const max_output = 1024 * 1024;
+const test_directory_options: std.Io.Dir.OpenOptions = .{
+    .access_sub_paths = true,
+    .iterate = false,
+    .follow_symlinks = true,
+};
 const zc_binary = "zig-out/bin/zc";
 const cli_awake_timeout_seconds = 60;
 const build_awake_timeout_seconds = 180;
@@ -666,6 +671,79 @@ fn formatPort(buffer: *[5]u8, port: u16) ![]const u8 {
 // ---------------------------------------------------------------------------
 // 未知/缺失子命令：envelope + exit_usage
 // ---------------------------------------------------------------------------
+
+test "integration: unknown command keeps text and JSON terminal-safe strings" {
+    // Run hostile argv bytes through the real process boundary and verify both
+    // renderers preserve string envelopes without emitting raw controls.
+    const allocator = std.testing.allocator;
+    const hostile_cases = [_]struct {
+        command: []const u8,
+        escaped: []const u8,
+    }{
+        .{ .command = "bad\x1b[31m", .escaped = "bad\\x1b[31m" },
+        .{ .command = "bad\xe2\x80\xaevalue", .escaped = "bad\\u{202e}value" },
+        .{ .command = "bad\xffvalue", .escaped = "bad\\xffvalue" },
+    };
+    for (hostile_cases) |hostile_case| {
+        var json_run = try runCli(
+            allocator,
+            &.{ hostile_case.command, "--json" },
+        );
+        defer json_run.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 1), json_run.code);
+        try std.testing.expectEqualStrings("", json_run.stderr);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            json_run.stdout,
+            hostile_case.command,
+        ) == null);
+        var envelope = try parseEnvelope(allocator, json_run.stdout);
+        defer envelope.deinit();
+        try expectErrorEnvelope(
+            envelope.value,
+            envelope.value.object.get("command").?.string,
+            "COMMAND_UNKNOWN",
+        );
+        const message = envelope.value.object.get("error").?.object
+            .get("message").?.string;
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            message,
+            hostile_case.escaped,
+        ) != null);
+    }
+
+    const long_command = "x" ** 300;
+    var truncated_run = try runCli(
+        allocator,
+        &.{ long_command, "--json" },
+    );
+    defer truncated_run.deinit(allocator);
+    var truncated_envelope = try parseEnvelope(
+        allocator,
+        truncated_run.stdout,
+    );
+    defer truncated_envelope.deinit();
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        truncated_envelope.value.object.get("command").?.string,
+        "...[truncated]",
+    ));
+
+    var text_run = try runCli(allocator, &.{"bad\x1b[31m"});
+    defer text_run.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), text_run.code);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_run.stderr,
+        "\x1b",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_run.stderr,
+        "\\x1b",
+    ) != null);
+}
 
 test "integration: profile unknown subcommand -> PROFILE_SUBCOMMAND_UNKNOWN, exit_usage" {
     const allocator = std.testing.allocator;
@@ -1975,6 +2053,504 @@ test "integration: special pid files fail without blocking" {
     try expectErrorEnvelope(envelope.value, "status", "STATUS_FAILED");
 }
 
+test "integration: legacy validator text escapes terminal controls" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "unsafe-diagnostic.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(
+        source_path,
+        "mixed-port: 7890\nlog-level: \"bad\\nINJECTED\"\n",
+    );
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "test", "-c", source_path },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stderr, "bad\\nINJECTED") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stderr, "bad\nINJECTED") == null,
+    );
+}
+
+test "integration: config load JSON reports concrete validation errors" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "invalid.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(
+        source_path,
+        "mixed-port: 7890\nlog-level: \"verbose\\u202eJSON\"\nrules:\n  - MATCH,missing\n",
+    );
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    try std.testing.expectEqualStrings("", rejected.stderr);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stdout, "\\u202e") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stdout, "\xe2\x80\xae") == null,
+    );
+    var envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer envelope.deinit();
+    try expectErrorEnvelope(
+        envelope.value,
+        "config load",
+        "CONFIG_LOAD_INVALID",
+    );
+    const data = envelope.value.object.get("data").?.object;
+    const errors = data.get("config_errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), errors.len);
+    try std.testing.expect(
+        std.mem.indexOf(u8, errors[0].string, "Unknown log level") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, errors[1].string, "undefined target 'missing'") != null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        data.get("config_warnings").?.array.items.len,
+    );
+    try std.testing.expect(!data.get("config_diagnostics_truncated").?.bool);
+}
+
+test "integration: config load text reports concrete validation errors" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "invalid.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(
+        source_path,
+        "mixed-port: 7890\nlog-level: verbose\nrules:\n  - MATCH,missing\n",
+    );
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    try std.testing.expectEqualStrings("", rejected.stdout);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stderr, "Configuration errors:") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stderr, "Unknown log level") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stderr, "undefined target 'missing'") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stderr, "code: CONFIG_LOAD_INVALID") != null,
+    );
+}
+
+test "integration: parser-invalid config load gives an executable hint" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "parser-invalid.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(
+        source_path,
+        "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n  - DOMAIN,example.com,DIRECT\n",
+    );
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer envelope.deinit();
+    try expectErrorEnvelope(
+        envelope.value,
+        "config load",
+        "CONFIG_LOAD_INVALID",
+    );
+    try std.testing.expect(envelope.value.object.get("data") == null);
+    const hint = envelope.value.object.get("error").?.object
+        .get("hint").?.string;
+    try std.testing.expect(
+        std.mem.indexOf(u8, hint, "YAML structure") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, hint, "doctor") == null,
+    );
+}
+
+test "integration: typed proxy parser errors map to CONFIG_LOAD_INVALID" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "missing-name.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(
+        source_path,
+        \\mixed-port: 7890
+        \\proxies:
+        \\  - type: trojan
+        \\    server: edge.example.com
+        \\    port: 443
+        \\    password: secret
+        ,
+    );
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer envelope.deinit();
+    try expectErrorEnvelope(
+        envelope.value,
+        "config load",
+        "CONFIG_LOAD_INVALID",
+    );
+    const message = envelope.value.object.get("error").?.object
+        .get("message").?.string;
+    try std.testing.expect(
+        std.mem.indexOf(u8, message, "missing required field 'name'") != null,
+    );
+}
+
+test "integration: RULE-SET semantic failures map to CONFIG_LOAD_INVALID" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+
+    const missing_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "missing-provider-ref.yaml" },
+    );
+    defer allocator.free(missing_path);
+    try writeAbsoluteFile(
+        missing_path,
+        "mixed-port: 7890\nrules:\n  - RULE-SET,missing,DIRECT\n  - MATCH,DIRECT\n",
+    );
+    var missing = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", missing_path, "--json" },
+    );
+    defer missing.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), missing.code);
+    var missing_envelope = try parseEnvelope(allocator, missing.stdout);
+    defer missing_envelope.deinit();
+    try expectErrorEnvelope(
+        missing_envelope.value,
+        "config load",
+        "CONFIG_LOAD_INVALID",
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        missing_envelope.value.object.get("error").?.object
+            .get("message").?.string,
+        "undeclared provider",
+    ) != null);
+
+    const provider_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "malformed-rules.yaml" },
+    );
+    defer allocator.free(provider_path);
+    try writeAbsoluteFile(provider_path, "payload: {}\n");
+    const malformed_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "malformed-provider.yaml" },
+    );
+    defer allocator.free(malformed_path);
+    try writeAbsoluteFile(
+        malformed_path,
+        \\mixed-port: 7890
+        \\rule-providers:
+        \\  bad:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: malformed-rules.yaml
+        \\rules:
+        \\  - RULE-SET,bad,DIRECT
+        \\  - MATCH,DIRECT
+        ,
+    );
+    var malformed = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", malformed_path, "--json" },
+    );
+    defer malformed.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), malformed.code);
+    var malformed_envelope = try parseEnvelope(
+        allocator,
+        malformed.stdout,
+    );
+    defer malformed_envelope.deinit();
+    try expectErrorEnvelope(
+        malformed_envelope.value,
+        "config load",
+        "CONFIG_LOAD_INVALID",
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        malformed_envelope.value.object.get("error").?.object
+            .get("message").?.string,
+        "invalid structure",
+    ) != null);
+}
+
+test "integration: rule-provider paths map to actionable config errors" {
+    // Load absolute and source-escaping provider paths through the real CLI and
+    // verify deterministic path semantics never masquerade as filesystem failure.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    try tmp.dir.createDir(compat.io(), "home/source", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const absolute_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "absolute.yaml" },
+    );
+    defer allocator.free(absolute_path);
+    try writeAbsoluteFile(
+        absolute_path,
+        \\mixed-port: 7890
+        \\rule-providers:
+        \\  early-missing:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: '!absent.yaml'
+        \\  bad:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: /tmp/rules.yaml
+        \\rules:
+        \\  - RULE-SET,bad,DIRECT
+        ,
+    );
+    const traversal_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "source", "traversal.yaml" },
+    );
+    defer allocator.free(traversal_path);
+    try writeAbsoluteFile(
+        traversal_path,
+        \\mixed-port: 7890
+        \\rule-providers:
+        \\  early-missing:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: '!absent.yaml'
+        \\  bad:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: ../outside.yaml
+        \\rules:
+        \\  - RULE-SET,bad,DIRECT
+        ,
+    );
+
+    const cases = [_]struct {
+        path: []const u8,
+        expected: []const u8,
+    }{
+        .{ .path = absolute_path, .expected = "must be relative" },
+        .{ .path = traversal_path, .expected = "escapes the config source" },
+    };
+    for (cases) |case| {
+        var rejected = try runCliWithHome(
+            allocator,
+            home,
+            &.{ "config", "load", case.path, "--json" },
+        );
+        defer rejected.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 1), rejected.code);
+        var envelope = try parseEnvelope(allocator, rejected.stdout);
+        defer envelope.deinit();
+        try expectErrorEnvelope(
+            envelope.value,
+            "config load",
+            "CONFIG_LOAD_INVALID",
+        );
+        const message = envelope.value.object.get("error").?.object
+            .get("message").?.string;
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            message,
+            case.expected,
+        ) != null);
+    }
+    const state_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, ".config", "zc", "state-v2.json" },
+    );
+    defer allocator.free(state_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        compat.fs.accessAbsolute(state_path, .{
+            .follow_symlinks = true,
+            .read = false,
+            .write = false,
+            .execute = false,
+        }),
+    );
+}
+
+test "integration: unresolved remote RULE-SET fails before catalog bootstrap" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(test_directory_options);
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const home = try tmp.dir.realPathFileAlloc(compat.io(), "home", allocator);
+    defer allocator.free(home);
+    const source_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, "remote-provider.yaml" },
+    );
+    defer allocator.free(source_path);
+    try writeAbsoluteFile(
+        source_path,
+        \\mixed-port: 7890
+        \\rule-providers:
+        \\  one:
+        \\    type: http
+        \\    behavior: domain
+        \\    url: https://example.invalid/one.yaml
+        \\    path: one.yaml
+        \\  two:
+        \\    type: http
+        \\    behavior: domain
+        \\    url: https://example.invalid/two.yaml
+        \\    path: two.yaml
+        \\rules:
+        \\  - RULE-SET,one,DIRECT
+        \\  - RULE-SET,one,DIRECT
+        \\  - RULE-SET,two,DIRECT
+        \\  - MATCH,DIRECT
+        ,
+    );
+
+    var rejected = try runCliWithHome(
+        allocator,
+        home,
+        &.{ "config", "load", source_path, "--json" },
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), rejected.code);
+    var envelope = try parseEnvelope(allocator, rejected.stdout);
+    defer envelope.deinit();
+    try expectErrorEnvelope(
+        envelope.value,
+        "config load",
+        "CONFIG_LOAD_INVALID",
+    );
+    const data = envelope.value.object.get("data").?.object;
+    const errors = data.get("config_errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), errors.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        errors[0].string,
+        "provider 'one' is remote",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        errors[1].string,
+        "provider 'two' is remote",
+    ) != null);
+    for (0..2) |diagnostic_index| {
+        const diagnostic = errors[diagnostic_index];
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            diagnostic.string,
+            "replace it with type:file",
+        ) != null);
+    }
+    try std.testing.expect(!data.get("config_diagnostics_truncated").?.bool);
+
+    const state_path = try compat.fs.path.join(
+        allocator,
+        &.{ home, ".config", "zc", "state-v2.json" },
+    );
+    defer allocator.free(state_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        compat.fs.accessAbsolute(state_path, .{
+            .follow_symlinks = true,
+            .read = false,
+            .write = false,
+            .execute = false,
+        }),
+    );
+}
+
 test "integration: config load reports proxy count limit without state mutation" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2100,6 +2676,104 @@ test "integration: config load maps global YAML collection entry limit" {
         "baseline",
         before,
     );
+}
+
+test "integration: download and update report invalid UTF-8 as source errors" {
+    // Run the real CLI in an isolated home and verify its exit code, envelope,
+    // and filesystem effects.
+    const allocator = std.testing.allocator;
+    const invalid = "mixed-port: 7890\nlog-level: bad\x80value\n";
+
+    var download_tmp = std.testing.tmpDir(test_directory_options);
+    defer download_tmp.cleanup();
+    try download_tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const download_home = try download_tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home",
+        allocator,
+    );
+    defer allocator.free(download_home);
+    var download_responder = try ConfigHttpResponder.start(&.{invalid});
+    defer download_responder.stop();
+    const download_url = try download_responder.urlAlloc(allocator);
+    defer allocator.free(download_url);
+    var download = try runCliWithHome(
+        allocator,
+        download_home,
+        &.{
+            "config",
+            "download",
+            download_url,
+            "-n",
+            "invalid-utf8",
+            "--json",
+        },
+    );
+    defer download.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), download.code);
+    var download_envelope = try parseEnvelope(allocator, download.stdout);
+    defer download_envelope.deinit();
+    try expectErrorEnvelope(
+        download_envelope.value,
+        "config download",
+        "CONFIG_DOWNLOAD_FAILED",
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        download_envelope.value.object.get("error").?.object
+            .get("message").?.string,
+        "not valid UTF-8",
+    ) != null);
+
+    var update_tmp = std.testing.tmpDir(test_directory_options);
+    defer update_tmp.cleanup();
+    try update_tmp.dir.createDir(compat.io(), "home", .default_dir);
+    const update_home = try update_tmp.dir.realPathFileAlloc(
+        compat.io(),
+        "home",
+        allocator,
+    );
+    defer allocator.free(update_home);
+    const valid = "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n";
+    var update_responder = try ConfigHttpResponder.start(&.{ valid, invalid });
+    defer update_responder.stop();
+    const update_url = try update_responder.urlAlloc(allocator);
+    defer allocator.free(update_url);
+    var created = try runCliWithHome(
+        allocator,
+        update_home,
+        &.{
+            "config",
+            "download",
+            update_url,
+            "-n",
+            "utf8-update",
+            "--json",
+        },
+    );
+    defer created.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), created.code);
+
+    var update = try runCliWithHome(
+        allocator,
+        update_home,
+        &.{ "config", "update", "utf8-update", "--json" },
+    );
+    defer update.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), update.code);
+    var update_envelope = try parseEnvelope(allocator, update.stdout);
+    defer update_envelope.deinit();
+    try expectErrorEnvelope(
+        update_envelope.value,
+        "config update",
+        "CONFIG_UPDATE_FAILED",
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        update_envelope.value.object.get("error").?.object
+            .get("message").?.string,
+        "not valid UTF-8",
+    ) != null);
 }
 
 test "integration: config download maps rule-provider count limit without state mutation" {

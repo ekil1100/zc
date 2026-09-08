@@ -4,6 +4,14 @@ const compat = @import("compat.zig");
 const config_mod = @import("config.zig");
 const config_validator = @import("config_validator.zig");
 
+const symlink_hop_count_max: usize = switch (builtin.os.tag) {
+    .linux => 40,
+    else => 32,
+};
+const symlink_hop_rejection_count: usize = symlink_hop_count_max + 1;
+const path_walk_step_count_max: usize =
+    symlink_hop_count_max * std.fs.max_path_bytes;
+
 pub const CaptureLimits = struct {
     max_source_bytes: usize = config_mod.config_source_bytes_max,
     // Every captured asset is a local rule-provider source, so capture and
@@ -83,9 +91,38 @@ const CaptureHook = struct {
     run: *const fn (*anyopaque) anyerror!void,
 };
 
+const AncestorContainmentOptions = struct {
+    root: []const u8,
+    logical_path: []const u8,
+    test_probe_count: ?*usize = null,
+};
+
+const JoinPathOptions = struct {
+    parent: []const u8,
+    component: []const u8,
+};
+
+const PrependPendingPathOptions = struct {
+    target: []const u8,
+    remaining: []const u8,
+};
+
+const PathContainmentOptions = struct {
+    root: []const u8,
+    path: []const u8,
+};
+
 pub const OfflineLoad = struct {
     config: config_mod.Config,
     validation: config_validator.ValidationResult,
+
+    pub fn takeValidation(self: *OfflineLoad) config_validator.ValidationResult {
+        const validation = self.validation;
+        self.validation = config_validator.ValidationResult.init(
+            validation.allocator,
+        );
+        return validation;
+    }
 
     pub fn deinit(self: *OfflineLoad) void {
         self.validation.deinit();
@@ -562,14 +599,60 @@ pub const ConfigBundle = struct {
         try assets.ensureTotalCapacity(allocator, local_paths.items.len);
 
         for (local_paths.items) |logical_path| {
-            if (bind_source_dir_root and compat.fs.path.isAbsolute(logical_path)) {
-                return error.AbsoluteAssetPathNotAllowed;
-            }
-            const base_dir = if (compat.fs.path.isAbsolute(logical_path)) std.Io.Dir.cwd() else root_dir;
-            var asset_capture = try openCapturedRegularFile(allocator, base_dir, logical_path);
-            defer asset_capture.deinit();
-            if (!isStrictDescendant(root, asset_capture.canonical_path)) {
+            try validateLocalProviderPath(logical_path);
+        }
+
+        const resolved_paths = try allocator.alloc(
+            ?[:0]u8,
+            local_paths.items.len,
+        );
+        defer allocator.free(resolved_paths);
+        @memset(resolved_paths, null);
+        defer for (resolved_paths) |resolved_path| {
+            if (resolved_path) |path| allocator.free(path);
+        };
+        var first_resolution_error: ?anyerror = null;
+        for (local_paths.items, resolved_paths) |logical_path, *resolved_path| {
+            resolved_path.* = root_dir.realPathFileAlloc(
+                compat.io(),
+                logical_path,
+                allocator,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    try ensureExistingAncestorContained(
+                        allocator,
+                        root_dir,
+                        .{
+                            .root = root,
+                            .logical_path = logical_path,
+                        },
+                    );
+                    if (first_resolution_error == null) {
+                        first_resolution_error = err;
+                    }
+                    continue;
+                },
+            };
+            if (!isStrictDescendant(root, resolved_path.*.?)) {
                 return error.PathOutsideSourceRoot;
+            }
+        }
+        if (first_resolution_error) |err| return err;
+
+        for (local_paths.items, resolved_paths) |logical_path, resolved_path| {
+            var asset_capture = try openCapturedRegularFile(
+                allocator,
+                root_dir,
+                logical_path,
+            );
+            defer asset_capture.deinit();
+            if (!std.mem.eql(
+                u8,
+                resolved_path.?,
+                asset_capture.canonical_path,
+            )) {
+                return error.SourceChanged;
             }
 
             var bytes = readCapturedFile(allocator, &asset_capture, limits.max_asset_bytes) catch |err| switch (err) {
@@ -801,14 +884,294 @@ fn isSingleComponent(path: []const u8) bool {
         std.mem.indexOfAny(u8, path, "/\\") == null;
 }
 
+fn validateLocalProviderPath(logical_path: []const u8) !void {
+    if (logical_path.len >= std.fs.max_path_bytes) {
+        return error.InvalidRuleProviderPath;
+    }
+    if (compat.fs.path.isAbsolute(logical_path)) {
+        return error.AbsoluteAssetPathNotAllowed;
+    }
+    if (relativePathEscapesRoot(logical_path)) {
+        return error.PathOutsideSourceRoot;
+    }
+}
+
+fn ensureExistingAncestorContained(
+    allocator: std.mem.Allocator,
+    root_dir: std.Io.Dir,
+    options: AncestorContainmentOptions,
+) error{
+    OutOfMemory,
+    PathOutsideSourceRoot,
+    InvalidRuleProviderPath,
+}!void {
+    var pending_buffers: [2][std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(
+        pending_buffers[0][0..options.logical_path.len],
+        options.logical_path,
+    );
+    var active_pending_index: usize = 0;
+    var pending_byte_count = options.logical_path.len;
+    var pending_cursor: usize = 0;
+    var current_path: [std.fs.max_path_bytes]u8 = undefined;
+    if (options.root.len >= current_path.len) {
+        return error.InvalidRuleProviderPath;
+    }
+    @memcpy(current_path[0..options.root.len], options.root);
+    var current_path_byte_count = options.root.len;
+    var symlink_hop_count: usize = 0;
+    var path_probe_count: usize = 0;
+
+    for (0..path_walk_step_count_max) |_| {
+        const pending = pending_buffers[active_pending_index][0..pending_byte_count];
+        for (pending_cursor..pending.len) |byte_index| {
+            if (!isPathSeparator(pending[byte_index])) break;
+            pending_cursor = std.math.add(
+                usize,
+                byte_index,
+                1,
+            ) catch unreachable;
+        }
+        if (pending_cursor == pending.len) {
+            if (!isPathContained(.{
+                .root = options.root,
+                .path = current_path[0..current_path_byte_count],
+            })) return error.PathOutsideSourceRoot;
+            return;
+        }
+        const component_start = pending_cursor;
+        var component_end = pending.len;
+        for (component_start..pending.len) |byte_index| {
+            if (!isPathSeparator(pending[byte_index])) continue;
+            component_end = byte_index;
+            break;
+        }
+        pending_cursor = component_end;
+        const component = pending[component_start..component_end];
+        if (std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            current_path_byte_count = parentPathLength(
+                current_path[0..current_path_byte_count],
+            );
+            continue;
+        }
+
+        path_probe_count = std.math.add(
+            usize,
+            path_probe_count,
+            1,
+        ) catch unreachable;
+        if (options.test_probe_count) |count| {
+            count.* = path_probe_count;
+        }
+        var candidate: [std.fs.max_path_bytes]u8 = undefined;
+        const candidate_byte_count = try joinPath(
+            .{
+                .parent = current_path[0..current_path_byte_count],
+                .component = component,
+            },
+            &candidate,
+        );
+        const candidate_path = candidate[0..candidate_byte_count];
+
+        var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const target_length = root_dir.readLink(
+            compat.io(),
+            candidate_path,
+            &target_buffer,
+        ) catch null;
+        if (target_length) |length| {
+            if (symlink_hop_count == symlink_hop_count_max) return;
+            symlink_hop_count = std.math.add(
+                usize,
+                symlink_hop_count,
+                1,
+            ) catch unreachable;
+            var target = target_buffer[0..length];
+            if (compat.fs.path.isAbsolute(target)) {
+                if (comptime builtin.os.tag == .windows) {
+                    return error.InvalidRuleProviderPath;
+                }
+                current_path[0] = compat.fs.path.sep;
+                current_path_byte_count = 1;
+                var target_start: usize = 0;
+                for (target, 0..) |byte, byte_index| {
+                    if (!isPathSeparator(byte)) break;
+                    target_start = std.math.add(
+                        usize,
+                        byte_index,
+                        1,
+                    ) catch unreachable;
+                }
+                target = target[target_start..];
+            }
+            const next_pending_index: usize = @intFromBool(
+                active_pending_index == 0,
+            );
+            const remaining = pending[pending_cursor..];
+            pending_byte_count = try prependPendingPath(
+                .{
+                    .target = target,
+                    .remaining = remaining,
+                },
+                &pending_buffers[next_pending_index],
+            );
+            active_pending_index = next_pending_index;
+            pending_cursor = 0;
+            continue;
+        }
+
+        const resolved = root_dir.realPathFileAlloc(
+            compat.io(),
+            candidate_path,
+            allocator,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                if (!isPathContained(.{
+                    .root = options.root,
+                    .path = current_path[0..current_path_byte_count],
+                })) return error.PathOutsideSourceRoot;
+                return;
+            },
+        };
+        defer allocator.free(resolved);
+        if (resolved.len >= current_path.len) {
+            return error.InvalidRuleProviderPath;
+        }
+        @memcpy(current_path[0..resolved.len], resolved);
+        current_path_byte_count = resolved.len;
+
+        if (hasRemainingPathComponent(pending, pending_cursor)) {
+            const stat = root_dir.statFile(
+                compat.io(),
+                candidate_path,
+                .{ .follow_symlinks = true },
+            ) catch {
+                if (!isPathContained(.{
+                    .root = options.root,
+                    .path = current_path[0..current_path_byte_count],
+                })) return error.PathOutsideSourceRoot;
+                return;
+            };
+            if (stat.kind != .directory) {
+                if (!isPathContained(.{
+                    .root = options.root,
+                    .path = current_path[0..current_path_byte_count],
+                })) return error.PathOutsideSourceRoot;
+                return;
+            }
+        }
+    }
+    return error.InvalidRuleProviderPath;
+}
+
+fn parentPathLength(path: []const u8) usize {
+    const parent = compat.fs.path.dirname(path) orelse return path.len;
+    return parent.len;
+}
+
+fn joinPath(
+    options: JoinPathOptions,
+    output: *[std.fs.max_path_bytes]u8,
+) error{InvalidRuleProviderPath}!usize {
+    var byte_count: usize = 0;
+    if (options.parent.len != 0) {
+        if (options.parent.len >= output.len) {
+            return error.InvalidRuleProviderPath;
+        }
+        @memcpy(output[0..options.parent.len], options.parent);
+        byte_count = options.parent.len;
+        if (!isPathSeparator(options.parent[options.parent.len - 1])) {
+            output[byte_count] = compat.fs.path.sep;
+            byte_count = std.math.add(
+                usize,
+                byte_count,
+                1,
+            ) catch unreachable;
+        }
+    }
+    const total = std.math.add(
+        usize,
+        byte_count,
+        options.component.len,
+    ) catch return error.InvalidRuleProviderPath;
+    if (total >= output.len) return error.InvalidRuleProviderPath;
+    @memcpy(output[byte_count..total], options.component);
+    return total;
+}
+
+fn prependPendingPath(
+    options: PrependPendingPathOptions,
+    output: *[std.fs.max_path_bytes]u8,
+) error{InvalidRuleProviderPath}!usize {
+    const total = std.math.add(
+        usize,
+        options.target.len,
+        options.remaining.len,
+    ) catch return error.InvalidRuleProviderPath;
+    if (total >= output.len) return error.InvalidRuleProviderPath;
+    @memcpy(output[0..options.target.len], options.target);
+    @memcpy(output[options.target.len..total], options.remaining);
+    return total;
+}
+
+fn hasRemainingPathComponent(path: []const u8, cursor: usize) bool {
+    std.debug.assert(cursor <= path.len);
+    for (path[cursor..]) |byte| {
+        if (!isPathSeparator(byte)) return true;
+    }
+    return false;
+}
+
+fn relativePathEscapesRoot(path: []const u8) bool {
+    std.debug.assert(!compat.fs.path.isAbsolute(path));
+    std.debug.assert(path.len <= CaptureLimits.defaults.max_source_bytes);
+    var depth: usize = 0;
+    var component_start: usize = 0;
+    for (path, 0..) |byte, byte_index| {
+        if (!isPathSeparator(byte)) continue;
+        if (pathComponentEscapesRoot(
+            path[component_start..byte_index],
+            &depth,
+        )) return true;
+        component_start = std.math.add(
+            usize,
+            byte_index,
+            1,
+        ) catch unreachable;
+    }
+    return pathComponentEscapesRoot(path[component_start..], &depth);
+}
+
+fn pathComponentEscapesRoot(component: []const u8, depth: *usize) bool {
+    if (component.len == 0) return false;
+    if (std.mem.eql(u8, component, ".")) return false;
+    if (std.mem.eql(u8, component, "..")) {
+        if (depth.* == 0) return true;
+        depth.* -= 1;
+        return false;
+    }
+    depth.* = std.math.add(usize, depth.*, 1) catch unreachable;
+    return false;
+}
+
+fn isPathContained(options: PathContainmentOptions) bool {
+    if (std.mem.eql(u8, options.root, options.path)) return true;
+    return isStrictDescendant(options.root, options.path);
+}
+
 fn isStrictDescendant(root: []const u8, path: []const u8) bool {
     return relativeToRoot(root, path) != null;
 }
 
 fn relativeToRoot(root: []const u8, path: []const u8) ?[]const u8 {
-    if (path.len <= root.len or !std.mem.startsWith(u8, path, root)) return null;
-    if (root.len != 0 and isPathSeparator(root[root.len - 1])) {
-        return path[root.len..];
+    if (path.len <= root.len) return null;
+    if (!std.mem.startsWith(u8, path, root)) return null;
+    if (root.len != 0) {
+        if (isPathSeparator(root[root.len - 1])) {
+            return path[root.len..];
+        }
     }
     if (!isPathSeparator(path[root.len])) return null;
     return path[root.len + 1 ..];
@@ -939,6 +1302,231 @@ fn sameFileStat(left: std.Io.File.Stat, right: std.Io.File.Stat) bool {
         left.size == right.size and
         std.meta.eql(left.mtime, right.mtime) and
         std.meta.eql(left.ctime, right.ctime);
+}
+
+test "relative provider path traversal is classified before file access" {
+    // Compare ordinary, normalized, and escaping components without touching
+    // the filesystem so deterministic path semantics win over I/O errors.
+    try std.testing.expect(!relativePathEscapesRoot("rules.yaml"));
+    try std.testing.expect(!relativePathEscapesRoot("sub/../rules.yaml"));
+    try std.testing.expect(relativePathEscapesRoot("../rules.yaml"));
+    try std.testing.expect(relativePathEscapesRoot("sub/../../rules.yaml"));
+}
+
+test "local provider paths reject the platform limit before resolution" {
+    // Exercise the exact path-length gate directly so a deeply nested escape
+    // cannot exhaust ancestor classification and fall through as success.
+    const oversized = [_]u8{'x'} ** std.fs.max_path_bytes;
+    try std.testing.expectError(
+        error.InvalidRuleProviderPath,
+        validateLocalProviderPath(&oversized),
+    );
+}
+
+test "symlink cycles consume a linear component walk budget" {
+    // Attach a long unchanged suffix to a two-node cycle and count component
+    // probes, proving each hop examines only its next filesystem component.
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{
+        .access_sub_paths = true,
+        .iterate = false,
+        .follow_symlinks = true,
+    });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "root", .default_dir);
+    tmp.dir.symLink(
+        compat.io(),
+        "b",
+        "root/a",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    tmp.dir.symLink(
+        compat.io(),
+        "a",
+        "root/b",
+        .{ .is_directory = false },
+    ) catch return error.SkipZigTest;
+    const root_dir = try tmp.dir.openDir(
+        compat.io(),
+        "root",
+        .{
+            .access_sub_paths = true,
+            .iterate = false,
+            .follow_symlinks = false,
+        },
+    );
+    defer root_dir.close(compat.io());
+    const root = try dirCanonicalPathAlloc(testing.allocator, root_dir);
+    defer testing.allocator.free(root);
+    var logical_path = std.ArrayList(u8).empty;
+    defer logical_path.deinit(testing.allocator);
+    try logical_path.appendSlice(testing.allocator, "a");
+    for (0..250) |_| {
+        try logical_path.appendSlice(testing.allocator, "/x");
+    }
+    try logical_path.appendSlice(testing.allocator, "/missing.yaml");
+
+    var probe_count: usize = 0;
+    try ensureExistingAncestorContained(
+        testing.allocator,
+        root_dir,
+        .{
+            .root = root,
+            .logical_path = logical_path.items,
+            .test_probe_count = &probe_count,
+        },
+    );
+    try testing.expect(probe_count <= symlink_hop_rejection_count);
+}
+
+test "symlink walk honors the platform hop boundary" {
+    // Build exact and plus-one chains, then verify the helper stops at the
+    // platform boundary while full capture preserves the kernel error.
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{
+        .access_sub_paths = true,
+        .iterate = false,
+        .follow_symlinks = true,
+    });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(compat.io(), "root", .default_dir);
+    var source_buffer: [32]u8 = undefined;
+    var target_buffer: [32]u8 = undefined;
+    for (0..symlink_hop_count_max) |hop_index| {
+        const next_hop_index = std.math.add(
+            usize,
+            hop_index,
+            1,
+        ) catch unreachable;
+        const source = try std.fmt.bufPrint(
+            &source_buffer,
+            "root/accepted-{d}",
+            .{hop_index},
+        );
+        const target = if (next_hop_index == symlink_hop_count_max)
+            "accepted-missing.yaml"
+        else
+            try std.fmt.bufPrint(
+                &target_buffer,
+                "accepted-{d}",
+                .{next_hop_index},
+            );
+        try tmp.dir.symLink(
+            compat.io(),
+            target,
+            source,
+            .{ .is_directory = false },
+        );
+    }
+    for (0..symlink_hop_rejection_count) |hop_index| {
+        const next_hop_index = std.math.add(
+            usize,
+            hop_index,
+            1,
+        ) catch unreachable;
+        const source = try std.fmt.bufPrint(
+            &source_buffer,
+            "root/rejected-{d}",
+            .{hop_index},
+        );
+        const target = if (hop_index == symlink_hop_count_max)
+            "rejected-missing.yaml"
+        else
+            try std.fmt.bufPrint(
+                &target_buffer,
+                "rejected-{d}",
+                .{next_hop_index},
+            );
+        try tmp.dir.symLink(
+            compat.io(),
+            target,
+            source,
+            .{ .is_directory = false },
+        );
+    }
+    const root_dir = try tmp.dir.openDir(
+        compat.io(),
+        "root",
+        .{
+            .access_sub_paths = true,
+            .iterate = false,
+            .follow_symlinks = false,
+        },
+    );
+    defer root_dir.close(compat.io());
+    const root = try dirCanonicalPathAlloc(testing.allocator, root_dir);
+    defer testing.allocator.free(root);
+
+    try ensureExistingAncestorContained(
+        testing.allocator,
+        root_dir,
+        .{ .root = root, .logical_path = "accepted-0" },
+    );
+    try ensureExistingAncestorContained(
+        testing.allocator,
+        root_dir,
+        .{ .root = root, .logical_path = "rejected-0" },
+    );
+
+    const accepted_source =
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: accepted-0
+    ;
+    const rejected_source =
+        \\rule-providers:
+        \\  local:
+        \\    type: file
+        \\    behavior: domain
+        \\    path: rejected-0
+    ;
+    const source_file = try root_dir.createFile(
+        compat.io(),
+        "config.yaml",
+        .{
+            .read = false,
+            .truncate = true,
+            .exclusive = false,
+            .lock = .none,
+            .lock_nonblocking = false,
+            .permissions = .default_file,
+            .resolve_beneath = false,
+        },
+    );
+    try source_file.writeStreamingAll(compat.io(), accepted_source);
+    source_file.close(compat.io());
+    const source_path = try root_dir.realPathFileAlloc(
+        compat.io(),
+        "config.yaml",
+        testing.allocator,
+    );
+    defer testing.allocator.free(source_path);
+    try testing.expectError(
+        error.FileNotFound,
+        ConfigBundle.capture(testing.allocator, source_path, .{}),
+    );
+
+    const rejected_file = try root_dir.createFile(
+        compat.io(),
+        "config.yaml",
+        .{
+            .read = false,
+            .truncate = true,
+            .exclusive = false,
+            .lock = .none,
+            .lock_nonblocking = false,
+            .permissions = .default_file,
+            .resolve_beneath = false,
+        },
+    );
+    try rejected_file.writeStreamingAll(compat.io(), rejected_source);
+    rejected_file.close(compat.io());
+    try testing.expectError(
+        error.SymLinkLoop,
+        ConfigBundle.capture(testing.allocator, source_path, .{}),
+    );
 }
 
 test "aggregate accounting accepts the 64 MiB boundary and rejects one byte more" {

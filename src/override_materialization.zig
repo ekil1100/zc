@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const override = @import("override.zig");
+const safe_text = @import("safe_text.zig");
 
 pub const max_script_bytes = 1024 * 1024;
 pub const max_patch_bytes = 1024 * 1024;
@@ -211,9 +212,17 @@ fn isSingleComponent(name: []const u8) bool {
 }
 
 fn isText(text: []const u8) bool {
-    if (text.len == 0 or !isUtf8WithoutNul(text)) return false;
-    for (text) |byte| if (byte < 0x20 or byte == 0x7f) return false;
-    return true;
+    if (text.len == 0) return false;
+    return safe_text.isDisplaySafe(text);
+}
+
+test "override display text rejects terminal and bidirectional controls" {
+    // Exercise the shared display predicate used by persisted script metadata
+    // and verify unsafe Unicode never reaches catalog state or CLI output.
+    try std.testing.expect(isText("override.lua"));
+    try std.testing.expect(!isText("unsafe\xc2\x9b.lua"));
+    try std.testing.expect(!isText("unsafe\xe2\x80\xae.lua"));
+    try std.testing.expect(!isText("unsafe\xff.lua"));
 }
 
 fn isUtf8WithoutNul(text: []const u8) bool {
