@@ -31,20 +31,20 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Build
-        run: just build
+      - name: Build Zig reference
+        run: just zig-build
 
-      - name: Test
-        run: just test
+      - name: Test Zig reference
+        run: just zig-test
 
       - name: Smoke (migrator regression)
-        run: just migrator-regression
+        run: just zig-migrator-test
 
       - name: Smoke (install regression)
-        run: just install-regression
+        run: just zig-install-test
 
       - name: Eval framework selfcheck
-        run: just eval-selfcheck
+        run: just zig-eval-selfcheck
 
   e2e:
     runs-on: ubuntu-latest

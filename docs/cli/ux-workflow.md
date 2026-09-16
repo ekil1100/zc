@@ -89,7 +89,7 @@
 - `zc status --json | jq -e '.ok and .command=="status"'`；
 - 失败路径恰好一行 JSON、exit ≠ 0、无 Zig stack trace；
 - `zc start --help`/`zc log --help` 只打印帮助；
-- `just install` 全程可用（Justfile 改 `| jq -r .data.state`，删除 `2>&1` workaround 注释）；
+- 当时的 `just install` 全程可用（历史验收记录；Rust 迁移期间已移除此命令，当前安装步骤见 [`../install/README.md`](../install/README.md)）；
 - `zclash.service` / `build-deb.sh` / podman e2e 改用 `--foreground` 后通过。
 
 ### Batch 3 — config 树 ✅ 完成

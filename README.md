@@ -13,8 +13,8 @@
 仓库已加入可运行的 Rust 前台 TCP 版本；**尚不能替换生产 Zig 版**。现有安装器与下方功能表仍描述 Zig `v1.0.1` 基线，Rust 不读取或修改已有托管状态。
 
 ```bash
-cargo build --locked
-cargo run --locked -- start -c testdata/config/rust-tcp.yaml --port 17890 --foreground
+just build
+just run
 ```
 
 Rust 首版支持 mixed HTTP CONNECT / SOCKS5 CONNECT、受限 HTTP forward、DIRECT/REJECT、classic AEAD Shadowsocks 与原生 TLS Trojan TCP。未支持能力明确拒绝。
@@ -32,38 +32,33 @@ zc --version
 
 ## 开发与验证
 
-本地开发与 CI 对齐的入口统一用 [`just`](https://github.com/casey/just)（`just --list` 查看全部）：
+本地与 CI 统一使用 [`just`](https://github.com/casey/just)。**无前缀开发命令运行 Rust**；Zig 对照命令统一使用 `zig-` 前缀，`just` 列出全部任务。
 
 ```bash
-# Build / test
-just build
-just test
+just build                   # Rust debug binary: target/debug/zc
+just release                 # Rust optimized binary: target/release/zc
+just fmt                     # Format Rust source
+just check                   # Formatting check + Clippy
+just test                    # Rust tests
+just e2e                     # Independent SS/Trojan interoperability
+just validate                # check + test + e2e
 
-# Eval framework (reports under .zig-cache/eval/)
-just eval-selfcheck          # fast CI-safe contract checks
-just eval-selfcheck-full     # also runs correctness + contract
-just eval correctness        # zig build + zig build test
-just eval contract           # migrator + install regression + S1/S2
-just eval interop            # local zig build e2e
-just eval perf               # control-plane record (clean worktree required)
-just eval all                # correctness -> contract -> perf
-just eval all -- --with-interop
-just eval-s1                 # startup scenario (default zig-out/bin/zc)
-just eval-s2                 # rule-matrix scenario
-just eval-help
+just run                     # Example config, port 17890, foreground
+just run path/to/config.yaml 17891
+just -- test --test cli       # Forward arguments to cargo test
 
-# Gates
-just beta-gate
-just validate                # install + migrator + beta-gate
-just install-regression
-just migrator-regression
-
-# Perf / reliability
-just perf-record -- --samples 9
-just e2e
+# Zig reference only (Zig 0.16.0)
+just zig-build
+just zig-test
+just zig-e2e
+just zig-eval-selfcheck
+just zig-eval correctness
+just -- zig-eval all --with-interop
+just zig-migrator-test
+just zig-install-test
 ```
 
-带 `-` 的额外参数用 `--` 隔开，例如：`just eval all -- --run-id my-run`。
+`just run` 拒绝生产端口 `7899`。旧的 `rust-*` 别名和自动停启 daemon 的 `just install` 已移除；安装仍见 [`docs/install/README.md`](docs/install/README.md)，不会因构建 Rust 而替换生产二进制。
 
 ## 与 mihomo 的功能对比
 

@@ -1,0 +1,60 @@
+name: Rust migration
+
+on:
+  push:
+    paths:
+      - 'Justfile'
+      - 'scripts/ci/test-justfile.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**/*.rs'
+      - 'tests/**'
+      - 'testdata/config/rust-tcp.yaml'
+      - 'testdata/e2e/**'
+      - 'scripts/e2e/run-rust-tcp.py'
+      - 'scripts/e2e/fetch-static-fixtures.sh'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'Justfile'
+      - 'scripts/ci/test-justfile.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**/*.rs'
+      - 'tests/**'
+      - 'testdata/config/rust-tcp.yaml'
+      - 'testdata/e2e/**'
+      - 'scripts/e2e/run-rust-tcp.py'
+      - 'scripts/e2e/fetch-static-fixtures.sh'
+      - '.github/workflows/rust.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tcp:
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Setup just
+        uses: extractions/setup-just@v3
+      - name: Validate task runner
+        run: python3 scripts/ci/test-justfile.py
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - name: Format and lint
+        run: just check
+      - name: Test public interfaces
+        run: just test
+      - name: Independent TCP interoperability
+        run: just e2e

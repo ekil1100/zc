@@ -69,13 +69,25 @@ zc start          # only if it was running before the upgrade
 
 ## Local install flow
 
-The shortest local install flow is:
+Rust 迁移期间，`just build` / `just release` 只生成 `target/` 中的 Rust 二进制，
+不安装、不接管已有 daemon；旧的自动停启安装命令 `just install` 已移除。
+Rust 首版尚不能覆盖生产安装，开发请使用 `just run`。
+
+如需安装当前 **Zig 基线**，先用现有安装二进制或 supervisor 停止旧实例，
+确认停止后再显式构建、安装：
 
 ```bash
-just install
+"$HOME/.local/bin/zc" stop
+"$HOME/.local/bin/zc" status --json  # Must report data.state == "stopped".
+zig build -Doptimize=ReleaseFast
+bash scripts/install/local-dev-install.sh
 ```
 
-This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`. `just install` binds lifecycle checks to the exact target `$HOME/.local/bin/zc`: it detects a running daemon with that old binary, verifies the tracked process was launched from that exact target path, stops it before replacement, verifies it stopped, then starts it with the new target binary. Success requires a changed PID and an executable device/inode matching the newly installed target, so `already_running` cannot accept a respawned old inode. If replacement or startup verification fails, an EXIT rollback restores the retained old binary and attempts to restart it. Automatic restart is limited to the default managed prepared invocation; foreground, explicit source, CLI port, and one-shot override invocations must be preserved manually through their supervisor. The lower-level `local-dev-install.sh` only replaces the binary. It rejects symlink targets and any visible process whose executable identity is the exact logical or physical install target, including an untracked process executing an older unlinked inode. It scans both before and after publication and restores the retained target if final verification fails; it must not be used directly while a daemon is running.
+首次安装不需要执行前两条命令。有自定义配置、端口、override 或 supervisor 的实例，
+必须保留原参数，并通过原有方式手动恢复运行；安装脚本不会代为重启。
+`scripts/install/local-dev-install.sh` 只替换 `~/.local/bin/zc`，拒绝 symlink
+目标和仍使用该安装目标的可见进程（包括仍执行旧 inode 的实例）。脚本在发布前后
+都校验进程身份；最终校验失败会恢复旧二进制。不得在 daemon 运行时直接执行。
 
 The underlying maintained install workflow is script-based:
 

@@ -9,10 +9,11 @@ source "$ROOT_DIR/scripts/eval/lib.sh"
 usage() {
   cat <<'EOF'
 Usage:
-  just eval <suite> [-- --run-id <id>]
-  just eval all [-- --with-interop] [-- --run-id <id>]
-  just eval-selfcheck
-  just eval-s1 / just eval-s2
+  just zig-eval <suite>
+  just -- zig-eval all --with-interop --run-id <id>
+  just zig-eval-selfcheck
+  bash scripts/eval/scenarios/s1_startup.sh
+  bash scripts/eval/scenarios/s2_rule_matrix.sh
 
   # equivalent direct entry (prefer just):
   bash scripts/eval/run.sh --help

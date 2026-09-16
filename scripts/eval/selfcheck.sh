@@ -17,8 +17,8 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       cat <<'EOF'
 Usage:
-  just eval-selfcheck
-  just eval-selfcheck-full
+  just zig-eval-selfcheck
+  just -- zig-eval-selfcheck --full
   bash scripts/eval/selfcheck.sh [--full]
 
 Fast checks for eval framework contracts (report schema, orchestrator CLI,

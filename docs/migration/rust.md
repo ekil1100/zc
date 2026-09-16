@@ -24,17 +24,22 @@
 ### 使用与验证
 
 ```bash
-cargo build --locked
-cargo run --locked -- start -c testdata/config/rust-tcp.yaml --port 17890 --foreground
+just build
+just run
 # Use Ctrl-C or SIGTERM to stop the foreground process.
 
-ulimit -n 8192
-cargo test --locked
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-bash scripts/e2e/fetch-static-fixtures.sh .zig-cache/e2e-fixtures
-python3 scripts/e2e/run-rust-tcp.py target/debug/zc .zig-cache/e2e-fixtures
+just test
+just check
+just e2e
+just validate
 ```
+
+`Justfile` 默认面向 Rust：`build` / `release` 构建 debug / release 二进制，
+`fmt` 格式化，`check` 检查格式与 Clippy，`validate` 顺序执行 check、test、e2e。
+`just run` 使用 `testdata/config/rust-tcp.yaml`、端口 `17890` 和前台模式；
+`just run <config> <port>` 可覆盖配置与端口，但拒绝生产端口 `7899`。
+带选项的 Cargo 参数可使用 `just -- test --test cli` 传递。
+Zig 基线使用独立的 `zig-*` 命令；不保留旧 `rust-*` 别名，不提供自动安装命令。
 
 示例配置默认 DIRECT。真实节点可以声明为：
 
@@ -72,7 +77,7 @@ CLI 仅提供 help/version 与 `start`；`-c/--config`、`--port`、`--foregroun
 地址必须显式 `allow-lan: true`，首版没有入站认证，不应直接暴露到不可信网络。
 
 `cargo test` 不下载或依赖外部服务；连接容量测试需要文件描述符上限至少 4096，
-上面的测试命令使用 8192。独立 E2E 脚本复用 SHA-256 校验的固定
+`just test` 与 CI 使用 8192。`just e2e` 复用 SHA-256 校验的固定
 `shadowsocks-rust v1.24.0`、`trojan-go v0.10.6` 服务端，要求本机 IPv4/IPv6。
 通过真实 Rust CLI 验证独立服务端双向 payload、域名/IPv4/IPv6、server-first、
 HTTP forward、错误密码、TLS 信任/SNI 负路径和无 DIRECT 回退；缺少 fixture 或
@@ -130,13 +135,13 @@ Rust 最低工具链声明为 1.91，当前本地验证使用 1.98.1；Zig 基�
 
 ## 验证状态
 
-本地 macOS arm64 已通过 Rust 测试和独立 SS/Trojan CLI 互操作。
-其他平台的 CI、Release 性能、长稳和与 Zig 数据面的吞吐/内存对照尚待完成。
-默认 Just 开发命令、安装与发布仍保持 Zig 基线。
+本地 macOS arm64 已通过 Rust 测试和独立 SS/Trojan CLI 互操作。新增 Rust CI
+覆盖 Linux/macOS × amd64/arm64；远端 CI 尚待运行，不能视为四平台已经验收。
+未验证 Release 性能、长稳或与 Zig 数据面的吞吐/内存等价；默认 Just 开发命令已切换 Rust，安装与发布仍保持 Zig 基线。
 
 ## 后续顺序
 
 1. 收敛本阶段兼容性、错误路径、互操作与吞吐/内存对照。
 2. 迁移托管配置、revision 与持久选择，明确旧数据接管要求。
 3. 迁移 daemon 与 minimal API，再迁移 UDP、simple-obfs 等已支持能力。
-4. 完成四平台发布与回归验收后切换默认开发、安装与发布入口，移除 Zig 生产实现。
+4. 完成四平台发布与回归验收后切换安装与发布入口，移除 Zig 生产实现。
