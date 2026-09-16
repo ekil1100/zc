@@ -7,6 +7,9 @@ zig-out/
 # Runtime generated artifacts
 ruleset/
 
+# Rust build artifacts
+/target/
+
 # Build artifacts
 *.o
 *.exe

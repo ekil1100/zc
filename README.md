@@ -8,6 +8,18 @@
   一个面向 mihomo/clash 配置生态的 CLI-first Zig 代理运行时。
 </p>
 
+## Rust 迁移首版
+
+仓库已加入可运行的 Rust 前台 TCP 版本；**尚不能替换生产 Zig 版**。现有安装器与下方功能表仍描述 Zig `v1.0.1` 基线，Rust 不读取或修改已有托管状态。
+
+```bash
+cargo build --locked
+cargo run --locked -- start -c testdata/config/rust-tcp.yaml --port 17890 --foreground
+```
+
+Rust 首版支持 mixed HTTP CONNECT / SOCKS5 CONNECT、受限 HTTP forward、DIRECT/REJECT、classic AEAD Shadowsocks 与原生 TLS Trojan TCP。未支持能力明确拒绝。
+完整范围、测试入口与后续顺序见 [`docs/migration/rust.md`](docs/migration/rust.md)。
+
 ## 安装
 
 ```bash

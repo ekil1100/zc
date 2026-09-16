@@ -4,6 +4,10 @@ This directory is the public documentation entry for zc.
 
 首次阅读请从根目录 [`README.md`](../README.md) 开始，其中只列出 zc 相对 mihomo 已实现与未实现的能力；安装、CLI、API 与运行细节由本目录中的专题文档分别维护。
 
+## Rust 迁移
+
+当前分支新增 Rust 前台 TCP 首版，构建入口为 Cargo；范围、命令、验证与限制见 [`migration/rust.md`](migration/rust.md)。下述 v1.0 文档仍描述 Zig 发布基线，不能视为 Rust 已实现能力。
+
 ## Current status
 
 v1.0 实现路线图已经完成，`v1.0.1` 是当前正式发布基线。已完成的范围和常规发布验证入口见 [`roadmap/v1.0.md`](roadmap/v1.0.md)；该文件是完成记录，不再作为进行中的任务清单。
