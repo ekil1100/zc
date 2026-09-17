@@ -14,7 +14,12 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use zc::{config::Config, dns::Dns, outbound::Connector, target::Target};
+use zc::{
+    config::{Config, Proxy, ProxyKind},
+    dns::Dns,
+    outbound::Connector,
+    target::Target,
+};
 
 const CASES: &[&str] = &[
     "baseline-untrusted",
@@ -122,6 +127,41 @@ fn acceptor(directory: &Path) -> tokio_rustls::TlsAcceptor {
     tokio_rustls::TlsAcceptor::from(Arc::new(config))
 }
 
+fn selected_proxy(config: &Config) -> &Proxy {
+    let proxy = config
+        .proxies()
+        .iter()
+        .find(|proxy| proxy.name == "native")
+        .expect("native Trojan fixture is missing");
+    assert!(
+        matches!(
+            proxy.kind,
+            ProxyKind::Trojan {
+                skip_cert_verify: false,
+                ..
+            }
+        ),
+        "fixture must exercise verified Trojan, not a built-in proxy"
+    );
+    proxy
+}
+
+#[test]
+fn fixture_selects_named_verified_trojan() {
+    let config = Config::parse(
+        "proxies: [{name: native, type: trojan, server: 127.0.0.1, port: 18443, password: password, sni: front.example}]\nrules: ['MATCH,native']",
+    ).unwrap();
+    let proxy = selected_proxy(&config);
+    assert_eq!(proxy.name, "native");
+    assert!(matches!(
+        proxy.kind,
+        ProxyKind::Trojan {
+            skip_cert_verify: false,
+            ..
+        }
+    ));
+}
+
 async fn exercise(fixture: &Fixture, dns: &Dns, dns_first: bool) {
     if dns_first {
         resolve_localhost(dns).await;
@@ -180,7 +220,7 @@ async fn exercise(fixture: &Fixture, dns: &Dns, dns_first: bool) {
         stream.shutdown().await.unwrap();
     });
     let target = Target::new("127.0.0.1", destination_port).unwrap();
-    let result = connector.connect(&config.proxies()[0], &target).await;
+    let result = connector.connect(selected_proxy(&config), &target).await;
     if reject {
         let error = match result {
             Ok(_) => panic!("native certificate policy unexpectedly accepted the peer"),

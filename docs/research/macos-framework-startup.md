@@ -8,7 +8,9 @@
 
 首次原生调用另由 `tests/macos_native.rs` 和 `scripts/ci/test-macos-native.py` 覆盖。只有显式确认的一次性 macOS CI runner 才能执行：使用独有证书/临时 keychain，验证 native trust 阳性/阴性、错误 SNI、User deny、Admin trust 阳性与 User deny 优先级，以及 TLS/DNS 首次并发。每例独立进程、父进程 watchdog，退出恢复搜索列表、移除自己创建的信任项；本机只验证拒绝门禁与编译，不操作真实用户 trust。没有覆盖 System-domain 冲突或 TrustAsRoot 的完整矩阵，不能据此宣称所有信任语义已穷举。
 
-CI/Release 显式选择可用的 Xcode 26.3，实际是否支持以链接和产物检查为准，失败不自动换工具链。macOS 15 arm64、15 Intel 和更新系统的原生执行、正式性能及长稳尚须新候选的实际结果；最新状态见[完成标准](../migration/completion.md)。
+CI/Release 显式选择可用的 Xcode 26.3，实际是否支持以链接和产物检查为准，失败不自动换工具链。[首轮 CI 35231178121](https://github.com/ekil1100/zc/actions/runs/35231178121) 的 macOS 15/较新 arm64 已通过产物、冷启动与 core/TCP E2E；native 场景随后失败。原因是新 fixture 用 `config.proxies()[0]` 错选内建 DIRECT，而非命名 Trojan，不是证书被错误放行的证据。已先用不读系统信任的配置测试复现 `DIRECT != native`，再改为按名称选择并断言 verified Trojan；原 TLS 拒绝断言没有放宽，真实 native 场景仍须重新运行。
+
+完整原生门禁、正式性能及长稳尚须新候选的实际结果；最新状态见[完成标准](../migration/completion.md)。
 
 ## 原研究结论
 
