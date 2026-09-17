@@ -20,7 +20,8 @@
 - [x] SS/Trojan UDP 与 simple-obfs HTTP。
 - [x] daemon、minimal API、完整 CLI 与诊断。
 - [x] 独立旧版 E2E、状态样本互读、进程/资源负路径本机回归。
-- [x] Linux/macOS × x64/arm64 原生 CI、生产产物构建及产物 E2E/隔离安装回归。
+- [x] 候选 `10d2bab` 的 Linux/macOS × x64/arm64 原生 CI、生产产物与产物回归。
+- [ ] 新 macOS 15 延迟初始化候选的完整原生信任/首次使用门禁。
 - [ ] 性能与长稳验收、正式发布及本机安装切换。
 - [ ] 删除已替代的 Zig 生产路径并同步全部有效文档。
 
@@ -28,7 +29,9 @@
 
 用户已批准最低 macOS 提高到 15。构建配置、最终产物校验、ad-hoc 签名和冷启动检查已接入；本机 Debug/Release arm64 通过，旧产物在新契约下明确失败。原生 trust/首次 DNS/并发验证只在显式授权的一次性 CI runner 执行，不以本机假 HOME 冒充系统信任隔离。
 
-**新构建配置仍待自己的远端验收，不能复用下节 `10d2bab` 的成功作为放行证据。** 见[实施与边界](../research/macos-framework-startup.md#后续实施状态)。
+[CI 35234530286 / `23eb9a1`](https://github.com/ekil1100/zc/actions/runs/35234530286)：Linux x64/arm64 全部通过；macOS 15 arm64、15 Intel 和较新 arm64 均通过产物最小版本/强延迟标记、签名、冷启动及产物 E2E，真实 native baseline-untrusted 也通过。但随后 User trust 写入/清理失败，**完整原生门禁尚未通过**。runner 已补充原错误保留与预算内只读采样，待新 CI 定位，不能把失败当作跳过。
+
+见[实施与边界](../research/macos-framework-startup.md#后续实施状态)和[原生门禁](../reliability/macos-native.md)。不能复用下节 `10d2bab` 的成功作为新构建放行证据。
 
 ## 已通过候选的远端证据
 
@@ -65,8 +68,8 @@
 
 ## 仍阻塞完整验收
 
-1. **性能尚未放行**：`10d2bab` clean-commit 冻结 Release 对照中，100 条规则 `config dump` 为 Rust 4.455 ms / Zig 2.964 ms，慢 **50.3%（1.491 ms）**。万规则改善和 loopback 中位数接近不能抵消该退化；来源绑定不等于正式性能 PASS。原始样本和方法见 [performance](performance.md)。最低 macOS 15 已获批准，延迟 framework 已接入候选构建，但必须用新冻结候选重新测量，不能用历史探针收益宣布门禁通过。
-2. **可靠性证据未齐**：四平台上述原生 CI 已通过；24/72h 长稳、完整 RSS/尾延迟门禁及旧 OS 版本矩阵尚未证明。资源/DNS/TLS 等已知差异仍按迁移文档显式保留。
+1. **性能尚未放行**：新 `bdefd33` clean-commit 冻结 Release 的 100 条规则 dump 为 Rust 3.469 ms / Zig 2.952 ms，仍慢 **17.5%（0.517 ms）**。另一次固定旧/新 Rust 和相同 Zig 的同批对照显示本次构建调整使 dump 下降 32.6%，但新 Rust 仍比 Zig 慢 16.1%。不同批次/采样口径不混算，不降低阈值；完整样本、hash 与限制见 [performance](performance.md)。
+2. **原生与可靠性证据未齐**：旧候选四平台通过不替代当前 macOS TrustSettings 门禁；目前卡在原生 fixture 的系统信任写入/清理，尚须直接运行证据。24/72h 长稳、完整 RSS/尾延迟与受支持 OS 矩阵也未全部证明。
 3. **发布尚未切换**：原 Zig 对照源码保留；未覆盖本机安装、未迁移真实 HOME。上述本地验收来自当时的未提交工作区；后续提交和候选分支推送不代表发布、生产安装或性能放行。许可自动检查不替代最终发行审核。
 
 只有有直接测试证据的项才能勾选。迁移完成前不覆盖本机已安装二进制，不触碰生产端口 7899，所有状态测试使用临时 HOME/XDG 目录。

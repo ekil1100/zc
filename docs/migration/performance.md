@@ -1,6 +1,43 @@
 # Rust 迁移：性能与可靠性工具验收
 
-## 最新候选：`10d2bab` clean-commit 冻结复测
+## 最新构建候选：`bdefd33` macOS 15 + 延迟 framework
+
+**启动已有改善，性能门禁仍不放行。** 用户已批准最低 macOS 15；本轮使用该提交的干净源码快照，按已提交的默认 Release 构建，不添加临时链接开关。完整 snapshot manifest 包含 `.cargo/config.toml`；源码、输入快照及二进制前后 hash 不变。
+
+```bash
+python3 scripts/perf/compare-runtimes.py --build \
+  --samples 7 --iterations 100 \
+  --output target/perf/rust-macos15-bdefd33-clean.json
+```
+
+| 公共接口 | Rust 中位数 | Zig 中位数 | Rust / Zig |
+| --- | ---: | ---: | ---: |
+| config dump，100 条规则 | 3.469 ms | 2.952 ms | **1.175** |
+| config dump，10000 条规则 | 25.904 ms | 49.725 ms | 0.521 |
+| 新 CONNECT + 4 KiB echo，100 条规则 | 209.68 μs | 226.41 μs | 0.926 |
+| 新 CONNECT + 4 KiB echo，10000 条规则 | 228.47 μs | 234.81 μs | 0.973 |
+| 常驻隧道 64 KiB echo，100 条规则 | 78.17 μs | 77.55 μs | 1.008 |
+| 常驻隧道 64 KiB echo，10000 条规则 | 77.82 μs | 78.49 μs | 0.991 |
+
+小配置仍慢 **17.5% / 0.517 ms**；组均值 nearest-rank p95 为 Rust **4.809 ms** / Zig **4.658 ms**。七组样本全部保留，仍为 `exploratory-runtime-comparison` / `formal_baseline: false`，不代表正式性能、RSS/逐请求尾延迟、其他平台或长稳通过。
+
+- snapshot manifest SHA-256：`bdc832db6c7c386a92b3d0b09cb4d8cd8a76927039790358be28eefbff990324`。
+- Rust SHA-256：`9c7f3d26e3b357d4f44e251e187976f8bb0dbf0ea5b5af3544c9d25574259c5a`。
+- Zig SHA-256：`d6639c053697b37ae755b2ba1ebd5823423bc75751a882833ae72b0bf0fa3338`。
+- 首次构建曾因沿用 minOS 27 的 `mlua-sys`/`blake3` C 缓存而被 `-fatal_warnings` 拒绝。清理共享 release 缓存后重新从 clean commit 构建；没有关闭警告或修改最低版本。
+
+### 同批次三方核验
+
+为避免将历史批次差异误认为优化收益，另固定旧 `10d2bab` Rust/Zig 及新 `bdefd33` Rust 三个二进制，同时测量 `--version` 与完整 JSON dump；启动/结束 hash 一致。每项每端先预热三次，七组各二十个真实子进程，轮换并反转执行顺序、不筛掉慢样本；完整输出须相等，HOME/XDG 全隔离。
+
+| 操作 | 原 Rust | 新 Rust | 同一 Zig | 新 Rust / 原 Rust | 新 Rust / Zig |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| --version | 4.174 ms | 2.731 ms | 2.154 ms | 0.654 | 1.268 |
+| config dump，100 条规则 | 4.766 ms | 3.214 ms | 2.767 ms | **0.674** | **1.161** |
+
+本次构建调整的小配置同批下降 **32.6%**，但相对 Zig 仍慢 **16.1% / 0.446 ms**，与上面的阻塞结论一致。两种采样口径不得混算；三方探针只隔离整体构建调整，不单独归因于某个 linker 开关。脚本与全量样本：`target/perf/macos15-three-way.py`、`target/perf/macos15-three-way.json`（记录脚本、输入报告与三个二进制 hash）。
+
+## 历史候选：`10d2bab` clean-commit 冻结复测
 
 **性能门禁仍未放行。** 在提交 `10d2babb62b9406cbcd8cd76514d4dd1c32fef78` 的干净工作区，用默认 Release 参数从独立源快照构建 Rust 与 Zig；构建/运行期间源码和二进制 hash 均未变化。工具仍明确标记 `exploratory-runtime-comparison` / `formal_baseline: false`：clean commit 解决了来源绑定，不等于完成正式阈值、RSS、逐请求尾延迟或四平台性能验收。
 
@@ -27,7 +64,7 @@ macOS arm64，同机同配置、交替顺序、全部七组原始样本保留；
 - Rust binary SHA-256：`447e0a0b62367fd554d4e3b484c5074c9bcdf37bdc8232497ee0328f87b61ce0`。
 - Zig binary SHA-256：`af42dd8624313699a50deec01ffa4935a78966912faa7f4e283820505711093d`。
 - 原始报告含构建命令/日志、逐文件 hash、全部样本与前后 provenance；路径为 `target/perf/rust-clean-10d2bab.json`。
-- 本次没有采用 `-delay_framework`，没有提高最低 macOS 版本。[延迟 framework 研究](../research/macos-framework-startup.md) 的部署兼容性决策仍待批准，不能用探针收益宣布当前候选通过。
+- 该历史候选没有采用 `-delay_framework`，当时没有提高最低 macOS 版本。后续批准与落地见本页最新候选及[延迟 framework 研究](../research/macos-framework-startup.md)；不能用旧探针收益宣布性能通过。
 - 24/72h 长稳及完整 RSS/尾延迟仍未验收；下列短测绑定历史候选，不能冒充本提交的长稳证明。
 
 ## 历史候选：本机交付门禁后的复测
