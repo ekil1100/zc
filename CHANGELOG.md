@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **破坏性变更（Rust 候选）**：最低 macOS 提升到 15（Sequoia），不再支持 11–14。通过 Apple linker 延迟 Security/SystemConfiguration/CoreFoundation 初始化，保留原生证书信任与 DNS API；构建/发布检查部署版本、强延迟标记、签名及冷启动，Homebrew 声明最低系统版本。性能和长稳仍须独立验收。
+
 ### Added
 - `zc status` 与 `zc status --json` 显示运行中 daemon 的有效 mixed port。
 - 实现 Trojan UDP ASSOCIATE：`udp:true` 节点可经 mixed SOCKS5 转发 IPv4、domain 和 IPv6 datagram；使用严格有界的 TLS stream frame codec，并通过固定 `trojan-go v0.10.6` 真实 E2E。

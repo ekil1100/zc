@@ -40,6 +40,15 @@ expect_text "$CI_WORKFLOW" "cargo build --locked --release --target"
 expect_text "$CI_WORKFLOW" "musl-tools"
 expect_text "$CI_WORKFLOW" 'bash scripts/e2e/run-core.sh "$PWD/$BINARY"'
 expect_text "$CI_WORKFLOW" 'python3 scripts/e2e/run-rust-tcp.py "$BINARY"'
+expect_text "$CI_WORKFLOW" 'os: macos-15'
+expect_text "$CI_WORKFLOW" 'python3 scripts/ci/test-macos-native.py --ephemeral-runner --target'
+for workflow in "$CI_WORKFLOW" "$RELEASE_WORKFLOW"; do
+  expect_text "$workflow" '/Applications/Xcode_26.3.app/Contents/Developer'
+  expect_text "$workflow" 'python3 scripts/ci/verify-macos-artifact.py "$BINARY"'
+  expect_text "$workflow" 'codesign --verify --strict "$BINARY"'
+done
+expect_text "$RELEASE_WORKFLOW" 'depends_on macos: :sequoia'
+expect_text "$JUSTFILE" 'python3 scripts/ci/test-macos-artifact.py'
 expect_text "$RELEASE_WORKFLOW" '-f branch=main'
 expect_text "$RELEASE_WORKFLOW" 'Cargo.toml)'
 reject_text "$RELEASE_WORKFLOW" 'build.zig.zon'

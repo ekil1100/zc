@@ -22,6 +22,8 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -32,6 +34,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Select macOS linker
+        if: runner.os == 'macOS'
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: |
+          test -d "$DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun ld -v
+          xcrun --show-sdk-version
       - name: Setup just
         uses: extractions/setup-just@v3
       - name: Setup independent crypto oracle
@@ -69,11 +81,18 @@ jobs:
           file "$BINARY"
           if [[ '${{ runner.os }}' == Linux ]]; then
             file "$BINARY" | grep -Eq 'statically linked|static-pie linked'
+          else
+            python3 scripts/ci/verify-macos-artifact.py "$BINARY"
+            codesign --verify --strict "$BINARY"
+            python3 scripts/ci/test-macos-launch.py "$BINARY"
           fi
           "$BINARY" --version
           bash scripts/e2e/run-core.sh "$PWD/$BINARY" "$PWD/target/debug/examples/e2e_origin" "$PWD/target/debug/examples/e2e_obfs_oracle" "$PWD/target/debug/examples/e2e_ss_udp_oracle" "$PWD/target/e2e-fixtures" "$PWD/testdata/e2e"
           TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)" python3 scripts/e2e/run-rust-tcp.py "$BINARY" target/e2e-fixtures
           bash scripts/install/test-oneline-installer.sh "$PWD/$BINARY" "$PWD/target/debug/examples/e2e_origin"
+      - name: Verify native macOS first use in disposable runner
+        if: runner.os == 'macOS'
+        run: python3 scripts/ci/test-macos-native.py --ephemeral-runner --target ${{ matrix.target }}
       - name: Verify default runtime port in isolated CI
         if: runner.os == 'Linux'
         run: bash scripts/ci/test-default-runtime-port.sh target/${{ matrix.target }}/release/zc

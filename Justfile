@@ -45,6 +45,7 @@ helper-test: e2e-helpers
 # Run task-runner and release workflow contracts without installation.
 delivery-test:
     python3 scripts/ci/test-justfile.py
+    python3 scripts/ci/test-macos-artifact.py
     bash scripts/ci/test-release-workflow.sh
 
 # Run the unchanged core harness plus independent TCP interoperability.

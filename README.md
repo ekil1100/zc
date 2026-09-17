@@ -23,7 +23,7 @@ just run                     # Foreground, example config, port 17890
 
 ## 开发与验证
 
-Rust 最低 `1.91`，CI 固定 `1.98.1`；原生依赖需要 C/C++ 工具链与 CMake，E2E 需要 Python 3、Node.js 和 [`just`](https://github.com/casey/just)。生产目标为 Linux/macOS × x64/arm64，不支持 Windows。
+Rust 最低 `1.91`，CI 固定 `1.98.1`；原生依赖需要 C/C++ 工具链与 CMake，E2E 需要 Python 3、Node.js 和 [`just`](https://github.com/casey/just)。生产目标为 Linux/macOS × x64/arm64，不支持 Windows。Rust 候选的最低 macOS 版本为 **15（Sequoia）**，不再支持 11–14；构建工具链与验收限制见[安装指南](docs/install/README.md#从源码构建)。
 
 ```bash
 just build

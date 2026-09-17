@@ -91,6 +91,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Select macOS linker
+        if: runner.os == 'macOS'
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: |
+          test -d "$DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun ld -v
+          xcrun --show-sdk-version
+
       - name: Install Rust toolchain
         run: rustup toolchain install 1.98.1 --profile minimal --target ${{ matrix.rust_target }}
 
@@ -116,6 +127,10 @@ jobs:
           file "$BINARY"
           if [[ "${{ matrix.target_os }}" == "linux" ]]; then
             file "$BINARY" | grep -Eq 'statically linked|static-pie linked'
+          else
+            python3 scripts/ci/verify-macos-artifact.py "$BINARY"
+            codesign --verify --strict "$BINARY"
+            python3 scripts/ci/test-macos-launch.py "$BINARY"
           fi
 
       - name: Verify binary version
@@ -310,6 +325,7 @@ jobs:
             end
 
             on_macos do
+              depends_on macos: :sequoia
               on_arm do
                 url "https://github.com/ekil1100/zc/releases/download/${VERSION}/zc-${VERSION}-macos-arm64.tar.gz"
                 sha256 "${MACOS_ARM64_SHA}"

@@ -8,6 +8,14 @@
 
 ## 从源码构建
 
+**Rust 候选的最低 macOS 版本为 15（Sequoia），不再支持 macOS 11–14。** 用户已明确批准这个兼容性变更；它不表示性能和迁移验收已经放行。旧版 Zig Release 的历史支持范围不由本次修改追溯改变。
+
+仓库 `.cargo/config.toml` 将 `MACOSX_DEPLOYMENT_TARGET` 默认设为 `15.0`；macOS 构建拒绝其他显式值。`build.rs` 仅为 macOS target 启用 Apple linker 的 `-delay_framework`（Security、SystemConfiguration、CoreFoundation）、`-fatal_warnings` 和 ad-hoc 签名，作用于 binary/tests/examples。仍使用同一组强系统依赖及原 TLS/DNS API，不做 weak-link、旧 OS 回退或运行时替换。
+
+需要支持上述功能的 Apple linker；本机 Xcode 27 已实测，CI/Release 固定选择镜像中存在的 `/Applications/Xcode_26.3.app/Contents/Developer` 并以实际链接/产物检查决定是否通过，不把版本号本身当能力证明。未知选项、忽略延迟或部署版本冲突必须失败。不要使用 LLD 替换，也不要忽略警告或修改 Mach-O header 冒充兼容。
+
+如果已有原生依赖缓存按宿主 SDK 27 构建，新增检查会拒绝把它们链接进 min15 产物。应使用新 `CARGO_TARGET_DIR`；本轮也验证了仅清理受影响的生成缓存 `cargo clean --locked -p mlua-sys -p blake3` 后重新构建。不要删除用户状态或降低链接检查。
+
 ```bash
 just build                         # target/debug/zc
 just release                       # cargo build --locked --release
@@ -28,7 +36,7 @@ CI 固定 Rust `1.98.1`，需要 rustfmt、Clippy、C/C++ 编译工具、CMake�
 | macOS x64 | `x86_64-apple-darwin` | `macos-amd64` |
 | macOS arm64 | `aarch64-apple-darwin` | `macos-arm64` |
 
-每个目标使用 `cargo build --locked --release --target <target> --bin zc`。Linux 产物必须通过静态 ELF 检查，macOS 产物应只链接系统库。矩阵是待运行的交付要求，不是四平台已验证的声明。
+每个目标使用 `cargo build --locked --release --target <target> --bin zc`。Linux 产物必须通过静态 ELF 检查。macOS 产物必须通过 `scripts/ci/verify-macos-artifact.py` 的 min15/强延迟/原生 imports/helpers 检查、`codesign --verify --strict` 和 `scripts/ci/test-macos-launch.py` 的短命令冷启动检查。ad-hoc 签名不是 Apple 公证。CI 增加 macOS 15 arm64，与 15 Intel、较新 arm64 系统一起验证；最新已通过的具体提交及尚未完成门禁见[迁移验收](../migration/completion.md)。
 
 ## 已发布版本的独立安装器
 
@@ -52,6 +60,8 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/ekil1100/zc/main/install.sh \
   | ZC_VERSION=v1.0.1 ZC_INSTALL_DIR="$HOME/bin" sh
 ```
+
+新的 macOS Rust 归档要求系统 15+；生成的 Homebrew formula 声明 `macos: :sequoia`。独立安装器仍先对下载产物执行版本自检，不兼容产物不能替换原程序。
 
 归档和校验格式保持不变：`zc-v<version>-<os>-<arch>.tar.gz`、同名 `.tar.gz.sha256`，归档内同名目录包含 `zc`、README、LICENSE 和 THIRD_PARTY_NOTICES。Homebrew 消费同样的四种归档。
 

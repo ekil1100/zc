@@ -1,6 +1,16 @@
 # macOS Framework 延迟初始化可行性
 
-## 结论
+## 后续实施状态
+
+用户已明确批准最低 macOS 提高到 **15**。候选构建现通过 `.cargo/config.toml` + `build.rs` 设置真实部署目标并启用强依赖延迟初始化，未改 TLS/DNS 绑定、未改 Mach-O header、未覆盖本机安装。Debug 与完整 Cargo Release 的本机 arm64 产物已通过 header/import/helper、严格签名和短命令冷启动检查。下面保留的是此前研究批次的证据与限制，不能将其未执行项追认为已完成。
+
+新增公开交付契约：`scripts/ci/verify-macos-artifact.py` 拒绝旧 min11、min15 eager、弱化依赖及不完整 imports/helpers；`test-macos-artifact.py` 验证拒绝路径；`test-macos-launch.py` 从新进程的真实 dyld trace 验证 version/help/dump 没有提前初始化三组框架，缺 trace 不能通过。本机旧实际产物 RED、新 Debug/Release GREEN，短命令各只有 7 条 initializer。
+
+首次原生调用另由 `tests/macos_native.rs` 和 `scripts/ci/test-macos-native.py` 覆盖。只有显式确认的一次性 macOS CI runner 才能执行：使用独有证书/临时 keychain，验证 native trust 阳性/阴性、错误 SNI、User deny、Admin trust 阳性与 User deny 优先级，以及 TLS/DNS 首次并发。每例独立进程、父进程 watchdog，退出恢复搜索列表、移除自己创建的信任项；本机只验证拒绝门禁与编译，不操作真实用户 trust。没有覆盖 System-domain 冲突或 TrustAsRoot 的完整矩阵，不能据此宣称所有信任语义已穷举。
+
+CI/Release 显式选择可用的 Xcode 26.3，实际是否支持以链接和产物检查为准，失败不自动换工具链。macOS 15 arm64、15 Intel 和更新系统的原生执行、正式性能及长稳尚须新候选的实际结果；最新状态见[完成标准](../migration/completion.md)。
+
+## 原研究结论
 
 **可行，但有部署条件：使用支持 `-delay_framework` 的 Apple linker，最低部署版本设为 macOS 15.0，现有 Rust 单二进制可延迟 Security / SystemConfiguration / CoreFoundation 的初始化，无须新增依赖、unsafe、FFI shim 或改写 TLS/DNS 实现。** 本机 macOS 27 arm64 的安全 Rust API 探针及真实 `main.rs + libzc.rlib` 重链接均成功；x86_64 完成独立重链接和代码检查，未执行。[1][2][3]
 
