@@ -19,7 +19,11 @@
 
 [CI 35234530286](https://github.com/ekil1100/zc/actions/runs/35234530286) 的 Linux 两架构通过；macOS 的原生信任门禁失败。macOS 15 arm64 日志已确认 baseline-untrusted 通过，随后 User trust 写入阶段约 30 秒后出现清理 item-not-found。旧 harness 只打印最终 cleanup 错误，遮住了 primary，**这些日志还不能证明一定在等待 GUI**。
 
-当前 runner 保留 primary 和全部 cleanup 错误，按阶段打印 BEGIN/END/FAIL 与 owned PID，不打印密码参数。只有 trust setter 到原 30 秒预算的一半仍未完成时，才对仍持有的子进程做一次 1 秒只读栈采样；采样最多占用剩余预算中的 3 秒，随后仅等待原 deadline 的剩余时间。采样失败不替代原错误，栈输出上限 16 KiB；不放宽 timeout，不重试操作。
+当前 runner 保留 primary 和全部 cleanup 错误，按阶段打印 BEGIN/END/FAIL 与 owned PID，不打印密码参数。只有 trust setter 到原 30 秒预算的一半仍未完成时，才对仍持有的命令进程做一次 1 秒只读栈采样（Admin 时持有的是 sudo wrapper）；采样最多占用剩余预算中的 3 秒，随后仅等待原 deadline 的剩余时间。采样失败不替代原错误，栈输出上限 16 KiB；不放宽 timeout，不重试操作。
+
+[诊断 CI 35240315075 / `5ab079b`](https://github.com/ekil1100/zc/actions/runs/35240315075) 已取得直接栈证据：两个 arm64 系统的独立 `/usr/bin/security` 命令停在 `SecTrustSettingsSetTrustSettings → TrustSettings::flushToDisk → SecTrustSettingsXPCWrite → securityd_send_sync_and_do → xpc_connection_send_message_with_reply_sync → mach_msg2_trap`。原错误完整保留为 User `add-trusted-cert` 的 30 秒 watchdog；清理 item-not-found 仍明确失败，search list 恢复与 owned keychain 删除则成功。**已定位到系统信任写入的同步 IPC，尚未确定服务端是授权、锁还是其他等待；没有据此声称 GUI 根因或延迟加载回归。** 还需要服务端证据，不能直接改 authdb、重试或增大超时。
+
+同轮 Linux 两架构及 24 项 runner 合约测试通过。Intel 在更早的 core E2E、进入 shadowsocks-rust UDP 三 cipher 对照阶段后出现 `deadline has elapsed`，未到达 native 阶段；前一轮 Intel 通过不覆盖这次失败，尚未定位，也未为此调整生产行为或测试预算。全部结果/日志位于 `target/ci/35240315075/`。
 
 不能凭旧经验用 `authorizationdb ... allow` 绕过：Apple [authd `_find_rule`](https://github.com/apple-oss-distributions/Security/blob/db15acbe6a7f257a859ad9a3bb86097bfe0679d9/OSX/authd/engine.m#L1235-L1246) 在数据库查询前为 User/Admin TrustSettings 选择硬编码规则；[规则实现](https://github.com/apple-oss-distributions/Security/blob/db15acbe6a7f257a859ad9a3bb86097bfe0679d9/OSX/authd/rule.c#L183-L275) 保留 session-owner/admin 授权。数据库读写成功不证明有效授权改变。源码调查不是运行中系统的 trace，仍需原生采样定位。只读证据详见 `target/ci/35234530286/user-trust-authorization.md`。
 

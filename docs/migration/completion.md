@@ -29,7 +29,9 @@
 
 用户已批准最低 macOS 提高到 15。构建配置、最终产物校验、ad-hoc 签名和冷启动检查已接入；本机 Debug/Release arm64 通过，旧产物在新契约下明确失败。原生 trust/首次 DNS/并发验证只在显式授权的一次性 CI runner 执行，不以本机假 HOME 冒充系统信任隔离。
 
-[CI 35234530286 / `23eb9a1`](https://github.com/ekil1100/zc/actions/runs/35234530286)：Linux x64/arm64 全部通过；macOS 15 arm64、15 Intel 和较新 arm64 均通过产物最小版本/强延迟标记、签名、冷启动及产物 E2E，真实 native baseline-untrusted 也通过。但随后 User trust 写入/清理失败，**完整原生门禁尚未通过**。runner 已补充原错误保留与预算内只读采样，待新 CI 定位，不能把失败当作跳过。
+[CI 35234530286 / `23eb9a1`](https://github.com/ekil1100/zc/actions/runs/35234530286)：Linux x64/arm64 全部通过；macOS 15 arm64、15 Intel 和较新 arm64 均通过产物最小版本/强延迟标记、签名、冷启动及产物 E2E，真实 native baseline-untrusted 也通过。但随后 User trust 写入/清理失败，**完整原生门禁尚未通过**。
+
+[诊断 CI 35240315075 / `5ab079b`](https://github.com/ekil1100/zc/actions/runs/35240315075) 的 Linux 两架构继续通过；两个 arm64 系统的直接栈确认 `/usr/bin/security` 卡在 TrustSettings 写入的同步 XPC，原 30 秒超时和清理失败均保留。尚无服务端证据证明 GUI/授权或锁根因。Intel 本轮另在 shadowsocks-rust UDP core E2E 阶段超时，尚未定位，不能用历史 PASS 覆盖。没有修改授权策略、增加重试/超时或跳过测试。
 
 见[实施与边界](../research/macos-framework-startup.md#后续实施状态)和[原生门禁](../reliability/macos-native.md)。不能复用下节 `10d2bab` 的成功作为新构建放行证据。
 
@@ -69,7 +71,7 @@
 ## 仍阻塞完整验收
 
 1. **性能尚未放行**：新 `bdefd33` clean-commit 冻结 Release 的 100 条规则 dump 为 Rust 3.469 ms / Zig 2.952 ms，仍慢 **17.5%（0.517 ms）**。另一次固定旧/新 Rust 和相同 Zig 的同批对照显示本次构建调整使 dump 下降 32.6%，但新 Rust 仍比 Zig 慢 16.1%。不同批次/采样口径不混算，不降低阈值；完整样本、hash 与限制见 [performance](performance.md)。
-2. **原生与可靠性证据未齐**：旧候选四平台通过不替代当前 macOS TrustSettings 门禁；目前卡在原生 fixture 的系统信任写入/清理，尚须直接运行证据。24/72h 长稳、完整 RSS/尾延迟与受支持 OS 矩阵也未全部证明。
+2. **原生与可靠性证据未齐**：旧候选四平台通过不替代当前 macOS TrustSettings 门禁；系统信任写入已定位为同步 IPC 等待，但服务端根因和真实信任正/负矩阵尚未完成；最新 Intel UDP E2E 超时也待定位。24/72h 长稳、完整 RSS/尾延迟与受支持 OS 矩阵未全部证明。
 3. **发布尚未切换**：原 Zig 对照源码保留；未覆盖本机安装、未迁移真实 HOME。上述本地验收来自当时的未提交工作区；后续提交和候选分支推送不代表发布、生产安装或性能放行。许可自动检查不替代最终发行审核。
 
 只有有直接测试证据的项才能勾选。迁移完成前不覆盖本机已安装二进制，不触碰生产端口 7899，所有状态测试使用临时 HOME/XDG 目录。
