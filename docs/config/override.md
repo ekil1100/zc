@@ -74,7 +74,7 @@ rules:
 
 Managed materialization 只使用捕获的本地 assets。被 RULE-SET 引用的 HTTP provider 在离线发布/激活 gate 拒绝；未引用声明可 deferred。持久 override 加入远程 RULE-SET 并不使 managed revision 自动获得网络权限。
 
-Unmanaged 来源经 `capture_for_runtime` 后，在准备阶段真实下载 HTTP provider 并冻结结果。当前 Rust 不提供原 Zig 的 cache/interval best-effort refresh、`zc test` 缓存特例或 curl fallback；网络失败直接拒绝，旧运行实例在 reload preparation 失败时继续服务。此差异尚待对齐，详见 [迁移说明](../migration/rust.md)。
+Unmanaged 来源在准备阶段同步、校验并冻结 HTTP provider bytes；已支持 root-contained cache、interval 刷新、普通网络失败时的已验证缓存回退，以及独立 `zc test` 的 missing-only 策略。畸形、超限或发布错误不得回退；不使用 curl fallback。reload preparation 失败时旧运行实例继续服务。完整策略与安全边界见 [兼容说明](../compat/mihomo-clash.md#rule-provider-与离线托管)。
 
 ## Dump 与错误
 
@@ -83,5 +83,7 @@ Unmanaged 来源经 `capture_for_runtime` 后，在准备阶段真实下载 HTTP
 唯一敏感例外：`config dump -c <name> --no-override` 的 malformed recovery-only **文本**输出保留经验证的 raw source，可能包含凭据；终端不安全字符拒绝，重定向保留字节。不要将其发到公开日志。
 
 常见错误：`OVERRIDE_SCRIPT_NOT_FOUND`、`OVERRIDE_SCRIPT_EXEC_FAILED`、`OVERRIDE_SCRIPT_TIMEOUT`、`OVERRIDE_OUTPUT_INVALID`、`OVERRIDE_MERGE_FAILED`、`OVERRIDE_OPTION_DEPRECATED`、`CONFIG_OVERRIDE_APPLY_FAILED`、`CONFIG_DUMP_FAILED`。完整词汇见 [错误码](../api/error-codes.md)。
+
+非 `NotFound` 的 spawn 错误保留操作系统原因，便于区分权限、可执行文件忙与资源问题；不附带脚本内容或脚本 stderr，错误码仍为 `OVERRIDE_SCRIPT_EXEC_FAILED`。
 
 示例 [override-loyalsoldier-rules.lua](examples/override-loyalsoldier-rules.lua) 引用远程 provider，适用于 unmanaged 网络准备；不能据此宣称 managed offline 支持 HTTP RULE-SET。

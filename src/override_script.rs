@@ -980,7 +980,8 @@ async fn run_child(
         if error.kind() == std::io::ErrorKind::NotFound {
             anyhow!("OVERRIDE_SCRIPT_NOT_FOUND: selected script interpreter not found")
         } else {
-            anyhow!("OVERRIDE_SCRIPT_EXEC_FAILED: cannot spawn selected script")
+            anyhow::Error::new(error)
+                .context("OVERRIDE_SCRIPT_EXEC_FAILED: cannot spawn selected script")
         }
     })?;
     let mut running = RunningChild {

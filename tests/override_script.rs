@@ -191,6 +191,61 @@ async fn executable_script_receives_contract_and_freezes_captured_bytes() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn executable_spawn_failure_keeps_os_cause_without_script_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    use zc::override_script::{Invocation, Script, execute_bytes};
+    let temp = tempfile::tempdir().unwrap();
+    let interpreter = temp.path().canonicalize().unwrap().join("interpreter");
+    std::fs::write(&interpreter, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let secret = "SENSITIVE_SCRIPT_BODY_MUST_NOT_APPEAR";
+    let error = execute_bytes(
+        &Script {
+            name: "denied-interpreter.sh".into(),
+            bytes: format!("#!{}\n{secret}\n", interpreter.display()).into_bytes(),
+        },
+        &Invocation::default(),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.starts_with("OVERRIDE_SCRIPT_EXEC_FAILED:"), "{text}");
+    assert!(!text.contains(secret), "script contents leaked");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .unwrap_or_else(|| panic!("OS spawn cause missing: {text}"))
+            .raw_os_error(),
+        Some(rustix::io::Errno::ACCESS.raw_os_error())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_executable_captures_preserve_bytes_and_results() {
+    use zc::override_script::{Invocation, Script, execute_bytes};
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        tasks.spawn(async {
+            let script = Script {
+                name: "concurrent.sh".into(),
+                bytes: b"#!/bin/sh\nprintf 'mode: global\\n'\n".to_vec(),
+            };
+            let invocation = Invocation::default();
+            for _ in 0..64 {
+                let result = execute_bytes(&script, &invocation).await.unwrap();
+                assert_eq!(result.patch_bytes, b"mode: global\n");
+                assert_eq!(result.script.bytes, script.bytes);
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn executable_timeout_and_both_output_limits_are_bounded() {
     use zc::override_script::{Invocation, Script, execute_bytes};
     for (script, expected) in [
