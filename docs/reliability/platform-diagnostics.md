@@ -16,6 +16,8 @@
 
 [诊断 CI 35247844404 / `d22abd6`](https://github.com/ekil1100/zc/actions/runs/35247844404) 已确认：无 Rust 的 User setter 仍在相同 XPC 路径超时，独立 keychain-only 对照通过。stream 首个事件比 setter 启动晚约 0.2 秒；仅捕获 authd 的 `builtin:authenticate`，缺少关联 right/请求来源，**还不能把它直接认定为本次 GUI 根因**。新增持久日志查询用于补足这一证据缺口，不是修复或授权绕过。
 
+[后续诊断 35248899957 / `d501556`](https://github.com/ekil1100/zc/actions/runs/35248899957) 已关联同一 token 60、setter PID 2007 与 `com.apple.trust-settings.user`：客户端 engine 67 的 `0x13` 含 PreAuthorize；服务端 trustd engine 68 的 `0x3` 实际执行 `hardcoded-authenticate-session-owner`，并启动 SecurityAgent/`builtin:authenticate`。因此可排除“Rust 是夹具失败的必要原因”，并确认存在尚需满足的系统身份认证要求。**预授权成功不是最终认证完成**；日志前缀被 UI 启动噪声截断，不能宣称已看见某个弹窗或证明全部后续等待原因。持久查询进一步限定到 Authorization subsystem，避免这些无关噪声。下一阶段需要能正常完成合法认证的专用一次性环境，不以 authdb/SIP/账户改动或跳过用例替代。
+
 ## Intel UDP：最小真实链路
 
 `scripts/e2e/diagnose-ss-udp.py` 使用真实 CLI、SOCKS5 TCP control/UDP socket、独立 shadowsocks-rust 1.24.0 与 loopback echo，不用生产内部 mock。
@@ -36,9 +38,11 @@ helper 错误现在带 probe kind、当前阶段、收发包数和耗时；`ZC_E
 
 本机 arm64 已测 73 轮、219 次实际探测，0 次自然复现；这**不能关闭 Intel 故障**。收到包后的校验失败、等待 UDP 返回、等待 TCP 控制连接关闭由不同阶段区分。若最小 Intel 链路也通过，仍需保留原 core 失败，不能假定省略的历史不重要。原始报告：`target/diagnose-ss-udp/REPORT.md`。
 
+`35247844404` 的原生 Intel 最小链路也完成三种 cipher 各 30 轮、合计 270 次 probe，全部成功；全部配置未变，原始样本下载于 `target/ci/35247844404/udp-samples/`。仍不关闭原故障：独立诊断增加原样 core 的 trace=0/1 对照，保留完整 suite 历史与后台模式，并观察逐阶段日志是否影响复现；两次结果均保留，任一次失败总状态仍失败，不尝试“跑到绿”。
+
 ## CI 与安全回归
 
-`.github/workflows/platform-diagnostics.yml` 与正式验收分离：两台新 macOS runner 做 trust/keychain 对照，Intel runner 对三种 cipher 各做 30 轮，保存全部 UDP 样本且失败仍非零。工作流名称明确 `not acceptance`。只上传隔离的 UDP 测试工件，不上传 trust 私有夹具。
+`.github/workflows/platform-diagnostics.yml` 与正式验收分离：两台新 macOS runner 做 trust/keychain 对照，Intel runner 对三种 cipher 各做 30 轮，随后执行两次不同 trace 设置的原样 core，保存全部样本且失败仍非零。工作流名称明确 `not acceptance`。只上传隔离的 UDP 测试工件，不上传 trust 私有夹具。
 
 开发机可安全运行：
 

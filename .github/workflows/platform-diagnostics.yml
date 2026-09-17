@@ -52,13 +52,18 @@ jobs:
           test -d "$DEVELOPER_DIR"
           xcodebuild -version
           rustup toolchain install 1.98.1 --profile minimal
+      - name: Setup independent crypto oracle
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
       - name: Build real public-interface probe
-        run: cargo build --locked --bin zc --example e2e_ss_udp_oracle
+        run: cargo build --locked --bin zc --example e2e_ss_udp_oracle --example e2e_origin --example e2e_obfs_oracle
       - name: Fetch independent fixed server
         run: bash scripts/e2e/fetch-static-fixtures.sh target/e2e-fixtures
       - name: Validate red-capable diagnostic harness
         run: python3 scripts/e2e/test-diagnose-ss-udp.py
       - name: Preserve all isolated UDP samples
+        id: udp_samples
         shell: bash
         run: |
           set -euo pipefail
@@ -73,6 +78,31 @@ jobs:
               result=1
               echo "DIAGNOSTIC_BATCH=$cipher:FAIL"
             fi
+          done
+          exit "$result"
+      - name: Compare original core history with tracing off and on
+        if: ${{ success() || steps.udp_samples.outcome == 'failure' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          result=0
+          for trace in 0 1; do
+            directory="$PWD/target/diagnose-ss-udp/core-trace-$trace"
+            mkdir "$directory"
+            status=0
+            if ZC_E2E_UDP_DIAGNOSTIC="$trace" bash scripts/e2e/run-core.sh \
+              "$PWD/target/debug/zc" "$PWD/target/debug/examples/e2e_origin" \
+              "$PWD/target/debug/examples/e2e_obfs_oracle" "$PWD/target/debug/examples/e2e_ss_udp_oracle" \
+              "$PWD/target/e2e-fixtures" "$PWD/testdata/e2e" \
+              > "$directory/stdout.log" 2> "$directory/stderr.log"; then
+              echo "DIAGNOSTIC_CORE_TRACE=$trace:PASS"
+            else
+              status=$?
+              result=1
+              echo "DIAGNOSTIC_CORE_TRACE=$trace:FAIL:$status"
+              tail -100 "$directory/stderr.log"
+            fi
+            printf '{"trace":%s,"exit_code":%s}\n' "$trace" "$status" > "$directory/result.json"
           done
           exit "$result"
       - name: Preserve every sample including failures
