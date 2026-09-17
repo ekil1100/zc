@@ -1615,39 +1615,133 @@ pub async fn log(lines: usize, follow: bool, json_output: bool) -> Result<()> {
 mod lifecycle_tests {
     use super::*;
 
+    mod descriptor_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/descriptor_fixture.rs"
+        ));
+    }
+
     #[test]
     fn atomic_descriptor_publication_never_accepts_unlinked_or_partial_state() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let dir = Arc::new(SecureDir::open(temp.path()).unwrap());
+        use std::{
+            fs,
+            io::Read,
+            os::unix::{
+                fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+                net::UnixListener,
+            },
+        };
+        let Some(root) = std::env::var_os(descriptor_fixture::ROOT_ENV) else {
+            descriptor_fixture::run_scoped();
+            return;
+        };
+        let root = PathBuf::from(root);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = Arc::new(SecureDir::open(&root).unwrap());
         let bytes = include_bytes!("../tests/fixtures/daemon_zig_descriptor.json");
-        dir.atomic_write(DESCRIPTOR, bytes).unwrap();
-        let expected: Descriptor = serde_json::from_slice(bytes).unwrap();
+        assert!(
+            dir.atomic_write(DESCRIPTOR, bytes)
+                .unwrap()
+                .durability_error
+                .is_none()
+        );
+        let mut expected: Descriptor = serde_json::from_slice(bytes).unwrap();
+        dir.write_new("control-inode", b"unrelated").unwrap();
+        dir.write_new("unused-inode", b"never read").unwrap();
+        let socket = UnixListener::bind(root.join("writer.sock")).unwrap();
         let writer = dir.clone();
-        let (publish, request) = std::sync::mpsc::sync_channel(0);
+        let (publish, request) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(0);
         let task = std::thread::spawn(move || {
-            for _ in 0..500 {
-                request.recv().unwrap();
-                writer.atomic_write(DESCRIPTOR, bytes).unwrap();
+            for epoch in 1_u64..=500 {
+                let (requested_epoch, bytes) =
+                    request.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(requested_epoch, epoch);
+                let (mut stream, _) = socket.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut notification = [0; 8];
+                stream.read_exact(&mut notification).unwrap();
+                assert_eq!(u64::from_ne_bytes(notification), epoch);
+                assert!(
+                    writer
+                        .atomic_write(DESCRIPTOR, &bytes)
+                        .unwrap()
+                        .durability_error
+                        .is_none()
+                );
+                stream.write_all(&epoch.to_ne_bytes()).unwrap();
             }
         });
-        // Race one publication per batch; bounded retries do not promise progress
-        // against unlimited replacements. Reads still overlap the active writer.
-        for _ in 0..500 {
-            publish.send(()).unwrap();
-            for _ in 0..10 {
+        let case = std::env::var(descriptor_fixture::NEGATIVE_ENV).unwrap();
+        let mut markers = String::new();
+        let mut successes = 0;
+        for epoch in 1_u64..=500 {
+            // Sample the actual current inode BEFORE arming; every publication
+            // has different valid bytes, so accepting the old handle must fail.
+            let current = fs::metadata(root.join(DESCRIPTOR)).unwrap();
+            expected.pid += 1;
+            publish.send((epoch, encode(&expected).unwrap())).unwrap();
+            let control = match case.as_str() {
+                "malformed" => "invalid control\n".to_owned(),
+                "miss" => {
+                    let unused = fs::metadata(root.join("unused-inode")).unwrap();
+                    format!("{} {} {epoch}\n", unused.dev(), unused.ino())
+                }
+                _ => format!("{} {} {epoch}\n", current.dev(), current.ino()),
+            };
+            let mut arm = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(root.join("control.next"))
+                .unwrap();
+            arm.write_all(control.as_bytes()).unwrap();
+            drop(arm);
+            fs::rename(root.join("control.next"), root.join("control")).unwrap();
+            // An unrelated inode must not consume either target snapshot.
+            assert_eq!(dir.read("control-inode", 9).unwrap(), b"unrelated");
+            assert_eq!(descriptor_fixture::read_markers(&root), markers);
+            // The hook pauses capture-before, not checked-open. The writer does
+            // a real rename while this read holds the old fd; only the existing
+            // production retry may return the NEXT complete descriptor.
+            let first = read_descriptor(&dir).unwrap().unwrap();
+            markers.push_str(&format!(
+                "DESCRIPTOR_CAPTURE {epoch} {} {} nlink=0\n",
+                current.dev(),
+                current.ino()
+            ));
+            assert_eq!(
+                descriptor_fixture::read_markers(&root),
+                markers,
+                "descriptor hook missed at epoch {epoch}"
+            );
+            assert_eq!(first, expected);
+            successes += 1;
+            for _ in 0..9 {
                 assert_eq!(read_descriptor(&dir).unwrap().unwrap(), expected);
+                successes += 1;
             }
         }
         task.join().unwrap();
+        assert_eq!(successes, 5000);
+        assert_eq!(
+            fs::read_to_string(root.join("markers"))
+                .unwrap()
+                .lines()
+                .count(),
+            500
+        );
         assert_eq!(read_descriptor(&dir).unwrap().unwrap(), expected);
-        std::fs::hard_link(
-            temp.path().join(DESCRIPTOR),
-            temp.path().join("linked.json"),
-        )
-        .unwrap();
+        fs::hard_link(root.join(DESCRIPTOR), root.join("linked.json")).unwrap();
         assert!(read_descriptor(&dir).is_err());
+        eprintln!(
+            "Verified 500 capture/rename overlaps, 5000 complete NEXT reads, and static hardlink refusal"
+        );
     }
 
     #[tokio::test]

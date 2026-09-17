@@ -2,6 +2,9 @@
 #define _GNU_SOURCE
 #define _LARGEFILE64_SOURCE
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdint.h>
@@ -24,8 +27,104 @@ static void fail(const char *operation) {
     _exit(90);
 }
 
+/* Separate scope: schedule real descriptor publication, never mutate a stat. */
+static atomic_uint_fast64_t descriptor_disarmed;
+static _Thread_local uint64_t descriptor_epoch;
+static _Thread_local unsigned descriptor_snapshots;
+static _Thread_local int descriptor_fd;
+
+static void exchange_epoch(int socket_fd, uint64_t epoch) {
+    const unsigned char *out = (const unsigned char *)&epoch;
+    size_t sent = 0;
+    while (sent < sizeof(epoch)) {
+        ssize_t n = write(socket_fd, out + sent, sizeof(epoch) - sent);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) fail("notify descriptor writer");
+        sent += (size_t)n;
+    }
+    uint64_t ack = 0;
+    unsigned char *in = (unsigned char *)&ack;
+    size_t received = 0;
+    while (received < sizeof(ack)) {
+        ssize_t n = read(socket_fd, in + received, sizeof(ack) - received);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) fail("await descriptor writer ACK");
+        received += (size_t)n;
+    }
+    if (ack != epoch) fail("wrong descriptor writer epoch");
+}
+
+static void descriptor_overlap(int fd, uint64_t dev, uint64_t ino, mode_t mode,
+                               uid_t uid, uint64_t nlink) {
+    const char *control = getenv("ZC_DESCRIPTOR_RACE_CONTROL");
+    if (!control) return;
+    int arm = open(control, O_RDONLY | O_NOFOLLOW);
+    if (arm < 0) {
+        if (errno == ENOENT) return; /* Child setup has not armed a round yet. */
+        fail("open descriptor control");
+    }
+    char record[128];
+    ssize_t length = read(arm, record, sizeof(record) - 1);
+    if (close(arm)) fail("close descriptor control");
+    if (length <= 0 || (size_t)length >= sizeof(record) - 1)
+        fail("malformed descriptor control");
+    record[length] = '\0';
+    unsigned long long device, inode, epoch;
+    char extra;
+    if (sscanf(record, "%llu %llu %llu %c", &device, &inode, &epoch, &extra) != 3 ||
+        !epoch || epoch > 500) fail("malformed descriptor control");
+    uint_fast64_t previous = atomic_load(&descriptor_disarmed);
+    if (epoch == previous) return;
+    if (epoch != previous + 1) fail("out-of-order descriptor control");
+    if (dev != device || ino != inode) return;
+    /* Only this reader's second fd snapshot: checked-open, then capture-before.
+       TLS is accessed only inside the explicit, armed runtime scope. */
+    if (descriptor_epoch != epoch) {
+        descriptor_epoch = epoch;
+        descriptor_snapshots = 0;
+        descriptor_fd = fd;
+    }
+    if (fd != descriptor_fd) fail("descriptor reader changed fd");
+    if (++descriptor_snapshots != 2) return;
+    if (!S_ISREG(mode) || uid != geteuid() || nlink != 1 || (mode & 077) ||
+        (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY)
+        fail("invalid descriptor capture-before");
+    /* Disarm BEFORE notifying the writer: its checked-open and the verification
+       below must remain real and must never recursively enter the handshake. */
+    if (!atomic_compare_exchange_strong(&descriptor_disarmed, &previous, epoch))
+        fail("duplicate descriptor reader");
+    const char *path = getenv("ZC_DESCRIPTOR_RACE_SOCKET");
+    const char *marker = getenv("ZC_DESCRIPTOR_RACE_MARKER");
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    if (!path || !marker || strlen(path) >= sizeof(address.sun_path))
+        fail("invalid descriptor socket scope");
+    strcpy(address.sun_path, path);
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct timeval timeout = { .tv_sec = 10, .tv_usec = 0 };
+    if (socket_fd < 0 ||
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
+        setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) ||
+        connect(socket_fd, (struct sockaddr *)&address, sizeof(address)))
+        fail("connect descriptor writer");
+    exchange_epoch(socket_fd, epoch);
+    if (close(socket_fd)) fail("close descriptor writer socket");
+    struct stat after;
+    if (fstat(fd, &after) || (uint64_t)after.st_dev != dev ||
+        (uint64_t)after.st_ino != ino || after.st_nlink != 0)
+        fail("descriptor old fd was not unlinked");
+    int size = snprintf(record, sizeof(record),
+                        "DESCRIPTOR_CAPTURE %llu %llu %llu nlink=0\n", epoch, device, inode);
+    int mark = open(marker, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    if (size <= 0 || (size_t)size >= sizeof(record) || mark < 0 ||
+        write(mark, record, (size_t)size) != size || close(mark))
+        fail("write descriptor overlap marker");
+    /* The caller returns its ORIGINAL successful snapshot, completely intact. */
+}
+
 static void inject(int fd, uint64_t dev, uint64_t ino, mode_t mode,
                    uid_t uid, uint64_t nlink) {
+    descriptor_overlap(fd, dev, ino, mode, uid, nlink);
     const char *target = getenv("ZC_READ_RACE_TARGET");
     const char *device = getenv("ZC_READ_RACE_DEV");
     const char *inode = getenv("ZC_READ_RACE_INO");

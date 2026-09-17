@@ -28,6 +28,10 @@ cargo test --locked --test fsutil read_capture:: -- --nocapture --test-threads=1
 
 [CI 35171024849](https://github.com/ekil1100/zc/actions/runs/35171024849) 的 Linux x64 记录了 descriptor capture 的 metadata 不稳定。`read_descriptor` 最多首次读取加三次重试，且当前路径复检失败也会立即拒绝；日志不能证明一定耗尽全部重试。
 
-原测试让 500 次发布连续冲击 5000 次读取，却要求每次读取成功，超出了有界重试的保证。现在用零容量 channel 每批释放一次 publication，再执行十次读取；下一次 publication 须等待上一批读取结束，读写仍可重叠。保留全部 500 次写、5000 次成功断言及静态 hardlink 拒绝，并加强为完整 descriptor 相等与最终稳定读取检查。不将任何读取错误当作通过。
+原测试让 500 次发布连续冲击 5000 次读取，却要求每次读取成功，超出了有界重试的保证。历史修正曾用零容量 channel 每批释放一次 publication，但 [CI 35231178121](https://github.com/ekil1100/zc/actions/runs/35231178121) 的 Linux x64 仍捕获 metadata 拒绝；**一次 publication 也不保证当前路径复检一定成功**。
 
-该调度不保证 rename 恰好命中 metadata 捕获窗口；确定性交错由上面的真实文件注入测试负责。生产读取重试和身份校验未因调整测试而放宽。
+Linux v6.8 的 ext4 rename 先减少旧目标 inode 的链接数，文件系统回调返回后 VFS 才 `d_move`；缓存命中的只读 open 可以看到旧 inode。因而 capture 已发现变化、guard 仍看到 `nlink=0` 是合法交错，不必耗尽重试。这是内核源码反例，不冒充本次 CI 的精确 trace。原日志及来源保存在 `target/ci/35231178121/descriptor-capture-diagnosis.md`。
+
+当前 fixture 在真实 capture-before syscall 已取得合法快照后暂停，通知独立 writer 完成真实 `SecureDir::atomic_write` 并确认 durability receipt，再恢复读取。syscall 返回值不修改；旧句柄确实变成 `nlink=0`，现有 production retry 必须取得新的完整 descriptor。每轮递增合法 pid，使误接受旧字节也会失败。
+
+保留 **500 次有 marker 证明的 capture/rename 重叠、5000 次顶层成功相等断言**、最终稳定读取和硬链接拒绝。错 inode 漏钩与畸形控制记录均须失败；marker 读取错误不得当成空记录通过。负向拒绝仍由前面的真实文件注入用例覆盖，不计入成功读次数。只改变测试调度与 fixture，没有增加生产重试、改变身份/metadata 检查或删掉并发窗口。
