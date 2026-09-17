@@ -411,7 +411,7 @@ fn config_override_captures_instance_before_script_preparation() {
     let script = f.home.join("daemon_apply_block.sh");
     let gate = f.home.join("apply_gate");
     let release = f.home.join("apply_release");
-    fs::write(&script, format!("#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do /bin/sleep 0.01; done\nprintf 'rules: [\\\"MATCH,REJECT\\\"]\\n'\n", gate.display(), release.display())).unwrap();
+    fs::write(&script, format!("#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do /bin/sleep 0.01; done\nprintf '%s\\n' 'rules: [\"MATCH,REJECT\"]'\n", gate.display(), release.display())).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let mut paused = Process(
         f.command(&["config", "override", script.to_str().unwrap(), "--json"])

@@ -37,6 +37,12 @@ fixture 契约：
 
 回归测试固定清理窗口并要求过渡期 status **失败且不改 descriptor/PID**；释放清理锁后，只对已持有的原 lock 文件 handle 做有界 `try_lock` 等待。只有 `WouldBlock` 可以继续等待，其他错误立即失败。确认旧 owner 释放原 inode、descriptor/PID 已删除后，仍严格要求 `status` 成功且为 stopped。不轮询吞掉 status 错误，不读数值 PID 后发信号，也不修改 metadata、nonce 或冻结快照验证。
 
+## override 脚本使用可移植的 printf
+
+原生 CI 的两个 Linux 目标在 `config_override_captures_instance_before_script_preparation` 同时报告 `OVERRIDE_MERGE_FAILED: unknown rule type`。原因是 fixture 在 printf 的单引号格式串里使用 `\"`：macOS `/bin/sh` 输出双引号，Linux dash 保留反斜杠，产生不同的 YAML，而非生产实例身份检查失效。
+
+fixture 改用 `printf '%s\n' 'rules: ["MATCH,REJECT"]'`，格式串与数据分离；本机 `/bin/sh` 和 `/bin/dash` 的输出逐字节相同。原用例仍要求 `RESTART_CONTENDED` 且新实例 descriptor 不变，不能接受 merge 错误来替代该断言。原始失败见 [CI 35168734642](https://github.com/ekil1100/zc/actions/runs/35168734642)。
+
 ## 定向验证入口
 
 ```bash
@@ -49,4 +55,4 @@ rustfmt --edition 2024 --check tests/daemon.rs
 
 本机结果：15 个 daemon 用例通过；随后直接执行同一测试二进制 **50 轮 × 15 用例** 全部通过（`final/summary.txt`，约 365 秒），Clippy 与 rustfmt 检查通过。`src/daemon.rs`、`src/fsutil.rs` 与诊断前副本逐字节一致。红绿原始输出与有界重复运行日志位于 `/tmp/zc-daemon-race-diagnosis/`。
 
-本次不重跑无关四平台构建、300 秒 UDP idle、E2E、安装或性能门禁，也不据此宣称那些门禁重新通过。
+上述 socket/spawn 与清理窗口的定向结果，不替代四平台构建、300 秒 UDP idle、E2E、安装或性能门禁；各项须保留独立执行证据。
