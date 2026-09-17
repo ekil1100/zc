@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -89,6 +90,37 @@ class Helpers(unittest.TestCase):
             self.assertEqual(p.stdout.readline().strip(), 'E2E_OBFS_ORACLE_REQUEST=oracle:GET_HOST_UPGRADE_CONNECTION_KEY_CONTENT_LENGTH_EXACT:3')
             self.assertEqual(p.stdout.readline().strip(), f'E2E_OBFS_ORACLE_RESPONSE=oracle:{mode}')
             self.assertEqual(p.stdout.readline().strip(), 'E2E_OBFS_ORACLE_FORWARD=oracle:RAW_TCP_HALF_CLOSE_PASS')
+
+    def test_obfs_survives_idle_between_harness_phases(self):
+        origin = self.start('e2e_origin')
+        backend = int(origin.stdout.readline().strip().split('=')[1])
+        body = b'GET /idle-gap HTTP/1.1\r\nHost: localhost\r\n\r\n'
+        p = self.start('e2e_obfs_oracle', backend, 'alias.test', len(body), 'same_write_tail', 'idle')
+        port = int(p.stdout.readline().strip().split(':')[1])
+        self.assertEqual(p.stdout.readline().strip(), f'E2E_OBFS_ORACLE_EXPECTED=idle:host=alias.test:body={len(body)}:mode=same_write_tail')
+
+        def header(length):
+            return (f'GET / HTTP/1.1\r\nHost: alias.test:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\nContent-Length: {length}\r\n\r\n').encode()
+
+        with socket.create_connection(('127.0.0.1', port), timeout=3) as s:
+            s.sendall(header(len(body) + 1))
+            self.assertEqual(s.recv(1), b'')
+        self.assertEqual(p.stdout.readline().strip(), 'E2E_OBFS_ORACLE_RAW_ACCEPTED=idle:1')
+        self.assertEqual(p.stdout.readline().strip(), 'E2E_OBFS_ORACLE_REJECTED=idle:raw=1:verified=0:error=ContentLengthMismatch')
+
+        # Real idle time between independent harness phases must not kill the fixture.
+        time.sleep(121)
+        self.assertIsNone(p.poll(), 'Oracle exited between harness phases')
+        with socket.create_connection(('127.0.0.1', port), timeout=3) as s:
+            s.sendall(header(len(body)) + body)
+            s.shutdown(socket.SHUT_WR)
+            response = b''
+            while chunk := s.recv(4096):
+                response += chunk
+        self.assertTrue(response.startswith(b'HTTP/1.1 101 Switching Protocols\r\n'))
+        self.assertTrue(response.endswith(b'zc-e2e-origin:idle-gap'))
+        self.assertEqual(p.stdout.readline().strip(), 'E2E_OBFS_ORACLE_RAW_ACCEPTED=idle:2')
+        self.assertEqual(p.stdout.readline().strip(), 'E2E_OBFS_ORACLE_VERIFIED=idle:1')
 
     def test_udp_independent_vectors_health_and_packet_recovery(self):
         output = subprocess.check_output([str(BIN / 'e2e_ss_udp_oracle'), 'selftest'], text=True, timeout=10)

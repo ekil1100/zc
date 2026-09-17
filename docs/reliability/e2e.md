@@ -20,7 +20,8 @@ daemon CLI 回归的 socket/spawn 隔离与锁替换同步边界见 [daemon fixt
 - `plugin: obfs` 与 `obfs-local` 的 simple-obfs HTTP 真实 socket round-trip；两个 alias 分别绑定不同 oracle endpoint 与 Host，且都经真实 CLI selection、mixed SOCKS5 和 socket 转发；
 - oracle 独立校验 GET、Host、Upgrade、Connection、Sec-WebSocket-Key，并把首帧 `Content-Length` 精确绑定到按固定 SOCKS domain target 推导出的 72 字节 body；header/body 同 read tail、split read 与 71/73 off-by-one 负例都进入门禁；
 - 两个 oracle 分别输出 raw TCP accept 与 fully verified counter；alias 请求只允许对应 endpoint 的两个 counter 精确增长，错误请求只能增长 raw counter。响应分别覆盖分片 101 header 与同 write 的 101+Shadowsocks tail，并要求 zc/oracle/ssserver/origin 四方证据一致；
-- oracle 的 accept/read/partial-write/relay 全部使用 monotonic absolute deadline 和固定 buffer/iteration 上界；内部可执行回归覆盖 timeout、partial write、TCP EOF half-close、双向完成以及 oversized header/body；
+- TCP oracle 的 accept 每次等待 120 秒；空闲到期只重新等待，不退出 fixture，也不消耗连接计数。真正的 accept I/O 错误仍失败；read/partial-write/relay 的期限及 buffer/iteration 上界保持不变，fixture 最终由 harness cleanup 回收；
+- `just helper-test` 通过独立进程和真实 socket，验证负例拒绝后空闲 121 秒，同一 oracle 进程、同一端点仍能正向转发且 raw/verified counter 正确；这防止较慢 CI 的中间 UDP 阶段把尚未使用的 TCP oracle 耗尽；
 - simple-obfs `tls`、未知 plugin/mode、缺 options/host 与 CRLF host 在 mixed listener bind 和 oracle dial 前失败，两个 TCP oracle 的 raw/verified counter 都保持不变；
 - Shadowsocks UDP 三种算法与 `chacha20-poly1305` alias 经真实 mixed SOCKS5 UDP ASSOCIATE 完成 IPv4/domain/IPv6 round-trip；固定 `shadowsocks-rust v1.24.0 -U`、dual-stack echo 与独立 oracle counter 共同证明双向互操作；
 - UDP 负路径覆盖 bad tag、截短 salt/tag、RSV/FRAG/ATYP/长度、65507/max+1、client IP/source port pin、control close、64+1 capacity 与 slot release；`udp:false` 在 allocation 前返回 REP 07，DIRECT、group→DIRECT 与非 UDP leaf 都 teardown 且不 fallback；

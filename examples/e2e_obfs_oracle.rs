@@ -46,7 +46,13 @@ async fn main() -> Result<()> {
     );
     let mut verified = 0;
     for raw in 1..=64 {
-        let (front, _) = timeout(Duration::from_secs(120), listener.accept()).await??;
+        // Idle gaps between harness phases do not consume the connection budget.
+        let (front, _) = loop {
+            match timeout(Duration::from_secs(120), listener.accept()).await {
+                Ok(connection) => break connection?,
+                Err(_) => continue,
+            }
+        };
         println!("E2E_OBFS_ORACLE_RAW_ACCEPTED={id}:{raw}");
         match handle(front, backend, &a[1], port, length, &a[3]).await {
             Ok(()) => {
