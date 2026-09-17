@@ -1,0 +1,85 @@
+name: Platform diagnostics (not acceptance)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ to-rust ]
+    paths:
+      - .github/workflows/platform-diagnostics.yml
+      - scripts/ci/diagnose-macos-trust.py
+      - scripts/e2e/diagnose-ss-udp.py
+
+permissions:
+  contents: read
+
+jobs:
+  trust-write:
+    name: No-Rust trust isolation (${{ matrix.mode }})
+    runs-on: macos-15
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [ user-trust, keychain-only ]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate safe diagnostic contracts
+        run: python3 scripts/ci/test-macos-trust-diagnostic.py
+      - name: Isolate stock system write on disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--ephemeral-runner --target aarch64-apple-darwin)
+          if [[ '${{ matrix.mode }}' == keychain-only ]]; then args+=(--keychain-only); fi
+          python3 scripts/ci/diagnose-macos-trust.py "${args[@]}"
+      # Never upload the private trust fixture, keychain, or certificate private key.
+
+  intel-udp:
+    name: Intel isolated real UDP
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Select native tools
+        run: |
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+          rustup toolchain install 1.98.1 --profile minimal
+      - name: Build real public-interface probe
+        run: cargo build --locked --bin zc --example e2e_ss_udp_oracle
+      - name: Fetch independent fixed server
+        run: bash scripts/e2e/fetch-static-fixtures.sh target/e2e-fixtures
+      - name: Validate red-capable diagnostic harness
+        run: python3 scripts/e2e/test-diagnose-ss-udp.py
+      - name: Preserve all isolated UDP samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          result=0
+          for cipher in aes-128-gcm aes-256-gcm chacha20-ietf-poly1305; do
+            if python3 scripts/e2e/diagnose-ss-udp.py \
+              --cipher "$cipher" --iterations 30 \
+              --kinds roundtrip roundtrip-domain roundtrip-ipv6 \
+              --artifacts "$PWD/target/diagnose-ss-udp/intel-$cipher"; then
+              echo "DIAGNOSTIC_BATCH=$cipher:PASS"
+            else
+              result=1
+              echo "DIAGNOSTIC_BATCH=$cipher:FAIL"
+            fi
+          done
+          exit "$result"
+      - name: Preserve every sample including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: intel-udp-diagnostic-samples
+          path: target/diagnose-ss-udp/
+          if-no-files-found: error
+          retention-days: 7
