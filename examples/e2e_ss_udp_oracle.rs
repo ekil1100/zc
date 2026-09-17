@@ -1,8 +1,9 @@
 // Test-only independent SS UDP services and SOCKS probes. Crypto is delegated
 // exclusively to Node/OpenSSL, not shadowsocks or any zc production module.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::Stdio;
 use std::time::Duration;
@@ -13,6 +14,58 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 const MAX: usize = 65507;
 const ABSENCE: Duration = Duration::from_millis(350);
+
+// Diagnostic-only: observe the existing helper without changing deadlines or I/O.
+tokio::task_local! {
+    static PROBE_TRACE: RefCell<ProbeTrace>;
+}
+struct ProbeTrace {
+    started: Instant,
+    stage: &'static str,
+    tx_packets: usize,
+    rx_packets: usize,
+    enabled: bool,
+}
+impl ProbeTrace {
+    fn summary(&self) -> String {
+        format!(
+            "protocol=socks5-udp stage={} tx_packets={} rx_packets={} elapsed_ms={}",
+            self.stage,
+            self.tx_packets,
+            self.rx_packets,
+            self.started.elapsed().as_millis()
+        )
+    }
+}
+fn stage(name: &'static str) {
+    let _ = PROBE_TRACE.try_with(|trace| {
+        let mut trace = trace.borrow_mut();
+        trace.stage = name;
+        if trace.enabled {
+            eprintln!("[DEBUG-udp-probe] {}", trace.summary());
+        }
+    });
+}
+fn packet_metric(sent: bool, peer: SocketAddr, bytes: &[u8]) {
+    let _ = PROBE_TRACE.try_with(|trace| {
+        let mut trace = trace.borrow_mut();
+        if sent {
+            trace.tx_packets += 1;
+        } else {
+            trace.rx_packets += 1;
+        }
+        if trace.enabled {
+            eprintln!(
+                "[DEBUG-udp-probe] {} direction={} peer={} bytes={} atyp={:?}",
+                trace.summary(),
+                if sent { "send" } else { "receive" },
+                peer,
+                bytes.len(),
+                bytes.get(3)
+            );
+        }
+    });
+}
 
 struct Crypto {
     _child: Child,
@@ -159,7 +212,27 @@ async fn main() -> Result<()> {
             println!("E2E_SS_UDP_HEALTH_PASS={}", a[2]);
         }
         "probe" => {
-            timeout(Duration::from_secs(5), probe(&a[1..])).await??;
+            let trace = RefCell::new(ProbeTrace {
+                started: Instant::now(),
+                stage: "arguments",
+                tx_packets: 0,
+                rx_packets: 0,
+                enabled: std::env::var_os("ZC_E2E_UDP_DIAGNOSTIC").as_deref()
+                    == Some(std::ffi::OsStr::new("1")),
+            });
+            PROBE_TRACE
+                .scope(trace, async {
+                    let result = timeout(Duration::from_secs(5), probe(&a[1..])).await;
+                    let context = format!(
+                        "[DEBUG-udp-probe] probe={} {}",
+                        a.get(1).map(String::as_str).unwrap_or("missing"),
+                        PROBE_TRACE.with(|trace| trace.borrow().summary())
+                    );
+                    result.context(context.clone())?.context(context)?;
+                    stage("complete");
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?;
             println!("E2E_SS_UDP_PROBE_PASS={}", a[1]);
         }
         _ => bail!("InvalidArguments"),
@@ -168,6 +241,7 @@ async fn main() -> Result<()> {
 }
 
 async fn udp(address: SocketAddr) -> Result<UdpSocket> {
+    stage("udp-bind");
     let socket = UdpSocket::bind(address).await?;
     rustix::net::sockopt::set_socket_send_buffer_size(&socket, MAX)?;
     rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 262144)?;
@@ -179,17 +253,21 @@ async fn udp(address: SocketAddr) -> Result<UdpSocket> {
     Ok(socket)
 }
 async fn receive(socket: &UdpSocket) -> Result<(Vec<u8>, SocketAddr)> {
+    stage("udp-receive");
     let mut buffer = vec![0; 65536];
     let (n, peer) = socket.recv_from(&mut buffer).await?;
     buffer.truncate(n);
+    packet_metric(false, peer, &buffer);
     Ok((buffer, peer))
 }
 async fn send(socket: &UdpSocket, bytes: &[u8], peer: SocketAddr) -> Result<()> {
+    stage("udp-send");
     ensure!(bytes.len() <= MAX, "DatagramTooLarge");
     ensure!(
         socket.send_to(bytes, peer).await? == bytes.len(),
         "PartialDatagram"
     );
+    packet_metric(true, peer, bytes);
     Ok(())
 }
 fn address_len(bytes: &[u8]) -> Result<usize> {
@@ -286,7 +364,19 @@ async fn echo(family: &str, port: u16) -> Result<()> {
         if bytes.len() > MAX {
             continue;
         }
+        if std::env::var_os("ZC_E2E_UDP_DIAGNOSTIC").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            eprintln!(
+                "[DEBUG-udp-echo] stage=received family={family} peer={peer} bytes={}",
+                bytes.len()
+            );
+        }
         send(&socket, &bytes, peer).await?;
+        if std::env::var_os("ZC_E2E_UDP_DIAGNOSTIC").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            eprintln!(
+                "[DEBUG-udp-echo] stage=sent family={family} peer={peer} bytes={}",
+                bytes.len()
+            );
+        }
         count += 1;
         println!("E2E_UDP_ECHO_PACKET={family}:{count}");
     }
@@ -299,14 +389,21 @@ struct Association {
     rep: u8,
 }
 async fn associate(port: u16, required: bool) -> Result<Association> {
+    stage("tcp-connect");
     let mut control = TcpStream::connect(("127.0.0.1", port)).await?;
+    stage("greeting-send");
     control.write_all(&[5, 1, 0]).await?;
     let mut greeting = [0; 2];
+    stage("greeting-receive");
     control.read_exact(&mut greeting).await?;
+    stage("greeting-validate");
     ensure!(greeting == [5, 0], "InvalidGreetingReply");
+    stage("associate-send");
     control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
     let mut reply = [0; 10];
+    stage("associate-receive");
     control.read_exact(&mut reply).await?;
+    stage("associate-validate");
     ensure!(
         reply[0] == 5 && reply[2] == 0 && reply[3] == 1,
         "InvalidAssociateReply"
@@ -331,6 +428,7 @@ async fn associate(port: u16, required: bool) -> Result<Association> {
     })
 }
 async fn eof(stream: &mut TcpStream) -> Result<()> {
+    stage("control-eof");
     match stream.read(&mut [0]).await {
         Ok(0) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
@@ -339,6 +437,7 @@ async fn eof(stream: &mut TcpStream) -> Result<()> {
     }
 }
 async fn teardown(a: &mut Association) -> Result<()> {
+    stage("control-shutdown");
     a.control.shutdown().await?;
     eof(&mut a.control).await
 }
@@ -381,11 +480,14 @@ async fn exchange(
 ) -> Result<()> {
     send(socket, &packet(addr, payload)?, relay).await?;
     let (bytes, peer) = receive(socket).await?;
+    stage("response-sender");
     ensure!(peer == relay, "UnexpectedResponseSender");
+    stage("response-header");
     ensure!(
         bytes.len() <= MAX && bytes.starts_with(&[0, 0, 0]),
         "InvalidSocksDatagram"
     );
+    stage("response-address");
     let n = address_len(&bytes[3..])?;
     let actual = &bytes[3..3 + n];
     let port = u16::from_be_bytes([addr[addr.len() - 2], addr[addr.len() - 1]]);
@@ -399,16 +501,21 @@ async fn exchange(
     } else {
         ensure!(actual == addr, "UnexpectedResponseAddress");
     }
+    stage("response-payload");
     ensure!(&bytes[3 + n..] == payload, "UnexpectedResponsePayload");
     Ok(())
 }
 async fn absent(sockets: &[&UdpSocket]) -> Result<()> {
+    stage("absence-check");
     let deadline = Instant::now() + ABSENCE;
     let mut bytes = [0; 65536];
     loop {
         for socket in sockets {
             match socket.try_recv_from(&mut bytes) {
-                Ok(_) => bail!("UnexpectedUdpResponse"),
+                Ok((n, peer)) => {
+                    packet_metric(false, peer, &bytes[..n]);
+                    bail!("UnexpectedUdpResponse");
+                }
                 Err(e)
                     if matches!(
                         e.kind(),

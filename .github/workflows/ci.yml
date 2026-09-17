@@ -64,10 +64,14 @@ jobs:
       - name: Validate beta gate contract
         run: bash scripts/ci/test-beta-gate.sh
       - name: Independent core and TCP interoperability
+        env:
+          ZC_E2E_UDP_DIAGNOSTIC: '1'
         run: just e2e
       - name: Isolated installer regression
         run: just install-test
       - name: Build production artifact
+        env:
+          ZC_E2E_UDP_DIAGNOSTIC: '1'
         shell: bash
         run: |
           set -euo pipefail
