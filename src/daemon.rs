@@ -1623,16 +1623,25 @@ mod lifecycle_tests {
         let dir = Arc::new(SecureDir::open(temp.path()).unwrap());
         let bytes = include_bytes!("../tests/fixtures/daemon_zig_descriptor.json");
         dir.atomic_write(DESCRIPTOR, bytes).unwrap();
+        let expected: Descriptor = serde_json::from_slice(bytes).unwrap();
         let writer = dir.clone();
+        let (publish, request) = std::sync::mpsc::sync_channel(0);
         let task = std::thread::spawn(move || {
             for _ in 0..500 {
+                request.recv().unwrap();
                 writer.atomic_write(DESCRIPTOR, bytes).unwrap();
             }
         });
-        for _ in 0..5000 {
-            assert!(read_descriptor(&dir).unwrap().unwrap().ready);
+        // Race one publication per batch; bounded retries do not promise progress
+        // against unlimited replacements. Reads still overlap the active writer.
+        for _ in 0..500 {
+            publish.send(()).unwrap();
+            for _ in 0..10 {
+                assert_eq!(read_descriptor(&dir).unwrap().unwrap(), expected);
+            }
         }
         task.join().unwrap();
+        assert_eq!(read_descriptor(&dir).unwrap().unwrap(), expected);
         std::fs::hard_link(
             temp.path().join(DESCRIPTOR),
             temp.path().join("linked.json"),

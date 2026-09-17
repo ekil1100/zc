@@ -61,8 +61,11 @@ pub fn nonce() -> io::Result<String> {
 
 #[cfg(unix)]
 fn check(file: &File, directory: bool, private: bool) -> io::Result<()> {
+    check_metadata(&file.metadata()?, directory, private)
+}
+#[cfg(unix)]
+fn check_metadata(m: &std::fs::Metadata, directory: bool, private: bool) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let m = file.metadata()?;
     if (directory && !m.is_dir()) || (!directory && !m.is_file()) {
         return Err(invalid("not a regular file or directory"));
     }
@@ -192,7 +195,7 @@ impl SecureDir {
         }
     }
     pub fn read(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
-        read_bounded(self.open_file(name, false, false)?, limit)
+        read_bounded(self.open_file(name, false, false)?, limit, 0o077)
     }
     pub fn exists(&self, name: &str) -> io::Result<bool> {
         component(name)?;
@@ -359,8 +362,17 @@ impl SecureDir {
     }
 }
 
-fn read_bounded(file: File, limit: usize) -> io::Result<Vec<u8>> {
+fn read_bounded(file: File, limit: usize, forbidden_permissions: u32) -> io::Result<Vec<u8>> {
     let before = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Validate the capture snapshot itself, not an earlier checked-open stat.
+        check_metadata(&before, false, false)?;
+        if before.mode() & forbidden_permissions != 0 {
+            return Err(invalid("unsafe file permissions during capture"));
+        }
+    }
     if before.len() > limit as u64 {
         return Err(invalid("file exceeds byte limit"));
     }
@@ -401,7 +413,7 @@ pub fn read_regular(path: impl AsRef<Path>, limit: usize) -> io::Result<Vec<u8>>
         )?
         .into();
         check(&file, false, false)?;
-        read_bounded(file, limit)
+        read_bounded(file, limit, 0)
     }
     #[cfg(not(unix))]
     {
@@ -504,7 +516,7 @@ pub fn read_contained(root: &Path, logical: &str, limit: usize) -> io::Result<(S
             names.push(part);
             if last {
                 check(&file, false, false)?;
-                return Ok((names.join("/"), read_bounded(file, limit)?));
+                return Ok((names.join("/"), read_bounded(file, limit, 0)?));
             }
             dirs.push(file);
         }
@@ -620,7 +632,7 @@ impl SecureDir {
     ) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
         let file = self.open_file(name, false, false)?;
         let metadata = file.metadata()?;
-        let bytes = read_bounded(file, limit)?;
+        let bytes = read_bounded(file, limit, 0o077)?;
         Ok((bytes, metadata))
     }
     pub fn file_metadata(&self, name: &str) -> io::Result<std::fs::Metadata> {
@@ -667,7 +679,7 @@ impl SecureDir {
         self.open_cache_file(name)?.metadata()
     }
     pub fn read_cache(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
-        read_bounded(self.open_cache_file(name)?, limit)
+        read_bounded(self.open_cache_file(name)?, limit, 0o022)
     }
     /// Caller holds the directory lock. New bytes are always owner-only.
     pub fn write_cache(&self, name: &str, bytes: &[u8]) -> io::Result<WriteReceipt> {

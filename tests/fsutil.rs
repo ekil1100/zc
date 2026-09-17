@@ -196,3 +196,183 @@ fn cache_permissions_allow_public_read_but_reject_group_or_other_write() {
         );
     }
 }
+
+// Native interposition is confined to an explicitly scoped child process.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod read_capture {
+    use std::{
+        fs, io,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::Path,
+        process::Command,
+    };
+    use zc::fsutil::{SecureDir, read_contained, read_regular};
+
+    const BYTES: &[u8] = b"capture payload\n";
+    const SEAMS: &[&str] = &[
+        "read",
+        "read_with_metadata",
+        "read_cache",
+        "read_regular",
+        "read_contained",
+    ];
+
+    fn capture(root: &Path, seam: &str, name: &str) -> io::Result<Vec<u8>> {
+        match seam {
+            "read" => SecureDir::open(root)?.read(name, BYTES.len()),
+            "read_with_metadata" => SecureDir::open(root)?
+                .read_with_metadata(name, BYTES.len())
+                .map(|(bytes, _)| bytes),
+            "read_cache" => SecureDir::open(root)?.read_cache(name, BYTES.len()),
+            "read_regular" => read_regular(root.join(name), BYTES.len()),
+            "read_contained" => read_contained(root, name, BYTES.len()).map(|(_, bytes)| bytes),
+            _ => panic!("unknown public read seam: {seam}"),
+        }
+    }
+
+    #[test]
+    fn child() {
+        let Some(root) = std::env::var_os("ZC_READ_RACE_ROOT") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let seam = std::env::var("ZC_READ_RACE_SEAM").unwrap();
+        let marker = std::env::var_os("ZC_READ_RACE_MARKER").unwrap();
+        // Same API and permissions, different inode: the shim must not affect it.
+        assert_eq!(capture(root, &seam, "control").unwrap(), BYTES);
+        assert!(
+            !Path::new(&marker).exists(),
+            "injected on the control inode"
+        );
+        let result = capture(root, &seam, "target");
+        let injection = fs::read_to_string(marker).expect("metadata hook did not fire");
+        eprint!("{injection}");
+        assert!(
+            result.is_err(),
+            "{seam} accepted an invalid capture: {result:?}"
+        );
+    }
+
+    fn reject_race(action: &str, seams: &[&str]) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let library = home.join(if cfg!(target_os = "macos") {
+            "read_capture_race.dylib"
+        } else {
+            "read_capture_race.so"
+        });
+        let mut cc = Command::new("cc");
+        cc.args(["-std=c11", "-Wall", "-Wextra", "-Werror"]);
+        if cfg!(target_os = "macos") {
+            cc.arg("-dynamiclib");
+        } else {
+            cc.args(["-shared", "-fPIC"]);
+        }
+        cc.arg("-o").arg(&library).arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/read_capture_race.c"
+        ));
+        if cfg!(target_os = "linux") {
+            cc.arg("-ldl");
+        }
+        let compiled = cc
+            .output()
+            .expect("cc is required for the metadata race shim");
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut failures = Vec::new();
+        for seam in seams {
+            let root = home.join(seam);
+            SecureDir::create(&root).unwrap();
+            let mode = if matches!(*seam, "read" | "read_with_metadata") {
+                0o600
+            } else {
+                0o644
+            };
+            for name in ["target", "control"] {
+                fs::write(root.join(name), BYTES).unwrap();
+                fs::set_permissions(root.join(name), fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let target = root.join("target");
+            let original = fs::metadata(&target).unwrap();
+            let marker = root.join("injected");
+            // Cache has a separate permission-check snapshot after checked-open.
+            // Widen only after that genuine snapshot, before capture's fresh stat.
+            let snapshot = if action == "cache-chmod" { "2" } else { "1" };
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "read_capture::child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("HOME", &home)
+                .env_remove("XDG_RUNTIME_DIR")
+                .env(
+                    if cfg!(target_os = "macos") {
+                        "DYLD_INSERT_LIBRARIES"
+                    } else {
+                        "LD_PRELOAD"
+                    },
+                    &library,
+                )
+                .env("ZC_READ_RACE_ROOT", &root)
+                .env("ZC_READ_RACE_SEAM", seam)
+                .env("ZC_READ_RACE_TARGET", &target)
+                .env("ZC_READ_RACE_DEV", original.dev().to_string())
+                .env("ZC_READ_RACE_INO", original.ino().to_string())
+                .env("ZC_READ_RACE_ACTION", action)
+                .env("ZC_READ_RACE_SNAPSHOT", snapshot)
+                .env("ZC_READ_RACE_MARKER", &marker)
+                .env("ZC_READ_RACE_ALIAS", root.join("alias"))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                fs::read_to_string(&marker).unwrap_or_default(),
+                format!("INJECT_READ_CAPTURE {action} snapshot={snapshot}\n"),
+                "{seam}/{action}: hook missed or mutation failed ({})\n{stdout}\n{stderr}",
+                output.status
+            );
+            if !output.status.success() {
+                failures.push(format!("{seam}/{action}:\n{stdout}\n{stderr}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn rejects_unlinked_inode_after_checked_open() {
+        reject_race("unlink", SEAMS);
+    }
+
+    #[test]
+    fn rejects_hardlinked_inode_after_checked_open() {
+        reject_race("hardlink", SEAMS);
+    }
+
+    #[test]
+    fn rejects_private_permission_widening_after_checked_open() {
+        reject_race("private-chmod", &["read", "read_with_metadata"]);
+    }
+
+    #[test]
+    fn rejects_cache_group_write_after_permission_check() {
+        reject_race("cache-chmod", &["read_cache"]);
+    }
+
+    #[test]
+    fn public_source_mode_0644_remains_legal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("source"), BYTES).unwrap();
+        fs::set_permissions(root.join("source"), fs::Permissions::from_mode(0o644)).unwrap();
+        for seam in ["read_regular", "read_contained"] {
+            assert_eq!(capture(&root, seam, "source").unwrap(), BYTES);
+        }
+    }
+}
