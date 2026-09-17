@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -27,7 +28,10 @@ class FixtureProcesses:
     """Simulate partial external writes and a pinned 30s deadline, not internal helpers."""
 
     def __init__(self, failures=None, *, log_output=None, log_spawn_error=False,
-                 real_popen=None, log_close_error=False, setter_spawn_error=False):
+                 real_popen=None, log_close_error=False, setter_spawn_error=False,
+                 show_output=b"", show_spawn_error=False, show_spawn_delay=0,
+                 show_wait_error=None, show_read_error=False, show_close_error=False,
+                 real_show_popen=None, real_show_code=None):
         self.failures = failures or {}
         self.log_output = log_output
         self.log_spawn_error = log_spawn_error
@@ -35,6 +39,14 @@ class FixtureProcesses:
         self.real_children = []
         self.log_close_error = log_close_error
         self.setter_spawn_error = setter_spawn_error
+        self.show_output = show_output
+        self.show_spawn_error = show_spawn_error
+        self.show_spawn_delay = show_spawn_delay
+        self.show_wait_error = show_wait_error
+        self.show_read_error = show_read_error
+        self.show_close_error = show_close_error
+        self.real_show_popen = real_show_popen
+        self.real_show_code = real_show_code
         self.calls = []
         self.waits = []
         self.clock = 100.0
@@ -47,9 +59,14 @@ class FixtureProcesses:
         executable = argv[0]
         assert executable in ("/usr/bin/security", "/usr/bin/openssl", "/usr/bin/sample", "/usr/bin/log"), argv
         operation = argv[1]
+        if executable == "/usr/bin/log" and operation == "show" and self.real_show_popen is not None:
+            child = self.real_show_popen([sys.executable, "-c", self.real_show_code], **kwargs)
+            self.real_children.append(child)
+            self.children.append(child)
+            return child
         if operation == "add-trusted-cert" and self.setter_spawn_error:
             raise OSError(1, "private setter argv")
-        if self.real_popen is not None and (executable == "/usr/bin/log" or operation == "add-trusted-cert"):
+        if self.real_popen is not None and (operation == "stream" or operation == "add-trusted-cert"):
             if executable == "/usr/bin/log":
                 code = "import os,time; os.write(1,b'trustd: request\\n'+b'x'*100000); time.sleep(60)"
             else:
@@ -67,8 +84,8 @@ class FixtureProcesses:
             operation = "sample"
             output = "Call graph:\n  SecTrustSettingsXPCWrite\n"
         elif executable == "/usr/bin/log":
-            operation = "logs"
-            if self.log_spawn_error:
+            operation = "show" if operation == "show" else "logs"
+            if (operation == "show" and self.show_spawn_error) or (operation == "logs" and self.log_spawn_error):
                 raise OSError(1, "private spawn arguments")
         elif operation == "create-keychain":
             self.directory = Path(argv[-1]).parent
@@ -86,6 +103,15 @@ class FixtureProcesses:
         child = mock.MagicMock(pid=42000 + len(self.calls), returncode=None)
         child.stdout = io.BytesIO(self.log_output if self.log_output is not None else
                                   b"trustd: trust settings request\nauthd: authorization request\n")
+        if operation == "show":
+            self.clock += self.show_spawn_delay
+            child.stdout = io.BytesIO(self.show_output)
+            if self.show_read_error or self.show_close_error:
+                child.stdout = mock.Mock(wraps=child.stdout)
+                if self.show_read_error:
+                    child.stdout.read.side_effect = OSError("private read details")
+                if self.show_close_error:
+                    child.stdout.close.side_effect = OSError("private close details")
         if operation == "logs" and status:
             child.returncode = status
         if operation == "logs" and self.log_close_error:
@@ -95,7 +121,18 @@ class FixtureProcesses:
         child.poll.side_effect = lambda: child.returncode
         child.kill.side_effect = lambda: setattr(child, "returncode", -9)
         child.terminate.side_effect = lambda: setattr(child, "returncode", -15)
-        child.wait.side_effect = lambda **kw: child.returncode
+        def wait(**kwargs):
+            if operation == "show" and "timeout" in kwargs:
+                self.waits.append((operation, kwargs["timeout"]))
+                if self.show_wait_error is not None:
+                    raise self.show_wait_error
+                if status is None:
+                    self.clock += kwargs["timeout"]
+                    raise subprocess.TimeoutExpired("private show argv", kwargs["timeout"])
+                child.returncode = status
+            return child.returncode
+
+        child.wait.side_effect = wait
 
         def communicate(timeout):
             self.waits.append((operation, timeout))
@@ -113,10 +150,11 @@ class FixtureProcesses:
 
 
 class DiagnosticTests(unittest.TestCase):
-    def exercise(self, failures=None, flags=(), **options):
+    def exercise(self, failures=None, flags=(), *, real_clock=False, **options):
         runner = load_runner()
         processes = FixtureProcesses(failures, **options)
         output = io.StringIO()
+        monotonic = time.monotonic
         with tempfile.TemporaryDirectory() as root:
             make_directory = tempfile.mkdtemp
             with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_OS": "macOS"}), \
@@ -125,7 +163,7 @@ class DiagnosticTests(unittest.TestCase):
                     mock.patch("platform.mac_ver", return_value=("15.0", (), "")), \
                     mock.patch.object(sys, "argv", [str(SCRIPT), "--ephemeral-runner", "--target",
                                                    "aarch64-apple-darwin", *flags]), \
-                    mock.patch("time.monotonic", side_effect=lambda: processes.clock), \
+                    mock.patch("time.monotonic", side_effect=monotonic if real_clock else lambda: processes.clock), \
                     mock.patch("tempfile.mkdtemp", side_effect=lambda **kw: make_directory(dir=root, **kw)), \
                     mock.patch("subprocess.Popen", side_effect=processes), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -216,7 +254,7 @@ class DiagnosticTests(unittest.TestCase):
         message, output, processes, _, _ = self.exercise(log_output=b"trustd: authorization " + b"x" * 100000)
         self.assertEqual(message, "")
         calls = processes.calls
-        log_indices = [i for i, call in enumerate(calls) if call[0] == "/usr/bin/log"]
+        log_indices = [i for i, call in enumerate(calls) if call[:2] == ["/usr/bin/log", "stream"]]
         self.assertEqual(len(log_indices), 1)
         i = log_indices[0]
         self.assertIn("append", output)
@@ -294,6 +332,118 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(message, "")
         self.assertNotIn("test-only-password", output)
         self.assertIn("<REDACTED>", output)
+
+    def test_persisted_authorization_window_runs_once_after_attempt_before_cleanup(self):
+        for flags, failures, options in (((), {}, {}), (["--keychain-only"], {}, {}),
+                                          ((), {"add-trusted-cert": (None, "timeout")}, {}),
+                                          ((), {}, {"setter_spawn_error": True})):
+            with self.subTest(flags=flags, failures=failures, options=options):
+                _, output, processes, _, _ = self.exercise(failures, flags, **options)
+                calls = processes.calls
+                shows = [i for i, call in enumerate(calls) if call[:2] == ["/usr/bin/log", "show"]]
+                self.assertEqual(len(shows), 1)
+                i = shows[0]
+                self.assertEqual(calls[i], ["/usr/bin/log", "show", "--last", "1m", "--style", "compact",
+                                            "--info", "--debug", "--predicate",
+                                            'process == "authd" OR process == "SecurityAgent"'])
+                setters = [j for j, call in enumerate(calls)
+                           if call[1] in ("add-trusted-cert", "add-certificates")]
+                self.assertEqual(len(setters), 1)
+                self.assertLess(setters[0], i)
+                self.assertIn(calls[i + 1][1], ("remove-trusted-cert", "list-keychains"))
+                self.assertLess(output.index("END service logs"), output.index("BEGIN authorization window"))
+                self.assertIn("origin/GUI cause remains unknown", output)
+        _, _, processes, _, _ = self.exercise({"create-keychain": (4, "partial write")})
+        self.assertFalse(any(call[:2] == ["/usr/bin/log", "show"] for call in processes.calls))
+
+    def test_authorization_window_redacts_before_byte_budget_including_read_boundary(self):
+        secret = "test-only-password" * 4
+        for data in (b"authd: " + b"x" * 15340 + secret.encode() + b"tail" * 10000,
+                     b"x" * 16350 + secret.encode() + b"tail" * 10000,
+                     secret.encode() * 1000, b"\xff" * 100000):
+            with self.subTest(prefix=data[:8]), mock.patch("secrets.token_hex", return_value=secret):
+                message, output, _, _, _ = self.exercise(show_output=data)
+                self.assertEqual(message, "")
+                window = output.split("BEGIN authorization window", 1)[1].split(
+                    "BEGIN user owned certificate remove-trusted-cert", 1)[0]
+                self.assertLessEqual(len(("BEGIN authorization window" + window).encode()), 16384)
+                self.assertNotIn("test-only-password", output)
+                if data.startswith(b"authd:") or data.startswith(secret.encode()):
+                    self.assertIn("<REDACTED>", window)
+
+    def test_authorization_window_has_own_deadline_and_no_termination_grace(self):
+        message, output, processes, _, _ = self.exercise(
+            {"add-trusted-cert": (None, "setter evidence"), "show": (None, "")}, show_spawn_delay=0.25,
+        )
+        self.assertIn("parent watchdog expired after 30s", message)
+        self.assertIn("owned watchdog expired after 3s", output)
+        self.assertEqual(processes.waits, [("snapshot", 30), ("certificate", 30),
+                                          ("create-keychain", 30), ("unlock-keychain", 30), ("append", 30),
+                                          ("add-trusted-cert", 15), ("sample", 3), ("add-trusted-cert", 14),
+                                          ("show", 2.75), ("remove-trusted-cert", 30), ("restore", 30),
+                                          ("delete-keychain", 30), ("verify", 30)])
+        self.assertEqual(processes.clock, 133)
+        i = next(i for i, call in enumerate(processes.calls) if call[:2] == ["/usr/bin/log", "show"])
+        child = processes.children[i]
+        child.kill.assert_called_once()
+        child.terminate.assert_not_called()
+        self.assertEqual(child.wait.call_count, 2)
+        self.assertIsNotNone(child.returncode)
+        self.assertTrue(child.stdout.closed)
+
+    def test_authorization_window_failures_preserve_primary_and_strict_cleanup(self):
+        cases = (({"show": (5, "")}, {"show_output": b"access denied"}),
+                 ({"show": (None, "")}, {}), ({}, {"show_spawn_error": True}),
+                 ({}, {"show_wait_error": KeyboardInterrupt("private interrupt details")}),
+                 ({}, {"show_read_error": True}), ({}, {"show_close_error": True}))
+        for failures, options in cases:
+            for setter_fails in (False, True):
+                with self.subTest(failures=failures, options=options, setter_fails=setter_fails):
+                    failures = dict(failures)
+                    if setter_fails:
+                        failures.update({"add-trusted-cert": (23, "setter failure"),
+                                         "remove-trusted-cert": (1, "item not found"),
+                                         "restore": (2, "restore failure"), "delete-keychain": (3, "delete failure"),
+                                         "verify": (4, "verify failure")})
+                    message, output, processes, preserved, _ = self.exercise(failures, **options)
+                    if setter_fails:
+                        self.assertIn("PRIMARY: user owned certificate add-trusted-cert: child failed (exit 23)", message)
+                        self.assertEqual(message.count("CLEANUP:"), 4)
+                        self.assertTrue(preserved)
+                    else:
+                        self.assertEqual(message, "")
+                        self.assertIn("PASS cleanup", output)
+                        self.assertFalse(preserved)
+                    self.assertIn("authorization window", output)
+                    self.assertNotIn("private ", message + output)
+                    self.assertEqual(processes.calls[-1], ["/usr/bin/security", "list-keychains", "-d", "user"])
+
+    def test_harmless_persisted_log_children_are_bounded_killed_and_reaped(self):
+        for code in ("import time; time.sleep(60)",
+                     "import os,time; os.write(1,b'authd: early request\\n'+b'x'*100000); time.sleep(60)"):
+            with self.subTest(code=code):
+                started = time.monotonic()
+                message, output, processes, preserved, _ = self.exercise(
+                    {"add-trusted-cert": (23, "setter failure")}, real_clock=True,
+                    real_show_popen=subprocess.Popen, real_show_code=code,
+                )
+                elapsed = time.monotonic() - started
+                self.assertGreaterEqual(elapsed, 2.5)
+                self.assertLess(elapsed, 4.5)  # Scheduling/reaping tolerance, not a larger watchdog.
+                self.assertIn("owned watchdog expired after 3s", output)
+                self.assertIn("PRIMARY: user owned certificate add-trusted-cert: child failed (exit 23)", message)
+                self.assertFalse(preserved)
+                self.assertEqual(len(processes.real_children), 1)
+                child = processes.real_children[0]
+                self.assertIsNotNone(child.returncode)
+                self.assertTrue(child.stdout.closed)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(child.pid, os.WNOHANG)
+                window = "BEGIN authorization window" + output.split("BEGIN authorization window", 1)[1].split(
+                    "BEGIN user owned certificate remove-trusted-cert", 1)[0]
+                self.assertLessEqual(len(window.encode()), 16384)
+                if "os.write" in code:
+                    self.assertIn("authd: early request", window)
 
     def test_valid_flags_still_refuse_wrong_host_target_or_os_version(self):
         runner = load_runner()

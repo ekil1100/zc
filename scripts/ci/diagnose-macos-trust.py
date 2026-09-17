@@ -15,6 +15,9 @@ On an approved ephemeral GHA arm64 runner only:
 The stock setter keeps its original 30s budget, including the halfway owned
 stack sample. Service logs run concurrently and retain at most 16 KiB of output;
 empty/filtered logs are not evidence that authorization or GUI activity is absent.
+After the attempt, before cleanup, one authd/SecurityAgent persisted last-minute
+query has its own 3s watchdog and 16 KiB output cap, with password redaction first.
+Missing request origin/right context leaves the authorization/GUI cause unknown.
 """
 
 import argparse
@@ -101,6 +104,62 @@ def service_logs(password, cleanup_errors):
               "startup, permissions and privacy filtering limit evidence", flush=True)
 
 
+def authorization_window(password):
+    # One read-only persisted query covers events missed during stream startup.
+    # A pipe bounds queued output; a full pipe may stall this client until its
+    # own watchdog kills it. Never communicate() an unbounded log into memory.
+    child = None
+    started = time.monotonic()
+    output = b""
+    outcome = "captured"
+    print("BEGIN authorization window (last 1m; owned watchdog 3s)", flush=True)
+    try:
+        child = subprocess.Popen(
+            ["/usr/bin/log", "show", "--last", "1m", "--style", "compact", "--info", "--debug",
+             "--predicate", 'process == "authd" OR process == "SecurityAgent"'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            umask=0o077,
+        )
+        status = child.wait(timeout=max(0, started + 3 - time.monotonic()))
+        if status:
+            outcome = f"exit {status}"
+    except subprocess.TimeoutExpired:
+        outcome = "owned watchdog expired after 3s"
+    except (Exception, KeyboardInterrupt) as error:
+        outcome = type(error).__name__
+    finally:
+        if child is not None:
+            try:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+                # Direct child only: after reaping, this pipe cannot block.
+                output = child.stdout.read(LOG_LIMIT + len(password))
+            except (Exception, KeyboardInterrupt) as error:
+                outcome = f"reap/read failed ({type(error).__name__})"
+            finally:
+                try:
+                    child.stdout.close()
+                except (Exception, KeyboardInterrupt) as error:
+                    outcome = f"stream close failed ({type(error).__name__})"
+    text = native.diagnostic_text(output, ["-p", password])
+    # A bounded read or killed writer can end inside the password. Suppress that
+    # suffix too, even if earlier redactions have shortened the retained prefix.
+    for length in range(len(password) - 1, 0, -1):
+        if text.endswith(password[:length]):
+            text = text[:-length]
+            break
+    if text:
+        print("EVIDENCE authorization window (bounded prefix; may be truncated):", flush=True)
+        # Reserve space for the probe's status lines as well as the newline.
+        print(text.encode("utf-8")[:LOG_LIMIT - 1024].decode("utf-8", errors="ignore"), flush=True)
+    else:
+        print("WARN authorization window: no evidence captured", flush=True)
+    print(f"END authorization window: {outcome}; elapsed={time.monotonic() - started:.3f}s", flush=True)
+    print("NOTE persistence, permissions and privacy may omit context; without a linked right/request, "
+          "origin/GUI cause remains unknown", flush=True)
+
+
 def diagnose(keychain_only):
     # Entry point has already checked isolation, before even this read-only snapshot.
     print("DIAGNOSTIC ONLY: " + ("keychain-only" if keychain_only else "user TrustSettings")
@@ -115,6 +174,7 @@ def diagnose(keychain_only):
     certificate = directory / "cert.pem"
     keychain_attempted = False
     trust_attempted = False
+    write_attempted = False
     primary = None
     errors = []
     try:
@@ -129,6 +189,7 @@ def diagnose(keychain_only):
         native.command([native.SECURITY, "list-keychains", "-d", "user", "-s", *original_search, keychain],
                        "append owned keychain to user search list")
         with service_logs(password, errors):
+            write_attempted = True
             if keychain_only:
                 native.command([native.SECURITY, "add-certificates", "-k", keychain, certificate],
                                "keychain-only owned certificate add-certificates")
@@ -140,6 +201,13 @@ def diagnose(keychain_only):
     except (Exception, KeyboardInterrupt) as error:
         primary = error
     finally:
+        if write_attempted:
+            try:
+                authorization_window(password)
+            except (Exception, KeyboardInterrupt) as error:
+                # Diagnostics cannot replace the saved primary or skip cleanup.
+                print(f"WARN authorization window unavailable ({type(error).__name__})", flush=True)
+
         def cleanup(action):
             try:
                 action()

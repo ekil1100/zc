@@ -9,10 +9,12 @@
 - 默认模式：不构建、不启动 Rust；生成唯一证书和独立 keychain，原样调用 User `add-trusted-cert`。
 - `--keychain-only`：在另一台全新 runner 上，只把同类证书写入独立 keychain，不写 TrustSettings。
 - 保持原 30 秒预算、写前登记清理、primary 与全部 cleanup 错误；item-not-found 不当成功。
-- 写入期间并发收集 trustd/authd/securityd 的限定日志，最多输出 16 KiB；空日志不证明不存在授权或 IPC 等待。
+- 写入期间并发收集 trustd/authd/securityd 的限定日志，最多输出 16 KiB。结束后另用独立 3 秒 watchdog 只读查询 authd/SecurityAgent 最近一分钟的持久日志，补齐 stream 启动前的事件；先脱敏再截断，不延长 setter 的 30 秒预算。空日志不证明不存在授权或 IPC 等待。
 - 不修改 authdb、SIP、账户或密码，不把 User setter 改成 sudo，不上传私有 keychain/证书私钥；失败后销毁 runner。
 
 有区分力的预测：无 Rust 仍失败可排除 Rust 前置验证是必要条件；keychain-only 成功而 TrustSettings 失败，将范围缩到后者；相关服务日志才可进一步区分授权、锁或其他 IPC 等待。上述模式通过也不代表九项 TLS/DNS 场景通过。
+
+[诊断 CI 35247844404 / `d22abd6`](https://github.com/ekil1100/zc/actions/runs/35247844404) 已确认：无 Rust 的 User setter 仍在相同 XPC 路径超时，独立 keychain-only 对照通过。stream 首个事件比 setter 启动晚约 0.2 秒；仅捕获 authd 的 `builtin:authenticate`，缺少关联 right/请求来源，**还不能把它直接认定为本次 GUI 根因**。新增持久日志查询用于补足这一证据缺口，不是修复或授权绕过。
 
 ## Intel UDP：最小真实链路
 
@@ -45,4 +47,4 @@ python3 scripts/ci/test-macos-trust-diagnostic.py
 just delivery-test
 ```
 
-15 项 trust 诊断合约只使用无害子进程和外部进程边界替身；6 项 UDP 回归使用真实 socket，包括黑洞、畸形响应、第一轮失败后第二轮成功仍报错、SIGTERM 回收。它们验证诊断工具能报红，不证明平台根因已修复。
+20 项 trust 诊断合约只使用无害子进程和外部进程边界替身；6 项 UDP 回归使用真实 socket，包括黑洞、畸形响应、第一轮失败后第二轮成功仍报错、SIGTERM 回收。它们验证诊断工具能报红，不证明平台根因已修复。
