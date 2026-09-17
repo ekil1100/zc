@@ -345,7 +345,8 @@ class DiagnosticTests(unittest.TestCase):
                 i = shows[0]
                 self.assertEqual(calls[i], ["/usr/bin/log", "show", "--last", "1m", "--style", "compact",
                                             "--info", "--debug", "--predicate",
-                                            'process == "authd" OR process == "SecurityAgent"'])
+                                            '(process == "authd" OR process == "SecurityAgent") AND '
+                                            'subsystem == "com.apple.Authorization"'])
                 setters = [j for j, call in enumerate(calls)
                            if call[1] in ("add-trusted-cert", "add-certificates")]
                 self.assertEqual(len(setters), 1)

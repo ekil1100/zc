@@ -116,7 +116,8 @@ def authorization_window(password):
     try:
         child = subprocess.Popen(
             ["/usr/bin/log", "show", "--last", "1m", "--style", "compact", "--info", "--debug",
-             "--predicate", 'process == "authd" OR process == "SecurityAgent"'],
+             "--predicate", '(process == "authd" OR process == "SecurityAgent") AND '
+             'subsystem == "com.apple.Authorization"'],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             umask=0o077,
         )
