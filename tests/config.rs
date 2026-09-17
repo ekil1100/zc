@@ -55,21 +55,16 @@ fn listener_declarations_are_strict_and_never_override_cli_port() {
         "bind-address: example.com",
         "bind-address: '192.168.1.1'",
         "allow-lan: yes",
-        "mode: global",
-        "mode: direct",
         "log-level: nonsense",
-        "mixed-port: 0",
+        "mixed-port: 0\nport: 12345",
         "mixed-port: 65536",
         "port: 12345",
         "socks-port: 12345",
         "redir-port: 12345",
         "tproxy-port: 12345",
-        "external-controller: 127.0.0.1:12345",
-        "secret: password",
         "dns: {}",
         "tun: {enable: false}",
         "proxy-providers: {}",
-        "rule-providers: {}",
         "profile: {}",
         "ipv6: true",
         "unknown: false",
@@ -147,7 +142,6 @@ fn unsupported_proxy_capabilities_and_unsafe_values_are_rejected_without_secrets
         ", network: ws",
         ", network: grpc",
         ", network: udp",
-        ", udp: true",
         ", tls: true",
         ", sni: example.com",
         ", skip-cert-verify: false",
@@ -167,7 +161,6 @@ fn unsupported_proxy_capabilities_and_unsafe_values_are_rejected_without_secrets
         ("name: edge", "name: 'bad,name'"),
         ("name: edge", "name: ' padded '"),
         ("type: ss", "type: vmess"),
-        ("type: ss", "type: direct"),
         ("server: localhost", "server: 'bad/host'"),
         ("server: localhost", "server: '[::1]'"),
         ("port: 443", "port: 0"),
@@ -199,7 +192,6 @@ fn unsupported_proxy_capabilities_and_unsafe_values_are_rejected_without_secrets
         ", sni: null",
         ", skip-cert-verify: null",
         ", network: ws",
-        ", udp: true",
     ] {
         assert!(Config::parse(&format!("proxies: [{{name: edge, type: trojan, server: localhost, port: 443, password: top-secret-marker{extra}}}]")).is_err());
     }
@@ -390,10 +382,7 @@ async fn ip_and_destination_port_rules_match_in_order_using_real_socket_destinat
         );
     }
     for rule in [
-        "GEOIP,CN,DIRECT",
-        "PROCESS-NAME,curl,DIRECT",
         "RULE-SET,list,DIRECT",
-        "SRC-PORT,443,DIRECT",
         "DOMAIN,,DIRECT",
         "DOMAIN,bad name,DIRECT",
         "DOMAIN,example.com,DIRECT,no-resolve",
@@ -495,7 +484,7 @@ fn configuration_collection_limits_are_inclusive_and_enforced_during_parsing() {
             "member count {count}"
         );
     }
-    for (count, valid) in [(262144, true), (262145, false)] {
+    for (count, valid) in [(262143, true), (262144, false)] {
         let source = format!("rules:\n{}", "- MATCH,DIRECT\n".repeat(count));
         assert_eq!(Config::parse(&source).is_ok(), valid, "rule count {count}");
     }

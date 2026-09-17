@@ -1,126 +1,81 @@
-use std::{
-    fs::OpenOptions,
-    io::Read,
-    path::{Path, PathBuf},
-};
-
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use zc::{config::Config, runtime::Runtime};
-
-#[derive(Parser)]
-#[command(
-    name = "zc",
-    version,
-    about = "An experimental TCP proxy runtime; foreground only, no daemon or managed state"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Start the experimental TCP mixed HTTP/SOCKS5 listener
-    Start {
-        /// Read an explicit configuration file (no managed profiles)
-        #[arg(short, long, value_name = "PATH")]
-        config: PathBuf,
-        /// Bind exactly this port; no default or fallback port
-        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
-        port: u16,
-        /// Run in the foreground (required)
-        #[arg(long, required = true)]
-        foreground: bool,
-    },
-}
-
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
-    match run(cli).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-fn read_config(path: &Path) -> Result<Config> {
-    const LIMIT: u64 = 16 * 1024 * 1024;
-    let metadata = std::fs::metadata(path)
-        .context("cannot inspect configuration file; check the path and permissions")?;
-    // Reject special files before opening: opening a FIFO could block indefinitely.
-    if !metadata.is_file() {
-        bail!("configuration must be a regular file");
-    }
-    if metadata.len() > LIMIT {
-        bail!("configuration exceeds the 16 MiB limit");
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // A path may become a FIFO after metadata(). Never block before fstat.
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    let file = options
-        .open(path)
-        .context("cannot open configuration file; check read permissions")?;
-    if !file
-        .metadata()
-        .context("cannot inspect opened configuration file")?
-        .is_file()
-    {
-        bail!("configuration must be a regular file");
-    }
-    let mut bytes = Vec::new();
-    file.take(LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .context("cannot read configuration file")?;
-    if bytes.len() as u64 > LIMIT {
-        bail!("configuration exceeds the 16 MiB limit");
-    }
-    let source = std::str::from_utf8(&bytes).context("configuration must be UTF-8")?;
-    // Config discards parser source snippets and returns credential-free diagnostics.
-    Config::parse(source).context("invalid configuration")
-}
-
-async fn run(cli: Cli) -> Result<()> {
-    let Commands::Start {
-        config,
-        port,
-        foreground: _,
-    } = cli.command;
-    let config = read_config(&config)?;
-    let runtime = Runtime::bind(config, port).await?;
-    #[cfg(unix)]
-    let shutdown = {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut interrupt =
-            signal(SignalKind::interrupt()).context("cannot install Ctrl-C handler")?;
-        let mut terminate =
-            signal(SignalKind::terminate()).context("cannot install SIGTERM handler")?;
-        async move {
-            tokio::select! {
-                _ = interrupt.recv() => {},
-                _ = terminate.recv() => {},
+fn main() -> std::process::ExitCode {
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<String> = match raw.iter().map(|arg| arg.clone().into_string()).collect() {
+        Ok(args) => args,
+        Err(_) => {
+            let json = raw.iter().any(|arg| arg == "--json");
+            let command = raw
+                .iter()
+                .take(2)
+                .filter_map(|arg| arg.to_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let code = if matches!(command.as_str(), "config load" | "config download") {
+                "CONFIG_NAME_INVALID"
+            } else {
+                "COMMAND_UNKNOWN"
+            };
+            if json {
+                println!(
+                    "{}",
+                    zc::cli::ascii_json(
+                        &serde_json::json!({"ok":false,"command":command,"error":{"code":code,"message":"command arguments must be valid UTF-8","hint":"use a UTF-8 config name and path"}})
+                    )
+                );
+            } else {
+                eprintln!(
+                    "error: command arguments must be valid UTF-8\nhint: use a UTF-8 config name and path\ncode: {code}"
+                );
             }
+            return std::process::ExitCode::FAILURE;
         }
     };
-    #[cfg(windows)]
-    let shutdown = {
-        let mut interrupt =
-            tokio::signal::windows::ctrl_c().context("cannot install Ctrl-C handler")?;
-        async move {
-            interrupt.recv().await;
+    // Internal worker modes must bypass ordinary CLI parsing and output envelopes.
+    if args
+        .first()
+        .is_some_and(|arg| arg == zc::override_script::WORKER_ARGUMENT)
+    {
+        return match zc::override_script::worker_main() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    // Short CLI commands need async IO, not a pool of runtime worker threads.
+    // Keep daemon/foreground scheduling unchanged; override workers above stay synchronous.
+    let daemon = args.first().is_some_and(|arg| arg == "--daemon-run");
+    let foreground = args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "start" | "up"))
+        && args.iter().any(|arg| arg == "--foreground");
+    let mut builder = if daemon || foreground {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let runtime = match builder.enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: cannot initialize async runtime: {error}");
+            return std::process::ExitCode::FAILURE;
         }
     };
-    eprintln!(
-        "Experimental TCP runtime listening on {} (foreground)",
-        runtime.local_addr()?
-    );
-    runtime.run(shutdown).await
+    runtime.block_on(async {
+        if daemon {
+            if args.len() != 3 {
+                eprintln!("error: invalid daemon invocation");
+                return std::process::ExitCode::from(2);
+            }
+            return match zc::daemon::run_child(&args[1], &args[2]).await {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
+        std::process::ExitCode::from(zc::cli::run(args).await)
+    })
 }

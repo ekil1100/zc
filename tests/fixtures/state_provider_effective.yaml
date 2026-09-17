@@ -1,0 +1,150 @@
+port: 0
+socks-port: 0
+mixed-port: 9001
+redir-port: 0
+tproxy-port: 0
+allow-lan: false
+bind-address: "*"
+mode: "rule"
+log-level: "info"
+ipv6: true
+idle-session-check-interval: 30
+idle-session-timeout: 30
+min-idle-session: 0
+rule-providers:
+  "zed":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "0.yaml"
+    interval: 86400
+  "beta":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "2.yaml"
+    interval: 86400
+  "provider-4-xxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "7.yaml"
+    interval: 86400
+  "provider-1-x":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "4.yaml"
+    interval: 86400
+  "provider-12-xxxxxxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "15.yaml"
+    interval: 86400
+  "provider-8-xxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "11.yaml"
+    interval: 86400
+  "provider-7-xxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "10.yaml"
+    interval: 86400
+  "provider-15-xxxxxxxxxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "18.yaml"
+    interval: 86400
+  "alpha":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "1.yaml"
+    interval: 86400
+  "long-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "19.yaml"
+    interval: 86400
+  "provider-13-xxxxxxxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "16.yaml"
+    interval: 86400
+  "中.example":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "20.yaml"
+    interval: 86400
+  "provider-6-xxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "9.yaml"
+    interval: 86400
+  "provider-10-xxxxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "13.yaml"
+    interval: 86400
+  "provider-0-":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "3.yaml"
+    interval: 86400
+  "provider-11-xxxxxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "14.yaml"
+    interval: 86400
+  "provider-14-xxxxxxxxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "17.yaml"
+    interval: 86400
+  "provider-3-xxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "6.yaml"
+    interval: 86400
+  "x\\u2066:#":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "21.yaml"
+    interval: 86400
+  "provider-9-xxxxxxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "12.yaml"
+    interval: 86400
+  "provider-5-xxxxx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "8.yaml"
+    interval: 86400
+  "provider-2-xx":
+    type: "http"
+    behavior: "domain"
+    url: "https://example.com/rules"
+    path: "5.yaml"
+    interval: 86400
+proxies: []
+proxy-groups: []
+rules:
+  - "MATCH,DIRECT"

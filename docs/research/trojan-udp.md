@@ -1,5 +1,7 @@
 # Trojan UDP 协议与互操作结论
 
+> 本文保留协议研究与原 Zig 实现/验证记录；其中 TLS 派生栈、线程模型和构建命令不描述当前 Rust 实现。当前使用 rustls/Tokio，支持边界及待验收项见 [兼容说明](../compat/mihomo-clash.md)。历史通过记录不能替代 Rust 门禁。
+
 ## 结论
 
 Trojan UDP ASSOCIATE 不是 UDP socket 直连代理服务器，而是在一条独立 TLS

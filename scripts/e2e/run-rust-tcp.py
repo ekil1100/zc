@@ -168,8 +168,19 @@ def runtime(zc, directory, label, proxy=None, trusted=False, reject=False):
     args = [str(zc), "start", "--config", str(config_file), "--port", str(listen_port), "--foreground"]
     with process(args, directory / "zc.log", listen_port, env, f"listening on 127.0.0.1:{listen_port}"):
         yield listen_port
-    assert list(home.iterdir()) == [], "Rust runtime mutated managed configuration"
-    assert list(run.iterdir()) == [], "Rust runtime mutated lifecycle state"
+    assert not (home / ".config/zc").exists(), "unmanaged runtime created a managed catalog"
+    assert not (home / "config/zc").exists(), "unmanaged runtime created an XDG managed catalog"
+    # Foreground now participates in the same nonce-bound lifecycle as daemon mode.
+    # Persistent locks/key/log are allowed; live identity and prepared inputs are not.
+    assert not (run / "zc.pid").exists(), "foreground left a live PID file"
+    assert not (run / "zc.daemon.json").exists(), "foreground left a live descriptor"
+    assert not list(run.glob("zc.start.*")), "foreground leaked prepared inputs"
+    assert not list(run.glob("zc.stop.*")), "foreground leaked a stop request"
+    assert run.stat().st_mode & 0o777 == 0o700, "runtime directory is not private"
+    for state_file in run.iterdir():
+        assert not state_file.is_symlink(), "lifecycle file is a symlink"
+        assert state_file.is_file(), "unexpected lifecycle file type"
+        assert state_file.stat().st_mode & 0o777 == 0o600, "lifecycle file is not private"
 
 
 def tunnel(mixed_port, target, kind="socks", host=None):
@@ -304,7 +315,7 @@ def main():
     parser.add_argument("fixtures", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="zc-rust-e2e-") as directory:
-        run(args.zc.resolve(), args.fixtures.resolve(), Path(directory))
+        run(args.zc.resolve(), args.fixtures.resolve(), Path(directory).resolve())
 
 
 if __name__ == "__main__":

@@ -1,129 +1,87 @@
-# Runtime Config Override
+# 配置 Override
 
-`zc` supports runtime config override for commands that load config (`start`, `test`, `doctor`, `proxy ...`).
+当前实现为 `src/override_script.rs`；命令编排位于 `src/cli.rs` / `src/service.rs`。一次性 CLI override 只影响本次准备；持久 override 发布新的 immutable revision，冻结脚本、参数、patch 与 materialized config，不覆盖原 source。
 
-A one-shot CLI override is in-memory only. A persistent override is captured as a new immutable managed revision; the source profile bytes remain unchanged, while the validated materialized result is frozen in that revision.
-You can bind a persistent override script to the active config profile via `zc config override`.
+## 使用
 
-## CLI Flags
-
-- `--override-script <path>`: run override script.
-- `--override-arg <k=v>`: repeatable key/value arguments passed to script.
-- `--override-timeout-ms <n>`：脚本超时范围为 `1..60000` ms，默认 `5000`；`0` 不再表示无期限执行。
-
-For merged config output, use:
-
-- `zc config dump` (YAML)
-- `zc config dump --json` (JSON)
-- `zc config dump --no-override` (ignore all override scripts and dump source config)
-
-## Persistent Binding (Per Config)
-
-- `zc config override <script.lua>`: bind a persistent override script to current config.
-- `zc config override --clear`: clear persistent binding for current config.
-- `zc config override`: show current config binding status.
-
-Persistence scope is the active profile's immutable catalog revision. `meta.json` and `configs/` are compatibility mirrors and are never authoritative writers.
-When setting override:
-
-- script bytes, invocation metadata, emitted patch, and materialized config are captured in a new revision
-- the active profile and authority token are bound before materialization; a concurrent `config use` or head change fails with a retryable conflict
-- the candidate is parsed and validated offline before the profile head advances
-- the original script file is no longer required after a successful commit
-- if the daemon is running, the exact committed revision is auto-applied (`auto`: try hot, fallback to an instance-bound prepared restart)
-
-When clearing override, a new revision is published from the unchanged source bytes without the frozen override. Existing immutable revisions remain available for exact identity checks.
-
-Runtime priority:
-
-1. CLI `--override-script` (highest, one-shot)
-2. persisted `zc config override` binding
-3. no override
-
-## Script Contract
-
-### Mode A: Lua script (`*.lua`)
-
-`zc` executes lua script and expects:
-
-- return `table`: override object
-- return `nil`: no override
-
-Requirement: `luajit` or `lua` executable must be available in runtime environment.
-
-Global input available in script:
-
-```lua
-input.command      -- string, e.g. "test" / "proxy.list"
-input.config_path  -- base config path or ""
-input.script_path  -- resolved override script path
-input.args         -- key/value map from --override-arg
+```bash
+zc start -c config.yaml --port 17890 --override-script rules.lua
+zc config override rules.lua
+zc config override
+zc config override --clear
+zc config dump
+zc config dump --json
+zc config dump --no-override
 ```
 
-Lua 参数通过逐项环境变量传输，值中的 `;`、`=` 和空字符串会原样保留；重复 key 按命令行顺序由后一个值覆盖前一个值。
+配置加载命令可使用 `--override-script <path>`、可重复 `--override-arg <k=v>`、`--override-timeout-ms <n>`。timeout 为 `1..60000` ms，默认 5000；0 不表示无限执行。旧 `--override-dump-yaml/json` 拒绝，改用 `config dump`。
 
-Example:
+优先级：一次性 CLI override > 当前 revision 已冻结的持久 override > 无 override。`config dump` 从 exact active revision 读取 materialization；有临时 override 时再执行一次，`--no-override` 读取 source。默认 restart 复用冻结快照，不自动重新执行脚本；reload 重读 tracked source，不能把两者混为一谈。
+
+## 持久绑定
+
+`config override <script>` / `--clear` 绑定操作开始时的 active identity 和 state token，离线校验候选后 CAS 发布；并发 config use/head 变化返回冲突，不能把脚本写到另一个 profile。原脚本提交后不再是读取该 revision 的依赖。清除时从未改变的 source 发布新 revision，旧 immutable revision 保留。
+
+提交后只向匹配 exact 旧 identity 的 daemon 尝试 apply，目前使用实例绑定的 prepared restart。supervised foreground 须通过 supervisor 操作。apply 失败不否定已经持久化的新 revision，需检查 status 后显式恢复。`meta.json/configs` 只是兼容镜像，不是持久 override 的权威来源。
+
+## Lua 与可执行脚本
+
+### Lua（`.lua`）
+
+Rust 通过 `mlua` 内嵌 Lua 5.4，在独立 worker 进程执行，**不需要系统 lua/luajit**。返回 table 作为 patch，nil 表示无 patch；也接受 YAML 字符串。输入：
+
+```lua
+input.command      -- e.g. "start" or "proxy.list"
+input.config_path  -- selected source path or ""
+input.script_path  -- selected script path
+input.args         -- key/value arguments
+```
 
 ```lua
 return {
-  mode = "global",
-  ["log-level"] = "debug",
-  ["mixed-port"] = 7899,
+  rules = {
+    "DOMAIN,blocked.invalid,REJECT",
+    "MATCH,DIRECT",
+  },
 }
 ```
 
-### Mode B: executable script (non-lua)
+重复参数 key 后者覆盖前者；`;`、`=`、空值原样保留，不按拼接分隔符猜测。worker 提供相应 `ZC_OVERRIDE_*` 环境输入。
 
-Executable script should print YAML override map to stdout.
+Lua worker 可使用标准 io/os；这是**受信任脚本执行，不是安全沙箱**，可能访问文件或创建子进程。与旧解释器环境可能有差异，不保证 LuaJIT/外部 Lua 模块兼容。脚本/输出各最多 1 MiB，Lua 内存预算 64 MiB、指令预算 5000 万，并受父进程 absolute timeout；stdout/stderr 各有界，超时/取消清理进程组。脚本日志不要混入 YAML stdout。
 
-Example output:
+### 非 Lua 可执行脚本
+
+选定文件必须是有执行权限的普通文件，stdout 输出一个 YAML map。脚本以冻结副本执行，环境清理后只传调用元数据，不保证继承 shell/PATH；需使用明确 shebang 与所需工具绝对路径。子进程同样受 deadline、输出上界与进程组回收约束。
 
 ```yaml
-mode: global
-log-level: debug
+rules:
+  - MATCH,DIRECT
 ```
 
-## Merge Rules
+## 合并与能力 gate
 
-- override stdout 必须是一个完整 YAML map；重复 key、尾随非注释内容和畸形文档会被拒绝
-- 整个 patch 采用事务式提交：语法、类型、分配或语义失败时，原配置保持不变
-- scalar keys: replace
-- map key `rule-providers`: whole-map replace
-- list keys (`proxies`, `proxy-groups`, `rules`): whole-list replace
-- unknown/unsupported key: error (`OVERRIDE_OUTPUT_INVALID`)
-- YAML `null` 清除 `external-controller`；带引号的 `"null"` 保持为字符串
+- patch 必须是完整 YAML map；重复 key、尾随非注释内容、畸形/超限文档拒绝。
+- scalar 替换；`rule-providers` 整 map 替换；`proxies/proxy-groups/rules` 整 list 替换，不增量拼接。
+- 未知/不支持字段或非法类型报错。YAML null 可清除 `external-controller`；字符串 `"null"` 不等同 null。
+- patch 事务式验证，失败不改变 source/authority。空 patch 也必须经过 capability gate；不能借 override 绕过 reserved 名称、未启用类型、standalone listener 或 plugin gate。
+- `mixed-port` patch 不控制实际端口，真正 bind 仍为 CLI `--port` 或生产默认 7899。兼容字段仅在 `runtime_source` 投影中移除，不能把投影字节写回 revision 冒充原 proof。
+- 共享资源上界见 [兼容说明](../compat/mihomo-clash.md#配置资源上界)，replacement 不得截断、绕过计数或部分发布。额外 1 MiB patch/脚本上界同时生效。
 
-The materialized result remains subject to all shared fixed limits: 4096 proxy nodes, 1024 proxy groups, 5120 mixed `proxies:` entries, 5122 members per group, 4096 rule providers, 262144 aggregate normalized provider entries / 64 MiB normalized bytes, 64 MiB aggregate raw provider source bytes per synchronization/authoritative load pass (16 MiB per source), and 262144 expanded rules / 64 MiB owned payload+target bytes. Override replacement cannot bypass or truncate these limits. The parser exposes typed proxy/provider/expanded-rule limit errors; the override transaction surfaces its existing merge/apply failure code. Reduce/filter the replacement list and retry; there is no limit switch or fallback.
+`plugin_opts/plugin-opts` map 输入规范成 `plugin-opts`，保留 mode/host；非 SS plugin、未知 plugin/mode、非 map 或冲突 alias 拒绝。不启动外部 SIP003 插件。
 
-`RULE-SET` in `rules` is supported via `rule-providers`. Each provider is also bounded to 262144 normalized entries, including raw legacy/classical lines. Multiple providers share the aggregate normalized budgets and the independent 64 MiB raw-source budget; a raw payload at the exact normalized aggregate bound succeeds and its next normalized entry returns `RuleProviderAggregateEntryCountLimitExceeded` before cloning. A YAML wrapper may instead reach the separate global decoded-YAML budget first. Expansion uses a borrowed-key hash index, rejects duplicate provider names, charges repeated references and targets, and reserves output only after a checked count/byte preflight. YAML allocation, collection-budget, and nesting failures never fall back to the line parser. Managed revisions expand captured local providers offline, but a referenced remote provider left as `RULE-SET` is not catalog-admissible or runtime-ready; it is rejected before revision publication and at the exact activation gate. Unreferenced remote provider declarations may remain deferred.
+## Provider：离线与网络准备分开
 
-Frozen materialization applies the shared v1 runtime-capability gate to both empty and non-empty patches. Reserved proxy/group declarations, disabled proxy/group types, standalone `port`/`socks-port`, and plugin capability errors all return `UnsupportedCapability`. 这里的 standalone 指结果中没有非零 `mixed-port` 声明；若 mixed listener 已配置，额外的 `port`/`socks-port` 仅作为 ignored compatibility declarations 保留，运行时不会绑定它们。Patch 中的 `mixed-port` 数值同样不控制运行端口；runtime preparation 只保留显式 CLI `--port`，否则规范化为 `7899`。This materialization gate performs no provider download or local-asset resolution; those remain responsibilities of the later bundle/offline-runtime preparation stages.
+Managed materialization 只使用捕获的本地 assets。被 RULE-SET 引用的 HTTP provider 在离线发布/激活 gate 拒绝；未引用声明可 deferred。持久 override 加入远程 RULE-SET 并不使 managed revision 自动获得网络权限。
 
-Runtime preparation behavior:
+Unmanaged 来源经 `capture_for_runtime` 后，在准备阶段真实下载 HTTP provider 并冻结结果。当前 Rust 不提供原 Zig 的 cache/interval best-effort refresh、`zc test` 缓存特例或 curl fallback；网络失败直接拒绝，旧运行实例在 reload preparation 失败时继续服务。此差异尚待对齐，详见 [迁移说明](../migration/rust.md)。
 
-- missing provider file + `url` present: download required (failure returns error)
-- existing provider file + `url` present + interval due: best-effort refresh (failure keeps cached file)
-- `zc test` exception: if the provider file already exists, skip interval-based refresh and reuse the local cache
-- missing provider file without `url`: `RULE_PROVIDER_FILE_NOT_FOUND`
+## Dump 与错误
 
-## Dump Output
+普通 dump 输出裸 YAML / JSON，脱敏 password、uuid、secret、sni 等字段；不加 CLI envelope，便于 jq/yq。失败仍使用标准错误 envelope。
 
-`zc config dump` normally prints merged config with sensitive fields redacted (`password`, `uuid`, `secret`, `sni`).
-`zc config dump` reads the frozen materialized bytes from the exact active revision. A temporary override flag is then applied once, if supplied. `--no-override` reads the immutable source bytes instead. Shadowsocks `plugin_opts`/`plugin-opts` map input is normalized to canonical `plugin-opts` output, preserving `mode` and `host`. The recovery-only text command `zc config dump -c <name> --no-override` emits a retained malformed revision's verified raw YAML because it cannot be safely normalized; treat that output as sensitive.
+唯一敏感例外：`config dump -c <name> --no-override` 的 malformed recovery-only **文本**输出保留经验证的 raw source，可能包含凭据；终端不安全字符拒绝，重定向保留字节。不要将其发到公开日志。
 
-## Error Codes
+常见错误：`OVERRIDE_SCRIPT_NOT_FOUND`、`OVERRIDE_SCRIPT_EXEC_FAILED`、`OVERRIDE_SCRIPT_TIMEOUT`、`OVERRIDE_OUTPUT_INVALID`、`OVERRIDE_MERGE_FAILED`、`OVERRIDE_OPTION_DEPRECATED`、`CONFIG_OVERRIDE_APPLY_FAILED`、`CONFIG_DUMP_FAILED`。完整词汇见 [错误码](../api/error-codes.md)。
 
-- `OVERRIDE_SCRIPT_NOT_FOUND`
-- `OVERRIDE_SCRIPT_EXEC_FAILED`
-- `OVERRIDE_SCRIPT_TIMEOUT`
-- `OVERRIDE_OUTPUT_INVALID`
-- `OVERRIDE_MERGE_FAILED`
-- `OVERRIDE_OPTION_DEPRECATED`
-- `RULE_PROVIDER_DOWNLOAD_FAILED`
-- `RULE_PROVIDER_FILE_NOT_FOUND`
-- `CONFIG_OVERRIDE_APPLY_FAILED`
-- `CONFIG_DUMP_FAILED`
-
-## Example
-
-- Lua rules override example: `docs/config/examples/override-loyalsoldier-rules.lua`
+示例 [override-loyalsoldier-rules.lua](examples/override-loyalsoldier-rules.lua) 引用远程 provider，适用于 unmanaged 网络准备；不能据此宣称 managed offline 支持 HTTP RULE-SET。

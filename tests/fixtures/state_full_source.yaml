@@ -1,0 +1,45 @@
+port: 8080
+socks-port: 1080
+mixed-port: 9000
+redir-port: 0
+tproxy-port: 0
+allow-lan: false
+bind-address: '*'
+mode: rule
+log-level: debug
+ipv6: false
+external-controller: '127.0.0.1:19091'
+external-ui: "a\u202e\u009b\x01\n\"\\中"
+secret: "private\x7f\tkey"
+idle-session-check-interval: -2
+idle-session-timeout: 12
+min-idle-session: 3
+rule-providers:
+  zed: {type: file, behavior: domain, path: zed.yaml}
+  alpha: {type: http, behavior: classical, path: alpha.yaml, url: 'https://example.com/a?b=c', interval: 77}
+  beta: {type: file, behavior: ipcidr, path: beta.yaml}
+proxies:
+  - {name: direct-node, type: direct}
+  - {name: reject-node, type: reject, udp: true}
+  - name: ss-node
+    type: ss
+    server: example.com
+    port: 8388
+    password: "a\n\"\\b"
+    cipher: aes-128-gcm
+    uuid: 'extra-uuid'
+    alterId: 9
+    sni: 'private.example'
+    network: tcp
+    udp: true
+    skip-cert-verify: true
+    plugin: obfs
+    plugin_opts: {host: obfs.example.com, mode: http}
+  - {name: trojan-node, type: trojan, server: example.com, port: 443, password: key, tls: true, sni: tls.example.com}
+  - {name: Mixed, type: select, proxies: [DIRECT, ss-node], url: 'https://example.com/check', interval: 12, tolerance: 7, lazy: false}
+proxy-groups:
+  - {name: Proxy, type: select, proxies: [Mixed, trojan-node, REJECT]}
+rules:
+  - 'DOMAIN, example.com , Proxy'
+  - 'IP-CIDR,10.0.0.0/8,REJECT,no-resolve'
+  - 'RULE-SET,zed,DIRECT'

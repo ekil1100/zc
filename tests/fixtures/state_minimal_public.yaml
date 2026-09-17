@@ -1,0 +1,17 @@
+port: 0
+socks-port: 0
+mixed-port: 9001
+redir-port: 0
+tproxy-port: 0
+allow-lan: false
+ipv6: true
+bind-address: "*"
+mode: "rule"
+log-level: "info"
+idle-session-check-interval: 30
+idle-session-timeout: 30
+min-idle-session: 0
+proxies: []
+proxy-groups: []
+rules:
+  - "MATCH,REJECT"

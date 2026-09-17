@@ -1,4 +1,6 @@
-# CLI/API Error Codes
+# CLI/API 错误码
+
+Rust 命令映射位于 `src/cli.rs`；本字典保留原冻结词汇和验收目标，不表示每个历史内部错误名都已逐点迁移。当前差异见 [迁移说明](../migration/rust.md)。message/hint 列是英文输出示例，不要求逐字相同。
 
 ## 1) 目标
 
@@ -34,7 +36,7 @@
 
 ---
 
-## 3) 已实现 CLI 错误码（与 `src/` 实际发射点一致）
+## 3) CLI 冻结错误码与验收目标
 
 ### A. 全局（dispatch / help / version）
 
@@ -137,6 +139,9 @@
 | `CONFIG_OVERRIDE_SCRIPT_NOT_FOUND` | override script file not found | check script path and retry |
 | `CONFIG_OVERRIDE_FAILED` | failed to update persisted config override | check config state and retry |
 | `CONFIG_OVERRIDE_APPLY_FAILED` | override persisted but failed to apply running daemon | check logs and run `zc restart` |
+| `CONFIG_DELETE_NAME_REQUIRED` | missing config name | use `zc config delete <name>` |
+| `CONFIG_DELETE_ARGUMENT_INVALID` | invalid delete arguments | use `zc config delete <name>` |
+| `CONFIG_DELETE_FAILED` | failed to delete config reference | inspect catalog state without deleting immutable data |
 | `CONFIG_SUBCOMMAND_UNKNOWN` | unknown config subcommand | use `zc config --help` to list config subcommands |
 
 `CONFIG_LOAD_INVALID` 是 validator 完成后的语义失败：文本 stderr 在错误块后列出具体 errors/warnings；JSON failure envelope 附带 `data.config_errors`、`data.config_warnings`、`data.config_diagnostics_truncated`。errors 优先于 warnings，占满 256 条共享上界时仍至少保留一条可操作 error。parser/I/O/resource-limit/name 错误不伪造这些字段。
@@ -223,7 +228,7 @@ source 并修复 subscription source；active update 只提示修复 subscriptio
 
 | code | message 示例 | hint 示例 |
 |---|---|---|
-| `OVERRIDE_SCRIPT_NOT_FOUND` | override script or runtime not found | check `--override-script` path and lua availability |
+| `OVERRIDE_SCRIPT_NOT_FOUND` | override script or executable interpreter not found | check the selected script path or executable interpreter |
 | `OVERRIDE_SCRIPT_EXEC_FAILED` | override script execution failed | ensure script exits 0 and outputs valid override |
 | `OVERRIDE_SCRIPT_TIMEOUT` | override script timed out | increase `--override-timeout-ms` or simplify script |
 | `OVERRIDE_OUTPUT_INVALID` | override output is invalid | output yaml object with known config keys |
@@ -271,7 +276,10 @@ override flag 本身的解析错误（`--override-script`/`--override-arg` 缺�
 - 旧 OpenAPI 草案已归档到 `docs/archive/api/openapi.yaml`，不再作为当前契约。
 - 新增错误码时，必须同步更新本字典，并在对应 CLI/API 文档中说明可触发场景。
 
-## 7) 后续落地
+## 7) Rust 对齐边界
 
-1. API 路径（`src/api/server.zig`）错误响应仍为 `{"error":"…"}` 简单格式，尚未对齐本字典的 envelope。
-2. 为高频 code 增加集成测试断言（已覆盖 PROXY / PROFILE / DIAG / CHECKS_FAILED 路径，见 `src/integration_error_test.zig`）。
+1. `src/api.rs` 保持 `{"error":"…"}` 简单响应，不承诺 CLI envelope。
+2. Rust CLI 回归位于 `tests/cli.rs`、`tests/cli_managed.rs`，daemon/CAS 另有独立测试；仍需完整原 core E2E 证明冻结码一致。
+3. 上文 typed resource error 名称来自原规范；Rust 部分边界使用字符串映射到公开 `CONFIG_*_LIMIT_EXCEEDED`，不能把内部类型一致性当作已完成。
+4. 原 validator 的有界多条详细诊断仍是验收目标，Rust 部分路径只发概括性错误；不要据字段存在宣称诊断精度已等价。
+5. `durability_uncertain:true` 是可见提交成功但持久性未确认，不应改成失败后自动重试发布；`mirror_out_of_sync:true` 也不代表 catalog commit 失败。

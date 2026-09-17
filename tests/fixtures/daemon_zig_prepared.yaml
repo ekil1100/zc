@@ -1,0 +1,28 @@
+# zc-prepared-v1 -
+# zc-prepared-source-v1 2f707269766174652f7661722f666f6c646572732f39632f32396b68706b736a347a6734766d787377316b787067336330303030676e2f542f7a632d6964656e746974792d7265766965772d6d335f39727163692f6461656d6f6e2d666978747572652d79317931716a626e2f686f6d652f636f6e6669672e79616d6c
+# zc-prepared-port-v1 54045
+port: 0
+socks-port: 0
+mixed-port: 54045
+redir-port: 0
+tproxy-port: 0
+allow-lan: false
+ipv6: true
+bind-address: "*"
+mode: "rule"
+log-level: "info"
+idle-session-check-interval: 30
+idle-session-timeout: 30
+min-idle-session: 0
+proxies: []
+proxy-groups:
+  - name: "pick"
+    type: "select"
+    proxies:
+      - "DIRECT"
+      - "REJECT"
+    interval: 300
+    tolerance: 100
+    lazy: true
+rules:
+  - "MATCH,pick"

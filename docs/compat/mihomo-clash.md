@@ -1,237 +1,141 @@
-# zc mihomo/clash compatibility boundaries
+# mihomo/clash 兼容边界
 
-This document describes compatibility based on current code, not aspirational roadmap items.
+本文描述 Rust 候选实现与原基线要求，**不是完整 mihomo 替代声明，也不是最终验收报告**。实现差异列在末节及 [迁移说明](../migration/rust.md)，原协议研究、日期化报告保留其历史 provenance。
 
-## Summary
+## 配置、入口与能力准入
 
-zc v1.0 targets a practical subset:
+- 一个 mixed HTTP/SOCKS5 listener，默认 loopback。生产默认端口 **7899**；只有 CLI `--port` 控制实际端口。来源 `mixed-port`（含 0）只作兼容声明，准备时规范化；开发显式使用其他端口。
+- 同文件存在 mixed 声明时，`port/socks-port` 是 ignored compatibility declarations；没有 mixed 的 standalone 入口拒绝。`redir-port/tproxy-port` 不创建 listener，TUN 不支持。
+- `allow-lan:false` 的规范运行时投影绑定 loopback；`allow-lan:true` 才允许 LAN。没有入站认证，不应暴露给不可信客户端。
+- `external-controller` 仅接受 `127.0.0.1:<port>`；必须精确绑定，不漂移、不静默关闭。
+- `mode/log-level` 接受合法兼容声明；不要据此宣称完整 mihomo 模式调度或动态日志级别。当前路由由规则决定。
+- `dns:`、fake-ip、enhanced-mode、nameserver-policy、proxy-providers 不提供完整运行时支持；`external-ui` 等兼容元数据不代表托管 dashboard。
+- `src/override_script.rs::runtime_source` 只投影已经校验的兼容字段给 `src/config.rs`；immutable source/materialization 的规范字节及内容摘要不能被运行时投影改写。
+- 未启用的 outbound/group/plugin 在准备或准入时明确拒绝，绝不回退 DIRECT。用户声明的精确名称 `DIRECT/REJECT` 保留，不能覆盖内置字面量。
 
-- mixed inbound only;
-- static proxy nodes and select proxy groups;
-- core rule matching;
-- rule-provider expansion;
-- minimal API;
-- CLI-first diagnostics.
+## TCP 与出站
 
-zc v1.0 is **not** a full mihomo/clash replacement.
+| 能力 | Rust 候选边界 |
+| --- | --- |
+| HTTP CONNECT / SOCKS5 CONNECT | 双向 TCP tunnel，保留 half-close；SOCKS5 无用户认证 |
+| HTTP forward | absolute-form HTTP/HTTPS；有界 Content-Length/chunked request、100-continue、顺序 keep-alive；每连接最多 1024 请求；拒绝冲突 framing/Host、非法 trailer、Upgrade |
+| DIRECT / REJECT | 内置字面量可用；REJECT 是终态，不因目标为私网/loopback 改写为 DIRECT |
+| 用户命名 `type: direct/reject` | 已由独立变更支持，可作为命名叶节点及 select 成员；本轮不重复实现 |
+| SS classic AEAD | `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`；`chacha20-poly1305` 是同一 wire alias |
+| simple-obfs | 只支持下述内建 HTTP 形状，仅包装 SS TCP |
+| Trojan | 原生 TLS/TCP，password/server/port/sni/skip-cert-verify；另有受限 UDP association |
+| HTTP/SOCKS5 outbound、VMess/VLESS/AnyTLS | 不支持；保留历史代码不构成启用 |
+| SS AEAD-2022、外部 SIP003、obfs TLS、Trojan WS/gRPC | 不支持，拒绝而非降级 |
 
-## Config fields
+HTTP request header 最多 16 KiB，request body 最多 16 MiB；chunk framing/trailer 也有计数/字节上界。response 按流转发，不应把 request body 上界误称 response 总大小上界。mixed 最多 1024 connection tasks，入站握手 10 秒，路由与出站准备另有 10 秒 deadline，TCP 转发空闲期限 15 分钟。退出取消并回收任务，不承诺 drain 完全部存量流量。这些数值不同于原 Zig 的 128 workers / 5 秒，仍须资源评审。
 
-Implemented parser fields include:
+TLS 使用 rustls / tokio-rustls、系统信任根、安全默认 TLS 1.2/1.3；不继承 Zig TLS 派生实现的 poll/partial-record/KeyUpdate 限制说明。Trojan server 必须是合法 IP 或 RFC hostname，DNS server 尾点在派生身份时去除；显式 SNI 必须是无尾点的 DNS hostname，不接受 IP/wildcard/控制字符。验证证书的 IP server 须显式 SNI。仅 `skip-cert-verify:true` 关闭链和身份校验，握手签名仍验证；这是安全降级，不是默认行为。uTLS/Reality/mTLS/任意 ALPN 配置不在支持范围。
 
-- `port`
-- `socks-port`
-- `mixed-port`
-- `allow-lan`
-- `bind-address`
-- `mode`
-- `log-level`
-- `external-controller`
-- `proxies`
-- `proxy-groups`
-- `rule-providers`
-- `rules`
-
-`mixed-port` 声明表示配置使用唯一的 mixed proxy listener，但其数值不控制运行端口。运行时只接受显式 CLI `--port`，否则固定绑定 `7899`；runtime preparation 会把配置、profile 或 override 中的其他 `mixed-port` 数值规范化。同文件中的 `port` / `socks-port` 会保留在原始 revision 中并产生 ignored warning，但运行时在 bind 前将它们清零；这类主流 Clash 配置可直接进入 legacy cutover、catalog capture 与 override materialization。若没有 mixed listener，单独依赖 `port` / `socks-port` 仍以 unsupported capability 拒绝，不会静默改成 mixed listener。
-
-Known gaps:
-
-- `dns:` is not wired as a full runtime DNS config;
-- `redir-port` / `tproxy-port` are not active runtime listeners;
-- `proxy-providers` are not supported;
-- managed revisions use captured local `rule-providers`; every referenced local provider is expanded from captured bytes, while a referenced remote provider that remains as `RULE-SET` is rejected before **any** managed revision publication (including inactive publication) and again at the exact persisted activation/runtime gate. An unused remote declaration with no `RULE-SET` reference may remain deferred. Managed loading never falls back to cwd/source paths. Capture accepts at most 4096 local-provider assets and 16 MiB per asset, matching the provider count/source limits. Each remote provider body is likewise limited to 16 MiB and all cached/downloaded provider sources in one sync pass share a fixed 64 MiB raw-byte budget. Under proxy-compatible HTTPS fallback, std HTTP and curl consume one shared remaining window: failed/HTTP-400 std response bytes reduce curl's cap and are included in successful download accounting. A candidate replaces an existing cache only after strict parse/validation, shared-budget reservation, and atomic publication. Only ordinary network/status failure may fall back to a strictly validated cached source; allocation, YAML, invalid-candidate, and resource-limit errors propagate unchanged;
-- `external-controller` is restricted to an explicit `127.0.0.1:<port>` endpoint；端口冲突时启动失败，不自动漂移或静默关闭控制面；
-- TUN/fake-ip/enhanced-mode are not supported;
-- both legacy and managed YAML parsing reject nesting deeper than 128 levels;
-- managed/offline configs without `MATCH` receive an implicit terminal `MATCH,REJECT`; duplicate or non-terminal `MATCH` entries are rejected. A legacy config with no `rules` field retains its historical `MATCH,DIRECT`; any present, well-formed ruleset without `MATCH` receives `MATCH,REJECT`, while malformed rule values are rejected;
-- rules use declaration-order first-match semantics across rule types. Domain matching is ASCII case-insensitive and ignores a final root dot. Domain targets reaching `IP-CIDR`, `IP-CIDR6`, or `GEOIP` use the system resolver and a bounded 256-entry process cache;
-- the mixed listener admits at most 128 concurrent connection workers. Initial HTTP/SOCKS negotiation has one 5-second monotonic deadline; excess or stalled handshakes are closed without terminating the daemon.
-
-## Config resource limits
-
-Every parser and runtime entry point uses one fixed, public resource contract:
-
-- at most **262144 decoded YAML collection entries globally**: every block/flow mapping entry and sequence item counts, including nested and unknown extension data;
-- at most **4096 rule-provider declarations**;
-- at most **262144 normalized entries in each rule-provider**, and at most **262144 normalized entries / 64 MiB normalized entry bytes across all providers**; legacy/raw line providers without a YAML `payload:` wrapper use the same shared budget;
-- at most **64 MiB aggregate raw rule-provider source bytes** across cached files and download bodies in each synchronization or authoritative load pass, independently of normalized bytes, so comments/low-normalization documents cannot amplify work; each individual provider source remains bounded to 16 MiB;
-- after `RULE-SET` resolution, at most **262144 rules / 64 MiB owned payload+target bytes**. Every repeated provider reference is charged again; classical entries conservatively charge their full normalized entry length as the payload bound;
-- at most **4096 proxy nodes**;
-- at most **1024 proxy groups** in total, including groups declared in the compatibility `proxies:` mixed array;
-- at most **5120 raw entries** in that mixed `proxies:` array (the checked sum of the two limits, including subscription information banners that zc later ignores);
-- at most **5122 members per proxy group** (all possible proxy/group identities plus the `DIRECT` and `REJECT` literals);
-- at most **1024 persisted selections** per profile.
-
-Complete config sources have one public **16 MiB** bound. `config.load`, managed document loading, catalog capture, and replacement snapshots probe one byte past that bound: exactly 16 MiB is accepted, while 16 MiB + 1 returns a size error. A long source is never treated as a valid truncated YAML prefix, including when meaningful fields occur after the first MiB.
-
-The exact maxima are accepted. A raw provider accepts exactly 262144 normalized entries when it is the only provider; the next normalized entry returns `RuleProviderAggregateEntryCountLimitExceeded` before cloning or list growth. Multiple providers consume shared normalized and raw-source budgets, and downloaded single-provider candidates retain the same fixed per-provider bounds. Sync passes the currently remaining raw budget (capped by the 16 MiB single-source bound) to the HTTP body writer; zero remaining bytes means no request is issued. A completed body is charged, while a transport failure with unreported partial bytes conservatively charges its advertised cap before cached fallback. Candidate reservations commit only after atomic visibility. Runtime loading then performs an independent shared-budget pass to detect post-sync file changes. A YAML-wrapped payload also consumes its surrounding mapping/sequence entries from the global document budget and can therefore reach `YamlCollectionEntryLimitExceeded` first. YAML allocation, collection-budget, and nesting errors never fall back to the line parser; only an ordinary syntax-compatibility failure may try the bounded legacy parser. Plain legacy lines and raw classical rules remain compatible.
-
-Expansion first builds a bounded borrowed-key provider-name hash index and rejects duplicate names. It then uses hash lookup to precompute final count and conservative owned bytes with checked arithmetic. Remote providers retained by managed local-only preparation keep their unresolved `RULE-SET` as one rule. Only after the complete plan is within bounds does zc reserve the output once and clone/expand rules. Complexity is `O(providers + rules + expanded)`, rather than a provider scan per rule. Repeated references, several providers, and target-byte multiplication all consume the final budget.
-
-Resource excess returns one of `ConfigTooLarge`, `YamlCollectionEntryLimitExceeded`, the proxy/group errors, `RuleProviderCountLimitExceeded`, `RuleProviderAggregateEntryCountLimitExceeded`, `RuleProviderAggregateBytesLimitExceeded`, `RuleProviderAggregateSourceBytesLimitExceeded`, `ExpandedRuleCountLimitExceeded`, or `ExpandedRuleBytesLimitExceeded` before revision publication, listener creation, output reservation, or dial. `requireConfigResourceLimits` applies the same checked contract to manually constructed providers, existing entries, and rules. At the CLI seam, `config load`, `config download`, and `config update` map those typed resource errors to `CONFIG_LOAD_LIMIT_EXCEEDED`, `CONFIG_DOWNLOAD_LIMIT_EXCEEDED`, and `CONFIG_UPDATE_LIMIT_EXCEEDED`; the 16 MiB source bound keeps separate `*_TOO_LARGE` codes. Catalog and legacy admission leave authoritative `state-v2.json` and the immutable revision tree unchanged on rejection. Reduce/filter YAML, provider entries, repeated references, or long targets and retry. There is no limit switch, truncation, compatibility fallback for resource errors, or partial publication.
-
-`OutboundManager.init`/`initWithKey` return an **owned pointer to a public opaque handle**; callers must invoke `deinit` exactly once and cannot construct a manager value with a struct literal. Its public persisted-selection transaction and selection-barrier owners are likewise allocated opaque pointers: `commit`/`deinit` consumes a transaction, and `deinit` consumes a barrier, exactly once. Copying one of those pointers does not create another owner, and the former shallow-copyable value API is intentionally incompatible. The private implementation borrows the admitted `Config`: the value and all nested storage must remain alive, immutable, and address-stable until handle deinit. Runtime config mutation is outside the interface and is not a supported recovery mechanism.
-
-Validation retains at most **256 errors and warnings combined**, with at most **512 rendered bytes per entry**. An oversized rendered template is truncated at a UTF-8 boundary and ends with ` ... [truncated]`. If the table is full of warnings, a later error replaces one warning; a later error is omitted only when every retained entry is already an error. Every omitted entry sets `diagnostics_truncated` without allocating, while invalid status remains exact. Text validation and doctor output report that additional details were omitted.
-
-`PersistedSelectionCountLimitExceeded` belongs to catalog/selection mutation, not to config YAML. The mutation seam enforces at most 1024 desired selections per profile. The config CLI retains a defensive catch for that typed error, but the normal load/download/update source path cannot construct it. A pre-existing `state-v2.json` with more than 1024 selections is corrupt catalog state and fails closed; it is not downgraded to a user-correctable source limit and receives no backward-compatibility exception.
-
-## Proxy support
-
-Runtime outbound support currently includes:
-
-| Type | v1.0 status | Notes |
-| --- | --- | --- |
-| `direct` | supported | Direct TCP connect. |
-| `reject` | supported | Fails connection intentionally. |
-| `ss` | supported subset | Classic AEAD TCP and mixed SOCKS5 UDP ASSOCIATE: `aes-128-gcm`, `aes-256-gcm`, `chacha20-poly1305`, `chacha20-ietf-poly1305`; TCP may be plain or use the exact built-in simple-obfs HTTP shape documented below. |
-| `vmess` | unsupported | v1.0 capability gate hard rejects it；现有代码未通过标准 wire/互操作验证。 |
-| `trojan` | supported subset | 原生 TLS + CONNECT（TCP）与 `udp:true` UDP ASSOCIATE；支持 `password`/`server`/`port`/`sni`/`skip-cert-verify`，IPv4/domain/IPv6 datagram。`server` 必须是 1..253-byte IP literal 或 RFC hostname（DNS 绝对域名尾点可用，派生 SNI/证书 identity 时会剥除；带尾点的数字 IP 形式拒绝）；显式 `sni` 必须是 RFC 6066 hostname，拒绝 IP/wildcard/空白/控制字符和尾点。启用证书验证的 IP server 必须提供 `sni`。只接受缺省或 `network: tcp`；WebSocket/gRPC/未知 transport 在配置校验阶段明确拒绝，绝不降级；`skip-cert-verify:true` 保留 SNI 但禁用证书链和身份校验，并产生安全告警。已知限制（M1/M5）见下文。 |
-| `vless` | unsupported | v1.0 capability gate hard rejects it；响应 framing 与 transport 尚未通过互操作门禁。 |
-| `anytls` | unsupported | v1.0 capability gate hard rejects it；保留实现和设计文档不构成支持声明，生命周期与资源上界门禁尚未关闭。 |
-| `http` | unsupported | Outbound connect 未实现；配置准入阶段拒绝。 |
-| `socks5` | unsupported | Outbound connect 未实现；配置准入阶段拒绝。 |
-
-### Shadowsocks simple-obfs HTTP boundary
-
-The only enabled Shadowsocks plugin transport is:
+### simple-obfs HTTP
 
 ```yaml
 plugin: obfs # or obfs-local
-plugin-opts: # plugin_opts map is accepted and canonicalized to this spelling
+plugin-opts:
   mode: http
   host: cdn.example.com
 ```
 
-`mode` and `host` must both be explicit. `host` is 1..255 bytes and may not contain CR, LF, or NUL. Managed config rejects malformed/non-map options and conflicting aliases; dump/override output uses the canonical `plugin-opts` map. SIP003 scalar option strings are intentionally not accepted in this release.
+两个字段必须显式存在。host 为 1–255 bytes，不含 CR/LF/NUL。`plugin_opts` map alias 可接受并规范成 `plugin-opts`；冲突 alias、非 map、SIP003 scalar 字符串、未知模式/plugin、缺 host、非 SS plugin 均拒绝。不启动外部 plugin，也不退化为 plain SS。
 
-simple-obfs `tls`, unknown modes, plugins other than `obfs`/`obfs-local`, missing options/host, and derived plugin fields without the matching plugin declaration fail closed in validator/doctor. Validator, catalog capture, complete manager admission, and the selected-proxy gate all consume one allocation-free runtime capability classifier; it also owns standalone `port`/`socks-port`（仅在没有非零 `mixed-port` 声明时拒绝；与 mixed listener 共存时作为 ignored compatibility declarations，mixed 数值在运行时按 `--port`/`7899` 策略规范化）、reserved declarations, disabled proxy/group types, non-SS plugin metadata, SS cipher/TLS/WebSocket, and Trojan WebSocket decisions. `OutboundManager.initWithKey` completes that full gate before its first manager allocation, then builds borrowed-key proxy and group hash indexes with complete failure cleanup. TCP/UDP admission is independent of configured proxy/group counts: each resolved group layer and the final proxy use fixed hash lookups, while literal `DIRECT`/`REJECT` performs no config-table lookup. The selected concrete proxy still receives one focused classifier gate before dial；UDP 要求最终 Shadowsocks 或 Trojan leaf 显式 `udp:true` 并通过对应字段 preflight。zc never launches an external plugin and never downgrades such a node to plain Shadowsocks. simple-obfs support remains TCP/HTTP only；Shadowsocks UDP 绕过 plugin，直接使用同一 server host/port。
+HTTP 首帧、Content-Length、分片 response header 与同 read 尾部由 `src/simple_obfs.rs` 有界处理；协议 oracle 的故意错误请求（如 ContentLengthMismatch）是负向验收，不应解释成生产 obfs 故障。wire 依据见 [研究](../research/shadowsocks-simple-obfs-udp.md)。
 
-Catalog recovery uses a separate strict-YAML raw-capture path: duplicate keys still fail, but explicitly marked malformed or unsupported Shadowsocks simple-obfs metadata can be retained byte-for-byte as an inactive recovery revision. `config download` uses the same bounded recovery rule: a malformed first download without `-d` succeeds but remains inactive, so only the first later **runtime-ready** managed config auto-activates. The exemption applies only to the marked SS plugin-semantic finding: SS TLS/cipher/WebSocket findings and Trojan/other proxy findings remain errors. It also does not bypass offline validation of reserved names, proxy/group types, basic fields, rules/references, or providers; non-Shadowsocks plugin metadata is rejected. A retained revision can be listed, inspected, updated, or deleted, but `config download -d`, an active replacement update, and `config use` return `CONFIG_CAPABILITY_UNSUPPORTED` rather than changing the active identity. It cannot run or produce a frozen override until its effective config validates; after repairing an inactive revision through `config update`, activate it explicitly with `config use`. Runtime `config.load` and `parseDocument` remain strict.
+仅明确 malformed/unsupported SS obfs metadata 可作为 inactive raw recovery revision 保存；严格 YAML、字段、规则/provider 和资源 gate 仍必须通过。`download -d`、active update、use 不能激活此 revision；修复 source 后 update/use。其他协议错误没有这一恢复豁免。
 
-User-declared proxy names `DIRECT` and `REJECT` are reserved and rejected before outbound allocation or dial. The same exact tokens remain valid as built-in literals in rules and proxy-group member lists.
+## UDP：受限 association，不是通用 DIRECT UDP 入口
 
-### Trojan 已知限制
+mixed SOCKS5 CMD=0x03 仅用于显式 `udp:true` 的 SS classic AEAD 或原生 TLS Trojan leaf。配置不存在任何此类 leaf 时，在 association/socket allocation 前返回 REP=0x07。成功 reply 的 endpoint 是客户端应使用的 relay；不支持独立 socks-port UDP。
 
-- **M1（TLS 截断暴露）**：Trojan 隧道承载*无帧*字节流，`read()` 在字节层面无法区分恶意的链路中途截断（攻击者注入 FIN/RST）与正常关闭——两者都呈现为干净的 0 长度 EOF。这是刻意权衡（`allow_truncation_attacks = true`），以容忍良性的 record 中途丢弃（brew 下载截断场景）。异常关闭不会被静默吞掉：底层 `TLSConnectionTruncated` 仍可经 `lastReadError()` / `ProxyStream.lastTLSReadError()` 观测，中继日志据此打点。对比 anytls 的有帧模型可拒绝过短的末帧，无帧的 Trojan 隧道在结构上做不到。
-- **M5（TCP 部分 record 限制）**：TCP 中继按 `POLL.IN` 轮询 Trojan 句柄，但 poll 只保证至少一字节*密文*就绪；单个 TLS record 可能跨多个 TCP 段，故 poll-ready 的 TCP `read()` 仍可能阻塞到当前 in-flight record 到齐，期间另一方向（client→target）短暂停顿。每次 read 最多消费一条完整 record；独立 KeyUpdate/NewSessionTicket/空 application record 会返回 `WouldBlock`，不会等待下一条 application record。Trojan UDP 使用可 shutdown/join 的单一 I/O owner，不占住 association worker。
+- TCP control peer IP 绑定 association；请求非零 source port 时约束该端口，否则首个完全合法、同 IP 数据报固定 source port。
+- 首个合法 datagram 执行规则与 select 解析并固定实际 leaf；后续 datagram 可有其他目标，但复用同一 outbound session，不重新选组、不 fallback。
+- DIRECT、group→DIRECT、REJECT、非 `udp:true` leaf 结束 association，不提供 DIRECT UDP ingress。内部测试/transport helper 有直连 UDP 不代表公开入口支持。
+- 最多 64 associations，第 65 个返回 general failure；control close 立即取消 DNS/open/send/relay 并释放 slot，另有 300 秒单调时钟 idle。
+- SOCKS 与 SS wire 单包上界均为 65507 bytes，按实际 address/cipher overhead 检查；坏 RSV/FRAG/ATYP/长度、SS bad tag 或截短 salt/tag 按 packet 丢弃；不分片、不重组、不积累无界队列。
 
-### AnyTLS 保留实现说明（v1.0 未启用）
+### SS classic AEAD UDP
 
-以下内容只记录保留实现的技术边界，不代表 v1.0 支持。重新启用 AnyTLS 前必须先关闭生命周期、buffer/backpressure、OOM teardown 与真实互操作门禁。
+使用 `shadowsocks` crate；每包独立 CSPRNG salt、HKDF-SHA1 `ss-subkey`、全零 nonce、空 AAD 与 `ATYP|ADDR|PORT|DATA` plaintext，不复用 TCP chunk framing。三种 cipher 与 alias 与 TCP 相同。simple-obfs 不包装 UDP，直接使用同一 server host/port 的 UDP endpoint；错误不得改走 plain/DIRECT fallback。
 
-保留实现使用 Zig 标准库的 `std.crypto.tls`（仅客户端 TLS 1.3）。以下能力受该 TLS 栈限制，**不支持**：
+### Trojan UDP
 
-- **uTLS / ClientHello 指纹模拟**：std TLS 发送固定的 ClientHello，无法模拟 Chrome 等浏览器指纹。
-- **ALPN 配置**：`std.crypto.tls.Client.Options` 无 alpn 字段，ClientHello 不发 ALPN 扩展。
-- **TLS 版本控制**：std 仅 TLS 1.3，无 min/max 版本旋钮。
-- **mTLS / 客户端证书**：std 客户端无客户端证书路径（且 AnyTLS 用 SHA-256 密码帧认证，本就不属于其协议）。
-- **Reality**：不属于 AnyTLS，且需要 std TLS 没有的自定义 X25519/伪造证书握手。
+专用 TLS/TCP stream 请求：`SHA224_HEX(password) | CRLF | CMD=0x03 | 0.0.0.0:0 | CRLF`。datagram frame：`SOCKS_ADDR | PAYLOAD_LEN_BE16 | CRLF | PAYLOAD`，payload 后无额外分隔符。支持 IPv4/domain/IPv6、空 payload；非法 CRLF、ATYP、长度和中途 EOF 结束 association，不做 stream 重同步。
 
-### Shadowsocks classic AEAD UDP boundary
+domain 先按原域名匹配规则，再本地解析成 IP frame 兼容主流服务端；session 缓存最后一个 domain/port 结果。Rust 使用异步单一 worker 独占 stream、有界双向各 2-frame channel，满时丢包；不沿用 Zig 的 256 KiB I/O thread 描述。wire 依据见 [研究](../research/trojan-udp.md)。实际 IPv6 可达性依赖服务端 egress；300 秒 idle 需单独真实等待验证，短测试不能替代。
 
-仅 mixed ingress 支持 SOCKS5 `UDP ASSOCIATE`（CMD=0x03）。配置中不存在任何受支持的 `ss + udp:true` 或 `trojan + udp:true` leaf 时，命令在 association/socket allocation 前返回 `REP=0x07`；存在 UDP leaf 后，成功 reply 的 IPv4 endpoint 是客户端唯一应使用的 relay。association 绑定 TCP control peer IP，首个完全合法且同 IP 的 UDP 数据报锁定 source port；control close 立即清理，另有 300 秒 awake-clock idle 和全局 64 association 上限。第 65 个 association 返回 general failure，不会挤出已有 association。
+## 代理组、规则与 DNS
 
-每个 classic 2017 AEAD UDP 包独立使用 CSPRNG salt、HKDF-SHA1 `ss-subkey`、全零 nonce、空 AAD 与 `ATYP|ADDR|PORT|DATA` plaintext；不复用 TCP chunk framing。单个 SOCKS 或 Shadowsocks wire datagram 上限均为 65507 bytes，长度按实际 cipher/address checked。坏 tag、截短 salt/tag、非零 RSV/FRAG、坏 ATYP/长度和超限包均按 packet 静默丢弃；不做 fragmentation/reassembly 或应用层 datagram queue。首个合法目标只解析一次规则/组选择；DIRECT、group→DIRECT、REJECT 或未声明 `udp:true` 的 leaf 都 teardown，绝不 fallback。
+仅 `select` 可运行；`url-test/fallback/load-balance/relay` 不启用。默认首成员，持久选择优先；嵌套组按预建索引解析，未知引用、循环拒绝，最多 1024 个组。不要假设 mihomo 的探测、故障转移或负载均衡策略。
 
-支持 AES-128-GCM、AES-256-GCM 与 ChaCha20-IETF-Poly1305；`chacha20-poly1305` 是同一 wire 的配置 alias。simple-obfs/SIP003 仍仅包装 TCP，UDP 直接发送到同一 Shadowsocks server UDP endpoint。AEAD-2022、standalone `socks-port` UDP 与 fragmentation 不在支持范围。
+支持解析与匹配：`DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD`、`IP-CIDR/IP-CIDR6`、`DST-PORT/SRC-PORT`（含范围）、`SRC-IP-CIDR`、`PROCESS-NAME`、`GEOIP`、`RULE-SET`、`MATCH`。
 
-### Trojan UDP ASSOCIATE boundary
+- 声明顺序 first-match，域名 ASCII 大小写不敏感、忽略末尾 root dot；无匹配拒绝，不任意 fallback DIRECT。
+- **严格 CLI 基线**：缺失 `rules`、显式 `[]`、非空规则缺终态 MATCH 均补 `MATCH,REJECT`；重复/非尾部 MATCH 拒绝。原 `config.zig::load()` 已调用严格 `parseDocument()`，只有不用于 CLI 的 legacy `parse()` 在字段缺失时补 DIRECT。旧二进制 dump 与真实 loopback 路由均确认严格语义；Rust canonical bytes/hash 不因此改变。
+- mixed HTTP/SOCKS 提供目标端口与来源 IP/端口；不提供进程名，`PROCESS-NAME` 的可解析性不等于实际进程规则生效。
+- GEOIP 保留原有静态 IPv4 heuristic table，不是完整地理库；IPv6 不完整。`no-resolve` 避免为相应 IP/GEOIP 规则解析域名。
+- 为 IP 规则解析后使用同一 DNS 快照，获准 IP 固定给后续 DIRECT/SS/Trojan dial/encode，不重解析并选择未获准地址。
 
-Trojan `udp:true` leaf 使用一条专用 TLS/TCP association。请求为 `SHA224_HEX(password) | CRLF | CMD=0x03 | 0.0.0.0:0 | CRLF`；双向 datagram frame 为 `SOCKS_ADDR | PAYLOAD_LEN_BE16 | CRLF | PAYLOAD`。frame 没有 SOCKS5 的 `RSV`/`FRAG`，payload 后也没有分隔符。codec 严格校验 CRLF、ATYP、port、完整长度和中途 EOF，支持协议 u16 长度、空 payload、IPv4/domain/IPv6；坏 stream frame 结束该 association，不进行字节重同步。
+Hickory 从系统 DNS 配置/hosts 初始化，网络查询非阻塞；2 秒 lookup deadline，64 query slots，每个并行 A/AAAA lookup 占 2 slots，最多保留 64 地址，取消释放 slot。cache size 配置为 64，但不是瞬时硬内存上界。系统/hosts 不自动重载，不等价于 libc/NSS、mDNS 或完整 split-DNS；没有 nameserver 时拒绝，不暗用公共 DNS。
 
-为兼容 mihomo/trojan-go 等主流 server，domain 先以原值做规则匹配，再使用 5 秒有界本地 DNS 解析成 IP frame；association 缓存最后一个 domain/port 结果。IPv6 wire 已实现并由固定 `trojan-go v0.10.6` dual-stack E2E 覆盖，但实际可达性仍取决于服务端 IPv6 egress。首个合法 client datagram 决定规则与 proxy，后续 datagram 复用同一 association；不做 fallback 或 fragmentation/reassembly。
+## rule-provider 与离线托管
 
-mixed SOCKS5 仍施加 65507-byte wire 上限，Shadowsocks 与 Trojan 共用 64 条 association 上限和 300 秒 awake-clock idle。Trojan UDP 用单一 256 KiB I/O thread 独占 TLS state，并通过固定 frame buffers、最多 2 个 frame 的有界收/发队列与 relay 交换数据；队列满时按 UDP 语义丢包，不增长内存。I/O owner 每轮至多处理一个完整 TLS record 和一个固定发送配额，独立 control/NST/空 application record 不会饿死出站；这样也避免 TLS 1.3 KeyUpdate 的并发状态竞争。随 Zig 0.16 源码审计的本地 TLS client 会对 `KeyUpdate(update_requested)` 先发送 `update_not_requested` 响应，再轮换发送密钥。TLS handshake 受同一 10 秒 absolute deadline/control cancellation 约束；control close 会 shutdown 上游并 join I/O thread，因此 blocking TLS read/write 不占死 association slot。codec 可增量处理分片与同一 read 中的连续 frame；`POLL.IN|POLL.HUP` 时完整末帧优先交付。
+`domain/ipcidr/classical` provider 展开为有界规则。local assets 必须位于配置根内、相对路径、普通文件；descriptor-relative traversal 拒绝 symlink/特殊文件，不能逃到 cwd/source 外部。托管 revision 捕获 source 与 assets，加载只信任捕获字节，不回读可变文件。
 
-## Proxy groups
+**Managed 离线 gate**：被 RULE-SET 引用的 HTTP provider 不可离线展开，load/download/update/旧数据接管在发布任何 revision（包括 inactive）前拒绝，activation/runtime 再检查。未引用 remote declaration 可作为 deferred metadata 存在。这是原离线基线限制，不是“已经实现远程 provider 托管”。
 
-The compatibility parser recognizes `select`, `url-test`, `fallback`, `load-balance`, and `relay`, but **zc v1.0 runtime supports only `select`**. `url-test`, `fallback`, `load-balance`, and `relay` return `UnsupportedProxyGroupType` during the allocation-free manager initialization gate. Public selection/control-plane operations may repeat that bounded complete validation; TCP/UDP connection paths rely on the opaque handle's admitted immutable borrow and the prebuilt group index, so admission cost depends on resolution depth rather than configured group count. Runtime mutation of a borrowed group is unsupported.
+**Unmanaged 显式来源**：准备阶段持有配置来源根目录的 dirfd，再同步、校验并冻结 provider bytes；监听器不得先于完整 body 和规则展开校验开放。默认 `interval: 86400` 秒，mtime 按秒判断；将来时间视为未到期。
 
-运行时选择优先使用持久化的用户选择；没有持久化选择时，合法的 `select` 组使用第一个组成员作为默认节点。TCP 与 UDP 共用同一个嵌套组解析器：每个实际组层级只做一次预建 hash-index 查询，并允许最多 **1024 个唯一组层级**。`DIRECT` 与 `REJECT` 是立即终止解析的合法 select 成员；非组名称继续交给最终 proxy index，因此未知名称仍返回 `ProxyNotFound`。重复层级返回明确的 `ProxyGroupResolutionCycle`；若在唯一层级上界后仍可命中另一组，防御性地返回 `ProxyGroupResolutionLimit`，不会静默截断、误报 `ProxyNotFound` 或无限循环。`zc status` 和 `zc test` 会显示同一套节点信息，JSON 字段为 `selected_proxies`；`zc test --json` 还会通过 `daemon_state` 报告本机 daemon 状态。不要在没有场景测试证明前假设完整 mihomo 策略一致性。
+| 调用路径 | 缓存策略 |
+| --- | --- |
+| start、显式来源 restart、reload、proxy/profile test | 缺文件下载；已有文件到期刷新，未到期不联网 |
+| 独立 `test` | missing-only：已有文件不周期刷新，但仍须校验 |
+| 默认 restart | 复用认证的冻结快照，不重新访问来源、cache 或网络 |
+| doctor / diag doctor | 原调用链只校验声明，不同步或展开 provider body；不是 runtime-ready 证明 |
+| managed revision | 保持离线 gate；未引用 remote metadata 不触发网络或缓存写入 |
 
-## Rules
+HTTP(S) 请求总期限 30 秒（包括迟到的 headers/body）、最多 5 次 redirect，不使用环境代理；仅 HTTP 200 是成功候选。无 remote 或全部使用有效缓存时不构造 HTTP client、不加载 TLS roots。普通连接/下载/状态失败只有在原缓存存在、且重新有界读取和内容校验通过时才可回退；不会替换成空规则或 DIRECT。畸形/非 UTF-8/超限候选、资源错误和发布失败不能回退。全部候选先进入独立 immutable assets；仅有待写缓存时，在第一笔发布前验证完整配置语义、aggregate 与重复 RULE-SET 展开预算。这些校验失败（包括后续 provider 畸形）时，所有旧缓存保持原字节；零更新路径不额外完整解析一次。逐文件发布不是多文件事务：后续 I/O 或目的身份冲突失败时，先前已发布文件可能保留。过期坏缓存可由有效下载修复，未到期或 missing-only 下的坏缓存直接拒绝。
 
-Parsed rule types:
+缓存必须是 source root 内的相对路径。根目录及子目录须为当前用户所有且不可被 group/other 写入；dirfd traversal 拒绝 symlink、特殊文件和越界，文件拒绝非本人所有或 hard links。已有普通缓存可为 0644，但 metadata/read/write 预检一致拒绝 POSIX `mode & 022 != 0`（例如 0666、0620）；此检查不构成 ACL 安全证明，也不改变普通 source 或 owner-only state 的权限规则。新文件原子写为 0600，新目录 0700；不以真实 configRoot/cwd 猜测缺失路径。source 与已有 provider 文件句柄跨 await 持有，按设备/inode 身份拒绝缓存覆盖 source、本地 provider 或其他 HTTP provider，包含文件系统实际支持的大小写/Unicode 别名，不用字符串小写化推断。不能使用内部 `.provider-cache.lock` 名称或文件身份别名。发布时复检目的身份，并记录新发布文件身份，后续缺失路径若成为其别名不得覆盖；此时允许先前输出已可见，不伪称整批回滚。rename 前失败报错；rename 后目录 fsync 失败保留已可见候选并明确提示 durability uncertain，不伪称回滚。
 
-- `DOMAIN`
-- `DOMAIN-SUFFIX`
-- `DOMAIN-KEYWORD`
-- `IP-CIDR`
-- `IP-CIDR6`
-- `GEOIP`
-- `RULE-SET`
-- `SRC-IP-CIDR`
-- `DST-PORT`
-- `SRC-PORT`
-- `PROCESS-NAME`
-- `MATCH`
+同步同时保留 source 16 MiB、4096 declarations/assets、raw aggregate 64 MiB、normalized 与 expanded budgets。失败 response body 也计费；无法精确获知失败传输量时保守扣除该请求剩余窗口，再检查缓存预算。冻结结果不受随后源文件/cache 编辑影响；managed source/materialization/revision 不就地刷新。
 
-`REJECT` 是终态策略：即使目标是 loopback、链路本地或私网地址，也不会被内部直连保护逻辑改写为 `DIRECT`。此语义同样适用于直接命名的 reject 节点和解析到 reject 节点的代理组。
+这些安全路径限制比旧 Zig 接受任意绝对路径更严格；没有迁移旧 cwd/绝对路径 cache，也没有 curl fallback。HTTP 状态/候选/写入失败策略来自原 `syncRuleProviderFilesIfNeededWithLimits`、`downloadRuleProviderFileUsing` 和 `publishRuleProviderFile`，不是将所有失败统称 best-effort。
 
-Known limitations:
+## 配置资源上界
 
-- HTTP CONNECT/forward paths must still be checked for full `DST-PORT` context propagation before GA.
-- `PROCESS-NAME`, `SRC-IP-CIDR`, and `SRC-PORT` depend on proxy context that is not always supplied.
-- IPv6 GEOIP is not complete.
+| 对象 | 上界 |
+| --- | --- |
+| 配置、单 provider source | 各 16 MiB，有效 UTF-8 |
+| decoded YAML collection entries | 全文 262144，包含 nested/extension map entry 与 sequence item |
+| proxies / groups | 4096 / 1024；兼容 mixed `proxies:` array 最多 5120 |
+| 每组 members | 5122 |
+| provider declarations / captured local assets | 4096 |
+| normalized provider entries | 全部合计 262144（单 provider 也不能超出） |
+| normalized provider bytes / aggregate raw provider bytes | 分别 64 MiB；注释计入 raw budget |
+| 展开规则 / owned payload+target bytes | 262144 / 64 MiB |
+| 每 profile persisted selections | 1024；已有 catalog 超限按损坏处理 |
+| catalog / revision manifest | 4 MiB / 1 MiB 独立编码上界 |
+| immutable bundle aggregate | 64 MiB |
 
-## API and dashboard compatibility
+这些是同时生效的最大值，不保证达到某个局部上界时仍能绕过另一全文上界。重复 RULE-SET/target 重复计费；classical entry 用完整 normalized 长度保守预检。provider-name 索引与完整 count/byte plan 在展开 reserve/clone 前检查，资源错误不能回退 legacy line parser，也不截断或部分发布。
 
-Implemented API endpoints are documented in [`../api/README.md`](../api/README.md).
+Rust YAML 按原 Zig 的“根节点之外最多 128 层”计数（最多 129 个 collection frame），block/flow 与 JSON-looking 文档共享此边界。复杂 YAML 使用受限 16 MiB 栈的解析线程，普通原生 JSON 快路径保留自身递归保护，超出该快路径的合法深度交给同样有界的 YAML parser。仍限制 events 1600000、nodes 524289、scalar 合计 16 MiB，禁 anchors/aliases/merge keys/duplicate keys；其他资源计数不宣称与 Zig 完全一致。source 16 MiB+1 使用 `CONFIG_*_TOO_LARGE`，collection/provider/展开超限映射 `CONFIG_*_LIMIT_EXCEEDED`，细节见 [错误码](../api/error-codes.md)。逻辑拒绝必须保持 authority 与 revision tree 不变；存储 I/O 故障可能产生已验证但不可达对象，不能混淆。
 
-Not supported in v1.0:
+## 控制面与仍待验收的差异
 
-- full REST API v1 resource model;
-- WebSocket event stream;
-- third-party dashboard parity;
-- built-in TUI.
+CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/README.md)。无 WebSocket、完整 REST v1、第三方 dashboard parity 或 TUI。
 
-Use CLI diagnostics instead — every zc command supports `--json` (single
-`{"ok","command","data"|"error"}` envelope on stdout; see
-[`../cli/spec.md`](../cli/spec.md)). The most useful ones:
+缺省 rules 的审计误判已由严格 parser/旧二进制证据纠正；unmanaged cache/refresh 和 YAML 深度边界已有定向回归。完整诊断精度及其余资源策略差异仍须对齐或明确审批；TLS/DNS 使用成熟 Rust 库也需要互操作与性能证据，而非源码相似性证明。四平台、性能和长稳结论由最终门禁维护。
 
-```bash
-zc status --json     # data.state / data.mixed_port / data.selected_proxies / data.paths
-zc doctor --json     # data.proxy_reachable / data.checks
-zc test --json       # data.daemon_state / data.checks
-zc proxy list --json # data.groups (group type + current node)
-zc log --json        # JSON Lines, one {"line":"..."} event per line
-```
+[配置 migrator](migrator-rules-quickref.md) 是独立 lint 工具；其可识别字段/类型不代表运行时启用。机器规则词汇包括 `PORT_TYPE_INT`、`LOG_LEVEL_ENUM`、`PROXY_GROUP_TYPE_CHECK`、`DNS_FIELD_CHECK`、`DNS_NAMESERVER_FORMAT`、`PROXY_GROUP_EMPTY_PROXIES`、`TUN_ENABLE_CHECK`、`EXTERNAL_CONTROLLER_FORMAT`、`ALLOW_LAN_BIND_CONFLICT`、`RULE_PROVIDER_REF_CHECK`、`PROXY_NODE_FIELDS_CHECK`、`SS_CIPHER_ENUM_CHECK`、`VMESS_UUID_FORMAT_CHECK`、`MIXED_PORT_CONFLICT_CHECK`、`MODE_ENUM_CHECK`、`PROXY_NAME_UNIQUENESS_CHECK`、`PORT_RANGE_CHECK`、`SS_PROTOCOL_CHECK`、`VMESS_ALTERID_RANGE_CHECK`、`TROJAN_FIELDS_CHECK`、`RULES_FORMAT_CHECK`、`VLESS_FIELDS_CHECK`、`PROXY_GROUP_REF_CHECK`、`YAML_SYNTAX_CHECK`、`SUBSCRIPTION_URL_CHECK`、`WS_OPTS_FORMAT_CHECK`、`TLS_SNI_CHECK`、`UNSUPPORTED_PROXY_TYPE_CHECK`、`PORT_CONFLICT_CHECK`。迁移工具与运行时边界仍需独立回归。
 
-## Migrator rules
+### 诊断的实际契约
 
-The config migrator contains rule checks for common compatibility issues. See [`migrator-rules-quickref.md`](migrator-rules-quickref.md).
+`doctor` 保留配置与连接两个 gating checks：daemon stopped 合法；运行中端口不可达才使连接 check 失败。`network_ok` 仍真实探测 `1.1.1.1:443`，200 ms，但不 gating。显式/默认 `config_source` 为原来的 `custom/default`。语法/I/O 失败返回 `DIAG_DOCTOR_FAILED`，显式 override 保留对应错误码，已识别的能力准入失败返回 `CONFIG_CAPABILITY_UNSUPPORTED`，不捏造字段诊断；可解析但语义无效时返回 `CHECKS_FAILED`，`config_errors` 给出具体错误，文本和 JSON 使用同一条消息，512 UTF-8 bytes 上限并明确标记截断。
 
-Machine-readable migrator rule declarations for parity checks:
+`test/proxy test/profile test` 加载失败使用 `PROXY_CONFIG_LOAD_FAILED`；端口不可达时不跑外网 targets。七个默认目标、至少一个目标成功才通过 connectivity 的判定保持不变。按 `test_cli.zig::getIpGeoInfo` 对齐 IP/Location JSON：成功含 `ip`（无 query 时 `unknown`），不含 `latency_ms`；其他成功 target 含 latency。502 失败，403 等非 502 响应仍算连通；文本显示同一 IP/latency/reason，连接期限 5 秒、geo 总期限 90 秒、其余目标 5 秒。新增公开 `doctor_diagnostics` / `diagnostic_target_probe` 接口仅供传入真实本地测试 probe target，不增加 CLI/env 开关，也不改变命令默认目标。
 
-- `PORT_TYPE_INT`
-- `LOG_LEVEL_ENUM`
-- `PROXY_GROUP_TYPE_CHECK`
-- `DNS_FIELD_CHECK`
-- `DNS_NAMESERVER_FORMAT`
-- `PROXY_GROUP_EMPTY_PROXIES`
-- `TUN_ENABLE_CHECK`
-- `EXTERNAL_CONTROLLER_FORMAT`
-- `ALLOW_LAN_BIND_CONFLICT`
-- `RULE_PROVIDER_REF_CHECK`
-- `PROXY_NODE_FIELDS_CHECK`
-- `SS_CIPHER_ENUM_CHECK`
-- `VMESS_UUID_FORMAT_CHECK`
-- `MIXED_PORT_CONFLICT_CHECK`
-- `MODE_ENUM_CHECK`
-- `PROXY_NAME_UNIQUENESS_CHECK`
-- `PORT_RANGE_CHECK`
-- `SS_PROTOCOL_CHECK`
-- `VMESS_ALTERID_RANGE_CHECK`
-- `TROJAN_FIELDS_CHECK`
-- `RULES_FORMAT_CHECK`
-- `VLESS_FIELDS_CHECK`
-- `PROXY_GROUP_REF_CHECK`
-- `YAML_SYNTAX_CHECK`
-- `SUBSCRIPTION_URL_CHECK`
-- `WS_OPTS_FORMAT_CHECK`
-- `TLS_SNI_CHECK`
-- `UNSUPPORTED_PROXY_TYPE_CHECK`
-- `PORT_CONFLICT_CHECK`
-
-Before GA, migrator/docs/validator must agree on unsupported proxy types and DNS/TUN limitations.
+**剩余精度差异**：Rust 仍只报告首个具体语义错误，没有完整移植旧 validator 的多错误汇总、warnings 和 migration hints；geo 文本的城市/地区附加信息及 curl 特有的底层错误细分也未逐项复刻。当前最多一条、每条 512 bytes，不会超过原 errors/warnings 合计 256 条预算，但不能声称原诊断内容已经全部迁移。

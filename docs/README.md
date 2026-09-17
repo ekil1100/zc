@@ -1,65 +1,28 @@
-# zc documentation
+# zc 文档
 
-This directory is the public documentation entry for zc.
+当前活跃文档描述 Rust `1.0.1` 候选版本。默认 Cargo / just 构建与交付入口已切换 Rust；这不代表原有行为、性能、四平台发布及长稳已全部验收。入口概览见根目录 [README](../README.md)。
 
-首次阅读请从根目录 [`README.md`](../README.md) 开始，其中只列出 zc 相对 mihomo 已实现与未实现的能力；安装、CLI、API 与运行细节由本目录中的专题文档分别维护。
+## 阅读导航
 
-## Rust 迁移
-
-当前分支新增 Rust 前台 TCP 首版，构建入口为 Cargo；范围、命令、验证与限制见 [`migration/rust.md`](migration/rust.md)。下述 v1.0 文档仍描述 Zig 发布基线，不能视为 Rust 已实现能力。
-
-## Current status
-
-v1.0 实现路线图已经完成，`v1.0.1` 是当前正式发布基线。已完成的范围和常规发布验证入口见 [`roadmap/v1.0.md`](roadmap/v1.0.md)；该文件是完成记录，不再作为进行中的任务清单。
-
-可靠持久选择与本地 `zc config load <path>` 已接入用户路径：选择先持久化再按 exact revision 尝试应用，本地配置及其依赖导入 immutable revision。托管下载只自动激活首个 runtime-ready revision；可恢复的 malformed simple-obfs raw revision 保持 inactive，capability 与资源上界错误使用文档化的 `CONFIG_CAPABILITY_UNSUPPORTED` / `CONFIG_*_LIMIT_EXCEEDED`。运行时 outbound manager 是 owned opaque handle，借用的配置及嵌套存储在 handle 销毁前必须保持 immutable/address-stable；准入使用预建 borrowed-key 索引，因此成本按 group 解析深度固定，不随配置节点总数线性增长。当前完整命令契约见 [`cli/spec.md`](cli/spec.md)，错误码见 [`api/error-codes.md`](api/error-codes.md)。
-
-## v1.0 documentation map
-
-| Area | Document | Purpose |
+| 主题 | 文档 | 用途 |
 | --- | --- | --- |
-| Release | [`roadmap/v1.0.md`](roadmap/v1.0.md) | Completed v1.0 scope and validation record. |
-| CLI | [`cli/spec.md`](cli/spec.md) | Current command surface and JSON contract status. |
-| Config | [`config/override.md`](config/override.md) | Runtime override behavior. |
-| Compatibility | [`compat/mihomo-clash.md`](compat/mihomo-clash.md) | mihomo/clash compatibility boundaries and unsupported features. |
-| Migrator | [`compat/migrator-rules-quickref.md`](compat/migrator-rules-quickref.md) | Config migrator rule reference. |
-| Install | [`install/README.md`](install/README.md) | Standalone one-line installer、static release、Homebrew 与本地验证流程。 |
-| API | [`api/README.md`](api/README.md) | Minimal API endpoints currently implemented. |
-| E2E | [`reliability/e2e.md`](reliability/e2e.md) | PR/tag-only real binary, network and protocol interoperability gate. |
-| Research | [`research/shadowsocks-simple-obfs-udp.md`](research/shadowsocks-simple-obfs-udp.md) | Primary-source wire and acceptance basis for simple-obfs HTTP and Shadowsocks UDP. |
-| Reliability | [`reliability/soak-guide.md`](reliability/soak-guide.md) | Soak runner usage and release-gate evidence. |
-| Perf reports | [`perf/reports/README.md`](perf/reports/README.md) | Perf report storage used by scripts. |
+| 迁移 | [Rust 候选实现](migration/rust.md) | 模块职责、已接入能力、差异和待验收门禁 |
+| CLI | [命令契约](cli/spec.md) | 命令、JSON、状态权威、reload/restart |
+| 配置 | [Override](config/override.md) | 内嵌 Lua、外部脚本、冻结 materialization |
+| 兼容 | [mihomo/clash 边界](compat/mihomo-clash.md) | TCP/UDP、provider、规则、DNS 与资源上界 |
+| 迁移工具 | [规则速查](compat/migrator-rules-quickref.md) | 配置 migrator，不等于运行时支持声明 |
+| 安装 | [构建与安装](install/README.md) | 发布矩阵、安装器与隔离验证 |
+| API | [Minimal API](api/README.md) | 端点、鉴权、CAS 与 HTTP 上界 |
+| 错误码 | [错误码字典](api/error-codes.md) | 冻结词汇与可操作错误 |
+| E2E | [端到端门禁](reliability/e2e.md) | 独立 wire oracle 与真实二进制回归 |
+| 长稳 | [运行指南](reliability/soak-guide.md) | 隔离 runner 与证据边界 |
+| 性能 | [报告入口](perf/reports/README.md) | 性能证据及其 provenance |
+| 协议依据 | [simple-obfs / SS UDP](research/shadowsocks-simple-obfs-udp.md)、[Trojan UDP](research/trojan-udp.md) | 协议研究与原验收依据 |
 
-## Project assets
+## 实现与证据分开
 
-The current project mark has three PNG variants:
+`src/main.rs` / `src/cli.rs` 提供 CLI，`src/store.rs` 管理不可变配置与 CAS，`src/service.rs` 准备运行快照，`src/daemon.rs` 管理实例身份与就绪，`src/api.rs` 提供 minimal API，`src/runtime.rs` 处理 mixed 数据面。原 Zig 文件暂留作迁移行为对照，不参与默认生产构建。
 
-- [`assets/zc-mark-transparent.png`](assets/zc-mark-transparent.png) for transparent background usage and the root README.
-- [`assets/zc-mark-dark.png`](assets/zc-mark-dark.png) for dark framed usage.
-- [`assets/zc-mark-light.png`](assets/zc-mark-light.png) for light background usage.
+已存在的 `state-v2.json`、revision 与旧 daemon snapshot 有明确接管路径；损坏状态必须拒绝，不得删除重建或回退 DIRECT。细节见 CLI 与迁移文档。
 
-## Archived docs
-
-Historical drafts and stale planning documents live under [`archive/`](archive/). They are kept only for traceability and **do not represent current v1.0 commitments**.
-
-The TUI documentation has been archived because TUI is removed from the v1.0 release scope.
-
-## v1.0 scope summary
-
-Included:
-
-- daemon lifecycle through CLI: `start` (`up`), `stop` (`down`), `restart`, `reload`, `status`, `log`, `doctor`, with a uniform `--json` envelope on stdout and uniform exit codes (see [`cli/spec.md`](cli/spec.md));
-- fixed `7899` mixed inbound runtime, with an explicit CLI override for non-production runs;
-- DIRECT、REJECT、四种 Shadowsocks AEAD cipher 的 TCP，以及 `udp:true` 节点经 mixed SOCKS5 UDP ASSOCIATE 的 classic AEAD UDP；
-- non-production explicit port override via `zc start --port <port>`;
-- core rule matching and rule-provider expansion;
-- minimal REST API for version/proxies/rules/proxy selection;
-- checksum-verified standalone installer、static Linux artifacts、PR/main real E2E and release validation gates.
-
-Not included in v1.0:
-
-- TUI;
-- TUN/redir/tproxy transparent proxying;
-- complete mihomo DNS behavior;
-- complete REST API v1/WebSocket event stream;
-- HTTP/SOCKS5/VMess/VLESS/AnyTLS outbound；这些协议只有在独立 wire、互操作、资源和生命周期门禁通过后才会逐个启用。
+[原 v1.0 路线图](roadmap/v1.0.md)、[CLI UX 决策记录](cli/ux-workflow.md)、日期化报告与 `archive/` 保留历史事实，不能把其中的完成标记当作 Rust 验收。TUI 已排除，旧 TUI 设计仅存档。项目图标位于 `assets/`。

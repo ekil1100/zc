@@ -13,10 +13,13 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 
 ## 技术约束
 
-- Zig 版本要求 `0.16.0+`
-- CI 使用 `0.16.0`
-- 本地开发默认使用 `0.16.0`
-- 不降级到低于 `0.16.0` 的版本
+- Rust 最低版本 `1.91`（以 `Cargo.toml` 为准）；CI 固定 `1.98.1`，本地优先同版本
+- 默认构建、测试与交付使用 Cargo / just；依赖使用已提交的 `Cargo.lock`
+- 原生依赖需要 C/C++ 工具链与 CMake；E2E 需要 Python 3、Node.js 与 just
+- 生产目标为 Linux/macOS × x64/arm64，不支持 Windows
+- Zig `0.16.0` 仅用于迁移期历史行为对照，不作为 Rust 构建或运行时回退
+- 修改状态、daemon 或协议时，先读 `docs/cli/spec.md`、`docs/compat/mihomo-clash.md` 及 `docs/migration/rust.md`；既有数据损坏必须拒绝，不得删除重建
+- 迁移验收以独立门禁证据为准，构建成功不代表性能、四平台或长稳通过
 
 ## 工程规则
 

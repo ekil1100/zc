@@ -31,3 +31,7 @@ Thumbs.db
 # Test artifacts
 test-output/
 coverage/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]

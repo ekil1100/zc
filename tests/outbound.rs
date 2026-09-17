@@ -27,6 +27,8 @@ async fn direct_roundtrip_preserves_half_close() {
         let config = Config::parse("rules: ['MATCH,DIRECT']\n").unwrap();
         let connector = Connector::new(&config).unwrap();
         let proxy = Proxy {
+            udp: true,
+            obfs: None,
             name: "DIRECT".into(),
             kind: ProxyKind::Direct,
         };
@@ -50,6 +52,8 @@ async fn reject_reports_policy_without_dialing_target() {
     let config = Config::parse("rules: ['MATCH,REJECT']\n").unwrap();
     let connector = Connector::new(&config).unwrap();
     let proxy = Proxy {
+        udp: true,
+        obfs: None,
         name: "REJECT".into(),
         kind: ProxyKind::Reject,
     };
@@ -109,6 +113,8 @@ async fn shadowsocks_sends_destination_before_server_first_payload_and_preserves
             let config = Config::parse("rules: ['MATCH,DIRECT']\n").unwrap();
             let connector = Connector::new(&config).unwrap();
             let proxy = Proxy {
+                udp: true,
+                obfs: None,
                 name: "ss".into(),
                 kind: ProxyKind::Shadowsocks {
                     server: address.ip().to_string(),
@@ -254,6 +260,8 @@ async fn verified_trojan_ip_requires_explicit_dns_sni_without_dialing() {
     let config = trojan_config(address.port(), false);
     let connector = Connector::new(&config).unwrap();
     let proxy = Proxy {
+        udp: true,
+        obfs: None,
         name: "trojan-ip".into(),
         kind: ProxyKind::Trojan {
             server: address.ip().to_string(),
@@ -291,6 +299,8 @@ async fn trojan_explicit_sni_rejects_ip_and_root_dot_before_dialing() {
     let target = Target::new("example.com", 443).unwrap();
     for sni in ["127.0.0.1", "::1", "front.example.", "bad_name.example"] {
         let proxy = Proxy {
+            udp: true,
+            obfs: None,
             name: "bad-sni".into(),
             kind: ProxyKind::Trojan {
                 server: address.ip().to_string(),
@@ -510,4 +520,82 @@ async fn ip_policy_pins_trojan_destination_but_preserves_tls_sni() {
             peer.await.unwrap();
         }
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn shadowsocks_http_obfs_wraps_ciphertext_before_independent_server_decryption() {
+    use shadowsocks::{
+        config::{ServerConfig, ServerType},
+        context::Context,
+        crypto::CipherKind,
+        relay::{socks5::Address, tcprelay::proxy_stream::ProxyServerStream},
+    };
+    timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // An independent HTTP envelope reader, not the client codec in reverse.
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") && header.len() < 1024 {
+                header.push(stream.read_u8().await.unwrap());
+            }
+            let header = String::from_utf8(header).unwrap();
+            assert!(header.starts_with("GET / HTTP/1.1\r\n"));
+            assert!(header.contains(&format!("Host: cover.example:{}\r\n", address.port())));
+            // AES-128: salt(16) + encrypted length(2+16) + address(15) + tag(16).
+            assert!(header.contains("\r\nContent-Length: 65\r\n"), "{header}");
+            stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n").await.unwrap();
+            let config = ServerConfig::new(address, "password", CipherKind::AES_128_GCM).unwrap();
+            let mut stream = ProxyServerStream::from_stream(Context::new_shared(ServerType::Server), stream, config.method(), config.key());
+            assert_eq!(stream.handshake().await.unwrap(), Address::DomainNameAddress("example.com".into(), 25));
+            stream.write_all(b"ready").await.unwrap(); stream.flush().await.unwrap();
+            let mut request = Vec::new(); stream.read_to_end(&mut request).await.unwrap(); assert_eq!(request, b"QUIT");
+            stream.write_all(b"bye").await.unwrap(); stream.shutdown().await.unwrap();
+        });
+        let config = Config::parse(&format!("proxies: [{{name: edge, type: ss, server: 127.0.0.1, port: {}, password: password, cipher: aes-128-gcm, plugin: obfs-local, plugin-opts: {{mode: http, host: cover.example}}}}]\nrules: ['MATCH,edge']", address.port())).unwrap();
+        let connector = Connector::new(&config).unwrap();
+        let target = Target::new("example.com", 25).unwrap(); let route = config.route(&target).await.unwrap();
+        let mut stream = connector.connect(route.proxy, &route.target).await.unwrap();
+        let mut greeting = [0; 5]; stream.read_exact(&mut greeting).await.unwrap(); assert_eq!(&greeting, b"ready");
+        stream.write_all(b"QUIT").await.unwrap(); stream.shutdown().await.unwrap();
+        let mut response = Vec::new(); stream.read_to_end(&mut response).await.unwrap(); assert_eq!(response, b"bye");
+        peer.await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn obfs_preflight_rejects_invalid_host_and_non_ss_metadata_before_tcp_or_udp_open() {
+    use zc::config::ObfsHttp;
+    let config = Config::parse("rules: ['MATCH,DIRECT']").unwrap();
+    let connector = Connector::new(&config).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let target = Target::new(address.ip().to_string(), address.port()).unwrap();
+    for (kind, host) in [
+        (ProxyKind::Direct, "cover.example"),
+        (
+            ProxyKind::Shadowsocks {
+                server: "127.0.0.1".into(),
+                port: address.port(),
+                password: "password".into(),
+                cipher: "aes-128-gcm".into(),
+            },
+            "bad\r\nInjected: true",
+        ),
+    ] {
+        let proxy = Proxy {
+            name: "invalid-obfs".into(),
+            kind,
+            udp: true,
+            obfs: Some(ObfsHttp { host: host.into() }),
+        };
+        assert!(connector.connect(&proxy, &target).await.is_err());
+        assert!(connector.open_udp(&proxy, &target).await.is_err());
+    }
+    assert!(
+        timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
 }

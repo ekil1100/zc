@@ -34,6 +34,16 @@ impl Target {
         Ok(Self { host, port })
     }
 
+    /// SOCKS domains are length-prefixed wire names, not validated DNS labels.
+    /// Configuration and HTTP authorities must continue to use `new`.
+    pub fn from_socks(host: impl Into<String>, port: u16) -> Result<Self> {
+        let host = host.into();
+        if host.is_empty() || host.len() > u8::MAX as usize || port == 0 {
+            bail!("SOCKS destination requires a 1..255 byte name and a nonzero port");
+        }
+        Ok(Self { host, port })
+    }
+
     pub fn host(&self) -> &str {
         &self.host
     }

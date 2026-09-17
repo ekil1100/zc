@@ -1,6 +1,6 @@
 # 迁移规则速查表
 
-> 快速查找 mihomo/clash → zc 配置迁移规则
+> 快速查找 mihomo/clash → zc 配置迁移规则。此工具是独立 lint，不是运行时 capability gate；可识别的 VMess/VLESS/AnyTLS、DNS 或组类型不代表 Rust 已启用。实际边界见 [兼容说明](mihomo-clash.md)。
 
 ## 规则总览（R1-R21）
 
@@ -8,7 +8,7 @@
 |------|------|-----------|----------|----------|
 | R1 PORT_TYPE_INT | warn | 端口值为字符串，应转为整数 | `port: "7890"` | `port: 7890` |
 | R2 LOG_LEVEL_ENUM | error | log-level 值不在枚举范围内 | `log-level: verbose` | `log-level: info` |
-| R3 PROXY_GROUP_TYPE_CHECK | error | 代理组类型无效 | `type: urll-test` | `type: url-test` |
+| R3 PROXY_GROUP_TYPE_CHECK | error | 代理组类型无效 | `type: urll-test` | Rust 运行时仅支持 `select` |
 | R4 DNS_FIELD_CHECK | warn/error | DNS 字段缺失或配置错误 | `nameserver: []` | 添加有效 DNS |
 | R5 DNS_NAMESERVER_FORMAT | warn | nameserver 为纯 IP 缺协议 | `8.8.8.8` | `udp://8.8.8.8` |
 | R6 PROXY_GROUP_EMPTY_PROXIES | error | 代理组无节点 | `proxies: []` | 添加代理节点 |
@@ -23,7 +23,7 @@
 | R15 MODE_ENUM_CHECK | error | mode 值无效 | `mode: auto` | `mode: rule` |
 | R16 PROXY_NAME_UNIQUENESS_CHECK | error | 代理名称重复 | 两个 `name: "node1"` | 改为唯一名称 |
 | R17 PORT_RANGE_CHECK | error | 端口超出范围 | `port: 99999` | `port: 1-65535` |
-| R18 SS_PROTOCOL_CHECK | warn | SS 协议变体识别 | `type: ss-plugin` | 确认支持（已支持） |
+| R18 SS_PROTOCOL_CHECK | warn | SS 协议变体识别 | `type: ss-plugin` | 改为受支持的 `ss` 与明确 obfs HTTP 形状 |
 | R19 VMESS_ALTERID_RANGE_CHECK | error | VMess alterId 超出范围 | `alterId: 99999` | `alterId: 0-65535` |
 | R20 TROJAN_FIELDS_CHECK | error/warn | Trojan 节点缺少字段 | 缺 `password` | 添加 password/sni |
 | R24 YAML_SYNTAX_CHECK | error | YAML 语法错误（缩进、冒号等） | `mixed-port 7890` | `mixed-port: 7890` |
@@ -34,10 +34,10 @@
 ## 快速修复命令
 
 ```bash
-# 运行所有检查
+# Run all lint checks
 bash tools/config-migrator/run.sh lint config.yaml
 
-# 查看完整回归测试
+# Run migrator regressions
 bash tools/config-migrator/run-all.sh
 ```
 
@@ -53,7 +53,7 @@ bash tools/config-migrator/run-all.sh
 | R21 RULES_FORMAT_CHECK | error | 规则格式错误 | `DOMAIN,google` | `DOMAIN,google.com,PROXY` |
 | R22 VLESS_FIELDS_CHECK | error/warn | VLESS 节点缺少字段 | 缺 `uuid` | 添加 uuid/sni |
 | R23 PROXY_GROUP_REF_CHECK | error | 代理组引用不存在 | `proxies: [missing]` | 添加 proxy 定义 |
-| R28 UNSUPPORTED_PROXY_TYPE_CHECK | error | 代理类型不支持 | `type: snell` | 更换为 ss/vmess/trojan/vless/anytls |
+| R28 UNSUPPORTED_PROXY_TYPE_CHECK | error | 代理类型不支持 | `type: snell` | 运行时仅选择受支持的 ss/trojan 子集 |
 | R29 PORT_CONFLICT_CHECK | warn | 不同代理使用相同端口 | node1:8388, node2:8388 | 使用不同端口 |
 | R30 DUPLICATE_KEY_CHECK | warn | 配置项重复定义 | `port: 7890` 出现两次 | 删除重复项 |
 | R31 DNS_INVALID_CHECK | error | DNS 服务器无效 | `nameserver: [localhost]` | 使用 8.8.8.8 或 1.1.1.1 |

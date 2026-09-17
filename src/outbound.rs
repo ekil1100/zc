@@ -45,6 +45,15 @@ pub struct Connector {
 
 impl Connector {
     pub fn new(config: &Config) -> Result<Self> {
+        Self::build(config, None)
+    }
+
+    /// Use an explicit trust store without process-global certificate environment changes.
+    pub fn with_tls_roots(config: &Config, roots: RootCertStore) -> Result<Self> {
+        Self::build(config, Some(roots))
+    }
+
+    fn build(config: &Config, roots: Option<RootCertStore>) -> Result<Self> {
         for proxy in config.proxies() {
             if let ProxyKind::Trojan {
                 server,
@@ -86,9 +95,11 @@ impl Connector {
             )
         });
         let tls_verified = if needs_verified {
-            let mut roots = RootCertStore::empty();
-            let native = rustls_native_certs::load_native_certs();
-            roots.add_parsable_certificates(native.certs);
+            let roots = roots.unwrap_or_else(|| {
+                let mut roots = RootCertStore::empty();
+                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+                roots
+            });
             if roots.is_empty() {
                 bail!(
                     "no usable system TLS trust roots; install trusted CA certificates or check SSL_CERT_FILE/SSL_CERT_DIR"
@@ -112,6 +123,55 @@ impl Connector {
         })
     }
 
+    /// Open a datagram association without sending a payload. Each send_to must
+    /// receive the routed target, because a session can carry multiple destinations.
+    pub async fn open_udp(
+        &self,
+        proxy: &Proxy,
+        _target: &Target,
+    ) -> Result<crate::udp::UdpSession> {
+        validate_obfs(proxy)?;
+        match &proxy.kind {
+            ProxyKind::Direct => crate::udp::UdpSession::direct(self.dns.clone()).await,
+            ProxyKind::Reject => bail!("UDP connection rejected by REJECT routing rule"),
+            ProxyKind::Shadowsocks {
+                server,
+                port,
+                password,
+                cipher,
+            } => {
+                if !proxy.udp {
+                    bail!("UDP is disabled for this proxy; configure udp: true");
+                }
+                let method = ss_method(cipher)?;
+                let config = ServerConfig::new((server.clone(), *port), password.clone(), method)
+                    .context("cannot prepare Shadowsocks UDP configuration")?;
+                timeout(
+                    Duration::from_secs(10),
+                    crate::udp::UdpSession::shadowsocks(
+                        self.dns.clone(),
+                        self.ss_context
+                            .get_or_init(|| ShadowsocksContext::new_shared(ServerType::Local))
+                            .clone(),
+                        &config,
+                        &Target::new(server.clone(), *port)?,
+                    ),
+                )
+                .await
+                .context("UDP setup timed out after 10 seconds")?
+            }
+            ProxyKind::Trojan { .. } => {
+                if !proxy.udp {
+                    bail!("UDP is disabled for this proxy; configure udp: true");
+                }
+                let stream = timeout(Duration::from_secs(10), self.trojan_stream(proxy, None))
+                    .await
+                    .context("UDP setup timed out after 10 seconds")??;
+                Ok(crate::udp::UdpSession::trojan(self.dns.clone(), stream))
+            }
+        }
+    }
+
     pub async fn connect(&self, proxy: &Proxy, target: &Target) -> Result<BoxStream> {
         timeout(Duration::from_secs(10), self.connect_inner(proxy, target))
             .await
@@ -133,6 +193,7 @@ impl Connector {
     }
 
     async fn connect_inner(&self, proxy: &Proxy, target: &Target) -> Result<BoxStream> {
+        validate_obfs(proxy)?;
         match &proxy.kind {
             ProxyKind::Direct => {
                 let stream = self
@@ -150,19 +211,18 @@ impl Connector {
                 password,
                 cipher,
             } => {
-                let method = match cipher.as_str() {
-                    "aes-128-gcm" => CipherKind::AES_128_GCM,
-                    "aes-256-gcm" => CipherKind::AES_256_GCM,
-                    "chacha20-ietf-poly1305" => CipherKind::CHACHA20_POLY1305,
-                    _ => bail!(
-                        "unsupported Shadowsocks cipher; use aes-128-gcm, aes-256-gcm or chacha20-ietf-poly1305"
-                    ),
-                };
+                let method = ss_method(cipher)?;
                 let config = ServerConfig::new((server.clone(), *port), password.clone(), method)
                     .context("cannot prepare Shadowsocks TCP configuration")?;
                 let socket = self.dial(server, *port).await.context(
                     "Shadowsocks server TCP connection failed; check server reachability",
                 )?;
+                let socket: BoxStream = match &proxy.obfs {
+                    Some(obfs) => Box::new(crate::simple_obfs::HttpObfsStream::new(
+                        socket, &obfs.host, *port,
+                    )?),
+                    None => Box::new(socket),
+                };
                 let context = self
                     .ss_context
                     .get_or_init(|| ShadowsocksContext::new_shared(ServerType::Local));
@@ -184,48 +244,57 @@ impl Connector {
                     .context("cannot flush Shadowsocks destination header")?;
                 Ok(Box::new(stream))
             }
-            ProxyKind::Trojan {
-                server,
-                port,
-                password,
-                sni,
-                skip_cert_verify,
-            } => {
-                let name = trojan_server_name(server, sni.as_deref(), *skip_cert_verify)?;
-                let tls = if *skip_cert_verify {
-                    &self.tls_unverified
-                } else {
-                    &self.tls_verified
-                };
-                let tls = tls.as_ref()
-                    .context("Trojan TLS configuration is unavailable; rebuild Connector with this proxy configuration")?;
-                let socket = self
-                    .dial(server, *port)
-                    .await
-                    .context("Trojan server TCP connection failed; check server reachability")?;
-                let mut stream = tls.connect(name, socket).await.context(
-                    "Trojan TLS handshake failed; check server certificate, trust roots and sni",
-                )?;
-                let mut request =
-                    format!("{:x}\r\n", Sha224::digest(password.as_bytes())).into_bytes();
-                request.push(1); // CONNECT
-                destination(target).write_to_buf(&mut request);
-                request.extend_from_slice(b"\r\n");
-                stream
-                    .write_all(&request)
-                    .await
-                    .context("cannot write Trojan CONNECT request")?;
-                stream
-                    .flush()
-                    .await
-                    .context("cannot flush Trojan CONNECT request")?;
-                Ok(Box::new(stream))
-            }
+            ProxyKind::Trojan { .. } => self.trojan_stream(proxy, Some(target)).await,
         }
+    }
+
+    async fn trojan_stream(&self, proxy: &Proxy, target: Option<&Target>) -> Result<BoxStream> {
+        let ProxyKind::Trojan {
+            server,
+            port,
+            password,
+            sni,
+            skip_cert_verify,
+        } = &proxy.kind
+        else {
+            bail!("Trojan transport requires a Trojan proxy");
+        };
+        let name = trojan_server_name(server, sni.as_deref(), *skip_cert_verify)?;
+        let tls = if *skip_cert_verify {
+            &self.tls_unverified
+        } else {
+            &self.tls_verified
+        };
+        let tls = tls.as_ref().context("Trojan TLS configuration is unavailable; rebuild Connector with this proxy configuration")?;
+        let socket = self
+            .dial(server, *port)
+            .await
+            .context("Trojan server TCP connection failed; check server reachability")?;
+        let mut stream = tls.connect(name, socket).await.context(
+            "Trojan TLS handshake failed; check server certificate, trust roots and sni",
+        )?;
+        let mut request = format!("{:x}\r\n", Sha224::digest(password.as_bytes())).into_bytes();
+        if let Some(target) = target {
+            request.push(1);
+            destination(target).write_to_buf(&mut request);
+        } else {
+            // Trojan UDP uses an unspecified IPv4 endpoint, not the first datagram target.
+            request.extend_from_slice(&[3, 1, 0, 0, 0, 0, 0, 0]);
+        }
+        request.extend_from_slice(b"\r\n");
+        stream
+            .write_all(&request)
+            .await
+            .context("cannot write Trojan request")?;
+        stream
+            .flush()
+            .await
+            .context("cannot flush Trojan request")?;
+        Ok(Box::new(stream))
     }
 }
 
-fn destination(target: &Target) -> Address {
+pub(crate) fn destination(target: &Target) -> Address {
     match target.host().parse::<IpAddr>() {
         Ok(ip) => Address::SocketAddress((ip, target.port()).into()),
         Err(_) => Address::DomainNameAddress(target.host().to_owned(), target.port()),
@@ -304,4 +373,25 @@ fn trojan_server_name(
     let name = sni.unwrap_or(server);
     ServerName::try_from(name.strip_suffix('.').unwrap_or(name).to_owned())
         .context("invalid Trojan TLS server name; configure a valid sni hostname")
+}
+
+fn ss_method(cipher: &str) -> Result<CipherKind> {
+    match cipher {
+        "aes-128-gcm" => Ok(CipherKind::AES_128_GCM),
+        "aes-256-gcm" => Ok(CipherKind::AES_256_GCM),
+        "chacha20-ietf-poly1305" | "chacha20-poly1305" => Ok(CipherKind::CHACHA20_POLY1305),
+        _ => bail!(
+            "unsupported Shadowsocks cipher; use aes-128-gcm, aes-256-gcm or chacha20-ietf-poly1305"
+        ),
+    }
+}
+
+fn validate_obfs(proxy: &Proxy) -> Result<()> {
+    if let Some(obfs) = &proxy.obfs {
+        if !matches!(proxy.kind, ProxyKind::Shadowsocks { .. }) {
+            bail!("simple-obfs is supported only for Shadowsocks TCP");
+        }
+        crate::simple_obfs::validate_host(&obfs.host)?;
+    }
+    Ok(())
 }

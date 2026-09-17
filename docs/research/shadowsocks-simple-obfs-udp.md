@@ -1,5 +1,7 @@
 # Research: simple-obfs HTTP、capability gate 与 Shadowsocks AEAD UDP（2017）
 
+> 保留原协议研究及设计建议，不能把建议或历史验证当作 Rust 完成声明。当前只接受 map 形式 plugin options，不支持 SIP003 scalar 字符串；实际边界见 [兼容说明](../compat/mihomo-clash.md)。
+
 ## Summary
 
 zc 应只实现 **simple-obfs HTTP 客户端传输层**，接受 mihomo 风格 `plugin: obfs` 与 SIP003 风格 `plugin: obfs-local`，统一为 `mode: http`、`host: <伪装 Host>`；虽然上游 simple-obfs 确有 `tls` mode，但本次不应支持。UDP 应实现经典 Shadowsocks AEAD（SIP004/SIP007，本文称“2017 AEAD”）的独立数据报格式，并通过显式 `udp` capability gate 启用；simple-obfs/SIP003 只包装 TCP，UDP 仍直接发往 Shadowsocks 服务端 UDP 端口。

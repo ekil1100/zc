@@ -1,138 +1,104 @@
-# zc CLI spec — v1.0 contract
+# zc CLI 契约
 
-This document describes the command surface and output contract implemented by
-`src/main.zig`, driven by the declarative command table in
-`src/cli/commands.zig` and the output layer in `src/cli/output.zig`.
-Help text is generated from the same table, so help can never drift from what
-the binary accepts.
+当前 Rust 入口是 `src/main.rs` / `src/cli.rs`；命令表生成帮助，服务编排位于 `src/service.rs`，实例生命周期位于 `src/daemon.rs`，持久权威位于 `src/store.rs`。本文件保留原 CLI 行为契约；[迁移说明](../migration/rust.md) 单独列出尚未对齐的差异，不以实现缺口改写规范。历史决策见 [UX 工作流](ux-workflow.md)，冻结错误码见 [字典](../api/error-codes.md)。
 
-验收标准与决策记录见 [`ux-workflow.md`](ux-workflow.md)；错误码字典见
-[`../api/error-codes.md`](../api/error-codes.md)。
+## 完整命令表
 
-## Global commands
+所有公开命令支持 `--json`；`-c` 等同于 `--config`。裸 `config/proxy/profile/diag` 输出组帮助并退出 0。每个命令接受 `help`、`--help`、`-h`，帮助请求不执行业务。
 
-| Command | Aliases | Notes |
-| --- | --- | --- |
-| `zc help [command]` / `zc --help` / `zc -h` | | Global help; `zc help start`、`zc help config download`、`zc help config` 均可。Unknown topic ⇒ `HELP_TOPIC_UNKNOWN`, exit 2. |
-| `zc version` | `zc --version` | Prints version on stdout, exit 0; supports `--json`. |
-| `zc start [-c <config>] [--port <port>] [--foreground] [--json]` | `zc up` | Fork-and-exit daemon start. `--foreground` runs without forking (containers/systemd). Background start fully prepares providers/overrides in the parent, then launches from an owner-only authenticated snapshot. Already-running daemon is reported as success (`detail:"already_running"`), exit 0. `--port` is the only runtime proxy-port override；未提供时固定使用 `7899`，配置/profile/override 中的 `mixed-port` 数值仅兼容解析并在 runtime preparation 中规范化为 `7899`。同文件中的 `port`/`socks-port` 按 ignored 语义处理，不创建额外 listener；没有 mixed listener 的 standalone 声明仍在 bind 前拒绝。Override flags (`--override-script`/`--override-arg`/`--override-timeout-ms`) accepted. |
-| `zc stop [--json]` | `zc down` | Stops the PID/nonce-bound daemon and removes its prepared snapshot. Already stopped ⇒ success (`detail:"already_stopped"`), exit 0. |
-| `zc restart [-c <config>] [--port <port>] [--json]` | | Fully validates and freezes the target before stopping the captured PID/nonce. A post-stop startup failure restores the exact previous snapshot; a changed runtime instance is never stopped. The original source and CLI port override remain tracked for later reloads, while an explicit new override replaces the prior one-shot override. JSON 模式只输出**一个**最终 envelope（中间步骤文本走 stderr）。`--foreground` is rejected (exit 2). |
-| `zc reload [--json]` | | Reloads the tracked original source, preserving its CLI port override; current hot reload falls back to the same instance-bound prepared restart. Daemon not running ⇒ `RELOAD_FAILED`, exit 1. Supervised foreground daemon（systemd/容器）拒绝并提示走 supervisor。 |
-| `zc status [--json]` | | Daemon state, uptime, mixed port, runtime paths, and current node of each select group. Running daemon reports the effective mixed port (`--port` or `7899`); stopped daemon reports `mixed_port` as null / `(none)`. Stopped daemon is **still exit 0**（状态在 `data.state`，决策 D5）。 |
-| `zc log [-n <lines>] [-f\|--no-follow] [--json]` | | Follows by default in text mode. `--json` = JSON Lines（每行一个 `{"line":"…"}` 事件），implies `--no-follow` unless `-f`. Default `-n` is 50 when not following. |
-| `zc test [-c <config>] [--port <port>] [--json]` | | Connectivity probes through the runtime proxy port（显式 `--port`，否则固定 `7899`）。文本与 JSON **跑相同探测**；文本模式并发测速，并按实际完成顺序逐项刷新结果。any failed check ⇒ `error.code=CHECKS_FAILED` + per-check `data`, exit 1（决策 D3）。JSON 含 `daemon_state`、`selected_proxies`、`ports`、`checks`、`targets`。 |
-| `zc doctor [-c <config>] [--json]` | | Config/daemon/port/connectivity diagnostics。文本标签冻结为 `Config:`、`Daemon:`、`PID:`、`Port:`、`Connection:`（健康输出含 `OK`/`valid`）。Failed checks ⇒ `CHECKS_FAILED` + `data.checks`, exit 1。JSON 含 `proxy_reachable`、`network_ok`、`config_ok` 与 `config_diagnostics_truncated`；validator 超过 256 条合计或单条 512 bytes 时文本会提示 omitted。 |
-
-Lifecycle commands enforce 决策 D11 like every other tree: unknown flags,
-stray positional arguments, and missing/invalid flag values (`-c`, `--port`,
-`log -n`) are usage errors — envelope/error block + exit 2, never silently
-ignored. `restart` shares `start`'s argument parser and therefore emits the
-frozen `START_*` argument-error codes (messages/hints rendered for restart);
-`stop`/`status`/`reload`/`log` use `<CMD>_ARGUMENT_INVALID`, and
-`doctor`/`diag doctor` share `DIAG_DOCTOR_ARGUMENT_INVALID`.
-
-v1 的 `external-controller` 只接受显式 `127.0.0.1:<port>`。启动必须绑定配置中的精确端口；端口已占用时返回 `START_CONTROLLER_PORT_IN_USE` / `RESTART_CONTROLLER_PORT_IN_USE`，不得自动改用相邻端口，也不得静默禁用控制面。
-
-生命周期文件 `zc.pid`、`zc.lock`、`zc.log`、`zc.daemon.json` 与 `zc.daemon.lock` 统一位于经过校验的 runtime directory。设置 `XDG_RUNTIME_DIR` 时，它必须是绝对、规范化、由当前 euid 所有且权限为 `0700` 的既有目录；未设置时使用规范化 `$HOME/.local/state/zc/runtime`，其父目录不得由 group/other 写入，最终目录权限为 `0700`。不安全路径与 symlink fail closed；文件明确收敛为 `0600`，特殊文件不得在类型校验前阻塞读取。后台日志超过 8 MiB 后重置到新的 owner-only 文件，避免 runtime filesystem 无界增长；`zc log -f` 在日志暂时缺失或整个 runtime directory 被安全重建时持续重开，不退出也不永久钉住旧目录。
-
-后台 `zc start` 先绑定所有配置 listener，并发布 `ready:false` 的 provisional descriptor；并发 `status`/`start` 不把它当作 running。exact desired reconciliation 完成后，daemon 持有 authority guard 与 selection barrier，并以独立 data-plane readiness barrier 阻塞包括 `DIRECT`/`REJECT` 在内的所有出站；descriptor 提升为 `ready:true` 后才释放数据面；并发 `start` 也以该 descriptor 作为最终就绪事实。`zc stop` 通过 descriptor nonce 认证的 runtime 请求让目标实例自行退出；descriptor/lock/PID 不一致时拒绝按数值 PID 发信号。运行中 lock path 缺失、inode 被替换或整个 runtime directory 被重建时，实例会校验继承 lock identity 并退出；`status`/`start` fail closed，不删除 live PID，也不形成永久双实例。`zc status` 返回 pid/lock/log 的实际路径；descriptor 位于同一 runtime directory，但不是冻结的 `paths` 字段。`proxy select` 只向 PID、instance nonce、revision、generation 与 endpoint 均匹配的 live descriptor 发送运行时变更；daemon 以 generation CAS 拒绝过期/乱序 apply；durable desired 领先时允许前跳到最新完整 snapshot，并在成功后推进 descriptor。descriptor 缺失、损坏或过期时只保留 durable selection，绝不回退猜测配置端点。显式 unmanaged 配置没有可比较 revision，`proxy select` 不做 live apply；需先 `zc config load` 导入。
-
-The TUI command is excluded from v1.0 and is not present in help/dispatch.
-`zc --daemon-run` is an internal mode used by `zc start` and is intentionally
-undocumented in help.
-
-## Command groups
-
-Bare group commands (`zc config`, `zc proxy`, `zc profile`, `zc diag`) print
-group help on stdout, exit 0. Every subcommand accepts `help`, `--help`, or
-`-h` after the subcommand, e.g. `zc config download --help`.
-
-### config
-
-| Command | Notes |
+| 命令 | 行为 |
 | --- | --- |
-| `zc config load <path> [--json]` | Validates and imports a local YAML plus its root-contained local provider assets into an immutable revision, makes it active, and never applies it to an already-running daemon (`data.applied:false`). Semantic validation failure ⇒ `CONFIG_LOAD_INVALID`; text lists concrete errors/warnings, JSON failure data contains `config_errors`, `config_warnings`, and `config_diagnostics_truncated`. Duplicate exact basename keys fail closed. YAML/proxy/provider/expanded-rule resource excess ⇒ `CONFIG_LOAD_LIMIT_EXCEEDED`; the 16 MiB source bound remains `CONFIG_LOAD_TOO_LARGE`. |
-| `zc config list [--json]` | Alias `zc config ls`. Lists configs + active one (`data.configs`, `data.active`). |
-| `zc config download <url> [-n <name>] [-d] [--json]` | Publishes an immutable revision through the catalog authority. `-d` requests activation; without `-d`, only the first **runtime-ready** managed config becomes active automatically. A first strict-YAML revision whose only recoverable defect is malformed/unsupported Shadowsocks simple-obfs metadata succeeds but remains inactive. Requesting its activation returns `CONFIG_CAPABILITY_UNSUPPORTED` and tells the user to retry without `-d`, inspect the retained source with `zc config dump -c <name> --no-override`, and repair its subscription source. Existing names fail closed. Missing `<url>` ⇒ `CONFIG_DOWNLOAD_URL_REQUIRED`, exit 2. Response body is limited to 16 MiB with a 30-second total deadline. YAML/proxy/provider/expanded-rule resource excess ⇒ `CONFIG_DOWNLOAD_LIMIT_EXCEEDED`; size excess stays `CONFIG_DOWNLOAD_TOO_LARGE`. `data.path` is null when compatibility mirror publication failed; the catalog commit still remains authoritative. |
-| `zc config update [name] [--apply auto\|hot\|restart] [--json]` | Re-downloads a previously downloaded config under the same 16 MiB / 30-second limits and commits only if the fetched subscription revision is still the profile head. Concurrent head changes fail rather than publishing bytes fetched for stale metadata. A malformed replacement for the active profile returns `CONFIG_CAPABILITY_UNSUPPORTED`, tells the user only to repair the subscription source and retry, and leaves its exact authoritative state unchanged. YAML/proxy/provider/expanded-rule resource excess ⇒ `CONFIG_UPDATE_LIMIT_EXCEEDED`; downloaded-source or persisted-override materialization size excess ⇒ `CONFIG_UPDATE_TOO_LARGE`. Applies to a running daemon per `--apply`（默认 auto）。JSON 单 envelope：`data.applied` / `data.apply_result`。 |
-| `zc config use <name> [--json]` | Switches the active config only when its exact revision is runtime-ready; a retained malformed revision returns `CONFIG_CAPABILITY_UNSUPPORTED`, points to `zc config dump -c <name> --no-override` for raw-source inspection, and does not change authoritative state. **绝不自动 apply**（决策 D8）：文本模式提示 `zc reload`；JSON `data.applied:false`。 |
-| `zc config dump [-c <config>] [--no-override] [--json]` | Without `-c`, reads the exact active catalog revision; `--no-override` reads that revision's immutable source instead of its frozen materialization. A retained malformed recovery name is accepted directly by `-c`; text mode emits its verified raw YAML so the advertised recovery seam remains executable. When stdout is a terminal, unsafe control/bidirectional bytes fail with `CONFIG_DUMP_UNSAFE_TERMINAL`; redirecting stdout preserves the exact recovery bytes. Other dumps print a **bare document** — YAML in text mode, bare JSON object with `--json`（唯一 envelope 例外，决策 D2）。可直接 `\| yq` / `\| jq`。Runtime-ready Shadowsocks `plugin_opts` input is emitted as a canonical `plugin-opts` map with mode/host preserved. Failures still use the envelope/error block。 |
-| `zc config override [<script>\|--clear] [--json]` | Bind/show/clear a frozen override by publishing a new immutable revision for the active config; applies to a running daemon. |
+| `zc help [command [subcommand]]`、`zc --help`、`zc -h` | 帮助写 stdout；未知主题 `HELP_TOPIC_UNKNOWN`，exit 2 |
+| `zc version`、`zc --version` | 版本写 stdout，exit 0 |
+| `zc start [-c <config>] [--port <port>] [--foreground]` | 别名 `up`；默认后台，父进程完成准备后启动认证快照；已运行返回成功 `detail:already_running` |
+| `zc stop` | 别名 `down`；只停止当前 PID/nonce 绑定实例并清理对应 snapshot；已停止成功 `detail:already_stopped` |
+| `zc restart [-c <config>] [--port <port>]` | 默认复用运行实例冻结快照；显式来源/override 才重新准备；目标先冻结、后停旧实例，失败尝试精确回滚 |
+| `zc reload` | 重读 tracked source，保留 CLI 端口覆盖；当前成功路径为 restart fallback；未运行返回 `RELOAD_FAILED` |
+| `zc status` | 实际 daemon 状态、uptime、端口、路径、select 当前选择；stopped 也是 exit 0 |
+| `zc log [-n <lines>] [-f\|--no-follow]` | 文本默认 follow；JSON 默认不 follow，`-f` 可显式启用；默认尾部 50 行 |
+| `zc test [-c <config>] [--port <port>]` | 通过代理端口做真实连通性检查；显式端口或默认 7899；文本/JSON 使用相同检查 |
+| `zc doctor [-c <config>]` | 配置、daemon、端口、连接诊断；运行中使用 descriptor 的实际 mixed 端口 |
+| `zc config load <path>` | 校验并捕获本地 YAML 与 root-contained provider 为 immutable revision，设为 active；不自动 apply，`applied:false` |
+| `zc config list` | 别名 `ls`；列出 profiles 与 active |
+| `zc config download <url> [-n <name>] [-d]` | 发布新 immutable revision；`-d` 请求激活，否则只自动激活首个 runtime-ready profile；同名拒绝 |
+| `zc config update [name] [--apply auto\|hot\|restart]` | 默认 active；仅订阅来源可更新；下载后 CAS 校验旧 head，再提交新 revision；仅对运行 exact 旧 identity 的 daemon 尝试 apply |
+| `zc config use <name>` | 切换 active，绝不自动 apply，`applied:false` |
+| `zc config delete <name>` | 别名 `rm/remove`；删除 catalog 引用，不破坏历史 immutable revision；不接管或停止运行实例 |
+| `zc config dump [-c <config>] [--no-override]` | 裸 YAML / 裸 JSON 文档，不包 envelope；默认 frozen materialization，`--no-override` 读 immutable source；通常脱敏 |
+| `zc config override [<script>\|--clear]` | 查询、绑定或清除 active profile 的冻结 override；变更发布新 revision 并尝试 apply |
+| `zc proxy list [-c <config>]` | 别名 `ls`；组、成员、`data.groups[].now` |
+| `zc proxy select [-g <group>] [-p <proxy>] [-c <config>]` | 先持久化 desired selection/generation，再尝试 exact revision live apply；JSON 无 `-p` 是只读 |
+| `zc proxy test [-c <config>] [--port <port>]` | 与 `zc test` 相同 |
+| `zc profile list/select/test` | `proxy` 的别名组，共用 handler；共享选择错误使用 `PROXY_*` |
+| `zc diag doctor [-c <config>]` | `zc doctor` 的别名路径 |
 
-新托管配置名在剥除一个 `.yaml` 后必须为 1–250 字节的有效 UTF-8，且不能是 `.`、`..`，也不能包含控制字符、双向/终端格式控制符、`/` 或 `\`。无效新名称返回 `CONFIG_NAME_INVALID`，并且不会发起网络或文件访问。旧版本已持久化的 251–255 字节 key 可继续读取和删除，避免升级时把 catalog 判坏；它们不再允许作为新 key，且兼容 mirror 可能报告 `mirror_out_of_sync:true`。bootstrap 通过共享 legacy cutover lock 冻结最终 snapshot 与 authority CAS；完成后，catalog v2 是 `load/list/download/update/use/delete/dump/override` 的唯一权威状态；`meta.json` 与 `configs/` 仅为派生兼容镜像，镜像损坏或不可写不会阻断健康 catalog 的读取。损坏 catalog、缺失 active identity 或缺失 immutable revision 均明确失败，不回退到内置 `DIRECT`。
+未知 flag、多余位置参数、缺值/非法参数不得静默忽略。`restart --foreground` 拒绝；`start/restart` 共用冻结 `START_*` 参数错误码。TUI 不在帮助或 dispatch 中；`--daemon-run` 和 override worker 是内部模式，不是用户入口。
 
-Legacy cutover 与 `config download` 的 raw recovery 只会把明确标记为 malformed/unsupported 的 Shadowsocks simple-obfs 语义保留为 inactive 原始 revision，使其仍可通过 `config list/delete/update` 检视或替换；reserved proxy/group 名、未支持的 proxy/group type、基础字段、rule/reference/provider 等离线错误仍会拒绝，非 Shadowsocks plugin metadata 也不会进入 catalog。首个这类 recovery revision 不会占用“首个 runtime-ready config 自动 active”的位置；修复来源并成功 `config update` 后，显式 `config use` 才会激活它。这一恢复例外不绕过运行时 capability gate：`config download -d`、active update 与 `config use` 均以 `CONFIG_CAPABILITY_UNSUPPORTED` 拒绝非 runtime-ready identity，并保持已有 active identity。旧状态没有 active profile 时，`start`/`restart` 返回 `START_CONFIG_NOT_SELECTED` / `RESTART_CONFIG_NOT_SELECTED`，必须先执行 `zc config use <name>`。唯一支持的 Shadowsocks plugin shape 是 `obfs|obfs-local` + map options 中显式 `mode: http` 与合法非空 host；通用外部插件不会启动。classic AEAD Shadowsocks 与原生 TLS Trojan 节点可声明 `udp:true`，仅通过 mixed SOCKS5 UDP ASSOCIATE 使用；Trojan domain 目标先按原域名匹配规则，再本地解析为 IP frame 以兼容主流服务端。simple-obfs 不包装 UDP，standalone `socks-port` UDP、AEAD-2022 与 fragmentation 仍不支持。
+`start/restart`、配置加载类诊断及 `config dump` 的一次性 override 使用 `--override-script <path>`、可重复 `--override-arg <k=v>`、`--override-timeout-ms <1..60000>`；适用与安全边界见 [override](../config/override.md)。
 
-Config YAML、override patch 输出与 local rule-provider source 都必须是合法 UTF-8；非法字节在 YAML/validator 或 legacy provider fallback 前拒绝，不会以 byte array 污染 JSON 字段，也不生成伪造的 field diagnostics。Config YAML 共享固定上界：整个 decoded document 最多 **262144 个 collection entries**（每个 block/flow mapping entry 与 sequence item 都计数，包含 nested 和 unknown extension data）、4096 proxies、1024 proxy groups、兼容 mixed `proxies:` array 5120 entries、每组 5122 members；此外最多 **4096 个 rule providers**，managed capture 因而最多保留 4096 个 local-provider assets，且每个 config 或 provider source 都最多 **16 MiB**。所有 provider 合计最多 **262144 个 normalized entries / 64 MiB normalized entry bytes**，且每次 provider 同步与权威加载另有独立的 **64 MiB aggregate raw source bytes** 上界（comments 也计 raw budget）；`RULE-SET` 展开结果最多 **262144 条 rules / 64 MiB owned payload+target bytes**。单个 provider 同样不能超过 262144 entries。local-provider asset 超过默认或收紧后的单 asset 上界都发射 `RuleProviderFileTooLarge` 并进入 command-specific `*_LIMIT_EXCEEDED`，而不是完整 config 的 `*_TOO_LARGE`。classical entry 在展开预检中按完整 normalized entry length 作为保守 payload 上界；重复引用会重复计入 entry、target 与最终 rule count。全局 YAML entry budget 与这些上界同时生效，不能通过换字段、拆分 provider、重复 `RULE-SET` 或放大 target 绕过。
+## 端口与实例生命周期
 
-`config load/download/update` 分别把 `YamlCollectionEntryLimitExceeded`、proxy/group limits、`RuleProvider{Count,AggregateEntryCount,AggregateBytes}LimitExceeded` 与 `ExpandedRule{Count,Bytes}LimitExceeded` 映射为 `CONFIG_LOAD_LIMIT_EXCEEDED`、`CONFIG_DOWNLOAD_LIMIT_EXCEEDED`、`CONFIG_UPDATE_LIMIT_EXCEEDED`；16 MiB + 1 分别使用 `CONFIG_LOAD_TOO_LARGE`、`CONFIG_DOWNLOAD_TOO_LARGE`、`CONFIG_UPDATE_TOO_LARGE`。Provider names 先进入 bounded borrowed-key hash index；重复名称 fail closed，引用查找与展开为 `O(providers + rules + expanded)`，不会为每条 `RULE-SET` 线性扫描 providers。任何展开 count/byte 超限都在 output reserve/clone 之前拒绝；catalog 与 legacy admission 也在 revision publication、listener 或 dial 前执行同一 gate。这些是默认且用户可感知的拒绝；前后 authoritative `state-v2.json` 与 immutable revision tree 均不变，因此 token/sequence/head/active/desired 均不变。
+生产 mixed 默认端口固定 **7899**，只有 CLI `--port` 能覆盖。配置/profile/override 的 `mixed-port` 数值（包括来源声明 0）仅兼容解析，准备时规范化；CLI 端口 0 非法。与 mixed 声明共存的 `port/socks-port` 忽略，不创建额外 listener；没有 mixed 声明的独立入口仍在 bind 前拒绝。开发必须显式选非生产端口；端口占用拒绝启动，不自动换端口。
 
-每 profile 1024 persisted selections 是独立的 catalog/selection mutation seam 上界，不是 YAML source 字段。合法的 `config load/download/update` source 不会生成 `PersistedSelectionCountLimitExceeded`；已有 on-disk catalog 若超出该上界属于损坏状态并 fail closed，不映射为普通用户 limit，也不保留向后兼容。
+`external-controller` 只接受显式 `127.0.0.1:<port>`，精确绑定失败返回 `START_CONTROLLER_PORT_IN_USE` / `RESTART_CONTROLLER_PORT_IN_USE`，不得漂移或静默关闭。mixed 非 loopback 暴露需要 `allow-lan:true`；当前入站不提供用户认证，不应暴露到不可信网络。
 
-Managed config JSON success data includes `durability_uncertain` and `mirror_out_of_sync`. A visible state commit whose parent-directory sync failed remains a success with `durability_uncertain:true`; callers must verify again before treating it as crash-durable. Mirror refresh failure is separately reported as `mirror_out_of_sync:true` and never changes catalog authority.
+### readiness 与安全停止
 
-### proxy / profile
+1. 父进程完成来源、providers、override、desired 的校验和冻结。
+2. 子进程验证快照、继承 lock，绑定全部 listener，发布 `ready:false` descriptor。
+3. 在 catalog authority 保护下完成 exact desired reconciliation；提升为 `ready:true` 后才运行数据面/API accept loop。DIRECT/REJECT 也不能绕过就绪门槛。
+4. `status/start` 以 ready descriptor 而非单独 PID 或监听 socket 判断 running。
 
-`profile` is an alias group for `proxy`（决策 D10）：same handler, messages and
-hints rendered per command path. Shared select errors keep the frozen `PROXY_*`
-codes on both paths; only the `*_ARGUMENT_INVALID` / `*_SUBCOMMAND_UNKNOWN`
-codes carry the family prefix (`PROXY_…` / `PROFILE_…`).
+`stop` 使用 owner-only、nonce 绑定的请求让实例自行退出，不按数值 PID 猜测并发送信号。不一致的 descriptor/lock/PID、替换的 lock inode 或 runtime directory 均 fail closed；旧实例会检测身份变化并退出，不收养其他 HOME/XDG 环境的进程。Rust 还使用稳定 lifecycle lock 防止 runtime 目录重建期间双实例。
 
-| Command | Notes |
-| --- | --- |
-| `zc proxy list [-c <config>] [--json]` | Alias `zc proxy ls`. Groups + members + current selection（`data.groups[].now`），all names escaped via `std.json`。 |
-| `zc proxy select [-g <group>] [-p <proxy>] [-c <config>] [--json]` | `-g` 只匹配 select 类型组（命中非 select 组 ⇒ `PROXY_GROUP_NOT_SELECTABLE`）。With `-p`: first commits the desired selection and increments its generation, then applies only to a daemon running the exact same config revision. Offline/mismatched daemon keeps `data.applied:false` but the selection is restored before listeners open on the next start. Interactive picker only when stdin is a TTY; non-TTY without `-p` ⇒ `PROXY_SELECT_NOT_INTERACTIVE`, exit 2。JSON without `-p` is read-only. |
-| `zc proxy test [-c <config>] [--port <port>] [--json]` | Same probe path and `CHECKS_FAILED` semantics as `zc test`. |
-| `zc profile list / select / test` | Same as the `proxy` equivalents. |
+### reload、restart 与 apply
 
-### diag
+- **reload**：重新准备 tracked source，保留原 CLI 端口覆盖；来源缺失、provider 下载或配置校验失败时，旧实例与流量保持不变。当前没有原地热替换，成功返回 `restart_fallback`。
+- **默认 restart**：复用认证的冻结快照，来源文件/脚本删除也可重启；显式 `--port` 可替换端口。显式 `-c` 或新的 override 才触发重新准备。只传新的 timeout 不代表要求重读来源。
+- 目标准备和冻结必须在停止捕获的 PID/nonce 前完成；期间实例变化返回 contention，不停止新实例。新启动失败时尝试恢复精确旧 snapshot，不重新读可变来源。
+- `--foreground` 实例由 systemd/容器等 supervisor 管理，CLI reload/restart 拒绝并提示 supervisor。
+- `config load/use` 仅持久化，不自动 apply。要显式切换运行来源可用 `restart -c <name>`；默认 restart 不等价于“读取最新 active”。
+- `config update/override` 提交成功后才尝试 live apply。当前 `auto/hot` 均走 prepared restart fallback，`restart` 显式走 restart；不承诺热切换或存量流量 drain。apply 失败不撤销已经提交的新 revision，错误会说明 persisted-but-not-applied。
 
-| Command | Notes |
-| --- | --- |
-| `zc diag doctor [-c <config>] [--json]` | Alias of `zc doctor`. |
-| `zc diag` (bare) | Group help, exit 0. Flags without a subcommand ⇒ `DIAG_SUBCOMMAND_MISSING`; unknown subcommand ⇒ `DIAG_SUBCOMMAND_UNKNOWN`; both exit 2. |
+## 状态、快照与持久选择
 
-## JSON contract（`--json`，全命令支持）
+catalog 位于 `$HOME/.config/zc/state-v2.json`，schema 2 为唯一权威，引用 immutable revisions。`meta.json` 与 `configs/` 是兼容镜像，损坏或不可写不改变健康 catalog 的权威。旧 metadata/configs 与 schema-1 authority 在 shared legacy cutover lock 下接管；已存在 schema-2 与 revision 必须通过原格式、canonical bytes、哈希校验。未知格式、损坏 catalog 或缺失 revision 都失败，禁止删除重建或默认 DIRECT 回退。
 
-- Success: `{"ok":true,"command":"<path>","data":{...}}` — one line, **stdout**, exit 0.
-- Failure: `{"ok":false,"command":"<path>","error":{"code":"…","message":"…","hint":"…"}}` — one line, **stdout**, exit ≠ 0. 诊断类命令（`test`/`doctor`/`proxy test`）失败时附带 `"data"`（逐项检查结果）；validator 产生的语义 `CONFIG_LOAD_INVALID` 附带有界配置诊断，encoding/parser 失败不附带伪造的 `data`。
-- `command` is the canonical command path (aliases resolved), e.g. `"config list"`, `"proxy select"`.
-- Exactly **one** JSON document per invocation on stdout. Streaming exception: `zc log --json` emits JSON Lines (one event object per line, no envelope).
-- Bare-document exception: `zc config dump --json` prints the merged config as a bare JSON object (no envelope); text mode prints bare YAML.
-- All JSON is serialized via `std.json`（真实转义，禁止手拼字符串）；wire 统一转义非 ASCII Unicode，解码后的字符串语义不变，终端字节流不含原始双向控制符；`null` optional fields are omitted.
+原生 Rust 与旧 Zig prepared snapshot 的认证格式、两种 nonce 的区别见 [迁移说明](../migration/rust.md#已有数据与实例安全)。原始配置、provider、脚本与 materialization 只写入新 revision，不就地覆盖旧 revision。
 
-## Stream rules
+新配置名剥除一个 `.yaml` 后须为 1–250 字节有效 UTF-8，排除 `.`、`..`、控制/双向字符、`/`、`\`；非法名称在网络/文件操作前报 `CONFIG_NAME_INVALID`。已有 251–255 字节 key 保持可读可删除，不允许创建同类新 key，mirror 可报告不同步。
 
-- Payload（人类主输出 / JSON envelope / JSON Lines / dump 文档）→ **stdout**.
-- Diagnostics and progress（校验警告、下载进度、restart 中间步骤、错误块）→ **stderr**.
-- Text-mode errors render as an actionable block on stderr: `error: <message>` / `hint: …` / `code: …`.
-- Color: ANSI only when the stream is a TTY and neither `NO_COLOR` (env) nor `--no-color` (flag) is set.
-- Interactive UI（`proxy select` picker）只在 stdin 为 TTY 时进入。
+selection 先以 state token（format/sequence/digest）CAS 提交，绑定 exact key/revision/generation；每 profile 最多 1024 项。daemon apply 还要求 PID、instance nonce、endpoint 与 identity 一致，拒绝旧/乱序 generation；durable desired 领先时可跳至最新完整 snapshot，再推进 descriptor。离线或不匹配时返回 `applied:false`，下次启动恢复。显式 unmanaged 配置不能用 CLI 持久选择，先 `config load`；API 的 unmanaged 临时选择另见 [API](../api/README.md)。
 
-## Exit codes
+无持久选择时 select 默认首成员；嵌套组、DIRECT/REJECT 字面量有效，未知引用/循环拒绝。文本交互只在 stdin 为 TTY 时进入；非 TTY 且无 `-p` 返回 `PROXY_SELECT_NOT_INTERACTIVE`，JSON 无 `-p` 只读。
 
-| Code | Meaning | Examples |
-| --- | --- | --- |
-| 0 | Success | `zc status`（含 stopped 状态）、`already_running`/`already_stopped`、help/version、picker cancel |
-| 1 | Runtime failure | start/stop/reload failures, download/network errors, `CHECKS_FAILED`（test/doctor 探测失败）, config load failures, `COMMAND_UNKNOWN` |
-| 2 | Usage error | bare `zc`, unknown subcommand, unknown/extra argument, missing flag value, `HELP_TOPIC_UNKNOWN`, non-TTY `select` without `-p`, `restart --foreground` |
+`status` 的 `active_config/selected_proxies` 是实际运行状态，不是当前 catalog active 的替身；通过匹配 descriptor 的 controller 查询。controller 不可用时保留实例 identity、选择为空、`runtime_state_available:false`，不能猜 endpoint。来源标记为 `persisted/transient/default`。原契约要求停止时 `mixed_port:null`，运行时为实际端口；当前 Rust CLI 的通用 null 过滤会移除停止态字段，仍待对齐，不能将省略字段改写为新规范。
 
-JSON mode and text mode always share the same exit code. Failure paths never
-print Zig stack traces.
+### durability 与恢复
 
-## Help behavior
+Managed JSON 成功结果提供 `durability_uncertain` 与 `mirror_out_of_sync`。authority rename 可见但父目录 fsync 失败时仍返回成功，并标记前者；调用方须重新检查并建立持久性证据，不能当作 crash-durable。mirror 失败独立报告，不能回滚已可见 authority。启动/重启失败与持久状态提交失败是不同边界。
 
-- `zc --help` / `zc -h` / `zc help` print global help to **stdout**, exit 0.
-- `zc help <command>`、`zc help <group>`、`zc help <group> <subcommand>` print specific help; unknown topics ⇒ `HELP_TOPIC_UNKNOWN`, exit 2.
-- `zc <command> --help` (and `-h`, or `help` as the first argument after the command) prints help and **never executes the command** — `zc start --help` must not start a daemon.
-- 裸 `help` 词只在命令词后的**第一个**参数位识别（值恰好为 "help" 的后续参数不会被吞掉成帮助请求）；`-h`/`--help` 在任意位置生效。
-- Bare `zc` prints a short usage line to **stderr**, exit 2.
-- All help text is generated from `src/cli/commands.zig`（含 `Usage:` 字样、别名、Options、Examples）。
+malformed/unsupported SS simple-obfs metadata 可在严格 YAML、基础字段/规则/provider 均有效时保留为 **inactive raw recovery revision**。仅该明确插件语义例外可恢复，不允许其他协议、reserved 名称、资源超限或离线 provider 错误混入。首个这类下载不占用首个 runtime-ready 自动激活位置；`download -d`、active update、`use` 返回 `CONFIG_CAPABILITY_UNSUPPORTED` 且保持 authority 不变。用 `config dump -c <name> --no-override` 检视、修复订阅并 update，再显式 use。
 
-## Error output
+普通 dump 脱敏；recovery-only raw text dump 为保留原字节可能含凭据，不应分享。终端不安全控制字符报 `CONFIG_DUMP_UNSAFE_TERMINAL`；重定向可保留原始字节。
 
-Every failure carries a stable `code` (frozen vocabulary, see
-[`../api/error-codes.md`](../api/error-codes.md)), a human-readable `message`,
-and a next-step `hint` — identical content in JSON envelope and text error
-block.
+## 资源、诊断与运行目录
+
+配置/每个 provider source 为 16 MiB，上界探测不能把长文件截成合法前缀；完整 collection/provider/展开限制见 [兼容说明](../compat/mihomo-clash.md#配置资源上界)。超限在 revision 发布、listener/dial 前拒绝；config load/download/update 映射 `CONFIG_*_LIMIT_EXCEEDED`，完整 source 大小独立为 `CONFIG_*_TOO_LARGE`。malformed raw recovery 也不能绕过上界。已有 catalog 超出 1024 selections 属损坏，不是可忽略的用户 limit。
+
+doctor 最多保留 256 条 errors/warnings 合计、每条 512 rendered bytes，错误优先并可替换末尾 warning；有效性独立于保留条数。超长消息使用原模板省略参数并追加 ` ... [truncated]`，数量或字节省略均以 `config_diagnostics_truncated` 明示。文本/JSON 同源输出多错误、warnings 与 migration hints；凭据不回显，终端控制字符清理。hints 保留原显式文件的 1 MiB 文本扫描规则（包括注释），不表示启用所提及的能力，unsupported 声明仍拒绝。加载失败不伪造语义诊断，语义错误保持 `CHECKS_FAILED`。证据与原 Zig 的精确差异见 [doctor 诊断验收](../migration/rust.md#doctor-validator-诊断验收)；其他配置加载命令的诊断精度不由此宣称完成。
+
+`test/proxy test/profile test` 含 `daemon_state/selected_proxies/ports/checks/targets`，文本并发探测按完成顺序输出；任何失败的 check 返回 `CHECKS_FAILED` + data，exit 1。单项 target 与聚合 check 不应混为一谈。`doctor` 含 `proxy_reachable/network_ok/config_ok/config_diagnostics_truncated`，文本冻结标签 `Config:/Daemon:/PID:/Port:/Connection:`。这些诊断会发起真实网络探测，不属于纯离线验证。
+
+`zc.pid/zc.lock/zc.log/zc.daemon.json/zc.daemon.lock` 位于安全 runtime directory。`XDG_RUNTIME_DIR` 须为既有、绝对规范路径、当前 euid 所有、0700；未设置使用规范化 `$HOME/.local/state/zc/runtime`。不安全父路径、symlink、特殊文件 fail closed；文件 0600。后台日志超过 8 MiB 重置到 owner-only 文件；follow 会在安全重建后重开。测试必须使用临时 HOME/runtime。
+
+## JSON、输出流与退出码
+
+- 成功：`{"ok":true,"command":"<path>","data":{...}}`，stdout 单行，exit 0。
+- 失败：`{"ok":false,"command":"<path>","error":{"code":"…","message":"…","hint":"…"}}`，stdout 单行。诊断失败及可用的语义校验附带 data，不伪造 parser/I/O 的字段诊断。
+- `log --json` 为 JSON Lines：每行 `{"line":"…"}`；`config dump --json` 为裸 JSON。除此之外每次一个最终 envelope，restart 中间诊断走 stderr。
+- `serde_json` 序列化并对 CLI wire 非 ASCII 字符转义；解析后的字符串无损。可选 null 字段一般省略；原契约要求 `status.mixed_port` 的停止态 null 保留，当前过滤差异见上文。字段顺序不是契约。
+- 文本主输出到 stdout，进度/错误到 stderr；错误块包含 `error:/hint:/code:`，不打印 Rust panic/backtrace。`--no-color` 与 `NO_COLOR` 不得出现 ANSI。
+- exit 0：成功、stopped status、already running/stopped、帮助/版本；exit 1：运行失败、检查失败、未知顶级命令；exit 2：裸命令、参数错误、未知子命令/帮助主题、非交互选择等用法错误。两种输出模式退出码相同。
+
+帮助由 `src/cli.rs` 命令表与 clap 排版生成。裸 `help` 只在命令词后首位作为帮助标记；`--help/-h` 在参数中生效，不把后续参数值恰好为 `help` 当成执行请求。
