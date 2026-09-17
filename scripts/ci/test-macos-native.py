@@ -50,19 +50,118 @@ def require_ci(args):
         raise RuntimeError("REFUSED: native scenarios require macOS 15 or newer")
 
 
-def command(argv, label, *, timeout=30, env=None, diagnostics=False):
+def diagnostic_text(value, argv, env=None):
+    # TimeoutExpired carries bytes even with text=True. Redact BEFORE truncating.
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
+    for index, arg in enumerate(argv[:-1]):
+        if str(arg) == "-p" and str(argv[index + 1]):
+            text = text.replace(str(argv[index + 1]), "<REDACTED>")
+    nonce = (env or {}).get("ZC_MACOS_NATIVE_NONCE")
+    if nonce:
+        text = text.replace(nonce, "<REDACTED>")
+    return text
+
+
+def sample_owned_setter(child, label, deadline):
+    # poll() returning None leaves the owned PID unreaped, preventing PID reuse.
+    # Never use this diagnostic for keychain/password operations.
+    if child.poll() is not None:
+        return
+    sample_deadline = min(deadline, time.monotonic() + 3)
+    if sample_deadline <= time.monotonic():
+        print(f"FAIL sample {label} setter_pid={child.pid}: no remaining budget", flush=True)
+        return
+    sampler = None
+    output = ""
+    failure = None
+    try:
+        sampler = subprocess.Popen(
+            ["/usr/bin/sample", str(child.pid), "1", "-file", "/dev/stdout"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, umask=0o077,
+        )
+        print(f"BEGIN sample {label} setter_pid={child.pid} pid={sampler.pid}", flush=True)
+        output, _stderr = sampler.communicate(timeout=max(0, sample_deadline - time.monotonic()))
+        if sampler.returncode != 0:
+            failure = f"exit {sampler.returncode}"
+    except subprocess.TimeoutExpired as error:
+        output = error.output
+        failure = "watchdog expired"
+    except (Exception, KeyboardInterrupt) as error:
+        # Do not expose exception argv, or replace the setter's primary failure.
+        failure = type(error).__name__
+    finally:
+        if sampler is not None:
+            try:
+                if sampler.poll() is None:
+                    # No termination grace: the diagnostic must not consume another budget.
+                    sampler.kill()
+                sampler.wait()
+            except (Exception, KeyboardInterrupt) as error:
+                failure = f"{failure or ''}; sample reap failed ({type(error).__name__})"
+            for stream in (sampler.stdout, sampler.stderr):
+                try:
+                    stream.close()
+                except (Exception, KeyboardInterrupt) as error:
+                    failure = f"{failure or ''}; sample stream close failed ({type(error).__name__})"
+    # sample's header can contain command arguments. Emit only its call graph,
+    # excluding the header and binary image paths, capped in bytes rather than characters.
+    text = diagnostic_text(output, [])
+    marker = "Call graph:\n"
+    if marker in text:
+        stack = marker + text.split(marker, 1)[1].split("\nBinary Images:", 1)[0]
+        # Reserve one byte for print's trailing newline.
+        print(stack.encode("utf-8")[:16383].decode("utf-8", errors="ignore"),
+              file=sys.stderr, flush=True)
+    elif failure is None:
+        failure = "no call graph in sample output"
+    stage = "FAIL" if failure else "END"
+    pid = sampler.pid if sampler is not None else "unavailable"
+    print(f"{stage} sample {label} setter_pid={child.pid} pid={pid}: {failure or 'captured'}", flush=True)
+
+
+def command(argv, label, *, timeout=30, env=None, diagnostics=False, sample_trust=False):
     # Never log argv/successful output: security's argv contains the temporary password.
-    # Kill/wait only through the owned Child handle, including on interruption.
-    with subprocess.Popen(
-        [str(arg) for arg in argv], cwd=ROOT, env=env,
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, umask=0o077,
-    ) as child:
+    started = time.monotonic()
+    deadline = started + timeout
+    try:
+        child = subprocess.Popen(
+            [str(arg) for arg in argv], cwd=ROOT, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, umask=0o077,
+        )
+    except OSError as error:
+        # Exception strings may contain argv or filenames; do not print them.
+        print(f"FAIL {label} pid=unavailable spawn errno={error.errno}", flush=True)
+        raise RuntimeError(f"{label}: could not start child (errno {error.errno})") from error
+    print(f"BEGIN {label} pid={child.pid}", flush=True)
+    primary = None
+    cleanup_errors = []
+    stdout, stderr = "", ""
+    try:
+        if sample_trust:
+            try:
+                stdout, stderr = child.communicate(
+                    timeout=max(0, started + timeout / 2 - time.monotonic())
+                )
+            except subprocess.TimeoutExpired as error:
+                stdout, stderr = error.output, error.stderr
+                sample_owned_setter(child, label, deadline)
+                # Sampling spends the ORIGINAL budget; never start another watchdog.
+                stdout, stderr = child.communicate(timeout=max(0, deadline - time.monotonic()))
+        else:
+            stdout, stderr = child.communicate(timeout=max(0, deadline - time.monotonic()))
+        if child.returncode != 0:
+            primary = RuntimeError(f"{label}: child failed (exit {child.returncode})")
+    except subprocess.TimeoutExpired as error:
+        stdout = error.output if error.output is not None else stdout
+        stderr = error.stderr if error.stderr is not None else stderr
+        primary = RuntimeError(f"{label}: parent watchdog expired after {timeout}s")
+    except (Exception, KeyboardInterrupt) as error:
+        primary = RuntimeError(f"{label}: child interrupted ({type(error).__name__})")
+    finally:
+        # Kill/wait only through our owned handle. Reaping failures must not hide primary.
         try:
-            stdout, _stderr = child.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"{label}: parent watchdog expired after {timeout}s") from None
-        finally:
             if child.poll() is None:
                 # Give sudo a chance to forward termination to its security child.
                 child.terminate()
@@ -71,18 +170,25 @@ def command(argv, label, *, timeout=30, env=None, diagnostics=False):
                 except subprocess.TimeoutExpired:
                     child.kill()
             child.wait()
-        if child.returncode != 0:
-            # Only Cargo and our fixed test executable opt in; never security/OpenSSL.
-            if diagnostics:
-                print((stdout + _stderr)[-16384:], file=sys.stderr)
-            else:
-                # Preserve OS failure causes, but not password arguments or stdout.
-                detail = _stderr
-                for index, arg in enumerate(argv[:-1]):
-                    if str(arg) == "-p":
-                        detail = detail.replace(str(argv[index + 1]), "<REDACTED>")
-                print(detail[-2048:], file=sys.stderr)
-            raise RuntimeError(f"{label}: child failed (exit {child.returncode})")
+        except (Exception, KeyboardInterrupt) as error:
+            cleanup_errors.append(f"{label}: child reap failed ({type(error).__name__})")
+        for stream in (child.stdout, child.stderr):
+            try:
+                stream.close()
+            except (Exception, KeyboardInterrupt) as error:
+                cleanup_errors.append(f"{label}: stream close failed ({type(error).__name__})")
+    if primary is not None:
+        detail = diagnostic_text(stderr, argv, env)
+        if diagnostics:
+            detail = diagnostic_text(stdout, argv, env) + detail
+        if detail:
+            print(detail[-(16384 if diagnostics else 2048):], file=sys.stderr, flush=True)
+    if primary is not None or cleanup_errors:
+        message = "; ".join(([str(primary)] if primary is not None else []) + cleanup_errors)
+        print(f"FAIL {label} pid={child.pid} elapsed={time.monotonic() - started:.3f}s: {message}",
+              flush=True)
+        raise RuntimeError(message) from primary
+    print(f"END {label} pid={child.pid} exit=0 elapsed={time.monotonic() - started:.3f}s", flush=True)
     return stdout
 
 
@@ -187,18 +293,19 @@ def scenarios(artifact):
     certificate = directory / "cert.pem"
     touched = set()
     keychain_attempted = False
+    primary = None
 
-    def security(domain, *args):
+    def security(domain, *args, sample_trust=False):
         prefix = ["/usr/bin/sudo", "-n"] if domain == "admin" else []
         domain_args = ["-d"] if domain == "admin" else []
         return command(prefix + [SECURITY, args[0]] + domain_args + list(args[1:]),
-                       f"{domain} owned certificate {args[0]}")
+                       f"{domain} owned certificate {args[0]}", sample_trust=sample_trust)
 
     def trust(domain, result):
         # Mark BEFORE attempting mutation so partial failure still gets cleanup.
         touched.add(domain)
         security(domain, "add-trusted-cert", "-r", result,
-                 "-k", keychain, certificate)
+                 "-k", keychain, certificate, sample_trust=True)
 
     def remove(domain):
         security(domain, "remove-trusted-cert", certificate)
@@ -226,6 +333,8 @@ def scenarios(artifact):
         run_case(artifact, directory, "admin-trust")
         trust("user", "deny")
         run_case(artifact, directory, "user-deny-admin-trust")
+    except (Exception, KeyboardInterrupt) as error:
+        primary = error
     finally:
         errors = []
 
@@ -243,10 +352,12 @@ def scenarios(artifact):
                 [SECURITY, "list-keychains", "-d", "user", "-s", *original_search],
                 "restore original user keychain search list",
             ))
-            if keychain.exists():
-                # Deleting only our whole keychain also removes the owned certificate.
-                cleanup(lambda: command([SECURITY, "delete-keychain", keychain],
-                                        "delete owned keychain"))
+            def delete_keychain():
+                if keychain.exists():
+                    # Deleting only our whole keychain also removes the owned certificate.
+                    command([SECURITY, "delete-keychain", keychain], "delete owned keychain")
+            cleanup(delete_keychain)
+
             def verify_search():
                 restored = shlex.split(command(
                     [SECURITY, "list-keychains", "-d", "user"], "verify restored search list"
@@ -254,14 +365,20 @@ def scenarios(artifact):
                 if restored != original_search:
                     raise RuntimeError("user keychain search list was not restored exactly")
             cleanup(verify_search)
-        if errors:
-            # Preserve the private certificate for manual repair if the OS refused cleanup.
-            raise RuntimeError(
-                f"CLEANUP FAILED; disposable runner must be destroyed; owned fixture: {directory}; "
-                + "; ".join(errors)
-            )
-        shutil.rmtree(directory)
-        print("PASS cleanup: owned trust/keychain removed; original search list restored", flush=True)
+        if not errors:
+            cleanup(lambda: shutil.rmtree(directory))
+        if not errors:
+            print("PASS cleanup: owned trust/keychain removed; original search list restored", flush=True)
+
+    failures = [f"PRIMARY: {primary}"] if primary is not None else []
+    if errors:
+        # Preserve the private certificate for manual repair if the OS refused cleanup.
+        failures.append(
+            f"CLEANUP FAILED; disposable runner must be destroyed; owned fixture: {directory}; "
+            + "; ".join(f"CLEANUP: {error}" for error in errors)
+        )
+    if failures:
+        raise RuntimeError("; ".join(failures)) from primary
 
 
 def interrupted(_signum, _frame):

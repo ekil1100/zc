@@ -46,6 +46,7 @@ helper-test: e2e-helpers
 delivery-test:
     python3 scripts/ci/test-justfile.py
     python3 scripts/ci/test-macos-artifact.py
+    python3 scripts/ci/test-macos-native-runner.py
     bash scripts/ci/test-release-workflow.sh
 
 # Run the unchanged core harness plus independent TCP interoperability.
