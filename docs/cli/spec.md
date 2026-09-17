@@ -72,7 +72,7 @@ selection 先以 state token（format/sequence/digest）CAS 提交，绑定 exac
 
 无持久选择时 select 默认首成员；嵌套组、DIRECT/REJECT 字面量有效，未知引用/循环拒绝。文本交互只在 stdin 为 TTY 时进入；非 TTY 且无 `-p` 返回 `PROXY_SELECT_NOT_INTERACTIVE`，JSON 无 `-p` 只读。
 
-`status` 的 `active_config/selected_proxies` 是实际运行状态，不是当前 catalog active 的替身；通过匹配 descriptor 的 controller 查询。controller 不可用时保留实例 identity、选择为空、`runtime_state_available:false`，不能猜 endpoint。来源标记为 `persisted/transient/default`。原契约要求停止时 `mixed_port:null`，运行时为实际端口；当前 Rust CLI 的通用 null 过滤会移除停止态字段，仍待对齐，不能将省略字段改写为新规范。
+`status` 的 `active_config/selected_proxies` 是实际运行状态，不是当前 catalog active 的替身；通过匹配 descriptor 的 controller 查询。controller 不可用时保留实例 identity、选择为空、`runtime_state_available:false`，不能猜 endpoint。来源标记为 `persisted/transient/default`。停止时保留显式 `mixed_port:null`，运行时为实际端口；该字段不受通用 null 过滤影响，公开 CLI 回归已覆盖。
 
 ### durability 与恢复
 
@@ -97,7 +97,7 @@ doctor 最多保留 256 条 errors/warnings 合计、每条 512 rendered bytes�
 - 成功：`{"ok":true,"command":"<path>","data":{...}}`，stdout 单行，exit 0。
 - 失败：`{"ok":false,"command":"<path>","error":{"code":"…","message":"…","hint":"…"}}`，stdout 单行。诊断失败及可用的语义校验附带 data，不伪造 parser/I/O 的字段诊断。
 - `log --json` 为 JSON Lines：每行 `{"line":"…"}`；`config dump --json` 为裸 JSON。除此之外每次一个最终 envelope，restart 中间诊断走 stderr。
-- `serde_json` 序列化并对 CLI wire 非 ASCII 字符转义；解析后的字符串无损。可选 null 字段一般省略；原契约要求 `status.mixed_port` 的停止态 null 保留，当前过滤差异见上文。字段顺序不是契约。
+- `serde_json` 序列化并对 CLI wire 非 ASCII 字符转义；解析后的字符串无损。可选 null 字段一般省略；`status.mixed_port` 的停止态 null 必须保留。字段顺序不是契约。
 - 文本主输出到 stdout，进度/错误到 stderr；错误块包含 `error:/hint:/code:`，不打印 Rust panic/backtrace。`--no-color` 与 `NO_COLOR` 不得出现 ANSI。
 - exit 0：成功、stopped status、already running/stopped、帮助/版本；exit 1：运行失败、检查失败、未知顶级命令；exit 2：裸命令、参数错误、未知子命令/帮助主题、非交互选择等用法错误。两种输出模式退出码相同。
 

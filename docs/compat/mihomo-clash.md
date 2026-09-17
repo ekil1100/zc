@@ -138,4 +138,4 @@ CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/
 
 `test/proxy test/profile test` 加载失败使用 `PROXY_CONFIG_LOAD_FAILED`；端口不可达时不跑外网 targets。七个默认目标、至少一个目标成功才通过 connectivity 的判定保持不变。按 `test_cli.zig::getIpGeoInfo` 对齐 IP/Location JSON：成功含 `ip`（无 query 时 `unknown`），不含 `latency_ms`；其他成功 target 含 latency。502 失败，403 等非 502 响应仍算连通；文本显示同一 IP/latency/reason，连接期限 5 秒、geo 总期限 90 秒、其余目标 5 秒。新增公开 `doctor_diagnostics` / `diagnostic_target_probe` 接口仅供传入真实本地测试 probe target，不增加 CLI/env 开关，也不改变命令默认目标。
 
-**剩余精度差异**：Rust 仍只报告首个具体语义错误，没有完整移植旧 validator 的多错误汇总、warnings 和 migration hints；geo 文本的城市/地区附加信息及 curl 特有的底层错误细分也未逐项复刻。当前最多一条、每条 512 bytes，不会超过原 errors/warnings 合计 256 条预算，但不能声称原诊断内容已经全部迁移。
+多错误汇总、支持范围内的 warnings 和 source-text migration hints 已补齐；errors/warnings 合计最多 256 条、每条 512 bytes，错误优先，省略必须显式标记。与旧 validator 的精确差异及直接证据见 [doctor 诊断验收](../migration/rust.md#doctor-validator-诊断验收)。geo 文本的城市/地区附加信息及 curl 特有的底层错误细分未逐项复刻，不宣称所有诊断文字完全等价。
