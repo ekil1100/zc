@@ -968,7 +968,9 @@ async fn run_child(
 ) -> Result<Vec<u8>> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
+    use tokio::time::{Instant, sleep_until, timeout_at};
     validate_timeout(timeout_ms)?;
+    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms.into());
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -976,14 +978,27 @@ async fn run_child(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            anyhow!("OVERRIDE_SCRIPT_NOT_FOUND: selected script interpreter not found")
-        } else {
-            anyhow::Error::new(error)
-                .context("OVERRIDE_SCRIPT_EXEC_FAILED: cannot spawn selected script")
+    let child = loop {
+        if Instant::now() >= deadline {
+            bail!("OVERRIDE_SCRIPT_TIMEOUT: script exceeded its deadline");
         }
-    })?;
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if !worker && error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                // Concurrent pre-exec children can briefly retain a writable fd.
+                // Retry only this frozen executable, inside its original budget.
+                sleep_until((Instant::now() + std::time::Duration::from_millis(5)).min(deadline))
+                    .await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!("OVERRIDE_SCRIPT_NOT_FOUND: selected script interpreter not found");
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context("OVERRIDE_SCRIPT_EXEC_FAILED: cannot spawn selected script"));
+            }
+        }
+    };
     let mut running = RunningChild {
         #[cfg(unix)]
         group: child
@@ -996,44 +1011,44 @@ async fn run_child(
     let mut stdin = running.child.stdin.take().unwrap();
     let stdout = running.child.stdout.take().unwrap();
     let stderr = running.child.stderr.take().unwrap();
-    let outcome =
-        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.into()), async {
-            let write_input = async {
-                stdin.write_all(&input).await.map_err(|_| {
-                    anyhow!("OVERRIDE_SCRIPT_EXEC_FAILED: worker input pipe failed")
-                })?;
-                drop(stdin);
-                Ok::<_, anyhow::Error>(())
-            };
-            // Drain both pipes concurrently; never wait on a child with a full output pipe.
-            let (_, stdout, stderr) = tokio::try_join!(
-                write_input,
-                read_pipe(stdout, MAX_OUTPUT_BYTES),
-                read_pipe(stderr, MAX_STDERR_BYTES)
-            )?;
-            let status = running.child.wait().await?;
-            running.active = false;
-            if !status.success() {
-                // The CLI prints worker errors to stderr. Preserve known codes only, never script text.
-                if worker
-                    && stderr
-                        .windows(b"OVERRIDE_SCRIPT_TIMEOUT".len())
-                        .any(|part| part == b"OVERRIDE_SCRIPT_TIMEOUT")
-                {
-                    bail!("OVERRIDE_SCRIPT_TIMEOUT: Lua execution limit exceeded");
-                }
-                if worker
-                    && stderr
-                        .windows(b"OVERRIDE_OUTPUT_INVALID".len())
-                        .any(|part| part == b"OVERRIDE_OUTPUT_INVALID")
-                {
-                    bail!("OVERRIDE_OUTPUT_INVALID: invalid Lua patch or output limit exceeded");
-                }
-                bail!("OVERRIDE_SCRIPT_EXEC_FAILED: script returned a nonzero status");
+    let outcome = timeout_at(deadline, async {
+        let write_input = async {
+            stdin
+                .write_all(&input)
+                .await
+                .map_err(|_| anyhow!("OVERRIDE_SCRIPT_EXEC_FAILED: worker input pipe failed"))?;
+            drop(stdin);
+            Ok::<_, anyhow::Error>(())
+        };
+        // Drain both pipes concurrently; never wait on a child with a full output pipe.
+        let (_, stdout, stderr) = tokio::try_join!(
+            write_input,
+            read_pipe(stdout, MAX_OUTPUT_BYTES),
+            read_pipe(stderr, MAX_STDERR_BYTES)
+        )?;
+        let status = running.child.wait().await?;
+        running.active = false;
+        if !status.success() {
+            // The CLI prints worker errors to stderr. Preserve known codes only, never script text.
+            if worker
+                && stderr
+                    .windows(b"OVERRIDE_SCRIPT_TIMEOUT".len())
+                    .any(|part| part == b"OVERRIDE_SCRIPT_TIMEOUT")
+            {
+                bail!("OVERRIDE_SCRIPT_TIMEOUT: Lua execution limit exceeded");
             }
-            Ok(stdout)
-        })
-        .await;
+            if worker
+                && stderr
+                    .windows(b"OVERRIDE_OUTPUT_INVALID".len())
+                    .any(|part| part == b"OVERRIDE_OUTPUT_INVALID")
+            {
+                bail!("OVERRIDE_OUTPUT_INVALID: invalid Lua patch or output limit exceeded");
+            }
+            bail!("OVERRIDE_SCRIPT_EXEC_FAILED: script returned a nonzero status");
+        }
+        Ok(stdout)
+    })
+    .await;
     match outcome {
         Ok(Ok(output)) => Ok(output),
         error => {

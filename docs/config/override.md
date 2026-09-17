@@ -54,6 +54,8 @@ Lua worker 可使用标准 io/os；这是**受信任脚本执行，不是安全�
 
 选定文件必须是有执行权限的普通文件，stdout 输出一个 YAML map。脚本以冻结副本执行，环境清理后只传调用元数据，不保证继承 shell/PATH；需使用明确 shebang 与所需工具绝对路径。子进程同样受 deadline、输出上界与进程组回收约束。
 
+冻结的非 Lua 可执行副本遇到 `ETXTBSY`（可执行文件仍被写打开）时，在同一次原始 absolute timeout 内以 5 ms 等待间隔重试同一 command；等待与成功 spawn 后的执行共享预算，不重新计时。取消等待后不再尝试启动；持续 busy 返回 `OVERRIDE_SCRIPT_TIMEOUT`。权限等其他错误及 Lua worker 的 spawn 错误不重试，不另选解释器或回退原脚本。证据见 [spawn 竞态回归](../reliability/override-spawn.md)。
+
 ```yaml
 rules:
   - MATCH,DIRECT
