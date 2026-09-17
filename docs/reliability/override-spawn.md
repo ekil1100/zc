@@ -21,4 +21,6 @@
 
 共享预算用例实际注入 400 ms busy，再执行包含 750 ms sleep 的子进程，总预算仍为 1000 ms。将执行阶段故意改回相对 timeout 的负对照会错误成功，回归确实 RED；恢复共享 deadline 后 GREEN。最初按 80 次等待估算时长的 fixture 因 timer 调度吞掉启动预算，已改为单调时钟窗口，未扩大产品 timeout。
 
-本机通过：`cargo test --locked --test override_spawn --test override_script`（8 + 24 tests）及严格 Clippy。负对照 `/tmp/zc-override-shared-budget-red.log`，修复回归 `/tmp/zc-override-final-regressions.log`。Linux 原生并发场景与四平台整体通过仍需后续 CI，不能用本机 fault injection 代替。
+本机通过：`cargo test --locked --test override_spawn --test override_script`（8 + 24 tests）及严格 Clippy。负对照 `/tmp/zc-override-shared-budget-red.log`，修复回归 `/tmp/zc-override-final-regressions.log`。
+
+修复提交 `10d2bab` 的 [CI 35176614058](https://github.com/ekil1100/zc/actions/runs/35176614058) 四平台全部通过，含原始 Linux 并发场景、公开边界 fault injection 和实际 Release 产物的 core/TCP/隔离安装回归；没有重跑失败 job 或放宽测试。原失败与本轮成功分别绑定自己的提交，不能用本机注入代替原生证据。

@@ -1,6 +1,36 @@
 # Rust 迁移：性能与可靠性工具验收
 
-## 最新候选：本机交付门禁后的复测
+## 最新候选：`10d2bab` clean-commit 冻结复测
+
+**性能门禁仍未放行。** 在提交 `10d2babb62b9406cbcd8cd76514d4dd1c32fef78` 的干净工作区，用默认 Release 参数从独立源快照构建 Rust 与 Zig；构建/运行期间源码和二进制 hash 均未变化。工具仍明确标记 `exploratory-runtime-comparison` / `formal_baseline: false`：clean commit 解决了来源绑定，不等于完成正式阈值、RSS、逐请求尾延迟或四平台性能验收。
+
+```bash
+python3 scripts/perf/compare-runtimes.py --build \
+  --samples 7 --iterations 100 \
+  --output target/perf/rust-clean-10d2bab.json
+```
+
+macOS arm64，同机同配置、交替顺序、全部七组原始样本保留；配置含表中 DOMAIN 规则数量加最终 MATCH。只用隔离 HOME/XDG 和非 7899 loopback 端口。
+
+| 公共接口 | Rust 中位数 | Zig 中位数 | Rust / Zig |
+| --- | ---: | ---: | ---: |
+| config dump，100 条规则 | 4.455 ms | 2.964 ms | **1.503** |
+| config dump，10000 条规则 | 26.651 ms | 50.444 ms | 0.528 |
+| 新 CONNECT + 4 KiB echo，100 条规则 | 208.3 μs | 227.5 μs | 0.916 |
+| 新 CONNECT + 4 KiB echo，10000 条规则 | 229.6 μs | 232.2 μs | 0.989 |
+| 常驻隧道 64 KiB echo，100 条规则 | 78.08 μs | 77.52 μs | 1.007 |
+| 常驻隧道 64 KiB echo，10000 条规则 | 78.37 μs | 78.03 μs | 1.004 |
+
+小配置慢 **50.3% / 1.491 ms**，组均值 nearest-rank p95 为 Rust **5.737 ms** / Zig **4.955 ms**。万规则 stream 同口径 p95 为 Rust 79.94 μs / Zig 80.24 μs。不剔除慢样本，不将不同二进制/批次的差值归因于某个修复，也不将 loopback 中位数接近视为整体等价。
+
+- 冻结完整 snapshot manifest SHA-256：`6128f7396dec98cf179994e0b13aa81a55dd380b64ad999271a8a7be3d5dbd04`。
+- Rust binary SHA-256：`447e0a0b62367fd554d4e3b484c5074c9bcdf37bdc8232497ee0328f87b61ce0`。
+- Zig binary SHA-256：`af42dd8624313699a50deec01ffa4935a78966912faa7f4e283820505711093d`。
+- 原始报告含构建命令/日志、逐文件 hash、全部样本与前后 provenance；路径为 `target/perf/rust-clean-10d2bab.json`。
+- 本次没有采用 `-delay_framework`，没有提高最低 macOS 版本。[延迟 framework 研究](../research/macos-framework-startup.md) 的部署兼容性决策仍待批准，不能用探针收益宣布当前候选通过。
+- 24/72h 长稳及完整 RSS/尾延迟仍未验收；下列短测绑定历史候选，不能冒充本提交的长稳证明。
+
+## 历史候选：本机交付门禁后的复测
 
 **功能门禁已通过，性能门禁仍未放行。** 本次使用同轮 beta gate 构建的 `target/release/zc`，复用先前相同 Zig ReleaseFast 对照二进制；没有修改构建参数或剔除慢样本。报告 `target/perf/rust-final-acceptance.json` 含前后源码/二进制哈希、全部原始样本及环境，测量期间工作区源码未变化。工作区仍 dirty；本次未使用 `--build` 创建独立源快照，不能作为 clean-commit 正式基线。
 

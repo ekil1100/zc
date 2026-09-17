@@ -20,12 +20,30 @@
 - [x] SS/Trojan UDP 与 simple-obfs HTTP。
 - [x] daemon、minimal API、完整 CLI 与诊断。
 - [x] 独立旧版 E2E、状态样本互读、进程/资源负路径本机回归。
-- [ ] 性能与长稳验收、四平台发布、安装器切换。
+- [x] Linux/macOS × x64/arm64 原生 CI、生产产物构建及产物 E2E/隔离安装回归。
+- [ ] 性能与长稳验收、正式发布及本机安装切换。
 - [ ] 删除已替代的 Zig 生产路径并同步全部有效文档。
 
-## 最终候选的直接证据
+## 当前提交的远端证据
 
-勾选代表本机现有验收语料通过，不代表四平台所有行为或发布门禁完成。
+候选 `10d2babb62b9406cbcd8cd76514d4dd1c32fef78` 的 [CI 35176614058](https://github.com/ekil1100/zc/actions/runs/35176614058) **四项全部成功**：
+
+| 原生 runner | 生产目标 | 结果 |
+| --- | --- | --- |
+| ubuntu-latest | x86_64-unknown-linux-musl | PASS |
+| ubuntu-24.04-arm | aarch64-unknown-linux-musl | PASS |
+| macos-latest | aarch64-apple-darwin | PASS |
+| macos-15-intel | x86_64-apple-darwin | PASS |
+
+每项运行格式/Clippy、公开接口测试、交付与 beta gate 契约、core/独立 TCP 互操作、隔离安装回归；随后以指定 target 构建实际 Release 产物，再对该产物运行 core、独立 TCP E2E 和隔离安装测试。Linux 另验证静态链接与隔离默认端口。这不是仅交叉编译通过，也没有重跑失败 job、扩大超时或删掉负测。
+
+此前失败已分别处理：可移植 shell YAML fixture、跨空闲阶段存活的 obfs oracle、[capture metadata 校验](../reliability/read-capture.md)、[冻结可执行文件 ETXTBSY](../reliability/override-spawn.md)。最后一项只在原始 deadline 内等待确定的 busy 错误，不重试权限等其他失败、不切换解释器；保持 8 × 64 并发调用和完整性断言。原失败记录仍保留。
+
+上述勾选只代表这些 runner、语料和候选通过，不等于所有旧 OS 版本、性能、24/72h 长稳或正式发布已经完成。原始结果快照：`target/ci/35176614058/result.json`。
+
+## 历史本机验收补充
+
+以下是在此前未提交工作区完成的本机证据；保留其来源边界，不冒充当前提交的长稳或远端运行结果。
 
 - `just check`：格式检查与全目标严格 Clippy 通过。
 - `just test --all-targets`：全部通过；默认忽略的真实 300 秒 UDP idle 用例已另行执行通过。
@@ -33,16 +51,16 @@
 - schema-1/schema-2、canonical hash、认证旧 snapshot、fsync 注入、CAS/并发与恢复用例通过；重启停止超时的 staged snapshot 泄漏已由公开 CLI 回归锁定。
 - provider cache 的 source/文件系统别名覆盖、整体展开失败提前发布、group/other 可写输入三个问题已修复；doctor 多错误、warnings、迁移提示及预算已补齐。依据和定向证据见 [Rust 迁移](rust.md)。
 - daemon/CLI fixture 的 macOS socket 继承竞态已隔离，未放宽生产身份或 metadata 校验，未移除单用例内部并发场景。历史失败和根因见 [fixture 记录](../reliability/daemon-fixtures.md)。
-- Linux/macOS × x64/arm64 四目标 Release 编译通过，Linux 为静态 musl 产物。本机仅执行 macOS arm64；其余目标仍待原生 CI。日志为 `target/cross-verification/logs/final-*.log`。
+- Linux/macOS × x64/arm64 四目标 Release 编译通过，Linux 为静态 musl 产物。当时本机仅执行 macOS arm64，其余目标的原生证据现由上节 CI 补齐。该轮交叉编译日志为 `target/cross-verification/logs/final-*.log`。
 - eval selfcheck 44 项、helper 5 项、tooling 2 项、可靠性 runner 3 项，以及许可生成器 8 项与 `--check` 通过。许可范围/人工审核限制未消除。
 - 最终 60 秒真实 soak：61 次转发、零崩溃/失败；10 秒进程退出恢复：11 次探测、零非注入崩溃/失败。不是 24/72h 长稳。
 
-最后一次总门禁日志：`/tmp/zc-final-beta-gate-r3.log`；全部 target tests：`/tmp/zc-final-all-targets.log`；UDP idle：`/tmp/zc-final-udp-idle.log`。这些是本次本地工件，尚非远端 CI 或已提交的发布证明。
+该轮本机总门禁日志：`/tmp/zc-final-beta-gate-r3.log`；全部 target tests：`/tmp/zc-final-all-targets.log`；UDP idle：`/tmp/zc-final-udp-idle.log`。这些是本次本地工件，尚非远端 CI 或已提交的发布证明。
 
 ## 仍阻塞完整验收
 
-1. **性能尚未放行**：最终 Release 探索性对照中，100 条规则 `config dump` 为 Rust 4.106 ms / Zig 3.032 ms，慢 **35.4%（1.074 ms）**。万规则改善、loopback 中位数接近不能抵消该退化；dirty candidate 不冒充 clean-commit 基线。原始样本和方法见 [performance](performance.md)。
-2. **平台和可靠性证据未齐**：其余三目标原生运行、远端 CI、24/72h 长稳、完整 RSS/尾延迟门禁尚未证明；资源/DNS/TLS 等已知差异仍按迁移文档显式保留。
+1. **性能尚未放行**：`10d2bab` clean-commit 冻结 Release 对照中，100 条规则 `config dump` 为 Rust 4.455 ms / Zig 2.964 ms，慢 **50.3%（1.491 ms）**。万规则改善和 loopback 中位数接近不能抵消该退化；来源绑定不等于正式性能 PASS。原始样本和方法见 [performance](performance.md)。延迟 framework 方案仍待最低 macOS 版本决策，尚未落地。
+2. **可靠性证据未齐**：四平台上述原生 CI 已通过；24/72h 长稳、完整 RSS/尾延迟门禁及旧 OS 版本矩阵尚未证明。资源/DNS/TLS 等已知差异仍按迁移文档显式保留。
 3. **发布尚未切换**：原 Zig 对照源码保留；未覆盖本机安装、未迁移真实 HOME。上述本地验收来自当时的未提交工作区；后续提交和候选分支推送不代表发布、生产安装或性能放行。许可自动检查不替代最终发行审核。
 
 只有有直接测试证据的项才能勾选。迁移完成前不覆盖本机已安装二进制，不触碰生产端口 7899，所有状态测试使用临时 HOME/XDG 目录。
