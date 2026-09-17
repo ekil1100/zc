@@ -9,23 +9,23 @@ source "$ROOT_DIR/scripts/eval/lib.sh"
 usage() {
   cat <<'EOF'
 Usage:
-  just zig-eval <suite>
-  just -- zig-eval all --with-interop --run-id <id>
-  just zig-eval-selfcheck
+  bash scripts/eval/run.sh --suite <suite>
+  bash scripts/eval/run.sh --suite all --with-interop --run-id <id>
+  bash scripts/eval/selfcheck.sh
   bash scripts/eval/scenarios/s1_startup.sh
   bash scripts/eval/scenarios/s2_rule_matrix.sh
 
-  # equivalent direct entry (prefer just):
+  # Additional direct entry options:
   bash scripts/eval/run.sh --help
   bash scripts/eval/run.sh --suite <name> [--run-id <id>]
   bash scripts/eval/run.sh --suite all [--with-interop] [--run-id <id>]
 
 Suites:
-  correctness   zig build + zig build test (baseline cpu)
-  contract      migrator + install regression (+ S1/S2 when wired)
-  interop       local zig build e2e (opt-in; also --with-interop with all)
+  correctness   cargo build + cargo test
+  contract      migrator + install regression + required S1/S2
+  interop       local just e2e (opt-in; also --with-interop with all)
   perf          control-plane record only (requires clean worktree; no threshold)
-  reliability   fail-closed until a real short gate exists
+  reliability   not wired as an eval gate (standalone isolated soak is available)
   all           correctness -> contract -> [interop if --with-interop] -> perf
 
 Exit codes:
@@ -34,8 +34,8 @@ Exit codes:
   2  CLI / dispatch / report / missing-dependency error
 
 Reports:
-  .zig-cache/eval/<run_id>/suites/<suite>.json
-  .zig-cache/eval/<run_id>/summary.json
+  target/eval/<run_id>/suites/<suite>.json
+  target/eval/<run_id>/summary.json
 
 Notes:
   - Selected suites are required; unselected suites are omitted (never skip/pass).

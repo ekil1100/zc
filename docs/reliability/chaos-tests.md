@@ -1,4 +1,6 @@
-# Reliability / Chaos Tests（P4-2）
+# 可靠性 / 故障注入场景（历史 P4-2 计划）
+
+> 以下保留原始计划与指标目标，不是 Rust 已通过的报告。当前隔离 runner 见 [长稳指南](soak-guide.md)；它只覆盖真实 CONNECT echo 与可选 harness 子进程重启，不覆盖 DNS 故障、代理 failover、热重载回滚或全部性能阈值。select 不提供自动 failover，下面的自动切换场景不能当作已实现产品能力。探索输出先写 `target/`，正式归档需复核 provenance。
 
 ## P4-2B：24h 长稳测试计划（最小落地）
 

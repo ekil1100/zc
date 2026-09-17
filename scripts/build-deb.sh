@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Debian 包构建脚本
-# 用法: bash scripts/build-deb.sh [version]
+# Build a Debian package without installing it.
+# Usage: bash scripts/build-deb.sh [version]
 
 if [[ $# -gt 1 ]]; then
   echo "Usage: bash scripts/build-deb.sh [version]" >&2
@@ -11,9 +11,9 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
-PACKAGE_VERSION=$(awk -F'"' '/^[[:space:]]*\.version = / { print $2; exit }' build.zig.zon)
+PACKAGE_VERSION=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
 if [[ ! "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
-  echo "Invalid package version in build.zig.zon: $PACKAGE_VERSION" >&2
+  echo "Invalid package version in Cargo.toml: $PACKAGE_VERSION" >&2
   exit 1
 fi
 
@@ -24,28 +24,29 @@ if [[ "$PKG_VERSION" != "$PACKAGE_VERSION" ]]; then
   echo "Requested version $PKG_VERSION does not match package version $PACKAGE_VERSION" >&2
   exit 2
 fi
-ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+[[ "$(uname -s)" == "Linux" ]] || { echo "Debian packages require a Linux build host" >&2; exit 2; }
+ARCH=$(dpkg --print-architecture)
 BUILD_DIR="$ROOT_DIR/build-deb"
 
 echo "=== Building .deb package ==="
 echo "Version: $PKG_VERSION"
 echo "Arch: $ARCH"
 
-# 清理并创建目录
+# Prepare the staging directory.
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/DEBIAN"
 mkdir -p "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/usr/bin"
 mkdir -p "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/usr/lib/systemd/system"
 mkdir -p "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/etc/zc"
 
-# 构建
+# Build.
 echo "Building zc..."
-zig build -Doptimize=ReleaseSafe
+cargo build --locked --release --bin zc --target-dir target
 
-# 复制二进制文件
-cp "zig-out/bin/zc" "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/usr/bin/"
+# Stage the binary.
+cp "target/release/zc" "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/usr/bin/"
 
-# 创建 control 文件
+# Write package metadata.
 cat > "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/DEBIAN/control" <<EOF
 Package: $PKG_NAME
 Version: $PKG_VERSION
@@ -53,11 +54,11 @@ Section: net
 Priority: optional
 Architecture: $ARCH
 Maintainer: Like <like@ekil.sh>
-Description: High-performance proxy tool in Zig
+Description: High-performance proxy tool in Rust
  Compatible with Clash configuration format.
 EOF
 
-# 创建 systemd 服务文件
+# Write the service unit.
 cat > "$BUILD_DIR/$PKG_NAME-$PKG_VERSION/usr/lib/systemd/system/zc.service" <<EOF
 [Unit]
 Description=zc proxy service
@@ -78,12 +79,12 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 构建 deb 包
+# Build the Debian archive.
 echo "Building .deb package..."
 dpkg-deb --build "$BUILD_DIR/$PKG_NAME-$PKG_VERSION"
 
-# 移动产物
+# Publish the package artifact.
 mkdir -p "dist"
 mv "$BUILD_DIR/$PKG_NAME-$PKG_VERSION.deb" "dist/${PKG_NAME}_${PKG_VERSION}_${ARCH}.deb"
 
-echo "✅ Package built: dist/${PKG_NAME}_${PKG_VERSION}_${ARCH}.deb"
+echo "Package built: dist/${PKG_NAME}_${PKG_VERSION}_${ARCH}.deb"

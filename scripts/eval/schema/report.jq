@@ -42,10 +42,10 @@ def require_keys($keys):
     end;
 
 def validate_env:
-  require_keys(["os", "arch", "zig_version"])
+  require_keys(["os", "arch", "rust_version"])
   | if (.os | is_nonempty_string | not) then fail("env.os must be a non-empty string")
     elif (.arch | is_nonempty_string | not) then fail("env.arch must be a non-empty string")
-    elif (.zig_version | is_nonempty_string | not) then fail("env.zig_version must be a non-empty string")
+    elif (.rust_version | is_nonempty_string | not) then fail("env.rust_version must be a non-empty string")
     else . end;
 
 def validate_provenance:

@@ -34,13 +34,32 @@ run config="testdata/config/rust-tcp.yaml" port="17890":
     if [[ "$2" =~ ^\+?0*7899$ ]]; then echo "error: port 7899 is reserved for production; choose another port" >&2; exit 2; fi
     cargo run --locked -- start --config "$1" --port "$2" --foreground
 
-# Test the Rust binary against independent SS/Trojan servers.
-e2e: build
-    bash scripts/e2e/fetch-static-fixtures.sh .zig-cache/e2e-fixtures
-    python3 scripts/e2e/run-rust-tcp.py target/debug/zc .zig-cache/e2e-fixtures
+# Build independent test-only helpers (never installed as production binaries).
+e2e-helpers:
+    cargo build --locked --examples
 
-# Run the complete Rust development checks.
-validate: check test e2e
+# Test helper public interfaces and independent literal crypto vectors.
+helper-test: e2e-helpers
+    python3 examples/support/test-helpers.py target/debug/examples
+
+# Run task-runner and release workflow contracts without installation.
+delivery-test:
+    python3 scripts/ci/test-justfile.py
+    bash scripts/ci/test-release-workflow.sh
+
+# Run the unchanged core harness plus independent TCP interoperability.
+e2e: build helper-test
+    bash scripts/e2e/fetch-static-fixtures.sh target/e2e-fixtures
+    bash scripts/e2e/run-core.sh "$PWD/target/debug/zc" "$PWD/target/debug/examples/e2e_origin" "$PWD/target/debug/examples/e2e_obfs_oracle" "$PWD/target/debug/examples/e2e_ss_udp_oracle" "$PWD/target/e2e-fixtures" "$PWD/testdata/e2e"
+    TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)" python3 scripts/e2e/run-rust-tcp.py target/debug/zc target/e2e-fixtures
+
+# Exercise installer rollback in temporary directories, never the real HOME.
+install-test: build e2e-helpers
+    bash scripts/install/run-all-regression.sh
+    bash scripts/install/test-oneline-installer.sh "$PWD/target/debug/zc" "$PWD/target/debug/examples/e2e_origin"
+
+# Run complete Rust delivery checks; no Zig runtime or compiler fallback.
+validate: check test delivery-test e2e install-test release
 
 # Build the Zig reference binary (Zig 0.16.0).
 zig-build:
@@ -54,18 +73,18 @@ zig-test:
 zig-e2e:
     zig build e2e --summary all
 
-# Run a Zig eval suite: correctness, contract, interop, perf, or all.
-zig-eval suite *args:
+# Run a Rust eval suite: correctness, contract, interop, perf, or all.
+eval suite *args:
     bash scripts/eval/run.sh --suite "$@"
 
-# Check the Zig eval framework; pass --full to include its suites.
-zig-eval-selfcheck *args:
+# Check the Rust eval framework; pass --full to include its suites.
+eval-selfcheck *args:
     bash scripts/eval/selfcheck.sh "$@"
 
-# Run configuration-migrator regressions for the Zig baseline.
-zig-migrator-test:
+# Run the independent configuration-migrator regressions.
+migrator-test:
     bash tools/config-migrator/run-all.sh
 
-# Run installer regressions for the Zig baseline; does not install zc.
+# Run historical installer regressions; does not install into the real HOME.
 zig-install-test:
     bash scripts/install/run-all-regression.sh

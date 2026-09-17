@@ -4,76 +4,76 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
+  rust-delivery:
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-
       - name: Setup just
         uses: extractions/setup-just@v3
-
-      - name: Validate release workflow
-        run: bash scripts/ci/test-release-workflow.sh
-
-      - name: Validate beta gate
+      - name: Setup independent crypto oracle
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target ${{ matrix.target }}
+      - name: Install native musl build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cmake build-essential pkg-config
+      - name: Format and lint
+        run: just check
+      - name: Test public interfaces
+        run: just test
+      - name: Validate delivery contracts
+        run: just delivery-test
+      - name: Validate beta gate contract
         run: bash scripts/ci/test-beta-gate.sh
-
-      - name: Setup Zig
-        uses: step-security/setup-zig@v2.2.2
-        with:
-          version: 0.16.0
-
-      - name: Build Zig reference
-        run: just zig-build
-
-      - name: Test Zig reference
-        run: just zig-test
-
-      - name: Smoke (migrator regression)
-        run: just zig-migrator-test
-
-      - name: Smoke (install regression)
-        run: just zig-install-test
-
-      - name: Eval framework selfcheck
-        run: just zig-eval-selfcheck
-
-  e2e:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Zig
-        uses: step-security/setup-zig@v2.2.2
-        with:
-          version: 0.16.0
-
-      - name: End-to-end release gate
-        run: >-
-          zig build e2e-release
-          -Dtarget=x86_64-linux-musl
-          -Doptimize=ReleaseSafe
-          -Dcpu=baseline
-          --summary all
-
-      - name: Verify default runtime port
+      - name: Independent core and TCP interoperability
+        run: just e2e
+      - name: Isolated installer regression
+        run: just install-test
+      - name: Build production artifact
+        shell: bash
         run: |
-          zig build \
-            -Dtarget=x86_64-linux-musl \
-            -Doptimize=ReleaseSafe \
-            -Dcpu=baseline
-          bash scripts/ci/test-default-runtime-port.sh zig-out/bin/zc
+          set -euo pipefail
+          if [[ '${{ runner.os }}' == Linux ]]; then
+            export CC=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          fi
+          cargo build --locked --release --target ${{ matrix.target }} --bin zc
+          BINARY="target/${{ matrix.target }}/release/zc"
+          file "$BINARY"
+          if [[ '${{ runner.os }}' == Linux ]]; then
+            file "$BINARY" | grep -Eq 'statically linked|static-pie linked'
+          fi
+          "$BINARY" --version
+          bash scripts/e2e/run-core.sh "$PWD/$BINARY" "$PWD/target/debug/examples/e2e_origin" "$PWD/target/debug/examples/e2e_obfs_oracle" "$PWD/target/debug/examples/e2e_ss_udp_oracle" "$PWD/target/e2e-fixtures" "$PWD/testdata/e2e"
+          TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)" python3 scripts/e2e/run-rust-tcp.py "$BINARY" target/e2e-fixtures
+          bash scripts/install/test-oneline-installer.sh "$PWD/$BINARY" "$PWD/target/debug/examples/e2e_origin"
+      - name: Verify default runtime port in isolated CI
+        if: runner.os == 'Linux'
+        run: bash scripts/ci/test-default-runtime-port.sh target/${{ matrix.target }}/release/zc

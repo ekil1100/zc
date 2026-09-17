@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Zig beta gate: build + test + migrator + installer regressions.
+# Rust candidate gate; failures are collected, never hidden.
 # Usage: bash scripts/run-beta-gate.sh
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,15 +28,17 @@ run_gate() {
     failed+=("$name")
     echo "  FAIL"
     echo "  --- failure details ---"
-    echo "$output" | grep -iE "error|fail|FAIL|expected|panic" | head -20 | sed 's/^/  /' || true
+    printf '%s\n' "$output"
     echo "  --- end ---"
   fi
 }
 
-run_gate "build" zig build
-run_gate "test" zig build test
-run_gate "migrator-regression" bash tools/config-migrator/run-all.sh
-run_gate "install-regression" bash scripts/install/run-all-regression.sh
+run_gate "release" just release
+run_gate "check" just check
+run_gate "test" just test
+run_gate "delivery-contract" just delivery-test
+run_gate "e2e" just e2e
+run_gate "install-regression" just install-test
 
 total=$(( ${#passed[@]} + ${#failed[@]} ))
 result="PASS"

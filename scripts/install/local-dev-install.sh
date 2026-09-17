@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-SOURCE_PATH="$ROOT_DIR/zig-out/bin/zc"
+SOURCE_PATH="$ROOT_DIR/target/release/zc"
 TARGET_DIR="${HOME}/.local/bin"
 
 while [[ $# -gt 0 ]]; do

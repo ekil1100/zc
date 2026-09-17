@@ -106,25 +106,69 @@ class JustfileContract(unittest.TestCase):
     def test_validate_contains_rust_checks_and_independent_e2e_only(self):
         result = self.just("validate", dry_run=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for command in ["cargo fmt", "cargo clippy", "cargo test --locked", "cargo build --locked", "scripts/e2e/fetch-static-fixtures.sh", "scripts/e2e/run-rust-tcp.py"]:
+        for command in ["cargo fmt", "cargo clippy", "cargo test --locked", "cargo build --locked", "scripts/e2e/fetch-static-fixtures.sh", "scripts/e2e/run-rust-tcp.py", "scripts/e2e/run-core.sh", "cargo build --locked --examples", "examples/support/test-helpers.py", "scripts/install/test-oneline-installer.sh", "cargo build --locked --release"]:
             self.assertIn(command, result.stderr)
         for forbidden in ["zig build", "local-dev-install", "run-full-validation", "7899"]:
             self.assertNotIn(forbidden, result.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_ci_keeps_rust_and_zig_tasks_separate(self):
+    def test_ci_requires_full_rust_delivery_matrix(self):
         rust = (ROOT / ".github/workflows/rust.yml").read_text()
-        for recipe in ["check", "test", "e2e"]:
-            self.assertIn(f"run: just {recipe}\n", rust)
-        self.assertIn("RUSTUP_TOOLCHAIN: 1.98.1", rust)
-        self.assertIn("python3 scripts/ci/test-justfile.py", rust)
-        self.assertEqual(rust.count("- 'Justfile'"), 2)
-        self.assertEqual(rust.count("- 'scripts/ci/test-justfile.py'"), 2)
-        zig = (ROOT / ".github/workflows/ci.yml").read_text()
-        for recipe in ["zig-build", "zig-test", "zig-migrator-test", "zig-install-test", "zig-eval-selfcheck"]:
-            self.assertIn(f"run: just {recipe}\n", zig)
-        self.assertNotIn("run: just build\n", zig)
-        self.assertNotIn("run: just test\n", zig)
+        self.assertIn("uses: ./.github/workflows/ci.yml", rust)
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        for recipe in ["check", "test", "delivery-test", "e2e", "install-test"]:
+            self.assertIn(f"run: just {recipe}\n", ci)
+        for platform in ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest", "macos-15-intel"]:
+            self.assertIn(platform, ci)
+        self.assertIn("RUSTUP_TOOLCHAIN: 1.98.1", ci)
+        self.assertIn("actions/setup-node@", ci)
+        self.assertNotIn("Setup Zig", ci)
+        self.assertNotIn("zig build", ci)
+
+    def test_delivery_gates_propagate_failures_without_zig(self):
+        repo = self.work / "repo"
+        scripts = repo / "scripts"
+        scripts.mkdir(parents=True)
+        for name in ["run-beta-gate.sh", "run-full-validation.sh"]:
+            (scripts / name).write_text((ROOT / "scripts" / name).read_text())
+        tool = self.work / "bin" / "just"
+        tool.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$ZC_GATE_LOG\"\n[[ $1 != ${ZC_FAIL_GATE:-test} ]]\n")
+        tool.chmod(0o755)
+        self.env["ZC_GATE_LOG"] = str(self.work / "gates.log")
+        for name, marker in [("run-beta-gate.sh", "BETA_GATE"), ("run-full-validation.sh", "VALIDATION")]:
+            result = subprocess.run(["bash", str(scripts / name)], env=self.env, text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f"{marker}_RESULT=FAIL", result.stdout)
+            self.assertIn("test", result.stdout)
+            self.assertIn(f"{marker}_PASS=5/6", result.stdout)
+            calls = Path(self.env["ZC_GATE_LOG"]).read_text().splitlines()
+            self.assertCountEqual(calls, ["release", "check", "test", "delivery-test", "e2e", "install-test"])
+            Path(self.env["ZC_GATE_LOG"]).write_text("")
+            result = subprocess.run(["bash", str(scripts / name)], env=dict(self.env, ZC_FAIL_GATE="none"), text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f"{marker}_RESULT=PASS", result.stdout)
+            self.assertIn(f"{marker}_PASS=6/6", result.stdout)
+            Path(self.env["ZC_GATE_LOG"]).write_text("")
+        self.assertEqual(self.calls(), [])
+
+    def test_local_installer_defaults_to_rust_release_in_isolated_home(self):
+        repo = self.work / "installer-repo"
+        scripts = repo / "scripts" / "install"
+        scripts.mkdir(parents=True)
+        installer = scripts / "local-dev-install.sh"
+        installer.write_text((ROOT / "scripts/install/local-dev-install.sh").read_text())
+        release = repo / "target" / "release"
+        release.mkdir(parents=True)
+        binary = release / "zc"
+        binary.write_text("#!/bin/sh\necho rust-release-source\n")
+        binary.chmod(0o755)
+        home = self.work / "home"
+        home.mkdir(mode=0o700)
+        result = subprocess.run(["bash", str(installer)], env=dict(self.env, HOME=str(home)), text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = home / ".local" / "bin" / "zc"
+        self.assertEqual(installed.read_bytes(), binary.read_bytes())
+        self.assertEqual(list(installed.parent.iterdir()), [installed])
 
     def test_task_failure_is_not_hidden(self):
         self.env["ZC_JUST_TEST_EXIT"] = "7"

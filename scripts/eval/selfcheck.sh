@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fast contract checks for the zc eval framework.
-# Default mode is CI-safe: no full zig test, e2e, or perf record.
+# Default mode is CI-safe: no full cargo test, e2e, or perf record.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd -P)"
@@ -17,12 +17,10 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       cat <<'EOF'
 Usage:
-  just zig-eval-selfcheck
-  just -- zig-eval-selfcheck --full
   bash scripts/eval/selfcheck.sh [--full]
 
 Fast checks for eval framework contracts (report schema, orchestrator CLI,
-adapter fail-closed behavior, scenario fixture presence). Prefer just.
+adapter fail-closed behavior, scenario fixture presence).
 
   --full   Also run correctness + contract suites (perf still needs a clean
            dedicated run and is never executed here).
@@ -115,7 +113,7 @@ write_valid_suite_fixture() {
   "env": {
     "os": "Darwin",
     "arch": "arm64",
-    "zig_version": "0.16.0"
+    "rust_version": "rustc 1.95.0"
   },
   "result": "pass",
   "metrics": {},
@@ -145,7 +143,7 @@ write_valid_summary_fixture() {
   "env": {
     "os": "Darwin",
     "arch": "arm64",
-    "zig_version": "0.16.0"
+    "rust_version": "rustc 1.95.0"
   },
   "requested_suites": ["correctness"],
   "suites": [
@@ -242,7 +240,7 @@ check_run_dir_helpers() {
   if [[ "$run_dir" != "$cache_root/$rid" ]]; then
     bad "eval_new_run_dir path" "got $run_dir"
   else
-    ok "eval_new_run_dir creates under .zig-cache/eval"
+    ok "eval_new_run_dir creates under target/eval"
   fi
   if [[ -d "$run_dir/suites" && -d "$run_dir/artifacts" ]]; then
     ok "eval_new_run_dir creates suites/ and artifacts/"
@@ -421,47 +419,49 @@ check_correctness_adapter() {
     return 0
   fi
   section "correctness adapter argv + fail aggregation"
-  local fake_bin="$WORK/fake-zig-bin"
+  local fake_bin="$WORK/fake-cargo-bin"
   mkdir -p "$fake_bin"
-  cat >"$fake_bin/zig" <<'FAKE'
+  printf '#!/bin/sh\nexit 99\n' >"$fake_bin/zig"
+  chmod +x "$fake_bin/zig"
+  cat >"$fake_bin/cargo" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
-log="${ZC_EVAL_FAKE_ZIG_LOG:?}"
+log="${ZC_EVAL_FAKE_CARGO_LOG:?}"
 printf '%s\n' "$*" >>"$log"
 case "$*" in
   version)
-    printf '0.16.0\n'
+    printf 'cargo 1.95.0\n'
     exit 0
     ;;
-  "build -Dcpu=baseline")
+  "build --locked")
     exit 42
     ;;
-  "build test -Dcpu=baseline")
+  "test --locked")
     exit 42
     ;;
   *)
-    printf 'fake zig: unexpected argv: %s\n' "$*" >&2
+    printf 'fake cargo: unexpected argv: %s\n' "$*" >&2
     exit 99
     ;;
 esac
 FAKE
-  chmod +x "$fake_bin/zig"
-  local log="$WORK/fake-zig.log"
+  chmod +x "$fake_bin/cargo"
+  local log="$WORK/fake-cargo.log"
   : >"$log"
   local rid="selfcheck-correctness-$$"
   rm -rf "$(eval_cache_root)/$rid"
   set +e
   local out rc
   out="$(
-    ZC_EVAL_FAKE_ZIG_LOG="$log" PATH="$fake_bin:$PATH" \
+    ZC_EVAL_FAKE_CARGO_LOG="$log" PATH="$fake_bin:$PATH" \
       bash "$ROOT_DIR/scripts/eval/run.sh" --suite correctness --run-id "$rid" 2>&1
   )"
   rc=$?
   set -e
   if [[ $rc -eq 1 ]]; then
-    ok "fake zig correctness exits 1"
+    ok "fake cargo correctness exits 1"
   else
-    bad "fake zig correctness exits 1" "rc=$rc out=$out"
+    bad "fake cargo correctness exits 1" "rc=$rc out=$out"
   fi
   local suite_json summary_json
   suite_json="$(eval_cache_root)/$rid/suites/correctness.json"
@@ -480,11 +480,11 @@ FAKE
   else
     bad "both build and test steps recorded as failed"
   fi
-  if grep -Fxq 'build -Dcpu=baseline' "$log" \
-    && grep -Fxq 'build test -Dcpu=baseline' "$log"; then
-    ok "fake zig received exact correctness argv"
+  if grep -Fxq 'build --locked' "$log" \
+    && grep -Fxq 'test --locked' "$log"; then
+    ok "fake cargo received exact correctness argv"
   else
-    bad "fake zig received exact correctness argv" "$(cat "$log")"
+    bad "fake cargo received exact correctness argv" "$(cat "$log")"
   fi
   rm -rf "$(eval_cache_root)/$rid"
 }
@@ -504,10 +504,8 @@ check_contract_adapter() {
     "$tmp/scripts/install" \
     "$tmp/tools/config-migrator" \
     "$tmp/.git"
-  # Minimal git repo so provenance helpers work.
+  # An uncommitted temporary repository exercises explicit unknown provenance.
   git -C "$tmp" init -q
-  git -C "$tmp" config user.email "eval@example.com"
-  git -C "$tmp" config user.name "eval"
   # Copy eval framework pieces.
   cp "$ROOT_DIR/scripts/eval/lib.sh" "$tmp/scripts/eval/lib.sh"
   cp "$ROOT_DIR/scripts/eval/run.sh" "$tmp/scripts/eval/run.sh"
@@ -532,9 +530,9 @@ EOF
 echo RULE_MATRIX_RESULT=PASS
 exit 0
 EOF
-  # Provide a dummy zc so contract does not attempt zig build in the fixture repo.
-  mkdir -p "$tmp/zig-out/bin"
-  cat >"$tmp/zig-out/bin/zc" <<'EOF'
+  # The Cargo stub represents the build boundary; this binary stays test-only.
+  mkdir -p "$tmp/target/debug"
+  cat >"$tmp/target/debug/zc" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
@@ -545,15 +543,16 @@ EOF
     "$tmp/scripts/eval/scenarios/s2_rule_matrix.sh" \
     "$tmp/scripts/eval/run.sh" \
     "$tmp/scripts/eval/suites/contract.sh" \
-    "$tmp/zig-out/bin/zc"
-  # Dummy commit so rev-parse works.
-  git -C "$tmp" add scripts tools
-  git -C "$tmp" commit -q -m "fixture"
+    "$tmp/target/debug/zc"
+  local fake_bin="$tmp/mock-bin"
+  mkdir -p "$fake_bin"
+  printf '#!/bin/sh\n[ "$*" = "build --locked --target-dir target" ] || exit 99\n' >"$fake_bin/cargo"
+  chmod +x "$fake_bin/cargo"
   local rid="selfcheck-contract-$$"
-  rm -rf "$tmp/.zig-cache/eval/$rid"
+  rm -rf "$tmp/target/eval/$rid"
   set +e
   local out rc
-  out="$(bash "$tmp/scripts/eval/run.sh" --suite contract --run-id "$rid" 2>&1)"
+  out="$(PATH="$fake_bin:$PATH" bash "$tmp/scripts/eval/run.sh" --suite contract --run-id "$rid" 2>&1)"
   rc=$?
   set -e
   if [[ $rc -eq 1 ]]; then
@@ -561,7 +560,7 @@ EOF
   else
     bad "contract fixture exits 1" "rc=$rc out=$out"
   fi
-  local suite_json="$tmp/.zig-cache/eval/$rid/suites/contract.json"
+  local suite_json="$tmp/target/eval/$rid/suites/contract.json"
   if [[ -f "$suite_json" ]]; then
     local failed names
     failed="$(jq -r '.failed | join(",")' "$suite_json")"
@@ -591,55 +590,57 @@ check_interop_adapter() {
     return 0
   fi
   section "interop adapter argv + pass/fail"
-  local fake_bin="$WORK/fake-zig-interop"
+  local fake_bin="$WORK/fake-just-interop"
   mkdir -p "$fake_bin"
-  cat >"$fake_bin/zig" <<'FAKE'
+  printf '#!/bin/sh\nexit 99\n' >"$fake_bin/zig"
+  chmod +x "$fake_bin/zig"
+  cat >"$fake_bin/just" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
-log="${ZC_EVAL_FAKE_ZIG_LOG:?}"
-mode="${ZC_EVAL_FAKE_ZIG_MODE:?}"
+log="${ZC_EVAL_FAKE_JUST_LOG:?}"
+mode="${ZC_EVAL_FAKE_JUST_MODE:?}"
 printf '%s\n' "$*" >>"$log"
 case "$*" in
   version)
-    printf '0.16.0\n'
+    printf 'just 1.95.0\n'
     exit 0
     ;;
-  "build e2e --summary all")
+  "e2e")
     if [[ "$mode" == "pass" ]]; then
       exit 0
     fi
     exit 42
     ;;
   *)
-    printf 'fake zig interop: unexpected argv: %s\n' "$*" >&2
+    printf 'fake just interop: unexpected argv: %s\n' "$*" >&2
     exit 99
     ;;
 esac
 FAKE
-  chmod +x "$fake_bin/zig"
+  chmod +x "$fake_bin/just"
 
   run_case() {
     local mode="$1"
     local expect_rc="$2"
     local expect_result="$3"
     local rid="selfcheck-interop-${mode}-$$"
-    local log="$WORK/fake-zig-interop-${mode}.log"
+    local log="$WORK/fake-just-interop-${mode}.log"
     : >"$log"
     rm -rf "$(eval_cache_root)/$rid"
     set +e
     local out rc
     out="$(
-      ZC_EVAL_FAKE_ZIG_LOG="$log" \
-      ZC_EVAL_FAKE_ZIG_MODE="$mode" \
+      ZC_EVAL_FAKE_JUST_LOG="$log" \
+      ZC_EVAL_FAKE_JUST_MODE="$mode" \
       PATH="$fake_bin:$PATH" \
         bash "$ROOT_DIR/scripts/eval/run.sh" --suite interop --run-id "$rid" 2>&1
     )"
     rc=$?
     set -e
     if [[ $rc -eq $expect_rc ]]; then
-      ok "interop fake zig mode=$mode exits $expect_rc"
+      ok "interop fake just mode=$mode exits $expect_rc"
     else
-      bad "interop fake zig mode=$mode exits $expect_rc" "rc=$rc out=$out"
+      bad "interop fake just mode=$mode exits $expect_rc" "rc=$rc out=$out"
     fi
     local suite_json summary_json
     suite_json="$(eval_cache_root)/$rid/suites/interop.json"
@@ -651,7 +652,7 @@ FAKE
     else
       bad "interop mode=$mode reports $expect_result"
     fi
-    if grep -Fxq 'build e2e --summary all' "$log"; then
+    if grep -Fxq 'e2e' "$log"; then
       ok "interop mode=$mode exact argv"
     else
       bad "interop mode=$mode exact argv" "$(cat "$log")"
@@ -709,14 +710,14 @@ EOF
     "$tmp/scripts/eval/run.sh" \
     "$tmp/scripts/eval/suites/contract.sh"
   git -C "$tmp" init -q
-  git -C "$tmp" config user.email "eval@example.com"
-  git -C "$tmp" config user.name "eval"
-  git -C "$tmp" add scripts tools
-  git -C "$tmp" commit -q -m "fixture"
+  local fake_bin="$tmp/mock-bin"
+  mkdir -p "$fake_bin"
+  printf '#!/bin/sh\n[ "$*" = "build --locked --target-dir target" ] || exit 99\n' >"$fake_bin/cargo"
+  chmod +x "$fake_bin/cargo"
   local rid="selfcheck-s2-fail-$$"
   set +e
   local out rc
-  out="$(bash "$tmp/scripts/eval/run.sh" --suite contract --run-id "$rid" 2>&1)"
+  out="$(PATH="$fake_bin:$PATH" bash "$tmp/scripts/eval/run.sh" --suite contract --run-id "$rid" 2>&1)"
   rc=$?
   set -e
   if [[ $rc -eq 1 ]]; then
@@ -724,12 +725,12 @@ EOF
   else
     bad "scenario fail exits 1" "rc=$rc out=$out"
   fi
-  local suite_json="$tmp/.zig-cache/eval/$rid/suites/contract.json"
+  local suite_json="$tmp/target/eval/$rid/suites/contract.json"
   if [[ -f "$suite_json" ]]; then
     local failed names
     failed="$(jq -r '.failed | join(",")' "$suite_json")"
     names="$(jq -r '[.steps[].name] | join(",")' "$suite_json")"
-    if [[ "$failed" == *s2_rule_matrix* && "$names" == *migrator* && "$names" == *install* && "$names" == *s1_startup* ]]; then
+    if [[ "$failed" == "s2_rule_matrix" && "$names" == *migrator* && "$names" == *install* && "$names" == *s1_startup* ]]; then
       ok "s2 fail still runs migrator/install/s1"
     else
       bad "s2 fail still runs migrator/install/s1" "failed=$failed names=$names"

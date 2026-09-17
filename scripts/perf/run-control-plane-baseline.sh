@@ -26,7 +26,7 @@ Options:
   --fixture-bytes <n>    Fixture size, 1..16777216 (default: 65536)
   --subject-commit <sha> Commit being measured (default: HEAD)
   --harness-commit <sha> Harness revision (default: HEAD)
-  --output <path>        JSON output (default: .zig-cache/perf/...json)
+  --output <path>        JSON output (default: target/perf/...json)
   -h, --help             Show help
 
 This command records measurements. It does not claim performance PASS/FAIL and
@@ -142,7 +142,7 @@ if [[ "$SUBJECT_COMMIT" != "$ACTUAL_HEAD" ]]; then
   fi
   while IFS= read -r -d '' changed_path; do
     case "$changed_path" in
-      build.zig|docs/perf/reports/README.md|scripts/perf/run-control-plane-baseline.sh|src/perf_runner.zig|src/perf_stats.zig|src/test_runner.zig)
+      docs/perf/reports/README.md|docs/migration/performance.md|scripts/perf/run-control-plane-baseline.sh|examples/perf_runner.rs)
         ;;
       *)
         echo "subject differs from harness by non-harness source: $changed_path" >&2
@@ -155,14 +155,14 @@ rm -rf "$provenance_tmp"
 trap - EXIT
 
 if [[ -z "$OUTPUT" ]]; then
-  OUTPUT="$ROOT_DIR/.zig-cache/perf/control-plane-$(date -u +%Y%m%dT%H%M%SZ).json"
+  OUTPUT="$ROOT_DIR/target/perf/control-plane-$(date -u +%Y%m%dT%H%M%SZ).json"
 elif [[ "$OUTPUT" != /* ]]; then
   OUTPUT="$ROOT_DIR/$OUTPUT"
 fi
 
 case "$OUTPUT" in
   "$ROOT_DIR/docs/perf/reports/"*)
-    echo "refusing to overwrite tracked perf reports; use .zig-cache or /tmp" >&2
+    echo "refusing to overwrite tracked perf reports; use target/perf or /tmp" >&2
     exit 2
     ;;
 esac
@@ -232,8 +232,7 @@ verify_checkout "$build_root" "$HARNESS_COMMIT" || {
 }
 (
   cd "$build_root"
-  env ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/zig-cache}" \
-    zig build perf -- \
+  cargo run --locked --release --example perf_runner --target-dir "$build_parent/target" -- \
       --samples "$SAMPLES" \
       --iterations "$ITERATIONS" \
       --fixture-bytes "$FIXTURE_BYTES" \
@@ -251,8 +250,8 @@ jq -e \
    .status == "measured" and
    .provenance.subject_commit == $subject and
    .provenance.harness_commit == $harness and
-   .provenance.optimize == "ReleaseFast" and
-   (.provenance.zig_version | length) > 0 and
+   .provenance.optimize == "release" and
+   (.provenance.rust_version | length) > 0 and
    (.provenance.cpu_model | length) > 0 and
    (.provenance.machine | length) > 0 and
    .method.sample_count == $samples and

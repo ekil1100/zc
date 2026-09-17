@@ -31,7 +31,7 @@ jobs:
           fi
 
           EXPECTED_VERSION="${RELEASE_TAG#v}"
-          PACKAGE_VERSION=$(awk -F'"' '/^[[:space:]]*\.version = / { print $2; exit }' build.zig.zon)
+          PACKAGE_VERSION=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
           if [[ "$PACKAGE_VERSION" != "$EXPECTED_VERSION" ]]; then
             echo "Tag/package version mismatch: tag=$EXPECTED_VERSION package=$PACKAGE_VERSION" >&2
             exit 1
@@ -48,6 +48,7 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
             -f head_sha="$TAGGED_SHA" \
             -f event=push \
+            -f branch=main \
             -f status=success \
             -f per_page=1 \
             --jq '.workflow_runs[0].id // empty')
@@ -58,6 +59,9 @@ jobs:
           echo "Verified main CI run $CI_RUN_ID for $TAGGED_SHA"
 
   release:
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+      BINARY: target/${{ matrix.rust_target }}/release/zc
     needs: validate-release
     strategy:
       fail-fast: false
@@ -66,19 +70,19 @@ jobs:
           - os: ubuntu-latest
             target_os: linux
             target_arch: amd64
-            zig_target: x86_64-linux-musl
+            rust_target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target_os: linux
             target_arch: arm64
-            zig_target: aarch64-linux-musl
+            rust_target: aarch64-unknown-linux-musl
           - os: macos-latest
             target_os: macos
             target_arch: arm64
-            zig_target: aarch64-macos
+            rust_target: aarch64-apple-darwin
           - os: macos-15-intel
             target_os: macos
             target_arch: amd64
-            zig_target: x86_64-macos
+            rust_target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -87,25 +91,31 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Zig
-        uses: step-security/setup-zig@v2.2.2
-        with:
-          version: 0.16.0
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --target ${{ matrix.rust_target }}
+
+      - name: Install native musl build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cmake build-essential pkg-config
 
       - name: Build standalone binary
-        run: >-
-          zig build
-          -Dtarget=${{ matrix.zig_target }}
-          -Doptimize=ReleaseSafe
-          -Dcpu=baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ runner.os }}' == Linux ]]; then
+            export CC=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          fi
+          cargo build --locked --release --target ${{ matrix.rust_target }} --bin zc
 
       - name: Verify standalone linkage
         shell: bash
         run: |
           set -euo pipefail
-          file zig-out/bin/zc
+          file "$BINARY"
           if [[ "${{ matrix.target_os }}" == "linux" ]]; then
-            file zig-out/bin/zc | grep -q 'statically linked'
+            file "$BINARY" | grep -Eq 'statically linked|static-pie linked'
           fi
 
       - name: Verify binary version
@@ -115,7 +125,7 @@ jobs:
         run: |
           set -euo pipefail
           EXPECTED="zc ${RELEASE_TAG#v}"
-          ACTUAL=$(./zig-out/bin/zc --version)
+          ACTUAL=$("$BINARY" --version)
           if [[ "$ACTUAL" != "$EXPECTED" ]]; then
             echo "Tag/binary version mismatch: expected='$EXPECTED' actual='$ACTUAL'" >&2
             exit 1
@@ -131,7 +141,7 @@ jobs:
           PKG_NAME="zc-${RELEASE_TAG}-${TARGET_OS}-${TARGET_ARCH}"
           PKG_DIR="dist/${PKG_NAME}"
           mkdir -p "$PKG_DIR"
-          cp ./zig-out/bin/zc "$PKG_DIR/"
+          cp "$BINARY" "$PKG_DIR/"
           cp ./README.md ./LICENSE ./THIRD_PARTY_NOTICES.md "$PKG_DIR/"
           tar -czf "dist/${PKG_NAME}.tar.gz" -C dist "$PKG_NAME"
           if command -v shasum >/dev/null 2>&1; then
