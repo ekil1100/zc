@@ -18,6 +18,8 @@
 
 [后续诊断 35248899957 / `d501556`](https://github.com/ekil1100/zc/actions/runs/35248899957) 已关联同一 token 60、setter PID 2007 与 `com.apple.trust-settings.user`：客户端 engine 67 的 `0x13` 含 PreAuthorize；服务端 trustd engine 68 的 `0x3` 实际执行 `hardcoded-authenticate-session-owner`，并启动 SecurityAgent/`builtin:authenticate`。因此可排除“Rust 是夹具失败的必要原因”，并确认存在尚需满足的系统身份认证要求。**预授权成功不是最终认证完成**；日志前缀被 UI 启动噪声截断，不能宣称已看见某个弹窗或证明全部后续等待原因。持久查询进一步限定到 Authorization subsystem，避免这些无关噪声。下一阶段需要能正常完成合法认证的专用一次性环境，不以 authdb/SIP/账户改动或跳过用例替代。
 
+[聚焦日志的诊断 35250040916 / `5bcd9a2`](https://github.com/ekil1100/zc/actions/runs/35250040916) 进一步保留了完整的短授权窗口：同一 token 134，客户端 engine 144 预授权后，服务端 engine 145 的共享凭据不满足规则，SecurityAgent 明确记录 `AgentMechanism invoked [builtin:authenticate]`、`Using modern UI` 和 `SC confirmation dialog detected`。这已将夹具所需的真实系统认证关联到本次请求；不是 Rust 程序启动卡住，更不意味着用户正常使用 zc 会触发信任写入。仍未完成合法认证后的正向验证，不声称观察了屏幕，也不把日志缺少结束记录当成完整证明。没有采用 authdb/SIP/账户绕过；九项门禁继续阻塞，等待能完成正常认证的独占可销毁环境。日志：`target/ci/35250040916/no-rust-trust.log`。
+
 ## Intel UDP：最小真实链路
 
 `scripts/e2e/diagnose-ss-udp.py` 使用真实 CLI、SOCKS5 TCP control/UDP socket、独立 shadowsocks-rust 1.24.0 与 loopback echo，不用生产内部 mock。
@@ -39,6 +41,10 @@ helper 错误现在带 probe kind、当前阶段、收发包数和耗时；`ZC_E
 本机 arm64 已测 73 轮、219 次实际探测，0 次自然复现；这**不能关闭 Intel 故障**。收到包后的校验失败、等待 UDP 返回、等待 TCP 控制连接关闭由不同阶段区分。若最小 Intel 链路也通过，仍需保留原 core 失败，不能假定省略的历史不重要。原始报告：`target/diagnose-ss-udp/REPORT.md`。
 
 `35247844404` 的原生 Intel 最小链路也完成三种 cipher 各 30 轮、合计 270 次 probe，全部成功；全部配置未变，原始样本下载于 `target/ci/35247844404/udp-samples/`。仍不关闭原故障：独立诊断增加原样 core 的 trace=0/1 对照，保留完整 suite 历史与后台模式，并观察逐阶段日志是否影响复现；两次结果均保留，任一次失败总状态仍失败，不尝试“跑到绿”。
+
+后续 `35250040916` 的 270 次最小探测，以及原样 core 的 trace=0、trace=1 **均通过**。父任务复核了原生 x86_64、每轮三个 probe、配置未变、owned children 已回收，以及两份 `CORE_E2E_RESULT=PASS` 和非伪造的退出码；原始数据：`target/ci/35250040916/udp-samples/`。没有复现原故障，因此没有生产修复，也不能将历史 UDP 失败关闭或证明日志完全无观察者效应。正式 CI 保留阶段信息，用于下一次真实失败。
+
+另一个独立问题：正式 CI `35247844266` 的 Intel `all_http_provider_wire_bytes_are_frozen_before_any_listener_opens` 在 `restart --json` 返回 `unsafe file ownership or hard links`。这不是 UDP 根因证据，已另记于 [capture metadata](read-capture.md)，未弱化安全检查。
 
 ## CI 与安全回归
 

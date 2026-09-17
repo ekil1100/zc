@@ -21,7 +21,9 @@
 
 当前 runner 保留 primary 和全部 cleanup 错误，按阶段打印 BEGIN/END/FAIL 与 owned PID，不打印密码参数。只有 trust setter 到原 30 秒预算的一半仍未完成时，才对仍持有的命令进程做一次 1 秒只读栈采样（Admin 时持有的是 sudo wrapper）；采样最多占用剩余预算中的 3 秒，随后仅等待原 deadline 的剩余时间。采样失败不替代原错误，栈输出上限 16 KiB；不放宽 timeout，不重试操作。
 
-[诊断 CI 35240315075 / `5ab079b`](https://github.com/ekil1100/zc/actions/runs/35240315075) 已取得直接栈证据：两个 arm64 系统的独立 `/usr/bin/security` 命令停在 `SecTrustSettingsSetTrustSettings → TrustSettings::flushToDisk → SecTrustSettingsXPCWrite → securityd_send_sync_and_do → xpc_connection_send_message_with_reply_sync → mach_msg2_trap`。原错误完整保留为 User `add-trusted-cert` 的 30 秒 watchdog；清理 item-not-found 仍明确失败，search list 恢复与 owned keychain 删除则成功。**已定位到系统信任写入的同步 IPC，尚未确定服务端是授权、锁还是其他等待；没有据此声称 GUI 根因或延迟加载回归。** 还需要服务端证据，不能直接改 authdb、重试或增大超时。
+[诊断 CI 35240315075 / `5ab079b`](https://github.com/ekil1100/zc/actions/runs/35240315075) 已取得直接栈证据：两个 arm64 系统的独立 `/usr/bin/security` 命令停在 `SecTrustSettingsSetTrustSettings → TrustSettings::flushToDisk → SecTrustSettingsXPCWrite → securityd_send_sync_and_do → xpc_connection_send_message_with_reply_sync → mach_msg2_trap`。原错误完整保留为 User `add-trusted-cert` 的 30 秒 watchdog；清理 item-not-found 仍明确失败，search list 恢复与 owned keychain 删除则成功。**已定位到系统信任写入的同步 IPC，尚未确定服务端是授权、锁还是其他等待；没有据此声称 GUI 根因或延迟加载回归。** 该轮还缺服务端证据，不能直接改 authdb、重试或增大超时。
+
+后续[独立诊断](platform-diagnostics.md)已补齐关键关联：完全不启动 Rust 的 User setter 仍超时，而 keychain-only 成功；`35250040916` 中同一 token 的服务端 engine 145 进入 `hardcoded-authenticate-session-owner`，SecurityAgent 记录 `builtin:authenticate` 和 `SC confirmation dialog detected`。因此必须先解决隔离测试环境的正常身份认证，不能把这个 setup 失败归为必须由 Rust 引起。客户端 PreAuthorize 的成功不代表服务端最终授权完成。没有修改授权策略，完整九项仍未通过。
 
 同轮 Linux 两架构及 24 项 runner 合约测试通过。Intel 在更早的 core E2E、进入 shadowsocks-rust UDP 三 cipher 对照阶段后出现 `deadline has elapsed`，未到达 native 阶段；前一轮 Intel 通过不覆盖这次失败，尚未定位，也未为此调整生产行为或测试预算。全部结果/日志位于 `target/ci/35240315075/`。
 
