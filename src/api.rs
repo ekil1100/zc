@@ -180,13 +180,14 @@ async fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Ht
     })
 }
 fn selected(config: &Config, source: impl Fn(&str) -> &'static str) -> Value {
+    // Keep one atomic selection snapshot, but display groups in declaration order.
+    let selections = config.selected();
     Value::Array(
         config
-            .selected()
-            .into_iter()
-            .map(|(group, proxy)| {
-                let origin = source(&group);
-                json!({"group": group, "proxy": proxy, "source": origin})
+            .group_names()
+            .map(|group| {
+                let origin = source(group);
+                json!({"group": group, "proxy": selections[group], "source": origin})
             })
             .collect(),
     )

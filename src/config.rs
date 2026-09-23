@@ -783,6 +783,10 @@ impl Config {
         unreachable!("validated group graph is acyclic")
     }
 
+    pub(crate) fn group_names(&self) -> impl Iterator<Item = &str> {
+        self.groups.iter().map(|group| group.name.as_str())
+    }
+
     pub fn selected(&self) -> BTreeMap<String, String> {
         let selections = self
             .selections

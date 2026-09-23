@@ -177,6 +177,13 @@ fn stopped_status_keeps_the_explicit_null_port_contract() {
     let status = ok(dir.path(), &["status", "--json"]);
     assert_eq!(status["data"]["state"], "stopped");
     assert_eq!(status["data"].get("mixed_port"), Some(&Value::Null));
+    let text = run(dir.path(), &["status"]);
+    assert!(text.status.success());
+    assert!(
+        String::from_utf8(text.stdout)
+            .unwrap()
+            .contains("Selected proxies: (none)")
+    );
     assert!(!dir.path().join(".config/zc").exists());
 }
 
@@ -689,6 +696,74 @@ fn managed_subscription_compatibility_fields_do_not_block_start() {
             .source(),
         contents.as_bytes()
     );
+}
+
+#[test]
+fn status_text_shows_live_selections_for_each_proxy_group() {
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let _guard = DaemonGuard(home.into());
+    let controller = free_port();
+    let port = free_port();
+    let source = home.join("status.yaml");
+    std::fs::write(&source, format!("external-controller: 127.0.0.1:{controller}\nproxies: [{{name: '🇭🇰 香港', type: direct}}, {{name: '👩‍💻 节点B', type: reject}}]\nproxy-groups: [{{name: Z-primary, type: select, proxies: ['🇭🇰 香港', '👩‍💻 节点B']}}, {{name: A-secondary, type: select, proxies: ['👩‍💻 节点B', '🇭🇰 香港']}}]\nrules: ['MATCH,Z-primary']\n")).unwrap();
+    ok(
+        home,
+        &["config", "load", source.to_str().unwrap(), "--json"],
+    );
+    ok(home, &["start", "--port", &port.to_string(), "--json"]);
+    let initial = run(home, &["status"]);
+    assert!(initial.status.success());
+    let text = String::from_utf8(initial.stdout).unwrap();
+    assert!(
+        text.contains("Selected proxies:\n  Z-primary -> 🇭🇰 香港\n  A-secondary -> 👩‍💻 节点B\n"),
+        "{text}"
+    );
+    let status = ok(home, &["status", "--json"]);
+    assert_eq!(status["data"]["selected_proxies"][0]["group"], "Z-primary");
+    assert_eq!(status["data"]["selected_proxies"][0]["proxy"], "🇭🇰 香港");
+    assert_eq!(
+        status["data"]["selected_proxies"][1]["group"],
+        "A-secondary"
+    );
+    let selected = ok(
+        home,
+        &[
+            "proxy",
+            "select",
+            "-g",
+            "Z-primary",
+            "-p",
+            "👩‍💻 节点B",
+            "--json",
+        ],
+    );
+    assert_eq!(selected["data"]["applied"], true);
+    let current = run(home, &["status"]);
+    assert!(current.status.success());
+    let text = String::from_utf8(current.stdout).unwrap();
+    assert!(text.contains("  Z-primary -> 👩‍💻 节点B\n"), "{text}");
+    assert!(!text.contains("Z-primary -> 🇭🇰 香港"), "{text}");
+
+    ok(home, &["stop", "--json"]);
+    std::fs::write(&source, "proxy-groups: [{name: Primary, type: select, proxies: [REJECT]}]\nrules: ['MATCH,Primary']\n").unwrap();
+    ok(
+        home,
+        &[
+            "start",
+            "-c",
+            source.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+            "--json",
+        ],
+    );
+    let unavailable = run(home, &["status"]);
+    assert!(unavailable.status.success());
+    let text = String::from_utf8(unavailable.stdout).unwrap();
+    assert!(text.contains("Selected proxies: (unavailable)"), "{text}");
+    assert!(!text.contains("Primary ->"), "{text}");
 }
 
 #[test]

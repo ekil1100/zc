@@ -673,6 +673,22 @@ fn render_text(command: &str, data: &Value) {
                     .map(Value::to_string)
                     .unwrap_or("(none)".into())
             );
+            if data["state"] == "running" && data["runtime_state_available"] != true {
+                println!("Selected proxies: (unavailable)");
+            } else if let Some(selections) = data["selected_proxies"].as_array()
+                && !selections.is_empty()
+            {
+                println!("Selected proxies:");
+                for selection in selections {
+                    println!(
+                        "  {} -> {}",
+                        safe_text(selection["group"].as_str().unwrap_or("")),
+                        safe_text(selection["proxy"].as_str().unwrap_or(""))
+                    );
+                }
+            } else {
+                println!("Selected proxies: (none)");
+            }
         }
         "doctor" | "diag doctor" | "test" | "proxy test" | "profile test" => {}
         _ => println!("{}: {}", command, ascii_json(data)),

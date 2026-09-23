@@ -23,7 +23,7 @@ rules:
 | GET | `/version` | 版本 |
 | GET | `/proxies` | 配置节点 |
 | GET | `/rules` | 配置规则 |
-| GET | `/status` | 实际运行 config identity 与当前 group selections |
+| GET | `/status` | 实际运行 config identity 与当前 group selections；`selected_proxies` 按运行配置的代理组声明顺序排列 |
 | PUT | `/proxies/<group>` | body 至少含 `{"name":"proxy"}`；group 支持百分号编码 |
 
 响应由 `serde_json` 序列化，引号、反斜杠、控制字符与 Unicode 正确转义。错误为 `{"error":"…"}`，不是 CLI 的 code/message/hint envelope。

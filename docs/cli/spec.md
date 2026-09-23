@@ -76,6 +76,8 @@ selection 先以 state token（format/sequence/digest）CAS 提交，绑定 exac
 
 无持久选择时 select 默认首成员；嵌套组、DIRECT/REJECT 字面量有效，未知引用/循环拒绝。文本交互只在 stdin 为 TTY 时进入；非 TTY 且无 `-p` 返回 `PROXY_SELECT_NOT_INTERACTIVE`，JSON 无 `-p` 只读。
 
+`status` 文本在 daemon/PID/端口之后显示 `Selected proxies:`，按运行配置中代理组的声明顺序，以 `代理组 -> 所选节点或组成员` 逐行列出实际运行选择（多个组可能选择不同成员，不虚构全局唯一节点）。运行状态不可读时显示 `(unavailable)`；已停止或没有代理组选择时显示 `(none)`。名称中的中文、国旗及组合 Emoji 原样输出 UTF-8；仅控制字符和不安全的方向控制符做终端安全转义，Emoji 的具体显示效果取决于终端与字体。JSON 结构保持不变，`selected_proxies` 数组同样按运行配置的组声明顺序排列；需运行新版 daemon 才会生成新的顺序。
+
 `status` 的 `active_config/selected_proxies` 是实际运行状态，不是当前 catalog active 的替身；通过匹配 descriptor 的 controller 查询。controller 不可用时保留实例 identity、选择为空、`runtime_state_available:false`，不能猜 endpoint。来源标记为 `persisted/transient/default`。停止时保留显式 `mixed_port:null`，运行时为实际端口；该字段不受通用 null 过滤影响，公开 CLI 回归已覆盖。
 
 ### durability 与恢复
