@@ -13,6 +13,10 @@ build *args:
 release:
     cargo build --locked --release
 
+# Build and install Rust locally; pass --target-dir to choose a destination. Never stop/start a daemon.
+install *args: release
+    bash scripts/install/local-dev-install.sh "$@"
+
 # Format Rust source files.
 fmt:
     cargo fmt --all

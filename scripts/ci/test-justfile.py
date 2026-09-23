@@ -61,6 +61,65 @@ class JustfileContract(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.calls(), expected)
 
+    def prepare_install(self):
+        scripts = self.work / "scripts" / "install"
+        scripts.mkdir(parents=True)
+        (scripts / "local-dev-install.sh").write_bytes((ROOT / "scripts/install/local-dev-install.sh").read_bytes())
+        release = self.work / "target" / "release"
+        release.mkdir(parents=True)
+        binary = release / "zc"
+        binary.write_text("#!/bin/sh\necho rust-release-source\n")
+        binary.chmod(0o755)
+        home = self.work / "home"
+        home.mkdir(mode=0o700)
+        self.env["HOME"] = str(home)
+        return home, binary
+
+    def test_install_builds_release_and_installs_in_isolated_home(self):
+        home, binary = self.prepare_install()
+        result = self.just("install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [["cargo", "build", "--locked", "--release"]])
+        installed = home / ".local" / "bin" / "zc"
+        self.assertEqual(installed.read_bytes(), binary.read_bytes())
+        probe = subprocess.run([str(installed), "--version"], text=True, capture_output=True, timeout=5)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(probe.stdout, "rust-release-source\n")
+
+    def test_install_target_arguments_are_literal_and_leave_default_untouched(self):
+        home, binary = self.prepare_install()
+        destination = self.work / "bin with spaces; $(touch injected)"
+        result = self.just("install", "--target-dir", str(destination))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((destination / "zc").read_bytes(), binary.read_bytes())
+        self.assertFalse((home / ".local").exists())
+        self.assertFalse((self.work / "injected").exists())
+
+    def test_install_build_failure_preserves_existing_binary(self):
+        home, _ = self.prepare_install()
+        target = home / ".local" / "bin" / "zc"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"previous-installation\n")
+        self.env["ZC_JUST_TEST_EXIT"] = "7"
+        result = self.just("install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [["cargo", "build", "--locked", "--release"]])
+        self.assertEqual(target.read_bytes(), b"previous-installation\n")
+        self.assertEqual(list(target.parent.iterdir()), [target])
+
+    def test_install_propagates_unsafe_target_refusal(self):
+        home, _ = self.prepare_install()
+        target = home / ".local" / "bin" / "zc"
+        target.parent.mkdir(parents=True)
+        original = self.work / "original"
+        original.write_bytes(b"previous-installation\n")
+        target.symlink_to(original)
+        result = self.just("install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symbolic link", result.stderr)
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(original.read_bytes(), b"previous-installation\n")
+
     def test_extra_cargo_arguments_preserve_word_boundaries(self):
         result = self.just("build", "--release", "--target-dir", "build output")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -99,7 +158,7 @@ class JustfileContract(unittest.TestCase):
             result = self.just(recipe)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.calls(), [["zig", *arguments]])
-        for recipe in ["install", "rust-build", "rust-test", "rust-check", "rust-e2e", "eval", "beta-gate", "soak"]:
+        for recipe in ["rust-build", "rust-test", "rust-check", "rust-e2e", "eval", "beta-gate", "soak"]:
             result = self.just(recipe, dry_run=True)
             self.assertNotEqual(result.returncode, 0, recipe)
 

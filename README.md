@@ -42,7 +42,7 @@ just run path/to/config.yaml 17891
 just -- test --test cli
 ```
 
-`just` 列出全部任务；`just fmt` 会格式化 Rust 源码。默认任务纯 Rust；临时 `zig-*` 任务只供历史对照，不能代替候选版本验收。没有自动停启 daemon 的 `just install`。
+`just` 列出全部任务；`just fmt` 会格式化 Rust 源码。默认任务纯 Rust；临时 `zig-*` 任务只供历史对照，不能代替候选版本验收。`just install` 构建 Release 并安装到 `~/.local/bin/zc`，不自动停启 daemon，拒绝覆盖仍在运行的目标。候选试用使用 `just install --target-dir /tmp/zc-candidate/bin`，不要覆盖生产安装。
 
 生产默认 mixed 端口为 **7899**；配置中的 `mixed-port` 数值不覆盖它。开发必须显式传 `--port` 或使用 `just run`（默认 `17890`，拒绝 `7899`）。端口冲突只报错，不漂移。测试使用临时 HOME/runtime，不读写真实用户状态。
 

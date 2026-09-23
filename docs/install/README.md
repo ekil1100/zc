@@ -95,11 +95,13 @@ brew upgrade ekil1100/tap/zc
 候选版本完成验收前不要覆盖生产安装。确需在明确授权的隔离环境试装时：
 
 ```bash
-just release
-bash scripts/install/local-dev-install.sh --target-dir /tmp/zc-candidate/bin
+just install --target-dir /tmp/zc-candidate/bin
+/tmp/zc-candidate/bin/zc --version
 ```
 
-脚本默认源是 `target/release/zc`，可用 `--source <path>` 显式指定。未指定目标目录时写入 `$HOME/.local/bin`；不要在测试中省略隔离 HOME 或显式目标。脚本不自动停止或重启 daemon，拒绝 symlink 和正在运行的目标，发布前后检查进程身份，检查失败保留或恢复旧二进制。
+`just install` 先执行 `just release`，再调用现有本地安装脚本；构建失败不会继续安装。无参数时安装到 `$HOME/.local/bin/zc`，可能替换已有的停止态安装，因此候选试用应始终显式指定独立目录。不会自动停止、启动或重启 daemon；运行中的目标、符号链接目标或无法确认进程状态时均拒绝安装，错误会传递给 `just`。发布前后检查进程身份，检查失败保留或恢复旧二进制。这只是显式安装入口，不代表迁移门禁或正式发布已经通过。
+
+额外参数原样传给 `scripts/install/local-dev-install.sh`。脚本默认源是 `target/release/zc`，可用 `--source <path>` 显式指定；自定义 Cargo 输出位置时也须指定对应产物。不要在测试中省略隔离 HOME 或显式目标。
 
 历史安装流程脚本仍有独立回归，用于校验 `INSTALL_*` 输出、版本要求和 marker/shim 回滚，不等同于真实 release 安装或 Rust 协议验收。
 
