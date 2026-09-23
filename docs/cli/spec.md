@@ -19,7 +19,7 @@
 | `zc test [-c <config>] [--port <port>]` | 通过代理端口做真实连通性检查；显式端口或默认 7899；文本/JSON 使用相同检查 |
 | `zc doctor [-c <config>]` | 配置、daemon、端口、连接诊断；运行中使用 descriptor 的实际 mixed 端口 |
 | `zc config load <path>` | 校验并捕获本地 YAML 与 root-contained provider 为 immutable revision，设为 active；不自动 apply，`applied:false` |
-| `zc config list` | 别名 `ls`；列出 profiles 与 active |
+| `zc config list` | 别名 `ls`；列出显示名称及可用于 `config use` 的 ID，以 `*` 标记 active；JSON 保持 `name`（ID）/`display`/`active` |
 | `zc config download <url> [-n <name>] [-d]` | 发布新 immutable revision；`-d` 请求激活，否则只自动激活首个 runtime-ready profile；同名拒绝 |
 | `zc config update [name] [--apply auto\|hot\|restart]` | 默认 active；仅订阅来源可更新；下载后 CAS 校验旧 head，再提交新 revision；仅对运行 exact 旧 identity 的 daemon 尝试 apply |
 | `zc config use <name>` | 切换 active，绝不自动 apply，`applied:false` |
@@ -33,6 +33,8 @@
 | `zc diag doctor [-c <config>]` | `zc doctor` 的别名路径 |
 
 未知 flag、多余位置参数、缺值/非法参数不得静默忽略。`restart --foreground` 拒绝；`start/restart` 共用冻结 `START_*` 参数错误码。TUI 不在帮助或 dispatch 中；`--daemon-run` 和 override worker 是内部模式，不是用户入口。
+
+`config list` 文本示例：`* Flower_SS.yaml (ID: BlWdYKsc)`。显示名称可能重复，操作时使用 ID，例如 `zc config use BlWdYKsc`；这只是已有 profile key 的展示，不引入新的身份字段，也不修改配置状态。
 
 `start/restart`、配置加载类诊断及 `config dump` 的一次性 override 使用 `--override-script <path>`、可重复 `--override-arg <k=v>`、`--override-timeout-ms <1..60000>`；适用与安全边界见 [override](../config/override.md)。
 

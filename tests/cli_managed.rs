@@ -75,6 +75,66 @@ fn immutable_managed_load_selection_and_dump_work_without_daemon() {
 }
 
 #[test]
+fn config_list_text_shows_selectable_ids_alongside_display_names() {
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let empty = run(home, &["config", "list"]);
+    assert!(empty.status.success());
+    assert!(
+        String::from_utf8(empty.stdout)
+            .unwrap()
+            .contains("(no config files found)")
+    );
+
+    let store = zc::store::Store::open(home.join(".config/zc")).unwrap();
+    let bundle =
+        zc::store::Bundle::from_memory(b"rules: ['MATCH,REJECT']\n", None, Default::default())
+            .unwrap();
+    // A display filename is not necessarily unique or usable as a selector.
+    for (id, active) in [("BlWdYKsc", true), ("another-id", false)] {
+        store
+            .publish(
+                &store.load().unwrap().token,
+                id,
+                None,
+                &bundle,
+                zc::store::Metadata {
+                    filename: Some("Flower_SS.yaml".into()),
+                    ..Default::default()
+                },
+                active,
+            )
+            .unwrap();
+    }
+    let before = store.load().unwrap().token;
+    for command in ["list", "ls"] {
+        let output = run(home, &["config", command]);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("  * Flower_SS.yaml (ID: BlWdYKsc)"), "{text}");
+        assert!(
+            text.contains("    Flower_SS.yaml (ID: another-id)"),
+            "{text}"
+        );
+    }
+    let listed = ok(home, &["config", "list", "--json"]);
+    assert_eq!(
+        listed["data"]["configs"],
+        json!([
+            {"name": "BlWdYKsc", "display": "Flower_SS.yaml", "active": true},
+            {"name": "another-id", "display": "Flower_SS.yaml", "active": false}
+        ])
+    );
+    assert_eq!(store.load().unwrap().token, before);
+    ok(home, &["config", "use", "another-id", "--json"]);
+    assert_eq!(
+        ok(home, &["config", "list", "--json"])["data"]["active"],
+        "another-id"
+    );
+}
+
+#[test]
 fn config_collection_limits_keep_the_command_error_without_publishing() {
     let _serial = cli_fixture::serial();
     let dir = tempfile::tempdir().unwrap();

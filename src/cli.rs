@@ -628,9 +628,10 @@ fn render_text(command: &str, data: &Value) {
             if let Some(items) = data["configs"].as_array() {
                 for item in items {
                     println!(
-                        "  {} {}",
+                        "  {} {} (ID: {})",
                         if item["active"] == true { "*" } else { " " },
-                        safe_text(item["display"].as_str().unwrap_or(""))
+                        safe_text(item["display"].as_str().unwrap_or("")),
+                        safe_text(item["name"].as_str().unwrap_or(""))
                     );
                 }
                 if items.is_empty() {
