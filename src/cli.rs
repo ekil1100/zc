@@ -967,6 +967,7 @@ async fn download(url: &str, command: &str) -> Result<Vec<u8>> {
         "{prefix}_FAILED: invalid HTTP URL"
     );
     let client = reqwest::Client::builder()
+        .user_agent(concat!("zc/", env!("CARGO_PKG_VERSION")))
         .no_proxy()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -978,10 +979,19 @@ async fn download(url: &str, command: &str) -> Result<Vec<u8>> {
             if e.is_timeout() { "TIMEOUT" } else { "FAILED" }
         )
     })?;
-    ensure!(
-        response.status().is_success(),
-        "{prefix}_FAILED: subscription server returned an unsuccessful status"
-    );
+    if !response.status().is_success() {
+        return Err(Failure {
+            code: format!("{prefix}_FAILED"),
+            message: format!(
+                "subscription server returned HTTP {}",
+                response.status().as_u16()
+            ),
+            hint: "check that the subscription link is enabled, valid and accessible".into(),
+            exit: 1,
+            data: None,
+        }
+        .into());
+    }
     ensure!(
         response
             .content_length()

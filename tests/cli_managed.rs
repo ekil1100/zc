@@ -257,6 +257,9 @@ struct HttpSource {
 }
 impl HttpSource {
     fn new(body: &[u8]) -> Self {
+        Self::with_status(body, 200)
+    }
+    fn with_status(body: &[u8], status: u16) -> Self {
         use std::{
             io::{Read, Write},
             sync::{
@@ -294,9 +297,10 @@ impl HttpSource {
                         continue;
                     }
                     let bytes = copy.lock().unwrap().clone();
+                    let reason = if status == 200 { "OK" } else { "Error" };
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         bytes.len()
                     );
                     let _ = stream.write_all(&bytes);
@@ -357,6 +361,134 @@ fn subscription_fixture_waits_for_a_complete_request_after_accept() {
     socket.read_to_end(&mut response).unwrap();
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert!(response.ends_with(b"verified-body"));
+}
+
+#[test]
+fn subscription_http_errors_report_status_without_credentials_or_publishing() {
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let initial = ok(dir.path(), &["config", "list", "--json"]);
+    for status in [400, 403, 503] {
+        let server = HttpSource::with_status(
+            b"PRIVATE_RESPONSE https://example.com/?token=PRIVATE_TOKEN",
+            status,
+        );
+        for json in [false, true] {
+            let mut args = vec!["config", "download", &server.url, "-n", "failed"];
+            if json {
+                args.push("--json");
+            }
+            let output = run(dir.path(), &args);
+            assert_eq!(output.status.code(), Some(1));
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let message = if json {
+                let result: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(result["error"]["code"], "CONFIG_DOWNLOAD_FAILED");
+                result["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                stderr.clone()
+            };
+            assert!(
+                message.contains(&format!("subscription server returned HTTP {status}")),
+                "{message}"
+            );
+            for sensitive in [
+                "private-token",
+                "PRIVATE_RESPONSE",
+                "PRIVATE_TOKEN",
+                &server.url,
+            ] {
+                assert!(!stdout.contains(sensitive) && !stderr.contains(sensitive));
+            }
+            assert_eq!(ok(dir.path(), &["config", "list", "--json"]), initial);
+            assert!(!dir.path().join(".config/zc/state-v2.json").exists());
+        }
+    }
+}
+
+#[test]
+fn subscription_download_and_update_send_the_zc_user_agent() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!(
+        "http://{}/subscription?private-token",
+        listener.local_addr().unwrap()
+    );
+    for command in ["download", "update"] {
+        let listener = listener.try_clone().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "subscription request did not arrive"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut header = Vec::new();
+            let mut byte = [0];
+            while !header.ends_with(b"\r\n\r\n") && header.len() < 16384 {
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            let expected = format!("user-agent: zc/{}", env!("CARGO_PKG_VERSION"));
+            let accepted = String::from_utf8(header)
+                .unwrap()
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&expected));
+            let status = if accepted { "200 OK" } else { "403 Forbidden" };
+            let body = if accepted {
+                "rules: ['MATCH,REJECT']\n"
+            } else {
+                "User-Agent required"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            accepted
+        });
+        let args = if command == "download" {
+            vec![
+                "config",
+                "download",
+                url.as_str(),
+                "-n",
+                "subscription",
+                "--json",
+            ]
+        } else {
+            vec!["config", "update", "subscription", "--json"]
+        };
+        let output = run(dir.path(), &args);
+        let accepted = server.join().unwrap();
+        assert!(accepted, "{command} omitted the zc User-Agent");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
 
 #[test]

@@ -34,6 +34,8 @@
 
 未知 flag、多余位置参数、缺值/非法参数不得静默忽略。`restart --foreground` 拒绝；`start/restart` 共用冻结 `START_*` 参数错误码。TUI 不在帮助或 dispatch 中；`--daemon-run` 和 override worker 是内部模式，不是用户入口。
 
+`config download/update` 的订阅 HTTP(S) 请求发送 `User-Agent: zc/<版本>`，避免服务端拒绝缺失客户端标识的请求；不冒充 Clash 或浏览器，不增加 curl 回退。仍保持 TLS 校验、直连（不读取环境代理）、30 秒超时、最多 5 次重定向和 16 MiB 响应上限。服务端返回非成功状态时保留 `CONFIG_DOWNLOAD_FAILED` / `CONFIG_UPDATE_FAILED` 错误码，消息明确给出 HTTP 状态码并提示检查订阅是否开启、有效、可访问；不回显订阅 URL 或响应正文，也不发布失败响应。
+
 `config list` 文本示例：`* Flower_SS.yaml (ID: BlWdYKsc)`。显示名称可能重复，操作时使用 ID，例如 `zc config use BlWdYKsc`；这只是已有 profile key 的展示，不引入新的身份字段，也不修改配置状态。
 
 `start/restart`、配置加载类诊断及 `config dump` 的一次性 override 使用 `--override-script <path>`、可重复 `--override-arg <k=v>`、`--override-timeout-ms <1..60000>`；适用与安全边界见 [override](../config/override.md)。
