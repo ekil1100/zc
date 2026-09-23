@@ -87,6 +87,75 @@ async fn direct_connect_transfers_real_payload() {
 }
 
 #[tokio::test]
+async fn connect_host_without_port_uses_the_target_port_and_transfers_payload() {
+    timeout(WAIT, async {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let runtime = Running::start("DIRECT").await;
+        let mut client = TcpStream::connect(runtime.addr).await.unwrap();
+        // Undici omits the Host port for HTTPS CONNECT and sends these hop headers.
+        client.write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nProxy-Connection: keep-alive\r\n\r\nhello").as_bytes()).await.unwrap();
+        assert_eq!(http_head(&mut client).await, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        let (mut server, _) = upstream.accept().await.unwrap();
+        let mut payload = [0; 5];
+        server.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"hello");
+        server.write_all(b"world").await.unwrap();
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"world");
+        runtime.stop().await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn connect_host_port_omission_keeps_authority_validation_and_reject_routing() {
+    let runtime = Running::start("REJECT").await;
+    for (target, host) in [
+        ("example.com:443", "example.com"),
+        ("example.com:8443", "EXAMPLE.COM"),
+        ("127.0.0.1:8443", "127.0.0.1"),
+        ("[::1]:443", "[::1]"),
+        ("[::1]:8443", "[0:0:0:0:0:0:0:1]"),
+    ] {
+        let mut client = TcpStream::connect(runtime.addr).await.unwrap();
+        client
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        // A valid request must reach REJECT, not be rejected as malformed or dial DIRECT.
+        let reply = http_head(&mut client).await;
+        assert!(
+            reply.starts_with(b"HTTP/1.1 502"),
+            "{target} / {host}: {reply:?}"
+        );
+    }
+    for request in [
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: other.example\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:8443\r\n\r\n",
+        "CONNECT example.com:8443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:+443\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:0\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:65536\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: user@example.com\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nHost: example.com\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\n\r\n",
+        "CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        "CONNECT [::1]:443 HTTP/1.1\r\nHost: [::2]\r\n\r\n",
+        "CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n",
+        "CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:\r\n\r\n",
+        "CONNECT [::1]:443 HTTP/1.1\r\nHost: ::1\r\n\r\n",
+        "GET http://example.com:8443/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    ] {
+        let mut client = TcpStream::connect(runtime.addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let reply = http_head(&mut client).await;
+        assert!(reply.starts_with(b"HTTP/1.1 400"), "{request:?}: {reply:?}");
+    }
+    runtime.stop().await;
+}
+
+#[tokio::test]
 async fn socks_connect_preserves_coalesced_payload_and_half_close() {
     timeout(WAIT, async {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -260,7 +260,12 @@ fn http_request(request: &httparse::Request<'_, '_>) -> Result<HttpRequest> {
                 }
                 host_seen = true;
                 let value = std::str::from_utf8(header.value)?.trim_matches([' ', '\t']);
-                let host = authority(value, if connect { None } else { Some(default_port) })?;
+                // CONNECT's authority-form target supplies the port when clients
+                // such as Undici omit it from Host. Explicit ports must still match.
+                let host = authority(
+                    value,
+                    Some(if connect { target.port() } else { default_port }),
+                )?;
                 if !same_target(&target, &host) {
                     bail!("Host conflicts with request target");
                 }

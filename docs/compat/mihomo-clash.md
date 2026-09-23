@@ -43,6 +43,8 @@
 | HTTP/SOCKS5 outbound、VMess/VLESS/AnyTLS | 不支持；保留历史代码不构成启用 |
 | SS AEAD-2022、外部 SIP003、obfs TLS、Trojan WS/gRPC | 不支持，拒绝而非降级 |
 
+HTTP CONNECT 的请求目标必须包含显式端口（例如 `CONNECT example.com:443`）。为兼容 Node/Undici/Pi，`Host: example.com` 省略端口时按请求目标端口校验；域名、IPv4 和带方括号的 IPv6 均支持。不同主机、冲突的显式端口、非法/重复 Host 及 HTTP/1.1 缺失 Host 仍拒绝；不改变规则匹配、出站目标或非 CONNECT 的 Host 校验。
+
 HTTP request header 最多 16 KiB，request body 最多 16 MiB；chunk framing/trailer 也有计数/字节上界。response 按流转发，不应把 request body 上界误称 response 总大小上界。mixed 最多 1024 connection tasks，入站握手 10 秒，路由与出站准备另有 10 秒 deadline，TCP 转发空闲期限 15 分钟。退出取消并回收任务，不承诺 drain 完全部存量流量。这些数值不同于原 Zig 的 128 workers / 5 秒，仍须资源评审。
 
 TLS 使用 rustls / tokio-rustls、系统信任根、安全默认 TLS 1.2/1.3；不继承 Zig TLS 派生实现的 poll/partial-record/KeyUpdate 限制说明。Trojan server 必须是合法 IP 或 RFC hostname，DNS server 尾点在派生身份时去除；显式 SNI 必须是无尾点的 DNS hostname，不接受 IP/wildcard/控制字符。验证证书的 IP server 须显式 SNI。仅 `skip-cert-verify:true` 关闭链和身份校验，握手签名仍验证；这是安全降级，不是默认行为。uTLS/Reality/mTLS/任意 ALPN 配置不在支持范围。
