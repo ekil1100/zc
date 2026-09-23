@@ -740,6 +740,33 @@ async fn strict_missing_empty_and_unmatched_rules_keep_zig_reject_canonical_byte
 }
 
 #[test]
+fn ignored_subscription_fields_do_not_bypass_yaml_or_runtime_validation() {
+    use zc::override_script::runtime_source;
+    for source in [
+        "dns: {enable: true}\ndns: {}\n",
+        "dns: &settings {}\nhosts: *settings\n",
+        "dns: {nested: [}\n",
+        "dns: {}\nallow-lan: invalid\n",
+        "dns: {}\nunknown-runtime-option: true\n",
+        "dns: {}\ntun: {enable: true}\n",
+        "dns: {}\nproxy-providers: {}\n",
+        "dns: {}\nproxies: [{name: edge, type: unsupported}]\n",
+        "dns: {}\nproxies: [{name: edge, type: ss, server: localhost, port: 443, cipher: aes-128-gcm, password: fixture, plugin: unknown}]\n",
+        "dns: {}\nproxy-groups: [{name: Pick, type: url-test, proxies: [DIRECT]}]\n",
+        "dns: {}\nrules: ['MATCH,missing']\n",
+    ] {
+        assert!(
+            runtime_source(source.as_bytes())
+                .and_then(|runtime| Config::parse(&runtime))
+                .is_err(),
+            "{source}"
+        );
+    }
+    let oversized = format!("dns: {{entries: [{}]}}\n", vec!["0"; 262_144].join(","));
+    assert!(runtime_source(oversized.as_bytes()).is_err());
+}
+
+#[test]
 fn yaml_depth_matches_strict_zig_root_plus_128_nested_collections() {
     use zc::config::parse_document;
     for depth in [127, 128, 129, 10_000] {

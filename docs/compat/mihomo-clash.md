@@ -9,9 +9,25 @@
 - `allow-lan:false` 的规范运行时投影绑定 loopback；`allow-lan:true` 才允许 LAN。没有入站认证，不应暴露给不可信客户端。
 - `external-controller` 仅接受 `127.0.0.1:<port>`；必须精确绑定，不漂移、不静默关闭。
 - `mode/log-level` 接受合法兼容声明；不要据此宣称完整 mihomo 模式调度或动态日志级别。当前路由由规则决定。
-- `dns:`、fake-ip、enhanced-mode、nameserver-policy、proxy-providers 不提供完整运行时支持；`external-ui` 等兼容元数据不代表托管 dashboard。
+- `dns`（含 fake-ip、enhanced-mode、nameserver-policy）、`hosts`、`sniffer`、`profile`、`experimental`、`unified-delay`、`clash-for-android` 接受但不执行，见下方清单；`proxy-providers` 仍拒绝。`external-ui` 等兼容元数据不代表托管 dashboard。
 - `src/override_script.rs::runtime_source` 只投影已经校验的兼容字段给 `src/config.rs`；immutable source/materialization 的规范字节及内容摘要不能被运行时投影改写。
 - 未启用的 outbound/group/plugin 在准备或准入时明确拒绝，绝不回退 DIRECT。用户声明的精确名称 `DIRECT/REJECT` 保留，不能覆盖内置字面量。
+
+## 接受但暂不执行的订阅字段
+
+以下七个**顶层字段**不会阻止配置加载、启动或 doctor 检查；仅在运行时投影中跳过，不修改原文件、托管 revision 的 source/materialization 或其内容摘要。它们仍受全文 YAML 语法、重复键、alias、深度和资源限制约束，但暂不校验其内部功能 schema。接受声明不表示相关功能生效。
+
+| 字段 | 当前行为 | 后续待支持 |
+| --- | --- | --- |
+| `dns` | 使用现有系统 DNS 路径，不应用本段配置 | 自定义解析器、fake-ip、nameserver-policy 等 |
+| `hosts` | 不应用配置内映射；系统 hosts 路径不变 | 配置级静态域名映射 |
+| `sniffer` | 不嗅探应用层协议或改写目标 | 协议嗅探与目标覆盖 |
+| `profile` | 不应用本段选项；zc 自身持久选择逻辑不变 | store-selected/store-fake-ip 等兼容语义 |
+| `experimental` | 不应用实验选项 | 逐项评估，不能据字段存在宣称支持 |
+| `unified-delay` | 不改变延迟测量 | 统一延迟测量语义 |
+| `clash-for-android` | 不应用 Android 客户端选项 | 评估有意义的跨平台选项；Android 不在生产目标内 |
+
+这是明确列举的兼容例外，不是忽略所有未知字段。未列出的未知字段、`tun`、`proxy-providers`、不支持的节点协议/插件/策略组以及错误规则仍拒绝；不会把未实现的出站替换为 DIRECT。override patch 的字段许可范围也不因此扩大。
 
 ## TCP 与出站
 
@@ -134,7 +150,7 @@ CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/
 
 ### 诊断的实际契约
 
-`doctor` 保留配置与连接两个 gating checks：daemon stopped 合法；运行中端口不可达才使连接 check 失败。`network_ok` 仍真实探测 `1.1.1.1:443`，200 ms，但不 gating。显式/默认 `config_source` 为原来的 `custom/default`。语法/I/O 失败返回 `DIAG_DOCTOR_FAILED`，显式 override 保留对应错误码，已识别的能力准入失败返回 `CONFIG_CAPABILITY_UNSUPPORTED`，不捏造字段诊断；可解析但语义无效时返回 `CHECKS_FAILED`，`config_errors` 给出具体错误，文本和 JSON 使用同一条消息，512 UTF-8 bytes 上限并明确标记截断。
+`doctor` 保留配置与连接两个 gating checks：daemon stopped 合法；运行中端口不可达才使连接 check 失败。`network_ok` 仍真实探测 `1.1.1.1:443`，200 ms，但不 gating。显式/默认 `config_source` 为原来的 `custom/default`。语法/I/O 失败返回 `DIAG_DOCTOR_FAILED`，显式 override 保留对应错误码，上表兼容字段不构成配置错误；已识别的能力准入失败返回 `CONFIG_CAPABILITY_UNSUPPORTED`，不捏造字段诊断；可解析但语义无效时返回 `CHECKS_FAILED`，`config_errors` 给出具体错误，文本和 JSON 使用同一条消息，512 UTF-8 bytes 上限并明确标记截断。
 
 `test/proxy test/profile test` 加载失败使用 `PROXY_CONFIG_LOAD_FAILED`；端口不可达时不跑外网 targets。七个默认目标、至少一个目标成功才通过 connectivity 的判定保持不变。按 `test_cli.zig::getIpGeoInfo` 对齐 IP/Location JSON：成功含 `ip`（无 query 时 `unknown`），不含 `latency_ms`；其他成功 target 含 latency。502 失败，403 等非 502 响应仍算连通；文本显示同一 IP/latency/reason，连接期限 5 秒、geo 总期限 90 秒、其余目标 5 秒。新增公开 `doctor_diagnostics` / `diagnostic_target_probe` 接口仅供传入真实本地测试 probe target，不增加 CLI/env 开关，也不改变命令默认目标。
 

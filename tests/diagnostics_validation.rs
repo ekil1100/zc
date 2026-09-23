@@ -68,14 +68,27 @@ async fn doctor_migration_hints_follow_original_source_scan_without_enabling_fea
             "proxy-providers is not supported; declare proxies statically in the config"
         ])
     );
-    for source in [
-        "tun: {enable: true}\n",
-        "dns: {enhanced-mode: fake-ip}\n",
-        "proxy-providers: {}\n",
-    ] {
+    for source in ["tun: {enable: true}\n", "proxy-providers: {}\n"] {
         let data = diagnose(source).await;
         assert_eq!(data["config_ok"], false, "{data}");
         assert!(!data["config_errors"].as_array().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn doctor_accepts_ignored_subscription_fields_without_claiming_runtime_support() {
+    for source in [
+        "dns: {enhanced-mode: fake-ip}\n",
+        "hosts: {example.com: 192.0.2.1}\n",
+        "sniffer: {enable: true}\n",
+        "profile: {store-selected: true}\n",
+        "experimental: {ignore-resolve-fail: true}\n",
+        "unified-delay: true\n",
+        "clash-for-android: {append-system-dns: false}\n",
+    ] {
+        let data = diagnose(source).await;
+        assert_eq!(data["config_ok"], true, "{source}: {data}");
+        assert_eq!(data["config_errors"], json!([]));
     }
 }
 

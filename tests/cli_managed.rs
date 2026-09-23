@@ -447,6 +447,59 @@ fn free_port() -> u16 {
 }
 
 #[test]
+fn managed_subscription_compatibility_fields_do_not_block_start() {
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let _guard = DaemonGuard(home.into());
+    let source = home.join("subscription.yaml");
+    let contents = json!({
+        "dns": {"enable": true, "enhanced-mode": "fake-ip", "nameserver": ["192.0.2.1"]},
+        "hosts": {"example.com": "192.0.2.2"},
+        "sniffer": {"enable": true},
+        "profile": {"store-selected": true, "store-fake-ip": true},
+        "experimental": {"ignore-resolve-fail": true},
+        "unified-delay": true,
+        "clash-for-android": {"append-system-dns": false},
+        "proxies": [{"name": "edge", "type": "ss", "server": "localhost", "port": 443,
+            "cipher": "aes-128-gcm", "password": "fixture", "plugin": "obfs",
+            "plugin-opts": {"mode": "http", "host": "example.com"}}],
+        "proxy-groups": [{"name": "Pick", "type": "select", "proxies": ["REJECT", "edge"]}],
+        "rules": ["MATCH,Pick"]
+    })
+    .to_string();
+    std::fs::write(&source, &contents).unwrap();
+    ok(
+        home,
+        &["config", "load", source.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), contents);
+    // The immutable source retains ignored fields rather than rewriting the subscription.
+    let store = zc::store::Store::open(home.join(".config/zc")).unwrap();
+    let active = store.load().unwrap().catalog.active.unwrap();
+    let view = store.read_bundle(&active.key, &active.revision).unwrap();
+    assert_eq!(view.bundle.source(), contents.as_bytes());
+    std::fs::remove_file(source).unwrap();
+    let port = free_port();
+    ok(home, &["start", "--port", &port.to_string(), "--json"]);
+    let status = ok(home, &["status", "--json"]);
+    assert_eq!(status["data"]["state"], "running");
+    assert_eq!(status["data"]["mixed_port"], port);
+    assert_eq!(
+        ok(home, &["proxy", "list", "--json"])["data"]["groups"][0]["now"],
+        "REJECT"
+    );
+    assert_eq!(
+        store
+            .read_bundle(&active.key, &active.revision)
+            .unwrap()
+            .bundle
+            .source(),
+        contents.as_bytes()
+    );
+}
+
+#[test]
 fn managed_live_selection_reload_and_immutable_local_provider_work_end_to_end() {
     let _serial = cli_fixture::serial();
     let dir = tempfile::tempdir().unwrap();

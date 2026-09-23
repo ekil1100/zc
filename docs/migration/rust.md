@@ -71,7 +71,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 2. **HTTP provider**：unmanaged 已接入 root-contained 安全磁盘 cache、interval 刷新、普通 HTTP 失败时的已验证缓存回退，以及独立 `test` 的 missing-only 策略；doctor 只检查声明。managed 仍拒绝引用 remote 的离线发布，不修改冻结 revision。详情及更严格的路径限制见 [兼容说明](../compat/mihomo-clash.md#rule-provider-与离线托管)。不提供 curl fallback。
 3. **资源行为差异**：共享 collection/provider/展开上界已接入；YAML 已对齐原 Zig 根外 128 层；其余 parser events/nodes/scalar budgets 仍有差异。mixed 连接任务 1024 / 握手 10 秒（原为 128 / 5 秒）。这需要显式评审，不能宣称资源行为完全等价。
 4. **CLI/缺省行为细节**：doctor 的多错误汇总、支持范围内的 warnings、原 source-text migration hints 及 256 条/512 bytes 错误优先预算已补齐；加载失败与语义检查失败保持分离，证据及保留差异见下节“doctor validator 诊断验收”。停止态保留显式 `mixed_port:null`；启动与重启的未转交 snapshot 由作用域 guard 清理，停止超时和取消不再遗留 staged 文件。缺省 rules 的旧审计结论已纠正：`config.zig::load/parseDocument` 的严格 CLI 路径本来就补 REJECT，DIRECT 只属于 legacy parser；原 dump 字节及真实路由已对照，不修改 canonical/hash。
-5. 不支持 HTTP/SOCKS5 outbound、VMess/VLESS/AnyTLS、SS AEAD-2022、通用 SIP003、obfs TLS、Trojan WS/gRPC、非 select 策略组、TUN/透明代理、完整 DNS、proxy-provider、TUI 或完整 mihomo Controller。
+5. 不支持 HTTP/SOCKS5 outbound、VMess/VLESS/AnyTLS、SS AEAD-2022、通用 SIP003、obfs TLS、Trojan WS/gRPC、非 select 策略组、TUN/透明代理、完整 DNS、proxy-provider、TUI 或完整 mihomo Controller。订阅的 `dns/hosts/sniffer/profile/experimental/unified-delay/clash-for-android` 七个顶层字段现接受并仅在运行时投影中跳过，原始数据不重写；具体行为及待支持项见[兼容字段清单](../compat/mihomo-clash.md#接受但暂不执行的订阅字段)。其余能力准入不放宽。
 6. UDP ingress 不支持 DIRECT、分片或 standalone socks-port。首个合法包固定实际 leaf，后续包不重新路由或 fallback；64 association、300 秒 idle、65507-byte wire 上界必须由真实边界测试验收。
 
 ## 验证入口与剩余门禁
@@ -112,7 +112,7 @@ just migrator-test
 - **语义诊断**：累计基础字段、代理必填项/身份、重复名称、组冲突/空组/引用、规则 payload/provider/target 错误；复用核心 typed proxy/group/provider/rule 校验，并继续拒绝所有分支上的组循环。语法、字段类型/规则格式及能力准入仍走既有加载失败路径，不把未知规则修成有效规则，也不以 hints 掩盖 unsupported 错误。语义无效仍由 config check 导致 `CHECKS_FAILED`。
 - **warnings**：恢复 `allow-lan:false` 忽略非 `*` bind-address、两个 idle session 参数 `<=5` 秒的原兼容提示，以及 Trojan 关闭证书验证的警告。不启用 AnyTLS，不修改原文件或 immutable revision 的 canonical bytes；CLI 端口选择已清除的 port/socks-port 不捏造 ignored-port warnings。
 - **预算**：errors/warnings 合计最多 256 条；后来的错误替换末尾 warning，独立 `has_errors` 不依赖保留条数。每条最多 512 UTF-8 bytes；超长值按原模板将所有参数替换成 `...`，追加精确后缀 ` ... [truncated]`，不先分配完整超长消息。数量或字节省略均置 `config_diagnostics_truncated`。控制字符清理前的原始字节也计费。
-- **migration hints**：保留 `doctor_cli.zig::collectMigrationHints` 的四条固定英文文案、顺序、显式原始文件路径与 1 MiB 上限；仍是文本子串扫描，注释也可能触发，默认 profile 不扫描。override 的 effective bytes 不冒充原提示来源。提示不是支持承诺；实际 `tun/dns/proxy-providers` 声明继续明确拒绝。文本与 JSON 展示同一份有界 errors/warnings/hints。
+- **migration hints**：保留 `doctor_cli.zig::collectMigrationHints` 的四条固定英文文案、顺序、显式原始文件路径与 1 MiB 上限；仍是文本子串扫描，注释也可能触发，默认 profile 不扫描。override 的 effective bytes 不冒充原提示来源。提示不是支持承诺；当时实际 `tun/dns/proxy-providers` 声明均明确拒绝；后续订阅兼容调整仅让 `dns` 接受但忽略，`tun/proxy-providers` 仍拒绝。文本与 JSON 展示同一份有界 errors/warnings/hints。
 
 ### 独立证据
 

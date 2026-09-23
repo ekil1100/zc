@@ -1971,7 +1971,16 @@ fn materializable(value: &Value) -> Result<()> {
 pub fn runtime_source(source: &[u8]) -> Result<String> {
     let mut value = config_document(source)?;
     let map = value.as_object_mut().unwrap();
+    // Accepted subscription metadata, not implemented runtime capabilities.
+    // Drop only from this projection; immutable source and proof bytes stay intact.
     for key in [
+        "dns",
+        "hosts",
+        "sniffer",
+        "profile",
+        "experimental",
+        "unified-delay",
+        "clash-for-android",
         "redir-port",
         "tproxy-port",
         "ipv6",
