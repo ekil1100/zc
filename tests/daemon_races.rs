@@ -435,3 +435,133 @@ fn config_override_captures_instance_before_script_preparation() {
     assert!(output.contains("RESTART_CONTENDED"), "{output}");
     assert_eq!(f.descriptor(), newer);
 }
+
+#[test]
+fn restart_serializes_descriptor_capture_with_exit_cleanup() {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let f = Fixture::new();
+    let scope = f.home.join("capture-race");
+    fs::create_dir(&scope).unwrap();
+    let library = scope.join(if cfg!(target_os = "macos") {
+        "capture.dylib"
+    } else {
+        "capture.so"
+    });
+    let mut cc = Command::new("cc");
+    cc.args(["-std=c11", "-Wall", "-Wextra", "-Werror"]);
+    if cfg!(target_os = "macos") {
+        cc.arg("-dynamiclib");
+    } else {
+        cc.args(["-shared", "-fPIC"]);
+    }
+    cc.arg("-o").arg(&library).arg(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/restart_capture_race.c"
+    ));
+    if cfg!(target_os = "linux") {
+        cc.arg("-ldl");
+    }
+    let compiled = cc.output().expect("cc is required for the restart fixture");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let preload = if cfg!(target_os = "macos") {
+        "DYLD_INSERT_LIBRARIES"
+    } else {
+        "LD_PRELOAD"
+    };
+    let started = f
+        .command(&[
+            "start",
+            "-c",
+            f.config.to_str().unwrap(),
+            "--port",
+            &port().to_string(),
+            "--json",
+        ])
+        .env(preload, &library)
+        .env("ZC_RESTART_CAPTURE_ROOT", &scope)
+        .env("ZC_RESTART_CAPTURE_ROLE", "writer")
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    let old = f.descriptor();
+    let pid = rustix::process::Pid::from_raw(old["pid"].as_i64().unwrap() as i32).unwrap();
+    struct Resume(rustix::process::Pid);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            let _ = rustix::process::kill_process(self.0, rustix::process::Signal::CONT);
+        }
+    }
+    let resume = Resume(pid);
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+    let descriptor_path = f.runtime.join("zc.daemon.json");
+    let descriptor = fs::metadata(&descriptor_path).unwrap();
+    let lock = fs::metadata(f.runtime.join("zc.daemon.lock")).unwrap();
+    fs::write(
+        scope.join("arming"),
+        format!(
+            "{} {} {} {}\n",
+            descriptor.dev(),
+            descriptor.ino(),
+            lock.dev(),
+            lock.ino()
+        ),
+    )
+    .unwrap();
+    fs::rename(scope.join("arming"), scope.join("armed")).unwrap();
+    let next_port = port();
+    let mut restart = Process(
+        f.command(&["restart", "--port", &next_port.to_string(), "--json"])
+            .env(preload, &library)
+            .env("ZC_RESTART_CAPTURE_ROOT", &scope)
+            .env("ZC_RESTART_CAPTURE_ROLE", "reader")
+            .env(
+                "ZC_RESTART_CAPTURE_REQUEST",
+                f.runtime
+                    .join(format!("zc.stop.{}", old["nonce"].as_str().unwrap())),
+            )
+            .spawn()
+            .unwrap(),
+    );
+    let evidence = |name: &str| fs::read_to_string(scope.join(name)).unwrap_or_default();
+    wait(|| !evidence("reader-ready").is_empty());
+    // Resume the real daemon only after stopped() has its capture-before stat.
+    // Its actual flock result tells us whether cleanup can unlink that inode.
+    drop(resume);
+    wait(|| !evidence("writer-lock").is_empty());
+    let writer = evidence("writer-lock");
+    if writer == "acquired\n" {
+        // On the broken implementation, finish the real unlink before allowing
+        // read_bounded to sample capture-after. No forged metadata or timeout.
+        wait(|| !descriptor_path.exists());
+    }
+    fs::write(scope.join("reader-release"), "").unwrap();
+    wait(|| restart.0.try_wait().unwrap().is_some());
+    let status = restart.0.wait().unwrap();
+    let mut output = String::new();
+    restart
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    let before = evidence("reader-ready");
+    let after = evidence("reader-after");
+    eprintln!("Restart capture: writer={writer:?}, before={before:?}, after={after:?}");
+    assert!(status.success(), "{output}");
+    assert_eq!(writer, "blocked\n", "cleanup did not overlap the reader");
+    assert_eq!(before, after, "captured inode changed during cleanup");
+    let result: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(result["ok"], true);
+    let current = f.json(&["status", "--json"]);
+    assert_eq!(current["data"]["state"], "running");
+    assert_eq!(current["data"]["mixed_port"], next_port);
+    assert_ne!(current["data"]["pid"], old["pid"]);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", next_port)).is_ok());
+}

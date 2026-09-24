@@ -24,6 +24,16 @@ cargo test --locked --test fsutil read_capture:: -- --nocapture --test-threads=1
 
 原始 RED 与重复探针记录位于 `target/ci/35171024849/read-capture-*.log`；修复后 fsutil/store/legacy/durability/daemon/provider/service/managed CLI 九个相关集成 suite 通过，日志 `/tmp/zc-capture-regression.log`。这些结果不代替全量 E2E、性能或长稳验收。
 
+## 停止确认与退出清理的读取临界区
+
+P0 观测联合回归在本机 macOS 再次捕获公开 `restart` 的 `file metadata changed during capture`。定向诊断确认调用链为 `restart_checked → stop_instance → stopped`：读端捕获 `zc.daemon.json` 时，daemon 正常退出在已有 `zc.daemon.lock` 下删除同一 inode；读前后的 `nlink` 从 1 变为 0。文件安全校验拒绝是正确行为，遗漏的是读端没有加入该临界区。
+
+`stopped()` 现在持有同一个 `zc.daemon.lock`，覆盖实例锁状态检查与 descriptor 捕获，不修改 metadata 检查、超时、重试次数或 PID 身份要求。
+
+`tests/daemon_races.rs::restart_serializes_descriptor_capture_with_exit_cleanup` 通过真实 CLI 和测试专用 `tests/support/restart_capture_race.c` 调度交错：实际 capture-before syscall 已取得合法快照后暂停 reader，让 daemon 尝试真实清理锁，然后恢复 reader。没有伪造 syscall 返回值或 metadata：修复前 writer 可获锁并 unlink、reader 观察 `nlink=0`，公开 restart 报原错误；修复后 writer 被锁阻挡、reader 保持 `nlink=1`，restart 成功。marker 必须证明 hook 命中及实际锁行为，不能把未触发当通过；所有对象和进程均为隔离测试所有。
+
+确定性红绿、原始场景及 daemon 回归日志：`target/reliability/restart-capture-{deterministic-red,deterministic-green,regression,clippy}.log`。本机验证不替代四平台；历史 Intel `unsafe file ownership or hard links` 尚缺对应 inode trace，不能据此自动宣布同源或关闭。
+
 ## descriptor 并发测试的调度
 
 [CI 35171024849](https://github.com/ekil1100/zc/actions/runs/35171024849) 的 Linux x64 记录了 descriptor capture 的 metadata 不稳定。`read_descriptor` 最多首次读取加三次重试，且当前路径复检失败也会立即拒绝；日志不能证明一定耗尽全部重试。

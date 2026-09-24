@@ -1294,6 +1294,9 @@ impl Drop for StopRequest<'_> {
 }
 fn stopped(runtime: &Directory, expected: &Descriptor) -> Result<bool> {
     runtime.dir.validate_path(&runtime.path)?;
+    // Exit cleanup removes the descriptor under this lock. Keep the ownership
+    // check and descriptor capture in one read-side critical section.
+    let _guard = runtime.dir.lock("zc.daemon.lock", LOCK_WAIT)?;
     if !lock_held(&runtime.dir)? {
         return Ok(true);
     }
