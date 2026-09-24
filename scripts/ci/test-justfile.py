@@ -31,13 +31,29 @@ class JustfileContract(unittest.TestCase):
         recorder.chmod(0o755)
         for tool in ["cargo", "zig"]:
             (tools / tool).symlink_to(recorder)
-        self.env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", ZC_JUST_TEST_LOG=str(self.log))
+        self.env = dict(
+            os.environ,
+            PATH=f"{tools}{os.pathsep}{os.environ['PATH']}",
+            ZC_JUST_TEST_LOG=str(self.log),
+        )
 
     def just(self, *args, dry_run=False):
-        command = ["just", "--justfile", str(ROOT / "Justfile"), "--working-directory", str(self.work)]
+        command = [
+            "just",
+            "--justfile",
+            str(ROOT / "Justfile"),
+            "--working-directory",
+            str(self.work),
+        ]
         if dry_run:
             command.append("--dry-run")
-        return subprocess.run([*command, "--", *args], env=self.env, text=True, capture_output=True, timeout=10)
+        return subprocess.run(
+            [*command, "--", *args],
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
 
     def calls(self):
         if not self.log.exists():
@@ -53,7 +69,21 @@ class JustfileContract(unittest.TestCase):
         for recipe, expected in [
             ("release", [["cargo", "build", "--locked", "--release"]]),
             ("fmt", [["cargo", "fmt", "--all"]]),
-            ("check", [["cargo", "fmt", "--all", "--", "--check"], ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"]]),
+            (
+                "check",
+                [
+                    ["cargo", "fmt", "--all", "--", "--check"],
+                    [
+                        "cargo",
+                        "clippy",
+                        "--locked",
+                        "--all-targets",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                ],
+            ),
         ]:
             with self.subTest(recipe=recipe):
                 self.log.write_text("")
@@ -64,7 +94,9 @@ class JustfileContract(unittest.TestCase):
     def prepare_install(self):
         scripts = self.work / "scripts" / "install"
         scripts.mkdir(parents=True)
-        (scripts / "local-dev-install.sh").write_bytes((ROOT / "scripts/install/local-dev-install.sh").read_bytes())
+        (scripts / "local-dev-install.sh").write_bytes(
+            (ROOT / "scripts/install/local-dev-install.sh").read_bytes()
+        )
         release = self.work / "target" / "release"
         release.mkdir(parents=True)
         binary = release / "zc"
@@ -82,7 +114,9 @@ class JustfileContract(unittest.TestCase):
         self.assertEqual(self.calls(), [["cargo", "build", "--locked", "--release"]])
         installed = home / ".local" / "bin" / "zc"
         self.assertEqual(installed.read_bytes(), binary.read_bytes())
-        probe = subprocess.run([str(installed), "--version"], text=True, capture_output=True, timeout=5)
+        probe = subprocess.run(
+            [str(installed), "--version"], text=True, capture_output=True, timeout=5
+        )
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertEqual(probe.stdout, "rust-release-source\n")
 
@@ -123,23 +157,70 @@ class JustfileContract(unittest.TestCase):
     def test_extra_cargo_arguments_preserve_word_boundaries(self):
         result = self.just("build", "--release", "--target-dir", "build output")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), [["cargo", "build", "--locked", "--release", "--target-dir", "build output"]])
+        self.assertEqual(
+            self.calls(),
+            [
+                [
+                    "cargo",
+                    "build",
+                    "--locked",
+                    "--release",
+                    "--target-dir",
+                    "build output",
+                ]
+            ],
+        )
         self.log.write_text("")
         result = self.just("test", "--test", "cli", "--", "--nocapture")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), [["cargo", "test", "--locked", "--test", "cli", "--", "--nocapture"]])
+        self.assertEqual(
+            self.calls(),
+            [["cargo", "test", "--locked", "--test", "cli", "--", "--nocapture"]],
+        )
 
     def test_run_defaults_to_foreground_and_nonproduction_port(self):
         result = self.just("run")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), [["cargo", "run", "--locked", "--", "start", "--config", "testdata/config/rust-tcp.yaml", "--port", "17890", "--foreground"]])
+        self.assertEqual(
+            self.calls(),
+            [
+                [
+                    "cargo",
+                    "run",
+                    "--locked",
+                    "--",
+                    "start",
+                    "--config",
+                    "testdata/config/rust-tcp.yaml",
+                    "--port",
+                    "17890",
+                    "--foreground",
+                ]
+            ],
+        )
 
     def test_run_parameters_are_literal_and_production_port_is_rejected(self):
         marker = self.work / "injected"
         config = f"config with spaces'; touch {marker}; echo '$(touch {marker}).yaml"
         result = self.just("run", config, "17891")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), [["cargo", "run", "--locked", "--", "start", "--config", config, "--port", "17891", "--foreground"]])
+        self.assertEqual(
+            self.calls(),
+            [
+                [
+                    "cargo",
+                    "run",
+                    "--locked",
+                    "--",
+                    "start",
+                    "--config",
+                    config,
+                    "--port",
+                    "17891",
+                    "--foreground",
+                ]
+            ],
+        )
         self.assertFalse(marker.exists())
         self.log.write_text("")
         for reserved in ["7899", "07899", "+7899", "+007899"]:
@@ -158,16 +239,41 @@ class JustfileContract(unittest.TestCase):
             result = self.just(recipe)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.calls(), [["zig", *arguments]])
-        for recipe in ["rust-build", "rust-test", "rust-check", "rust-e2e", "eval", "beta-gate", "soak"]:
+        for recipe in [
+            "rust-build",
+            "rust-test",
+            "rust-check",
+            "rust-e2e",
+            "eval",
+            "beta-gate",
+            "soak",
+        ]:
             result = self.just(recipe, dry_run=True)
             self.assertNotEqual(result.returncode, 0, recipe)
 
     def test_validate_contains_rust_checks_and_independent_e2e_only(self):
         result = self.just("validate", dry_run=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for command in ["cargo fmt", "cargo clippy", "cargo test --locked", "cargo build --locked", "scripts/e2e/fetch-static-fixtures.sh", "scripts/e2e/run-rust-tcp.py", "scripts/e2e/run-core.sh", "cargo build --locked --examples", "examples/support/test-helpers.py", "scripts/install/test-oneline-installer.sh", "cargo build --locked --release"]:
+        for command in [
+            "cargo fmt",
+            "cargo clippy",
+            "cargo test --locked",
+            "cargo build --locked",
+            "scripts/e2e/fetch-static-fixtures.sh",
+            "scripts/e2e/run-rust-tcp.py",
+            "scripts/e2e/run-core.sh",
+            "cargo build --locked --examples",
+            "examples/support/test-helpers.py",
+            "scripts/install/test-oneline-installer.sh",
+            "cargo build --locked --release",
+        ]:
             self.assertIn(command, result.stderr)
-        for forbidden in ["zig build", "local-dev-install", "run-full-validation", "7899"]:
+        for forbidden in [
+            "zig build",
+            "local-dev-install",
+            "run-full-validation",
+            "7899",
+        ]:
             self.assertNotIn(forbidden, result.stderr)
         self.assertEqual(self.calls(), [])
 
@@ -177,7 +283,12 @@ class JustfileContract(unittest.TestCase):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         for recipe in ["check", "test", "delivery-test", "e2e", "install-test"]:
             self.assertIn(f"run: just {recipe}\n", ci)
-        for platform in ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest", "macos-15-intel"]:
+        for platform in [
+            "ubuntu-latest",
+            "ubuntu-24.04-arm",
+            "macos-latest",
+            "macos-15-intel",
+        ]:
             self.assertIn(platform, ci)
         self.assertIn("RUSTUP_TOOLCHAIN: 1.98.1", ci)
         self.assertIn("actions/setup-node@", ci)
@@ -191,19 +302,39 @@ class JustfileContract(unittest.TestCase):
         for name in ["run-beta-gate.sh", "run-full-validation.sh"]:
             (scripts / name).write_text((ROOT / "scripts" / name).read_text())
         tool = self.work / "bin" / "just"
-        tool.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$ZC_GATE_LOG\"\n[[ $1 != ${ZC_FAIL_GATE:-test} ]]\n")
+        tool.write_text(
+            '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$ZC_GATE_LOG"\n[[ $1 != ${ZC_FAIL_GATE:-test} ]]\n'
+        )
         tool.chmod(0o755)
         self.env["ZC_GATE_LOG"] = str(self.work / "gates.log")
-        for name, marker in [("run-beta-gate.sh", "BETA_GATE"), ("run-full-validation.sh", "VALIDATION")]:
-            result = subprocess.run(["bash", str(scripts / name)], env=self.env, text=True, capture_output=True, timeout=10)
+        for name, marker in [
+            ("run-beta-gate.sh", "BETA_GATE"),
+            ("run-full-validation.sh", "VALIDATION"),
+        ]:
+            result = subprocess.run(
+                ["bash", str(scripts / name)],
+                env=self.env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn(f"{marker}_RESULT=FAIL", result.stdout)
             self.assertIn("test", result.stdout)
             self.assertIn(f"{marker}_PASS=5/6", result.stdout)
             calls = Path(self.env["ZC_GATE_LOG"]).read_text().splitlines()
-            self.assertCountEqual(calls, ["release", "check", "test", "delivery-test", "e2e", "install-test"])
+            self.assertCountEqual(
+                calls,
+                ["release", "check", "test", "delivery-test", "e2e", "install-test"],
+            )
             Path(self.env["ZC_GATE_LOG"]).write_text("")
-            result = subprocess.run(["bash", str(scripts / name)], env=dict(self.env, ZC_FAIL_GATE="none"), text=True, capture_output=True, timeout=10)
+            result = subprocess.run(
+                ["bash", str(scripts / name)],
+                env=dict(self.env, ZC_FAIL_GATE="none"),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn(f"{marker}_RESULT=PASS", result.stdout)
             self.assertIn(f"{marker}_PASS=6/6", result.stdout)
@@ -215,7 +346,9 @@ class JustfileContract(unittest.TestCase):
         scripts = repo / "scripts" / "install"
         scripts.mkdir(parents=True)
         installer = scripts / "local-dev-install.sh"
-        installer.write_text((ROOT / "scripts/install/local-dev-install.sh").read_text())
+        installer.write_text(
+            (ROOT / "scripts/install/local-dev-install.sh").read_text()
+        )
         release = repo / "target" / "release"
         release.mkdir(parents=True)
         binary = release / "zc"
@@ -223,7 +356,13 @@ class JustfileContract(unittest.TestCase):
         binary.chmod(0o755)
         home = self.work / "home"
         home.mkdir(mode=0o700)
-        result = subprocess.run(["bash", str(installer)], env=dict(self.env, HOME=str(home)), text=True, capture_output=True, timeout=15)
+        result = subprocess.run(
+            ["bash", str(installer)],
+            env=dict(self.env, HOME=str(home)),
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         installed = home / ".local" / "bin" / "zc"
         self.assertEqual(installed.read_bytes(), binary.read_bytes())

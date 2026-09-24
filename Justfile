@@ -17,9 +17,26 @@ release:
 install *args: release
     bash scripts/install/local-dev-install.sh "$@"
 
+# Install pre-commit hooks in this clone (requires the pre-commit tool).
+hooks-install:
+    pre-commit install
+
+# Test the hook through real commits in isolated repositories.
+hooks-test:
+    python3 scripts/ci/test-format-hook.py
+
 # Format Rust source files.
 fmt:
     cargo fmt --all
+
+# Format maintained Python scripts with the pinned Ruff version.
+python-fmt:
+    uvx ruff==0.16.8 format .
+
+# Check Python formatting and basic static errors without modifying files.
+python-check:
+    uvx ruff==0.16.8 format --check .
+    uvx ruff==0.16.8 check .
 
 # Check Rust formatting and lint all targets.
 check:

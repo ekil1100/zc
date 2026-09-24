@@ -49,7 +49,9 @@ class Origin(socketserver.ThreadingTCPServer):
         self.count = 0
         self.lock = threading.Lock()
         self.requests = []
-        super().__init__(("::1" if family == socket.AF_INET6 else "127.0.0.1", 0), Handler)
+        super().__init__(
+            ("::1" if family == socket.AF_INET6 else "127.0.0.1", 0), Handler
+        )
 
     def connections(self):
         with self.lock:
@@ -68,7 +70,9 @@ class Handler(socketserver.BaseRequestHandler):
                 head = http_head(self.request)
                 with self.server.lock:
                     self.server.requests.append(head)
-                self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nfixture-origin")
+                self.request.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nfixture-origin"
+                )
                 return
             if self.server.mode == "banner":
                 self.request.sendall(BANNER)
@@ -86,7 +90,9 @@ class Handler(socketserver.BaseRequestHandler):
 @contextlib.contextmanager
 def origin(mode="echo", family=socket.AF_INET):
     with Origin(mode, family) as server:
-        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.02}
+        )
         thread.start()
         try:
             yield server
@@ -145,10 +151,19 @@ def runtime(zc, directory, label, proxy=None, trusted=False, reject=False):
     directory = directory / label
     directory.mkdir()
     listen_port = port()
-    config = {"mixed-port": 7892, "rules": ["DOMAIN,blocked.invalid,REJECT", "MATCH,REJECT" if reject else "MATCH,DIRECT"]}
+    config = {
+        "mixed-port": 7892,
+        "rules": [
+            "DOMAIN,blocked.invalid,REJECT",
+            "MATCH,REJECT" if reject else "MATCH,DIRECT",
+        ],
+    }
     if proxy:
         config["proxies"] = [dict(name="edge", **proxy)]
-        config["proxy-groups"] = [{"name": "outer", "type": "select", "proxies": ["inner", "REJECT"]}, {"name": "inner", "type": "select", "proxies": ["edge"]}]
+        config["proxy-groups"] = [
+            {"name": "outer", "type": "select", "proxies": ["inner", "REJECT"]},
+            {"name": "inner", "type": "select", "proxies": ["edge"]},
+        ]
         config["rules"][-1] = "MATCH,outer"
     config_file = directory / "config.yaml"
     config_file.write_text(json.dumps(config))
@@ -157,7 +172,12 @@ def runtime(zc, directory, label, proxy=None, trusted=False, reject=False):
     home.mkdir()
     run = directory / "run"
     run.mkdir(mode=0o700)
-    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"), XDG_RUNTIME_DIR=str(run))
+    env = dict(
+        os.environ,
+        HOME=str(home),
+        XDG_CONFIG_HOME=str(home / "config"),
+        XDG_RUNTIME_DIR=str(run),
+    )
     if trusted:
         env["SSL_CERT_FILE"] = str(ROOT / "testdata/e2e/trojan-cert.pem")
         env["SSL_CERT_DIR"] = str(directory / "empty-certs")
@@ -165,11 +185,29 @@ def runtime(zc, directory, label, proxy=None, trusted=False, reject=False):
     else:
         env.pop("SSL_CERT_FILE", None)
         env.pop("SSL_CERT_DIR", None)
-    args = [str(zc), "start", "--config", str(config_file), "--port", str(listen_port), "--foreground"]
-    with process(args, directory / "zc.log", listen_port, env, f"listening on 127.0.0.1:{listen_port}"):
+    args = [
+        str(zc),
+        "start",
+        "--config",
+        str(config_file),
+        "--port",
+        str(listen_port),
+        "--foreground",
+    ]
+    with process(
+        args,
+        directory / "zc.log",
+        listen_port,
+        env,
+        f"listening on 127.0.0.1:{listen_port}",
+    ):
         yield listen_port
-    assert not (home / ".config/zc").exists(), "unmanaged runtime created a managed catalog"
-    assert not (home / "config/zc").exists(), "unmanaged runtime created an XDG managed catalog"
+    assert not (home / ".config/zc").exists(), (
+        "unmanaged runtime created a managed catalog"
+    )
+    assert not (home / "config/zc").exists(), (
+        "unmanaged runtime created an XDG managed catalog"
+    )
     # Foreground now participates in the same nonce-bound lifecycle as daemon mode.
     # Persistent locks/key/log are allowed; live identity and prepared inputs are not.
     assert not (run / "zc.pid").exists(), "foreground left a live PID file"
@@ -180,7 +218,9 @@ def runtime(zc, directory, label, proxy=None, trusted=False, reject=False):
     for state_file in run.iterdir():
         assert not state_file.is_symlink(), "lifecycle file is a symlink"
         assert state_file.is_file(), "unexpected lifecycle file type"
-        assert state_file.stat().st_mode & 0o777 == 0o600, "lifecycle file is not private"
+        assert state_file.stat().st_mode & 0o777 == 0o600, (
+            "lifecycle file is not private"
+        )
 
 
 def tunnel(mixed_port, target, kind="socks", host=None):
@@ -189,8 +229,12 @@ def tunnel(mixed_port, target, kind="socks", host=None):
     stream.settimeout(WAIT)
     try:
         if kind == "connect":
-            authority = f"[{host}]:{target[1]}" if ":" in host else f"{host}:{target[1]}"
-            stream.sendall(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+            authority = (
+                f"[{host}]:{target[1]}" if ":" in host else f"{host}:{target[1]}"
+            )
+            stream.sendall(
+                f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode()
+            )
             assert http_head(stream).startswith(b"HTTP/1.1 200 "), "CONNECT was refused"
         else:
             stream.sendall(b"\x05\x01\x00")
@@ -203,7 +247,9 @@ def tunnel(mixed_port, target, kind="socks", host=None):
                 except OSError:
                     address = b"\x03" + bytes([len(host)]) + host.encode()
             stream.sendall(b"\x05\x01\x00" + address + struct.pack("!H", target[1]))
-            assert exact(stream, 10)[:4] == b"\x05\x00\x00\x01", "SOCKS CONNECT was refused"
+            assert exact(stream, 10)[:4] == b"\x05\x00\x00\x01", (
+                "SOCKS CONNECT was refused"
+            )
         return stream
     except BaseException:
         stream.close()
@@ -221,7 +267,9 @@ def roundtrip(mixed_port, server, kind="socks", host=None, half_close=True):
         if half_close:
             stream.shutdown(socket.SHUT_WR)
             assert stream.recv(1) == b"", "EOF was not propagated"
-    assert server.connections() == before + 1, "traffic did not traverse independent origin"
+    assert server.connections() == before + 1, (
+        "traffic did not traverse independent origin"
+    )
 
 
 def denied(mixed_port, server, kind="socks"):
@@ -245,7 +293,9 @@ def forward(mixed_port, server):
     with socket.create_connection(("127.0.0.1", mixed_port), WAIT) as stream:
         stream.settimeout(WAIT)
         address = f"127.0.0.1:{server.server_address[1]}"
-        stream.sendall(f"GET http://{address}/probe HTTP/1.1\r\nHost: {address}\r\nProxy-Authorization: Basic never-forward\r\n\r\n".encode())
+        stream.sendall(
+            f"GET http://{address}/probe HTTP/1.1\r\nHost: {address}\r\nProxy-Authorization: Basic never-forward\r\n\r\n".encode()
+        )
         assert http_head(stream).startswith(b"HTTP/1.1 200 ")
         assert exact(stream, 14) == b"fixture-origin"
     assert server.connections() == before + 1
@@ -256,8 +306,12 @@ def forward(mixed_port, server):
 
 
 def run(zc, fixtures, work):
-    assert "shadowsocks 1.24.0" in subprocess.check_output([str(fixtures / "ssserver"), "--version"], text=True)
-    assert "Trojan-Go v0.10.6" in subprocess.check_output([str(fixtures / "trojan-go"), "-version"], text=True)
+    assert "shadowsocks 1.24.0" in subprocess.check_output(
+        [str(fixtures / "ssserver"), "--version"], text=True
+    )
+    assert "Trojan-Go v0.10.6" in subprocess.check_output(
+        [str(fixtures / "trojan-go"), "-version"], text=True
+    )
     with contextlib.ExitStack() as stack:
         echo = stack.enter_context(origin())
         banner = stack.enter_context(origin("banner"))
@@ -271,26 +325,83 @@ def run(zc, fixtures, work):
             denied(mixed, echo)
             denied(mixed, echo, "connect")
         print("PASS DIRECT/REJECT and HTTP forward")
-        for index, cipher in enumerate(["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "chacha20-poly1305"]):
+        for index, cipher in enumerate(
+            [
+                "aes-128-gcm",
+                "aes-256-gcm",
+                "chacha20-ietf-poly1305",
+                "chacha20-poly1305",
+            ]
+        ):
             listen = port()
-            server_cipher = "chacha20-ietf-poly1305" if cipher == "chacha20-poly1305" else cipher
-            args = [str(fixtures / "ssserver"), "-s", f"127.0.0.1:{listen}", "-k", "e2e-password", "-m", server_cipher]
+            server_cipher = (
+                "chacha20-ietf-poly1305" if cipher == "chacha20-poly1305" else cipher
+            )
+            args = [
+                str(fixtures / "ssserver"),
+                "-s",
+                f"127.0.0.1:{listen}",
+                "-k",
+                "e2e-password",
+                "-m",
+                server_cipher,
+            ]
             with process(args, work / f"ss-{index}.log", listen):
-                proxy = {"type": "ss", "server": "localhost", "port": listen, "password": "e2e-password", "cipher": cipher}
+                proxy = {
+                    "type": "ss",
+                    "server": "localhost",
+                    "port": listen,
+                    "password": "e2e-password",
+                    "cipher": cipher,
+                }
                 with runtime(zc, work, f"ss-{index}", proxy) as mixed:
                     roundtrip(mixed, echo, host="localhost")
                     roundtrip(mixed, banner, "connect")
                     roundtrip(mixed, ipv6)
                     forward(mixed, http)
-                with runtime(zc, work, f"ss-{index}-bad-password", dict(proxy, password="wrong-password")) as mixed:
+                with runtime(
+                    zc,
+                    work,
+                    f"ss-{index}-bad-password",
+                    dict(proxy, password="wrong-password"),
+                ) as mixed:
                     denied(mixed, echo)
-            print(f"PASS Shadowsocks {cipher}: domain/IPv4/IPv6, server-first, forward, wrong password")
+            print(
+                f"PASS Shadowsocks {cipher}: domain/IPv4/IPv6, server-first, forward, wrong password"
+            )
         listen = port()
         fallback = stack.enter_context(origin("sink"))
         trojan_file = work / "trojan.json"
-        trojan_file.write_text(json.dumps({"run_type": "server", "log_level": 2, "local_addr": "127.0.0.1", "local_port": listen, "remote_addr": "127.0.0.1", "remote_port": fallback.server_address[1], "password": ["e2e-password"], "ssl": {"cert": str(ROOT / "testdata/e2e/trojan-cert.pem"), "key": str(ROOT / "testdata/e2e/trojan-key.pem")}, "router": {"enabled": False}}))
-        with process([str(fixtures / "trojan-go"), "-config", str(trojan_file)], work / "trojan.log", listen):
-            proxy = {"type": "trojan", "server": "localhost", "port": listen, "password": "e2e-password", "sni": "localhost.localdomain"}
+        trojan_file.write_text(
+            json.dumps(
+                {
+                    "run_type": "server",
+                    "log_level": 2,
+                    "local_addr": "127.0.0.1",
+                    "local_port": listen,
+                    "remote_addr": "127.0.0.1",
+                    "remote_port": fallback.server_address[1],
+                    "password": ["e2e-password"],
+                    "ssl": {
+                        "cert": str(ROOT / "testdata/e2e/trojan-cert.pem"),
+                        "key": str(ROOT / "testdata/e2e/trojan-key.pem"),
+                    },
+                    "router": {"enabled": False},
+                }
+            )
+        )
+        with process(
+            [str(fixtures / "trojan-go"), "-config", str(trojan_file)],
+            work / "trojan.log",
+            listen,
+        ):
+            proxy = {
+                "type": "trojan",
+                "server": "localhost",
+                "port": listen,
+                "password": "e2e-password",
+                "sni": "localhost.localdomain",
+            }
             with runtime(zc, work, "trojan-verified", proxy, trusted=True) as mixed:
                 roundtrip(mixed, echo, host="localhost")
                 roundtrip(mixed, banner, "connect")
@@ -301,11 +412,20 @@ def run(zc, fixtures, work):
                 ("wrong-sni", dict(proxy, sni="wrong.example"), True),
                 ("wrong-password", dict(proxy, password="wrong-password"), True),
             ]:
-                with runtime(zc, work, f"trojan-{label}", settings, trusted=trust) as mixed:
+                with runtime(
+                    zc, work, f"trojan-{label}", settings, trusted=trust
+                ) as mixed:
                     denied(mixed, echo, "connect")
-            with runtime(zc, work, "trojan-explicit-skip", dict(proxy, **{"skip-cert-verify": True})) as mixed:
+            with runtime(
+                zc,
+                work,
+                "trojan-explicit-skip",
+                dict(proxy, **{"skip-cert-verify": True}),
+            ) as mixed:
                 roundtrip(mixed, echo)
-        print("PASS Trojan: verified TLS, domain/IPv4/IPv6, forward, SNI/trust/password rejection, explicit skip")
+        print(
+            "PASS Trojan: verified TLS, domain/IPv4/IPv6, forward, SNI/trust/password rejection, explicit skip"
+        )
     print("PASS Rust TCP independent fixture E2E")
 
 

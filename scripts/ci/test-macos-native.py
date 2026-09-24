@@ -52,7 +52,11 @@ def require_ci(args):
 
 def diagnostic_text(value, argv, env=None):
     # TimeoutExpired carries bytes even with text=True. Redact BEFORE truncating.
-    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
+    text = (
+        value.decode("utf-8", errors="replace")
+        if isinstance(value, bytes)
+        else (value or "")
+    )
     for index, arg in enumerate(argv[:-1]):
         if str(arg) == "-p" and str(argv[index + 1]):
             text = text.replace(str(argv[index + 1]), "<REDACTED>")
@@ -69,7 +73,10 @@ def sample_owned_setter(child, label, deadline):
         return
     sample_deadline = min(deadline, time.monotonic() + 3)
     if sample_deadline <= time.monotonic():
-        print(f"FAIL sample {label} setter_pid={child.pid}: no remaining budget", flush=True)
+        print(
+            f"FAIL sample {label} setter_pid={child.pid}: no remaining budget",
+            flush=True,
+        )
         return
     sampler = None
     output = ""
@@ -77,11 +84,18 @@ def sample_owned_setter(child, label, deadline):
     try:
         sampler = subprocess.Popen(
             ["/usr/bin/sample", str(child.pid), "1", "-file", "/dev/stdout"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, umask=0o077,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            umask=0o077,
         )
-        print(f"BEGIN sample {label} setter_pid={child.pid} pid={sampler.pid}", flush=True)
-        output, _stderr = sampler.communicate(timeout=max(0, sample_deadline - time.monotonic()))
+        print(
+            f"BEGIN sample {label} setter_pid={child.pid} pid={sampler.pid}", flush=True
+        )
+        output, _stderr = sampler.communicate(
+            timeout=max(0, sample_deadline - time.monotonic())
+        )
         if sampler.returncode != 0:
             failure = f"exit {sampler.returncode}"
     except subprocess.TimeoutExpired as error:
@@ -98,7 +112,9 @@ def sample_owned_setter(child, label, deadline):
                     sampler.kill()
                 sampler.wait()
             except (Exception, KeyboardInterrupt) as error:
-                failure = f"{failure or ''}; sample reap failed ({type(error).__name__})"
+                failure = (
+                    f"{failure or ''}; sample reap failed ({type(error).__name__})"
+                )
             for stream in (sampler.stdout, sampler.stderr):
                 try:
                     stream.close()
@@ -111,29 +127,44 @@ def sample_owned_setter(child, label, deadline):
     if marker in text:
         stack = marker + text.split(marker, 1)[1].split("\nBinary Images:", 1)[0]
         # Reserve one byte for print's trailing newline.
-        print(stack.encode("utf-8")[:16383].decode("utf-8", errors="ignore"),
-              file=sys.stderr, flush=True)
+        print(
+            stack.encode("utf-8")[:16383].decode("utf-8", errors="ignore"),
+            file=sys.stderr,
+            flush=True,
+        )
     elif failure is None:
         failure = "no call graph in sample output"
     stage = "FAIL" if failure else "END"
     pid = sampler.pid if sampler is not None else "unavailable"
-    print(f"{stage} sample {label} setter_pid={child.pid} pid={pid}: {failure or 'captured'}", flush=True)
+    print(
+        f"{stage} sample {label} setter_pid={child.pid} pid={pid}: {failure or 'captured'}",
+        flush=True,
+    )
 
 
-def command(argv, label, *, timeout=30, env=None, diagnostics=False, sample_trust=False):
+def command(
+    argv, label, *, timeout=30, env=None, diagnostics=False, sample_trust=False
+):
     # Never log argv/successful output: security's argv contains the temporary password.
     started = time.monotonic()
     deadline = started + timeout
     try:
         child = subprocess.Popen(
-            [str(arg) for arg in argv], cwd=ROOT, env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, umask=0o077,
+            [str(arg) for arg in argv],
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            umask=0o077,
         )
     except OSError as error:
         # Exception strings may contain argv or filenames; do not print them.
         print(f"FAIL {label} pid=unavailable spawn errno={error.errno}", flush=True)
-        raise RuntimeError(f"{label}: could not start child (errno {error.errno})") from error
+        raise RuntimeError(
+            f"{label}: could not start child (errno {error.errno})"
+        ) from error
     print(f"BEGIN {label} pid={child.pid}", flush=True)
     primary = None
     cleanup_errors = []
@@ -148,9 +179,13 @@ def command(argv, label, *, timeout=30, env=None, diagnostics=False, sample_trus
                 stdout, stderr = error.output, error.stderr
                 sample_owned_setter(child, label, deadline)
                 # Sampling spends the ORIGINAL budget; never start another watchdog.
-                stdout, stderr = child.communicate(timeout=max(0, deadline - time.monotonic()))
+                stdout, stderr = child.communicate(
+                    timeout=max(0, deadline - time.monotonic())
+                )
         else:
-            stdout, stderr = child.communicate(timeout=max(0, deadline - time.monotonic()))
+            stdout, stderr = child.communicate(
+                timeout=max(0, deadline - time.monotonic())
+            )
         if child.returncode != 0:
             primary = RuntimeError(f"{label}: child failed (exit {child.returncode})")
     except subprocess.TimeoutExpired as error:
@@ -171,43 +206,71 @@ def command(argv, label, *, timeout=30, env=None, diagnostics=False, sample_trus
                     child.kill()
             child.wait()
         except (Exception, KeyboardInterrupt) as error:
-            cleanup_errors.append(f"{label}: child reap failed ({type(error).__name__})")
+            cleanup_errors.append(
+                f"{label}: child reap failed ({type(error).__name__})"
+            )
         for stream in (child.stdout, child.stderr):
             try:
                 stream.close()
             except (Exception, KeyboardInterrupt) as error:
-                cleanup_errors.append(f"{label}: stream close failed ({type(error).__name__})")
+                cleanup_errors.append(
+                    f"{label}: stream close failed ({type(error).__name__})"
+                )
     if primary is not None:
         detail = diagnostic_text(stderr, argv, env)
         if diagnostics:
             detail = diagnostic_text(stdout, argv, env) + detail
         if detail:
-            print(detail[-(16384 if diagnostics else 2048):], file=sys.stderr, flush=True)
+            print(
+                detail[-(16384 if diagnostics else 2048) :], file=sys.stderr, flush=True
+            )
     if primary is not None or cleanup_errors:
-        message = "; ".join(([str(primary)] if primary is not None else []) + cleanup_errors)
-        print(f"FAIL {label} pid={child.pid} elapsed={time.monotonic() - started:.3f}s: {message}",
-              flush=True)
+        message = "; ".join(
+            ([str(primary)] if primary is not None else []) + cleanup_errors
+        )
+        print(
+            f"FAIL {label} pid={child.pid} elapsed={time.monotonic() - started:.3f}s: {message}",
+            flush=True,
+        )
         raise RuntimeError(message) from primary
-    print(f"END {label} pid={child.pid} exit=0 elapsed={time.monotonic() - started:.3f}s", flush=True)
+    print(
+        f"END {label} pid={child.pid} exit=0 elapsed={time.monotonic() - started:.3f}s",
+        flush=True,
+    )
     return stdout
 
 
 def build(target):
-    output = command([
-        "cargo", "test", "--locked", "--release", "--target", target,
-        "--test", "macos_native", "--no-run", "--message-format=json",
-    ], "release test build", timeout=1800, diagnostics=True)
+    output = command(
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "--release",
+            "--target",
+            target,
+            "--test",
+            "macos_native",
+            "--no-run",
+            "--message-format=json",
+        ],
+        "release test build",
+        timeout=1800,
+        diagnostics=True,
+    )
     artifacts = set()
     for line in output.splitlines():
         try:
             message = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (message.get("reason") == "compiler-artifact"
-                and message.get("target", {}).get("name") == "macos_native"
-                and "test" in message.get("target", {}).get("kind", [])
-                and message.get("profile", {}).get("test") is True
-                and message.get("executable")):
+        if (
+            message.get("reason") == "compiler-artifact"
+            and message.get("target", {}).get("name") == "macos_native"
+            and "test" in message.get("target", {}).get("kind", [])
+            and message.get("profile", {}).get("test") is True
+            and message.get("executable")
+        ):
             artifacts.add(Path(message["executable"]).resolve())
     if len(artifacts) != 1:
         raise RuntimeError("build must report exactly one macos_native test executable")
@@ -227,7 +290,9 @@ def generate_certificate(directory):
     # Self-signed end-entity certificate: it is both the tested leaf and trust anchor.
     # CA:FALSE avoids accidentally testing a CA certificate as a TLS end entity.
     config = directory / "openssl.cnf"
-    private_write(config, f"""[req]
+    private_write(
+        config,
+        f"""[req]
  distinguished_name = dn
  x509_extensions = extensions
  prompt = no
@@ -238,13 +303,30 @@ def generate_certificate(directory):
  keyUsage = critical,digitalSignature,keyEncipherment
  extendedKeyUsage = serverAuth
  subjectAltName = DNS:front.example
-""")
-    command([
-        "/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-sha256", "-days", "2", "-set_serial", "0x" + secrets.token_hex(16),
-        "-config", config, "-keyout", directory / "key.pem",
-        "-out", directory / "cert.pem",
-    ], "generate unique test certificate")
+""",
+    )
+    command(
+        [
+            "/usr/bin/openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-sha256",
+            "-days",
+            "2",
+            "-set_serial",
+            "0x" + secrets.token_hex(16),
+            "-config",
+            config,
+            "-keyout",
+            directory / "key.pem",
+            "-out",
+            directory / "cert.pem",
+        ],
+        "generate unique test certificate",
+    )
     for name in ("cert.pem", "key.pem"):
         (directory / name).chmod(0o600)
 
@@ -259,35 +341,55 @@ def run_case(artifact, directory, case):
     # Unset BOTH only in the CI test child. Empty SSL_CERT_DIR is not isolation.
     env.pop("SSL_CERT_FILE", None)
     env.pop("SSL_CERT_DIR", None)
-    env.update({
-        "ZC_MACOS_NATIVE_EPHEMERAL": "confirmed",
-        "ZC_MACOS_NATIVE_FIXTURE": str(directory),
-        "ZC_MACOS_NATIVE_NONCE": nonce,
-    })
+    env.update(
+        {
+            "ZC_MACOS_NATIVE_EPHEMERAL": "confirmed",
+            "ZC_MACOS_NATIVE_FIXTURE": str(directory),
+            "ZC_MACOS_NATIVE_NONCE": nonce,
+        }
+    )
     started = time.monotonic()
-    output = command([
-        artifact, "--ignored", "--exact", TEST, "--nocapture",
-        "--test-threads=1", "--format=terse",
-    ], f"native scenario {case}", timeout=CASE_TIMEOUT, env=env, diagnostics=True)
+    output = command(
+        [
+            artifact,
+            "--ignored",
+            "--exact",
+            TEST,
+            "--nocapture",
+            "--test-threads=1",
+            "--format=terse",
+        ],
+        f"native scenario {case}",
+        timeout=CASE_TIMEOUT,
+        env=env,
+        diagnostics=True,
+    )
     for stage in ("BEGIN", "PASS"):
         marker = f"ZC_MACOS_NATIVE_{stage} {case} {nonce}"
         if output.count(marker) != 1:
             raise RuntimeError(f"{case}: missing or duplicate {stage} assertion marker")
     if "test result: ok. 1 passed; 0 failed; 0 ignored;" not in output:
-        raise RuntimeError(f"{case}: expected exactly one executed test, not a skipped test")
+        raise RuntimeError(
+            f"{case}: expected exactly one executed test, not a skipped test"
+        )
     print(f"PASS native {case} ({time.monotonic() - started:.3f}s)", flush=True)
 
 
 def scenarios(artifact):
     # No fake HOME: CI explicitly authorizes changes to this disposable user's trust.
     # Snapshot BEFORE create-keychain, which may itself change the search list.
-    original_search = shlex.split(command(
-        [SECURITY, "list-keychains", "-d", "user"], "snapshot user keychain search list"
-    ))
+    original_search = shlex.split(
+        command(
+            [SECURITY, "list-keychains", "-d", "user"],
+            "snapshot user keychain search list",
+        )
+    )
     if any(not Path(path).is_absolute() for path in original_search):
         raise RuntimeError("cannot safely parse original keychain search list")
     # Admin priority is required here, not silently skipped if sudo is unavailable.
-    command(["/usr/bin/sudo", "-n", "true"], "require noninteractive disposable runner sudo")
+    command(
+        ["/usr/bin/sudo", "-n", "true"], "require noninteractive disposable runner sudo"
+    )
     directory = Path(tempfile.mkdtemp(prefix="zc-macos-native-")).resolve()
     keychain = directory / "owned.keychain-db"
     certificate = directory / "cert.pem"
@@ -298,14 +400,25 @@ def scenarios(artifact):
     def security(domain, *args, sample_trust=False):
         prefix = ["/usr/bin/sudo", "-n"] if domain == "admin" else []
         domain_args = ["-d"] if domain == "admin" else []
-        return command(prefix + [SECURITY, args[0]] + domain_args + list(args[1:]),
-                       f"{domain} owned certificate {args[0]}", sample_trust=sample_trust)
+        return command(
+            prefix + [SECURITY, args[0]] + domain_args + list(args[1:]),
+            f"{domain} owned certificate {args[0]}",
+            sample_trust=sample_trust,
+        )
 
     def trust(domain, result):
         # Mark BEFORE attempting mutation so partial failure still gets cleanup.
         touched.add(domain)
-        security(domain, "add-trusted-cert", "-r", result,
-                 "-k", keychain, certificate, sample_trust=True)
+        security(
+            domain,
+            "add-trusted-cert",
+            "-r",
+            result,
+            "-k",
+            keychain,
+            certificate,
+            sample_trust=True,
+        )
 
     def remove(domain):
         security(domain, "remove-trusted-cert", certificate)
@@ -315,14 +428,35 @@ def scenarios(artifact):
         generate_certificate(directory)
         password = secrets.token_hex(32)
         keychain_attempted = True
-        command([SECURITY, "create-keychain", "-p", password, keychain], "create owned keychain")
-        command([SECURITY, "unlock-keychain", "-p", password, keychain], "unlock owned keychain")
-        command([SECURITY, "list-keychains", "-d", "user", "-s", *original_search, keychain],
-                "append owned keychain to user search list")
+        command(
+            [SECURITY, "create-keychain", "-p", password, keychain],
+            "create owned keychain",
+        )
+        command(
+            [SECURITY, "unlock-keychain", "-p", password, keychain],
+            "unlock owned keychain",
+        )
+        command(
+            [
+                SECURITY,
+                "list-keychains",
+                "-d",
+                "user",
+                "-s",
+                *original_search,
+                keychain,
+            ],
+            "append owned keychain to user search list",
+        )
         run_case(artifact, directory, "baseline-untrusted")
         trust("user", "trustRoot")
-        for case in ("security-first", "dns-first", "wrong-sni",
-                     "concurrent-independent", "concurrent-shared"):
+        for case in (
+            "security-first",
+            "dns-first",
+            "wrong-sni",
+            "concurrent-independent",
+            "concurrent-shared",
+        ):
             run_case(artifact, directory, case)
         remove("user")
         trust("user", "deny")
@@ -348,27 +482,42 @@ def scenarios(artifact):
             if domain in touched:
                 cleanup(lambda domain=domain: remove(domain))
         if keychain_attempted:
-            cleanup(lambda: command(
-                [SECURITY, "list-keychains", "-d", "user", "-s", *original_search],
-                "restore original user keychain search list",
-            ))
+            cleanup(
+                lambda: command(
+                    [SECURITY, "list-keychains", "-d", "user", "-s", *original_search],
+                    "restore original user keychain search list",
+                )
+            )
+
             def delete_keychain():
                 if keychain.exists():
                     # Deleting only our whole keychain also removes the owned certificate.
-                    command([SECURITY, "delete-keychain", keychain], "delete owned keychain")
+                    command(
+                        [SECURITY, "delete-keychain", keychain], "delete owned keychain"
+                    )
+
             cleanup(delete_keychain)
 
             def verify_search():
-                restored = shlex.split(command(
-                    [SECURITY, "list-keychains", "-d", "user"], "verify restored search list"
-                ))
+                restored = shlex.split(
+                    command(
+                        [SECURITY, "list-keychains", "-d", "user"],
+                        "verify restored search list",
+                    )
+                )
                 if restored != original_search:
-                    raise RuntimeError("user keychain search list was not restored exactly")
+                    raise RuntimeError(
+                        "user keychain search list was not restored exactly"
+                    )
+
             cleanup(verify_search)
         if not errors:
             cleanup(lambda: shutil.rmtree(directory))
         if not errors:
-            print("PASS cleanup: owned trust/keychain removed; original search list restored", flush=True)
+            print(
+                "PASS cleanup: owned trust/keychain removed; original search list restored",
+                flush=True,
+            )
 
     failures = [f"PRIMARY: {primary}"] if primary is not None else []
     if errors:
@@ -387,8 +536,11 @@ def interrupted(_signum, _frame):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ephemeral-runner", action="store_true",
-                        help="confirm this macOS CI runner is disposable and has no concurrent trust writers")
+    parser.add_argument(
+        "--ephemeral-runner",
+        action="store_true",
+        help="confirm this macOS CI runner is disposable and has no concurrent trust writers",
+    )
     parser.add_argument("--target", required=True, choices=sorted(TARGETS.values()))
     args = parser.parse_args()
     require_ci(args)
@@ -397,7 +549,9 @@ def main():
         scenarios(build(args.target))
     finally:
         signal.signal(signal.SIGTERM, previous)
-    print("PASS all 9 native first-use scenarios; no System-domain or TrustAsRoot claim")
+    print(
+        "PASS all 9 native first-use scenarios; no System-domain or TrustAsRoot claim"
+    )
 
 
 if __name__ == "__main__":

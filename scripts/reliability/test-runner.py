@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """External soak contracts: explicit ports, real forwarding, bounded duration."""
+
 import json
 import pathlib
 import socket
@@ -13,7 +14,11 @@ ENTRY = ROOT / "scripts/reliability/run-soak-real.sh"
 
 class Soak(unittest.TestCase):
     def test_production_port_is_rejected(self):
-        result = subprocess.run(["bash", ENTRY, "--seconds", "1", "--port", "7899"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["bash", ENTRY, "--seconds", "1", "--port", "7899"],
+            capture_output=True,
+            text=True,
+        )
         self.assertEqual(result.returncode, 2)
         self.assertIn("7899", result.stderr)
 
@@ -23,7 +28,23 @@ class Soak(unittest.TestCase):
             port = probe.getsockname()[1]
         with tempfile.TemporaryDirectory() as work:
             report = pathlib.Path(work) / "soak.json"
-            result = subprocess.run(["bash", ENTRY, "--seconds", "2", "--interval", "0.5", "--port", str(port), "--output", report], capture_output=True, text=True, timeout=90)
+            result = subprocess.run(
+                [
+                    "bash",
+                    ENTRY,
+                    "--seconds",
+                    "2",
+                    "--interval",
+                    "0.5",
+                    "--port",
+                    str(port),
+                    "--output",
+                    report,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             data = json.loads(report.read_text())
             self.assertEqual(data["status"], "PASS")
@@ -40,7 +61,21 @@ class Soak(unittest.TestCase):
             owner.bind(("127.0.0.1", 0))
             owner.listen()
             port = owner.getsockname()[1]
-            result = subprocess.run(["bash", ENTRY, "--seconds", "1", "--port", str(port), "--output", str(pathlib.Path(work) / "busy.json")], capture_output=True, text=True, timeout=90)
+            result = subprocess.run(
+                [
+                    "bash",
+                    ENTRY,
+                    "--seconds",
+                    "1",
+                    "--port",
+                    str(port),
+                    "--output",
+                    str(pathlib.Path(work) / "busy.json"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(owner.getsockname()[1], port)
 

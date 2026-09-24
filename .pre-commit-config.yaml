@@ -1,0 +1,17 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      - id: ruff-format
+        args: [--check]
+        files: ^(scripts/|examples/support/|tests/fixtures/).*\.py$
+        stages: [pre-commit]
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: cargo fmt --all -- --check
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

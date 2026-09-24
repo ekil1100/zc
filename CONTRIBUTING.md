@@ -43,6 +43,38 @@ zig build
 zig build test
 ```
 
+### 提交前格式检查
+
+当前默认开发路径是 Rust，工具链和构建要求以 `AGENTS.md`、`Cargo.toml` 及 `Justfile` 为准。使用 `pre-commit` 管理 hook，配置位于随 Git 同步的 `.pre-commit-config.yaml`。安装工具后，每个新克隆启用一次：
+
+```bash
+uv tool install pre-commit
+just hooks-install
+```
+
+`git commit` 会由 `pre-commit` 暂时收起已跟踪文件中未暂存的修改，执行 Rust 格式检查 `cargo fmt --all -- --check`，对提交中的 Python 脚本执行 Ruff 格式检查，再恢复原修改；格式不合格就阻止提交。hook 不自动格式化或重新暂存文件；即使工作区已经修好、暂存区仍是未格式化版本，也不能通过。失败后执行：
+
+```bash
+just fmt         # Rust
+just python-fmt  # Python
+# 检查差异后重新暂存需要提交的文件，再提交。
+```
+
+hook 需要 Cargo 和 rustfmt（缺少时可运行 `rustup component add rustfmt`）。它只做格式检查，不替代测试或 Clippy。`pre-commit run --all-files` 可手动检查，`just hooks-test` 在临时仓库验证实际提交及部分暂存行为，需预先安装 `pre-commit`；CI 现有格式门禁不依赖安装 Git hook。
+
+若配置过 `core.hooksPath`，须先确认原 hook 的用途并迁移，再运行 `pre-commit install`；安装器不会静默覆盖该设置。不要盲目移除他人的 hook 配置。
+
+### Python 脚本检查
+
+`ruff.toml` 统一管理 `scripts/`、`examples/support/` 和 `tests/fixtures/` 下的 Python 脚本，固定 Ruff 版本为 `0.16.8`，基础规则检查未定义变量、未使用导入及常见语法问题。格式化目标为 Python 3.9，避免无意提高通用脚本的解释器要求；许可证生成器仍按其既有要求使用 Python 3.11 或更新版本。
+
+```bash
+just python-fmt    # 使用 uvx 调用固定版本，统一排版
+just python-check  # 只检查格式和基础静态错误
+```
+
+上述命令需要 `uv`，不会创建 Python 应用环境或给 zc 运行时添加依赖。pre-commit 会自动管理固定版本的 Ruff 环境，首次运行需要下载；hook 仅做格式检查，Python 静态检查放在本地 `just python-check` 和 CI 中，Clippy 仍由 `just check` 和 CI 执行。
+
 ### 代码规范
 
 - **提交信息**: 使用 conventional commits 格式
