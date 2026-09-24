@@ -22,6 +22,7 @@ use tokio::{
 
 use crate::{
     config::{Config, MatchContext, ProxyKind},
+    observability::{FailureStage, Observer},
     outbound::{BoxStream, Connector},
     target::Target,
     udp::{MAX_WIRE_BYTES, UdpSession},
@@ -40,6 +41,7 @@ pub struct Runtime {
 }
 
 struct ConnectionContext {
+    observer: Option<Arc<Observer>>,
     config: Arc<Config>,
     connector: Connector,
     udp_permits: Arc<Semaphore>,
@@ -55,12 +57,20 @@ impl Runtime {
         Ok(Self {
             listener,
             context: Arc::new(ConnectionContext {
+                observer: None,
                 config: Arc::new(config),
                 connector,
                 udp_permits: Arc::new(Semaphore::new(MAX_UDP_ASSOCIATIONS)),
                 forward_tls: OnceLock::new(),
             }),
         })
+    }
+
+    pub(crate) fn with_observer(mut self, observer: Arc<Observer>) -> Self {
+        Arc::get_mut(&mut self.context)
+            .expect("observer is attached before runtime sharing")
+            .observer = Some(observer);
+        self
     }
 
     pub fn config(&self) -> Arc<Config> {
@@ -74,36 +84,147 @@ impl Runtime {
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let mut tasks = JoinSet::new();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        // The task set and cancellation owner outlive the caught listener scope.
+        let mut result = crate::observability::catch_instance_panic(async {
         tokio::pin!(shutdown);
-        let result = loop {
+        loop {
             tokio::select! {
                 biased;
                 _ = &mut shutdown => break Ok(()),
                 completed = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Some(Err(error)) = completed {
-                        break Err(anyhow::anyhow!("connection task failed: {error}"));
+                    if let Some(ended) = completed
+                        && let Err(error) = ended.map_err(crate::observability::task_error).and_then(|r| r) {
+                        break Err(error);
                     }
                 }
                 accepted = self.listener.accept(), if tasks.len() < MAX_CONNECTIONS => {
-                    let (client, _) = match accepted {
+                    let (client, source) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => break Err(error).context("cannot accept TCP connection"),
                     };
                     let permit = permits.clone().try_acquire_owned()
                         .expect("task count bounds connection permits");
                     let context = self.context.clone();
+                    let connection = context.observer.as_ref().map(|observer| observer.connection());
+                    let mut stopped = stopped.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
-                        // Peer failures are isolated and never logged with request data.
-                        let _ = serve(client, context).await;
+                        let _connection = connection;
+                        // A Trojan UDP worker must remain owned even when serve is
+                        // cancelled or panics, and must be joined before the guard.
+                        let mut session = None;
+                        let result = crate::observability::catch_instance_panic(async {
+                            tokio::select! {
+                                biased;
+                                _ = stopped.changed() => {},
+                                served = serve(client, context.clone(), source, &mut session) => {
+                                    if let Err(error) = served { context.failure(FailureStage::Ingress, &error); }
+                                }
+                            }
+                            Ok(())
+                        }).await;
+                        let closed = match session.as_mut() {
+                            Some(session) => session.close().await,
+                            None => Ok(()),
+                        };
+                        result.and(closed)
                     });
                 }
             }
-        };
-        tasks.shutdown().await;
+        }
+        }).await;
+        let _ = stop.send(true);
+        while let Some(ended) = tasks.join_next().await {
+            let ended = ended
+                .map_err(crate::observability::task_error)
+                .and_then(|r| r);
+            if result.is_ok() {
+                result = ended;
+            }
+        }
         result
     }
 }
+
+impl ConnectionContext {
+    fn rejected(&self) {
+        if let Some(observer) = &self.observer {
+            observer.rejected();
+        }
+    }
+
+    fn failure(&self, fallback: FailureStage, error: &anyhow::Error) {
+        let stage = error
+            .downcast_ref::<FailureStage>()
+            .copied()
+            .unwrap_or(fallback);
+        // A raw tunnel's orderly EOF is Ok, not UnexpectedEof. At Transfer that
+        // error comes from protocol framing (HTTP, SS, obfs or TLS), not shutdown.
+        // Incomplete ingress handshakes and unframed peer resets remain normal.
+        if error.is::<IdleExpired>()
+            || (matches!(stage, FailureStage::Ingress | FailureStage::Transfer)
+                && !error.is::<HttpFramingTruncated>()
+                && !error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .and_then(io::Error::get_ref)
+                        .is_some_and(|inner| inner.is::<crate::outbound::ProtocolReadTruncated>())
+                })
+                && error.chain().any(|cause| {
+                    cause.downcast_ref::<io::Error>().is_some_and(|error| {
+                        (matches!(stage, FailureStage::Ingress)
+                            && error.kind() == io::ErrorKind::UnexpectedEof)
+                            || matches!(
+                                error.kind(),
+                                io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::BrokenPipe
+                            )
+                    })
+                }))
+        {
+            return;
+        }
+        if let Some(observer) = &self.observer {
+            if error.is::<tokio::time::error::Elapsed>()
+                || matches!(
+                    error.downcast_ref::<hickory_resolver::net::NetError>(),
+                    Some(hickory_resolver::net::NetError::Timeout)
+                )
+            {
+                // Normalize nested deadlines only for evidence, not wire replies.
+                observer.failure(stage, &io::Error::from(io::ErrorKind::TimedOut).into());
+            } else {
+                observer.failure(stage, error);
+            }
+        }
+    }
+
+    fn outcome<T>(
+        &self,
+        stage: FailureStage,
+        result: &Result<Result<T>, tokio::time::error::Elapsed>,
+    ) {
+        match result {
+            Ok(Err(error)) => self.failure(stage, error),
+            Err(_) => self.failure(
+                stage,
+                &anyhow::anyhow!(io::Error::from(io::ErrorKind::TimedOut)),
+            ),
+            Ok(Ok(_)) => {}
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IdleExpired;
+impl std::fmt::Display for IdleExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("connection idle expired")
+    }
+}
+impl std::error::Error for IdleExpired {}
 
 async fn http_reply(client: &mut (impl AsyncWrite + Unpin), status: &str) -> Result<()> {
     client
@@ -381,7 +502,7 @@ async fn http_line(reader: &mut (impl AsyncBufRead + Unpin), limit: usize) -> Re
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            bail!("incomplete HTTP line");
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
         let count = available
             .iter()
@@ -436,18 +557,21 @@ async fn dial(
     context: &ConnectionContext,
     target: &Target,
     source: SocketAddr,
+    stage: &mut FailureStage,
 ) -> Result<Option<BoxStream>> {
+    *stage = FailureStage::Dns;
     let route = context
         .config
         .route_with_context(target, &match_context(source))
         .await?;
     if matches!(route.proxy.kind, ProxyKind::Reject) {
+        context.rejected();
         return Ok(None);
     }
     Ok(Some(
         context
             .connector
-            .connect(route.proxy, &route.target)
+            .connect_observed(route.proxy, &route.target, stage)
             .await?,
     ))
 }
@@ -597,6 +721,9 @@ async fn associate(
     mut control: TcpStream,
     context: Arc<ConnectionContext>,
     requested: SocketAddr,
+    source: SocketAddr,
+    local: SocketAddr,
+    session: &mut Option<UdpSession>,
 ) -> Result<()> {
     if !context.config.proxies().iter().any(|proxy| {
         proxy.udp
@@ -605,10 +732,10 @@ async fn associate(
                 ProxyKind::Shadowsocks { .. } | ProxyKind::Trojan { .. }
             )
     }) {
+        context.rejected();
         timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut control, 7)).await??;
         return Ok(());
     }
-    let source = control.peer_addr()?;
     if !requested.ip().is_unspecified() && requested.ip() != source.ip() {
         timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut control, 2)).await??;
         return Ok(());
@@ -617,19 +744,22 @@ async fn associate(
         timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut control, 1)).await??;
         return Ok(());
     };
-    let socket = match UdpSocket::bind(SocketAddr::new(control.local_addr()?.ip(), 0)).await {
+    let socket = match UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await {
         Ok(socket) => socket,
-        Err(_) => {
+        Err(error) => {
+            context.failure(FailureStage::Udp, &error.into());
             timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut control, 1)).await??;
             return Ok(());
         }
     };
     #[cfg(unix)]
     {
-        rustix::net::sockopt::set_socket_send_buffer_size(&socket, 256 * 1024)?;
-        rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 256 * 1024)?;
+        rustix::net::sockopt::set_socket_send_buffer_size(&socket, 256 * 1024)
+            .context(FailureStage::Udp)?;
+        rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 256 * 1024)
+            .context(FailureStage::Udp)?;
     }
-    let bound = socket.local_addr()?;
+    let bound = socket.local_addr().context(FailureStage::Udp)?;
     let mut reply = vec![5, 0, 0];
     crate::outbound::destination(&Target::new(bound.ip().to_string(), bound.port())?)
         .write_to_buf(&mut reply);
@@ -640,7 +770,7 @@ async fn associate(
     tokio::select! {
         biased;
         _ = control.read(&mut byte) => Ok(()),
-        result = udp_relay(socket, &context, source.ip(), requested.port()) => result,
+        result = udp_relay(socket, &context, source.ip(), requested.port(), session) => result.context(FailureStage::Udp),
     }
 }
 
@@ -649,12 +779,12 @@ async fn udp_relay(
     context: &ConnectionContext,
     source_ip: IpAddr,
     requested_port: u16,
+    session: &mut Option<UdpSession>,
 ) -> Result<()> {
     let mut pinned = (requested_port != 0).then_some(SocketAddr::new(source_ip, requested_port));
     let mut storage = vec![0; 65536];
     // One outbound session per association bounds both per-node and total sessions
     // to 64. The selected leaf is immutable for each opened session.
-    let mut session: Option<UdpSession> = None;
     let mut deadline = Instant::now() + UDP_IDLE_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
@@ -670,17 +800,20 @@ async fn udp_relay(
                 let Ok((target, payload)) = udp_request(&storage[..len]) else { continue };
                 pinned = Some(sender);
                 let target = if session.is_none() {
+                    let mut stage = FailureStage::Dns;
                     let opened = timeout(HANDSHAKE_TIMEOUT, async {
                         let route = context.config.route_with_context(&target, &match_context(sender)).await?;
                         if !route.proxy.udp || !matches!(route.proxy.kind,
                             ProxyKind::Shadowsocks { .. } | ProxyKind::Trojan { .. }) {
-                            bail!("selected leaf does not support UDP associations");
+                            context.rejected();
+                            return Ok(None);
                         }
-                        let opened = context.connector.open_udp(route.proxy, &route.target).await?;
-                        Ok::<_, anyhow::Error>((opened, route.target))
+                        let opened = context.connector.open_udp_observed(route.proxy, &route.target, &mut stage).await?;
+                        Ok::<_, anyhow::Error>(Some((opened, route.target)))
                     }).await;
-                    let Ok(Ok((opened, target))) = opened else { return Ok(()) };
-                    session = Some(opened);
+                    context.outcome(stage, &opened);
+                    let Ok(Ok(Some((opened, target)))) = opened else { return Ok(()) };
+                    *session = Some(opened);
                     target
                 } else {
                     target
@@ -690,24 +823,29 @@ async fn udp_relay(
                 let forwarded = timeout(HANDSHAKE_TIMEOUT,
                     session.as_ref().expect("session opened").send_to(payload, &target)
                 ).await;
+                context.outcome(FailureStage::Udp, &forwarded);
                 if matches!(forwarded, Ok(Ok(_))) {
                     deadline = Instant::now() + UDP_IDLE_TIMEOUT;
                 }
             }
             received = async {
-                match &session {
+                match session.as_ref() {
                     Some(session) => session.recv_from().await,
                     None => std::future::pending().await,
                 }
             } => {
                 let datagram = match received {
                     Ok(datagram) => datagram,
-                    Err(_) => return Ok(()),
+                    Err(error) => {
+                        if !error.is::<crate::udp::IdleExpired>() { context.failure(FailureStage::Udp, &error); }
+                        return Ok(());
+                    },
                 };
                 if let Some(client) = pinned {
                     let Ok(response) = udp_response(&datagram.source, &datagram.payload) else { continue };
-                    if socket.send_to(&response, client).await.is_ok() {
-                        deadline = Instant::now() + UDP_IDLE_TIMEOUT;
+                    match socket.send_to(&response, client).await {
+                        Ok(_) => deadline = Instant::now() + UDP_IDLE_TIMEOUT,
+                        Err(error) => context.failure(FailureStage::Udp, &error.into()),
                     }
                 }
             }
@@ -715,11 +853,22 @@ async fn udp_relay(
     }
 }
 
-async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result<()> {
-    let source = client.peer_addr()?;
+async fn serve(
+    mut client: TcpStream,
+    context: Arc<ConnectionContext>,
+    source: SocketAddr,
+    session: &mut Option<UdpSession>,
+) -> Result<()> {
+    // accept supplies the stable peer address. Capture the local address before
+    // handshake awaits: a reset can make later TCP address queries fail.
+    let local = client.local_addr()?;
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut first = [0];
-    if timeout_at(deadline, client.peek(&mut first)).await?? == 0 {
+    if timeout_at(deadline, client.peek(&mut first))
+        .await
+        .context(IdleExpired)??
+        == 0
+    {
         return Ok(());
     }
     if first[0] == 5 {
@@ -729,12 +878,22 @@ async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result
         let target = match request {
             SocksRequest::Connect(target) => target,
             SocksRequest::Associate(requested) => {
-                return associate(client, context, requested).await;
+                // Control replies are ingress I/O; only actual relay operations
+                // carry Udp context. A vanished TCP peer is not a UDP fault.
+                return associate(client, context, requested, source, local, session).await;
             }
         };
-        let upstream = match timeout(HANDSHAKE_TIMEOUT, dial(&context, &target, source)).await {
+        // The operation owns its stage across cancellation; no connection shares it.
+        let mut stage = FailureStage::Connect;
+        let upstream = match timeout(
+            HANDSHAKE_TIMEOUT,
+            dial(&context, &target, source, &mut stage),
+        )
+        .await
+        {
             Ok(Ok(Some(upstream))) => upstream,
             result => {
+                context.outcome(stage, &result);
                 let code = match result {
                     Ok(Ok(None)) => 2,
                     Ok(Err(error)) => socks_connect_error(&error),
@@ -746,7 +905,9 @@ async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result
             }
         };
         timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut client, 0)).await??;
-        return transfer(client, upstream, Vec::new()).await;
+        return transfer(client, upstream, Vec::new())
+            .await
+            .context(FailureStage::Transfer);
     }
     let (read_client, mut write_client) = client.into_split();
     let mut client = BufReader::new(read_client);
@@ -756,12 +917,18 @@ async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result
         } else {
             Instant::now() + HANDSHAKE_TIMEOUT
         };
-        if number != 0 && timeout_at(deadline, client.fill_buf()).await??.is_empty() {
+        if number != 0
+            && timeout_at(deadline, client.fill_buf())
+                .await
+                .context(IdleExpired)??
+                .is_empty()
+        {
             return Ok(());
         }
         let request = match timeout_at(deadline, http_handshake(&mut client)).await {
             Ok(Ok(request)) => request,
-            _ => {
+            result => {
+                context.outcome(FailureStage::Ingress, &result);
                 timeout(
                     HANDSHAKE_TIMEOUT,
                     http_reply(&mut write_client, "400 Bad Request"),
@@ -770,18 +937,24 @@ async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result
                 return Ok(());
             }
         };
-        let mut upstream =
-            match timeout(HANDSHAKE_TIMEOUT, dial(&context, &request.target, source)).await {
-                Ok(Ok(Some(upstream))) => upstream,
-                _ => {
-                    timeout(
-                        HANDSHAKE_TIMEOUT,
-                        http_reply(&mut write_client, "502 Bad Gateway"),
-                    )
-                    .await??;
-                    return Ok(());
-                }
-            };
+        let mut stage = FailureStage::Connect;
+        let mut upstream = match timeout(
+            HANDSHAKE_TIMEOUT,
+            dial(&context, &request.target, source, &mut stage),
+        )
+        .await
+        {
+            Ok(Ok(Some(upstream))) => upstream,
+            result => {
+                context.outcome(stage, &result);
+                timeout(
+                    HANDSHAKE_TIMEOUT,
+                    http_reply(&mut write_client, "502 Bad Gateway"),
+                )
+                .await??;
+                return Ok(());
+            }
+        };
         let Some(mut forward) = request.forward else {
             timeout(
                 HANDSHAKE_TIMEOUT,
@@ -789,7 +962,9 @@ async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result
             )
             .await??;
             let prefix = client.buffer().to_vec();
-            return transfer(client.into_inner().reunite(write_client)?, upstream, prefix).await;
+            return transfer(client.into_inner().reunite(write_client)?, upstream, prefix)
+                .await
+                .context(FailureStage::Transfer);
         };
         if forward.tls {
             upstream = match timeout(
@@ -799,7 +974,8 @@ async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result
             .await
             {
                 Ok(Ok(stream)) => stream,
-                _ => {
+                result => {
+                    context.outcome(FailureStage::Tls, &result);
                     timeout(
                         HANDSHAKE_TIMEOUT,
                         http_reply(&mut write_client, "502 Bad Gateway"),
@@ -810,7 +986,10 @@ async fn serve(mut client: TcpStream, context: Arc<ConnectionContext>) -> Result
             };
         }
         forward.keep_alive &= number < 1023;
-        if !forward_http(&mut client, &mut write_client, upstream, forward).await? {
+        if !forward_http(&mut client, &mut write_client, upstream, forward)
+            .await
+            .context(FailureStage::Transfer)?
+        {
             return Ok(());
         }
     }
@@ -845,13 +1024,52 @@ async fn https_stream(
     Ok(Box::new(tls.connect(name, upstream).await?))
 }
 
+#[derive(Debug)]
+struct HttpFramingTruncated;
+impl std::fmt::Display for HttpFramingTruncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incomplete HTTP framing")
+    }
+}
+impl std::error::Error for HttpFramingTruncated {}
+
+// Preserve the copy loop and distinguish a failed frame read from a cancelled
+// peer write. Only the former proves truncation of the declared HTTP body.
+struct HttpBodyReader<R> {
+    reader: R,
+    read_failed: bool,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for HttpBodyReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.reader).poll_read(cx, buffer);
+        if matches!(result, Poll::Ready(Err(_))) {
+            self.read_failed = true;
+        }
+        result
+    }
+}
+
 async fn copy_exact(
     reader: &mut (impl AsyncRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
     length: u64,
 ) -> Result<()> {
-    if tokio::io::copy(&mut reader.take(length), writer).await? != length {
-        bail!("incomplete HTTP body");
+    let mut reader = HttpBodyReader {
+        reader,
+        read_failed: false,
+    };
+    let copied = tokio::io::copy(&mut (&mut reader).take(length), writer).await;
+    let copied = match copied {
+        Err(error) if reader.read_failed => return Err(error).context(HttpFramingTruncated),
+        result => result?,
+    };
+    if copied != length {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof)).context(HttpFramingTruncated);
     }
     Ok(())
 }
@@ -894,7 +1112,9 @@ async fn copy_chunked(
     let mut total = 0u64;
     // Bound framing overhead as well as payload, including zero/one-byte chunks.
     for _ in 0..262144 {
-        let line = http_line(reader, 4096).await?;
+        let line = http_line(reader, 4096)
+            .await
+            .context(HttpFramingTruncated)?;
         if !line[0].is_ascii_hexdigit()
             || line[..line.len() - 2]
                 .iter()
@@ -918,7 +1138,9 @@ async fn copy_chunked(
             // Validate all bounded trailers before forwarding the terminal chunk.
             let mut trailers = Vec::new();
             loop {
-                let line = http_line(reader, MAX_HEADER - trailers.len()).await?;
+                let line = http_line(reader, MAX_HEADER - trailers.len())
+                    .await
+                    .context(HttpFramingTruncated)?;
                 let end = line == b"\r\n";
                 trailers.extend_from_slice(&line);
                 if end {
@@ -941,7 +1163,10 @@ async fn copy_chunked(
         writer.write_all(&line).await?;
         copy_exact(reader, writer, size).await?;
         let mut crlf = [0; 2];
-        reader.read_exact(&mut crlf).await?;
+        reader
+            .read_exact(&mut crlf)
+            .await
+            .context(HttpFramingTruncated)?;
         if crlf != *b"\r\n" {
             bail!("invalid chunk delimiter");
         }
@@ -956,7 +1181,7 @@ async fn forward_response(
     forward: &Forward,
 ) -> Result<bool> {
     for _ in 0..16 {
-        let bytes = http_header(reader).await?;
+        let bytes = http_header(reader).await.context(HttpFramingTruncated)?;
         let mut fields = [httparse::EMPTY_HEADER; 128];
         let mut response = httparse::Response::new(&mut fields);
         if !response.parse(&bytes)?.is_complete() || !bytes.starts_with(b"HTTP/1.") {
@@ -1089,7 +1314,7 @@ async fn forward_http(
     };
     tokio::select! {
         result = transfer => result,
-        _ = idle_expired(last_activity) => bail!("HTTP connection idle for 15 minutes"),
+        _ = idle_expired(last_activity) => Err(IdleExpired.into()),
     }
 }
 
@@ -1193,6 +1418,59 @@ async fn transfer(client: TcpStream, upstream: BoxStream, prefix: Vec<u8>) -> Re
     };
     tokio::select! {
         result = transfer => result,
-        _ = idle_expired(last_activity) => bail!("TCP connection idle for 15 minutes"),
+        _ = idle_expired(last_activity) => Err(IdleExpired.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{dns::Dns, fsutil::SecureDir, observability::Evidence};
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use serde_json::Value;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn local_silent_dns_is_classified_for_routing_and_outbound() {
+        timeout(Duration::from_secs(8), async {
+            for rules in [
+                "rules: ['IP-CIDR,127.0.0.0/8,DIRECT', 'MATCH,REJECT']",
+                "rules: ['MATCH,DIRECT']",
+            ] {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let mut server = NameServerConfig::udp(socket.local_addr().unwrap().ip());
+                server.connections[0].port = socket.local_addr().unwrap().port();
+                let dns = Dns::from_config(ResolverConfig::from_name_servers(vec![server])).unwrap();
+                let config = Config::parse(rules).unwrap().with_dns(dns);
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().canonicalize().unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let dir = SecureDir::open_owned_absolute(&path, false).unwrap();
+                let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
+                let evidence = Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock).unwrap();
+                let runtime = Runtime::bind(config, 0).await.unwrap().with_observer(evidence.observer.clone());
+                let address = runtime.local_addr().unwrap();
+                let (stop, stopped) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(runtime.run(async { let _ = stopped.await; }));
+                let mut client = TcpStream::connect(address).await.unwrap();
+                client.write_all(b"CONNECT private-target.example.:443 HTTP/1.1\r\nHost: private-target.example.:443\r\nProxy-Authorization: Basic private-auth\r\n\r\n").await.unwrap();
+                // The query must reach only the configured loopback resolver.
+                let mut packet = [0; 4096];
+                let (count, _) = socket.recv_from(&mut packet).await.unwrap();
+                let query = hickory_resolver::proto::op::Message::from_vec(&packet[..count]).unwrap();
+                assert_eq!(query.queries[0].name().to_string(), "private-target.example.");
+                let mut response = String::new();
+                client.read_to_string(&mut response).await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 502"));
+                stop.send(()).unwrap();
+                task.await.unwrap().unwrap();
+                evidence.finish("stop_request", None).await;
+                let log = std::fs::read_to_string(path.join("zc.log")).unwrap();
+                let events: Vec<Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert!(events.iter().any(|event| event["event"] == "connection_failed"
+                    && event["stage"] == "dns" && event["error_kind"] == "TimedOut"), "{events:?}");
+                assert!(!log.contains("private-"));
+            }
+        }).await.unwrap();
     }
 }

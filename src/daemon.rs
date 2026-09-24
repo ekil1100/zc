@@ -31,6 +31,7 @@ use crate::{
     api,
     config::Config,
     fsutil::{self, FileLock, SecureDir},
+    observability::{self, Evidence, LOG_LIMIT},
     runtime::Runtime,
     store::{self, Store},
 };
@@ -55,7 +56,6 @@ use tokio::time::{Instant, sleep};
 const LOCK_WAIT: Duration = Duration::from_secs(1);
 const START_WAIT: Duration = Duration::from_secs(10);
 const STOP_WAIT: Duration = Duration::from_secs(5);
-const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 6 * (store::FILE_LIMIT + store::AGGREGATE_LIMIT) + 1024 * 1024;
 const DESCRIPTOR: &str = "zc.daemon.json";
 
@@ -206,10 +206,9 @@ fn publish(dir: &SecureDir, descriptor: &Descriptor) -> Result<()> {
         // Rename is already visible. Reverting the runtime here would disagree
         // with the committed descriptor; report uncertainty instead.
         eprintln!("Runtime descriptor durability is uncertain: {error}");
-        let _ = dir.append_bounded(
-            "zc.log",
+        let _ = observability::append_log(
+            dir,
             b"Warning: runtime descriptor durability is uncertain.\n",
-            LOG_LIMIT,
         );
     }
     Ok(())
@@ -967,10 +966,7 @@ pub async fn run_child(snapshot_name: &str, nonce: &str) -> Result<()> {
                 &message.as_bytes()[..message.len().min(4096)],
             );
         }
-        let _ =
-            runtime
-                .dir
-                .append_bounded("zc.log", b"Daemon startup or runtime failed.\n", LOG_LIMIT);
+        let _ = observability::append_log(&runtime.dir, b"Daemon startup or runtime failed.\n");
     }
     result
 }
@@ -1108,6 +1104,50 @@ fn desired_guard(identity: &ActiveIdentity) -> Result<Option<(store::Desired, Fi
     bail!("RUNTIME_DESIRED_CHANGED: desired state did not stabilize")
 }
 
+// Own listener tasks and the stable lifecycle lock outside the caught instance
+// future. Never abort a listener: it must cancel and join its own nested tasks.
+struct InstanceScope {
+    phase: &'static str,
+    guardian: Option<(Directory, FileLock)>,
+    control: Option<Arc<Control>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    tasks: tokio::task::JoinSet<Result<()>>,
+}
+impl InstanceScope {
+    fn new() -> Self {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Self {
+            phase: "startup",
+            guardian: None,
+            control: None,
+            shutdown,
+            tasks: tokio::task::JoinSet::new(),
+        }
+    }
+    async fn drain(&mut self) -> Result<()> {
+        if let Some(control) = &self.control {
+            control.stopped.store(true, Ordering::Release);
+        }
+        self.shutdown.send_replace(true);
+        let mut result = Ok(());
+        while let Some(ended) = self.tasks.join_next().await {
+            let ended = ended.map_err(observability::task_error).and_then(|r| r);
+            // Do not leave the sibling listener behind when one cleanup fails.
+            if result.is_ok() {
+                result = ended;
+            }
+        }
+        result
+    }
+}
+async fn wait_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 async fn run_instance(
     runtime: &Directory,
     prepared: Prepared,
@@ -1116,16 +1156,49 @@ async fn run_instance(
     lock: FileLock,
     exact: bool,
 ) -> Result<()> {
+    let mut scope = InstanceScope::new();
+    let lock = Arc::new(lock);
+    let evidence = Evidence::start(&runtime.path, nonce, lock.clone())?;
+    let mut result = observability::catch_instance_panic(run_instance_inner(
+        runtime, prepared, name, nonce, exact, &mut scope, &evidence,
+    ))
+    .await;
+    let drained = scope.drain().await;
+    if result.is_ok() && drained.is_err() {
+        scope.phase = "shutdown";
+        result = drained;
+    }
+    cleanup_instance(runtime, nonce, name);
+    // Both ownership locks and the private hook survive all nested task drops.
+    evidence.finish(scope.phase, result.as_ref().err()).await;
+    result
+}
+
+async fn run_instance_inner(
+    runtime: &Directory,
+    prepared: Prepared,
+    name: &str,
+    nonce: &str,
+    exact: bool,
+    scope: &mut InstanceScope,
+    evidence: &Evidence,
+) -> Result<()> {
+    let lock = evidence.instance_lock();
     // This second stable lock excludes overlap even if the entire XDG directory is replaced.
+    scope.phase = "lifecycle_lock";
     let guardian = fallback_parent(true)?;
     let guardian_lock = guardian
         .dir
         .lock("zc.lifecycle.lock", LOCK_WAIT)
         .context("START_FAILED: another runtime still owns the lifecycle lock")?;
+    scope.guardian = Some((guardian, guardian_lock));
+    scope.phase = "config";
     let config = parse_config(&prepared)?;
+    scope.phase = "mixed_bind";
     let proxy = Runtime::bind(config, prepared.port)
         .await
-        .map_err(|e| anyhow::anyhow!("START_PORT_IN_USE: {e:#}"))?;
+        .context("START_PORT_IN_USE: cannot bind mixed listener")?
+        .with_observer(evidence.observer.clone());
     let config = proxy.config();
     let mut invocation = prepared.invocation.clone();
     invocation.prepared = !invocation.foreground;
@@ -1156,6 +1229,8 @@ async fn run_instance(
         ),
         stopped: AtomicBool::new(false),
     });
+    scope.control = Some(control.clone());
+    scope.phase = "controller_bind";
     let controller = api::Server::bind(
         config.clone(),
         if prepared.identity.is_some() {
@@ -1165,7 +1240,8 @@ async fn run_instance(
         },
     )
     .await?;
-    let result = async {
+    async {
+        scope.phase = "readiness";
         lock.validate(&runtime.dir, "zc.lock")?;
         runtime.dir.validate_path(&runtime.path)?;
         lock.write_contents(b"")?;
@@ -1187,7 +1263,6 @@ async fn run_instance(
         }
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        runtime.dir.append_bounded("zc.log", format!("Daemon ready: mixed port {}.\n", prepared.port).as_bytes(), LOG_LIMIT)?;
         {
             let _guard = runtime.dir.lock("zc.daemon.lock", LOCK_WAIT)?;
             lock.validate(&runtime.dir, "zc.lock")?;
@@ -1195,24 +1270,24 @@ async fn run_instance(
             descriptor.ready = true;
             publish(&runtime.dir, &descriptor)?;
             *control.descriptor.lock().map_err(|_| anyhow::anyhow!("runtime state poisoned"))? = descriptor.clone();
+            // Readiness is already public; diagnostic failure cannot revoke it.
+            let _ = evidence.ready();
         }
         drop(authority);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let wait_shutdown = |mut rx: tokio::sync::watch::Receiver<bool>| async move { while !*rx.borrow_and_update() { if rx.changed().await.is_err() { break; } } };
-        let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(proxy.run(wait_shutdown(shutdown_rx.clone())));
-        if let Some(controller) = controller { tasks.spawn(controller.run(wait_shutdown(shutdown_rx))); }
-        let reason: Result<()> = loop {
+        scope.phase = "runtime";
+        scope.tasks.spawn(proxy.run(wait_shutdown(scope.shutdown.subscribe())));
+        if let Some(controller) = controller { scope.tasks.spawn(controller.run(wait_shutdown(scope.shutdown.subscribe()))); }
+        loop {
             tokio::select! {
-                _ = terminate.recv() => break Ok(()),
-                _ = interrupt.recv() => break Ok(()),
-                ended = tasks.join_next() => break match ended { Some(Ok(result)) => result, Some(Err(e)) => Err(e.into()), None => Ok(()) },
+                _ = terminate.recv() => { scope.phase = "sigterm"; break Ok(()); },
+                _ = interrupt.recv() => { scope.phase = "sigint"; break Ok(()); },
+                ended = scope.tasks.join_next() => break match ended { Some(Ok(result)) => result, Some(Err(e)) => Err(observability::task_error(e)), None => Ok(()) },
                 _ = sleep(Duration::from_millis(100)) => {
                     let check = (|| -> Result<bool> {
                         runtime.dir.validate_path(&runtime.path)?; lock.validate(&runtime.dir, "zc.lock")?;
+                        let (guardian, guardian_lock) = scope.guardian.as_ref().expect("lifecycle owner acquired");
                         guardian_lock.validate(&guardian.dir, "zc.lifecycle.lock")?;
                         ensure!(!control.stopped.load(Ordering::Acquire), "RUNTIME_FAILED: selection publication failed");
-                        if runtime.dir.exists("zc.log")? && runtime.dir.file_metadata("zc.log")?.len() > LOG_LIMIT as u64 { runtime.dir.atomic_write("zc.log", b"")?; }
                         let stop_name = format!("zc.stop.{nonce}");
                         if !runtime.dir.exists(&stop_name)? { return Ok(false); }
                         let request = runtime.dir.read(&stop_name, 33)?;
@@ -1223,16 +1298,18 @@ async fn run_instance(
                             Err(e) => Err(e.into()),
                         }
                     })();
-                    match check { Ok(false) => (), Ok(true) => break Ok(()), Err(error) => break Err(error) }
+                    match check {
+                        Ok(false) => (),
+                        Ok(true) => { scope.phase = "stop_request"; break Ok(()); },
+                        Err(error) => { scope.phase = "runtime_guard"; break Err(error); }
+                    }
                 }
             }
-        };
-        control.stopped.store(true, Ordering::Release);
-        let _ = shutdown_tx.send(true);
-        while let Some(ended) = tasks.join_next().await { ended??; }
-        reason
-    }.await;
-    control.stopped.store(true, Ordering::Release);
+        }
+    }.await
+}
+
+fn cleanup_instance(runtime: &Directory, nonce: &str, name: &str) {
     if let Ok(_guard) = runtime.dir.lock("zc.daemon.lock", LOCK_WAIT)
         && let Ok(Some(current)) = read_descriptor(&runtime.dir)
         && current.nonce == nonce
@@ -1245,7 +1322,6 @@ async fn run_instance(
         }
     }
     cleanup_names(&runtime.dir, nonce, name);
-    result
 }
 
 pub async fn stop() -> Result<Value> {
@@ -1548,12 +1624,30 @@ pub async fn log(lines: usize, follow: bool, json_output: bool) -> Result<()> {
             let Some(runtime) = runtime_dir(false)? else {
                 return Ok(None);
             };
-            let (bytes, metadata) = match runtime.dir.read_with_metadata("zc.log", LOG_LIMIT) {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
-            Ok(Some((bytes, metadata.dev(), metadata.ino())))
+            if !follow {
+                // Read both generations under the writer's rotation lock, including
+                // an archive-only state left between rename and current creation.
+                let guard = runtime.dir.lock("zc.log.lock", LOCK_WAIT)?;
+                guard.validate(&runtime.dir, "zc.log.lock")?;
+                let mut bytes = Vec::new();
+                let mut identity = None;
+                for name in ["zc.log.1", "zc.log"] {
+                    match runtime.dir.read_with_metadata(name, LOG_LIMIT) {
+                        Ok((part, metadata)) => {
+                            bytes.extend_from_slice(&part);
+                            identity = Some((metadata.dev(), metadata.ino()));
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                return Ok(identity.map(|(dev, ino)| (bytes, dev, ino)));
+            }
+            match runtime.dir.read_with_metadata("zc.log", LOG_LIMIT) {
+                Ok((bytes, metadata)) => Ok(Some((bytes, metadata.dev(), metadata.ino()))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
         })();
         match read {
             Ok(Some((bytes, dev, ino))) => {
@@ -1617,6 +1711,193 @@ pub async fn log(lines: usize, follow: bool, json_output: bool) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use std::fs;
+    use tokio::net::TcpStream;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn instance_panic_retains_owners_until_late_udp_drop_panic_is_joined() {
+        if std::env::var_os("ZC_EVIDENCE_HARNESS").is_some() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let dir = SecureDir::open(&path).unwrap();
+            let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
+            let evidence =
+                Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock).unwrap();
+            let mut scope = InstanceScope::new();
+            let guardian = fallback_parent(true).unwrap();
+            let guardian_path = guardian.path.clone();
+            let guardian_lock = guardian
+                .dir
+                .lock("zc.lifecycle.lock", Duration::from_secs(1))
+                .unwrap();
+            scope.guardian = Some((guardian, guardian_lock));
+            let runtime = Runtime::bind(Config::parse("rules: ['MATCH,DIRECT']").unwrap(), 0)
+                .await
+                .unwrap()
+                .with_observer(evidence.observer.clone());
+            let addr = runtime.local_addr().unwrap();
+            scope
+                .tasks
+                .spawn(runtime.run(wait_shutdown(scope.shutdown.subscribe())));
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0]);
+
+            // The transport boundary uses the actual Trojan worker. Its destructor
+            // is held at a channel barrier, then panics after the instance panic.
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (dropping, dropped) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::sync_channel(0);
+            let stream = DropPanicStream {
+                started: Some(started),
+                dropping: Some(dropping),
+                released,
+            };
+            let mut session = crate::udp::UdpSession::trojan(
+                Arc::new(crate::dns::Dns::system()),
+                Box::new(stream),
+            );
+            ready.await.unwrap();
+            let stopped = scope.shutdown.subscribe();
+            let connection = evidence.observer.connection();
+            scope.tasks.spawn(async move {
+                let _connection = connection;
+                wait_shutdown(stopped).await;
+                session.close().await
+            });
+            // A failed sibling must not short-circuit the remaining joins.
+            scope
+                .tasks
+                .spawn(async { anyhow::bail!("RUNTIME_FAILED: sibling stopped") });
+            let result = observability::catch_instance_panic(async {
+                tokio::task::yield_now().await;
+                panic!("private-instance-payload");
+            })
+            .await;
+            assert!(result.is_err());
+            let drained = {
+                let drain = scope.drain();
+                tokio::pin!(drain);
+                tokio::select! {
+                    biased;
+                    _ = &mut drain => panic!("instance cleanup returned before nested worker drop"),
+                    _ = dropped => {},
+                }
+                assert!(dir.lock("zc.lock", Duration::from_millis(10)).is_err());
+                let guardian = SecureDir::open(&guardian_path).unwrap();
+                assert!(
+                    guardian
+                        .lock("zc.lifecycle.lock", Duration::from_millis(10))
+                        .is_err()
+                );
+                assert!(path.join("zc.exit.json").exists());
+                let text = fs::read_to_string(path.join("zc.log")).unwrap();
+                assert!(!text.contains("\"phase\":\"final\""));
+                // Explicitly poll the drain while Drop is still held: it must wait.
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), drain)
+                    .await
+                    .unwrap()
+            };
+            assert!(drained.is_err());
+            assert!(scope.tasks.is_empty());
+            evidence.finish("runtime", result.as_ref().err()).await;
+            assert!(!path.join("zc.exit.json").exists());
+            // Stable ownership is retained through final evidence, not only abort.
+            assert!(
+                SecureDir::open(&guardian_path)
+                    .unwrap()
+                    .lock("zc.lifecycle.lock", Duration::from_millis(10))
+                    .is_err()
+            );
+            drop(scope);
+            let _guardian = SecureDir::open(&guardian_path)
+                .unwrap()
+                .lock("zc.lifecycle.lock", Duration::from_millis(50))
+                .unwrap();
+            let _instance = dir.lock("zc.lock", Duration::from_millis(50)).unwrap();
+            return;
+        }
+        let (home, output) = observability::tests::harness(
+            "daemon::lifecycle_tests::instance_panic_retains_owners_until_late_udp_drop_panic_is_joined",
+            "nested-instance",
+        );
+        assert!(output.status.success(), "{output:?}");
+        let text = fs::read_to_string(home.path().join("runtime/zc.log")).unwrap();
+        for text in [
+            text.as_str(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ] {
+            assert!(!text.contains("private-instance-payload"));
+            assert!(!text.contains("private-worker-drop-payload"));
+        }
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let summary = events
+            .iter()
+            .find(|e| e["event"] == "runtime_summary" && e["phase"] == "final")
+            .unwrap();
+        assert_eq!(summary["active_connections"], 0);
+        assert_eq!(summary["total_connections"], 2);
+        assert_eq!(summary["panics"], 2);
+        assert_eq!(events.last().unwrap()["event"], "daemon_failed");
+    }
+
+    struct DropPanicStream {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        dropping: Option<tokio::sync::oneshot::Sender<()>>,
+        released: std::sync::mpsc::Receiver<()>,
+    }
+    impl tokio::io::AsyncRead for DropPanicStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+            }
+            std::task::Poll::Pending
+        }
+    }
+    impl tokio::io::AsyncWrite for DropPanicStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl Drop for DropPanicStream {
+        fn drop(&mut self) {
+            self.dropping.take().unwrap().send(()).unwrap();
+            self.released.recv_timeout(Duration::from_secs(3)).unwrap();
+            panic!("private-worker-drop-payload");
+        }
+    }
 
     mod descriptor_fixture {
         include!(concat!(

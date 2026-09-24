@@ -96,7 +96,17 @@ doctor 最多保留 256 条 errors/warnings 合计、每条 512 rendered bytes�
 
 `test/proxy test/profile test` 含 `daemon_state/selected_proxies/ports/checks/targets`，文本并发探测按完成顺序输出；任何失败的 check 返回 `CHECKS_FAILED` + data，exit 1。单项 target 与聚合 check 不应混为一谈。`doctor` 含 `proxy_reachable/network_ok/config_ok/config_diagnostics_truncated`，文本冻结标签 `Config:/Daemon:/PID:/Port:/Connection:`。这些诊断会发起真实网络探测，不属于纯离线验证。
 
-`zc.pid/zc.lock/zc.log/zc.daemon.json/zc.daemon.lock` 位于安全 runtime directory。`XDG_RUNTIME_DIR` 须为既有、绝对规范路径、当前 euid 所有、0700；未设置使用规范化 `$HOME/.local/state/zc/runtime`。不安全父路径、symlink、特殊文件 fail closed；文件 0600。后台日志超过 8 MiB 重置到 owner-only 文件；follow 会在安全重建后重开。测试必须使用临时 HOME/runtime。
+`zc.pid/zc.lock/zc.log/zc.daemon.json/zc.daemon.lock` 位于安全 runtime directory。`XDG_RUNTIME_DIR` 须为既有、绝对规范路径、当前 euid 所有、0700；未设置使用规范化 `$HOME/.local/state/zc/runtime`。不安全父路径、symlink、特殊文件 fail closed；文件 0600。运行日志当前文件 `zc.log` 与归档 `zc.log.1` 各最多 8 MiB，轮转受 `zc.log.lock` 保护，follow 会在安全重建后重开；非 follow 合并归档和当前文件的一致快照后取尾部。`zc.exit.json` 仅为异常退出诊断标记，不参与实例权威判断。文件保持 owner-only，测试必须使用临时 HOME/runtime。
+
+### 稳定性日志
+
+后台与前台实例均记录结构化生命周期、连接故障和资源摘要，详见[稳定性观测](../reliability/observability.md)。事件带 `timestamp_ms`、`level`、`event`、`pid` 和 `instance`；生命周期额外包含 `phase` 与有限 `error_kind`。ready 发布后的日志失败不撤销启动，最终证据尽力写入，不用缺少错误日志证明健康。
+
+连接故障按 `ingress/dns/connect/tls/transfer/udp` 分类，首次记录后每 30 秒合并同类错误，退出补汇总；正常断连和策略拒绝不刷故障。独立线程记录初始、30 秒周期及最终 CPU/RSS 与连接计数；采样不可用时为 null，不阻止转发。新事件不包含原始错误、目标、请求内容或凭据。
+
+panic 记录不含 payload/位置；未完成的退出标记在下次启动报告 `previous_exit_unknown`，不猜测强杀、断电等根因。损坏标记保留，不据此接管或停止进程。实例流程之前的配置准备、快照认证等失败并非全部写入 daemon 日志，仍以 CLI 错误输出为准。
+
+`zc log --json` 保持既有 `{"line":"…"}` 包装；旧纯文本行与新 JSON 事件可共存。单个新事件最多 4 KiB，保留当前日志与一代归档，均保持 owner-only。这些能力不提供自动重启或长稳通过保证。
 
 ## JSON、输出流与退出码
 

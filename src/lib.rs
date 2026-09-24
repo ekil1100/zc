@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod dns;
 pub mod fsutil;
+pub(crate) mod observability;
 pub mod outbound;
 pub mod override_script;
 pub mod runtime;

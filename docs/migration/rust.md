@@ -130,6 +130,12 @@ just migrator-test
 
 性能、四平台 native release、真实安装回滚及 24/72 小时长稳仍待独立门禁；本轮定向诊断证据不替代这些验收，也未重新证明 all-targets 全量测试。
 
+## 稳定性观测
+
+Rust 实例已接入生命周期、连接故障分类及限频合并、异常退出诊断、脱敏 panic 记录、CPU/RSS 周期摘要和有界日志轮转；命令仍为 `zc log`，不新增配置开关或完整监控 API。连接热路径只更新计数，独立线程负责采样与写入。具体字段、归档、采样精度及不可用行为见[运行时稳定性观测](../reliability/observability.md)。
+
+这不替代长稳、四平台、性能和发布门禁，也未更新本机在用二进制。本轮复现的停止确认与 descriptor 退出清理竞态已通过共享既有读写锁修复，并有确定性红绿回归；它不自动关闭历史 Intel CI 的其他失败。记录、迭代检视后 175 项相关测试及检视前 Release 短测边界见上述文档。
+
 ## cache safety review 闭环
 
 本节仅关闭已复现的缓存 P2 与同类文件身份碰撞，不改变 daemon、diagnostics、CI 或 managed revision。修改限于 `config_provider`、`fsutil` 缓存辅助函数与 `service::prepare_loaded` 的来源/缓存集成，无新依赖。

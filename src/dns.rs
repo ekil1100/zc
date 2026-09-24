@@ -8,7 +8,7 @@ use hickory_resolver::{
 };
 use tokio::{sync::Semaphore, time::timeout};
 
-use crate::target::Target;
+use crate::{observability::FailureStage, target::Target};
 
 const LIMIT: usize = 64;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -70,6 +70,14 @@ impl Dns {
     }
 
     pub async fn resolve(&self, target: &Target) -> Result<Vec<IpAddr>> {
+        self.resolve_inner(target).await.map_err(|error| {
+            // Preserve the public resolver diagnostic while carrying a typed stage.
+            let message = error.to_string();
+            error.context(FailureStage::Dns).context(message)
+        })
+    }
+
+    async fn resolve_inner(&self, target: &Target) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = target.host().parse::<IpAddr>() {
             return Ok(vec![ip]);
         }

@@ -189,7 +189,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for HttpObfsStream<S> {
                 }
                 Err(error) => {
                     this.failed = true;
-                    return Poll::Ready(Err(error));
+                    return Poll::Ready(Err(if this.response.is_empty() {
+                        error
+                    } else {
+                        crate::outbound::truncated_read(error)
+                    }));
                 }
             }
             if let Some(end) = this

@@ -64,6 +64,159 @@ fn free_port() -> u16 {
         .unwrap()
         .port()
 }
+fn log_events(f: &Fixture) -> Vec<Value> {
+    let out = f.command(&["log", "--json", "--no-follow", "-n", "50"]);
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            serde_json::from_str(envelope["line"].as_str().unwrap()).ok()
+        })
+        .collect()
+}
+
+fn lifecycle_events(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some("daemon_starting" | "daemon_ready" | "daemon_stopped" | "daemon_failed")
+            )
+        })
+        .collect()
+}
+
+fn assert_resource_summaries(events: &[Value], starts: &[&Value]) {
+    let summaries: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "runtime_summary")
+        .collect();
+    assert_eq!(summaries.len(), starts.len() * 2, "{events:?}");
+    for start in starts {
+        let samples: Vec<_> = summaries
+            .iter()
+            .filter(|e| e["instance"] == start["instance"])
+            .collect();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["phase"], "initial");
+        assert_eq!(samples[1]["phase"], "final");
+        for sample in samples {
+            assert_eq!(sample["pid"], start["pid"]);
+            assert_eq!(sample["level"], "info");
+            assert!(sample["timestamp_ms"].as_u64().unwrap() > 0);
+            assert_eq!(sample["active_connections"], 0);
+            assert_eq!(sample["failures"], 0);
+            assert_eq!(sample["rejections"], 0);
+            assert_eq!(sample["panics"], 0);
+        }
+    }
+    assert!(!events.iter().any(|e| matches!(
+        e["event"].as_str(),
+        Some("connection_failed" | "connection_failure_summary" | "runtime_panic")
+    )));
+}
+
+#[test]
+fn lifecycle_events_are_readable_through_log_cli() {
+    let f = Fixture::new();
+    let port = free_port().to_string();
+    let started = f.json(&[
+        "start",
+        "-c",
+        f.config.to_str().unwrap(),
+        "--port",
+        &port,
+        "--json",
+    ]);
+    f.json(&["stop", "--json"]);
+    let all_events = log_events(&f);
+    let events = lifecycle_events(&all_events);
+    assert_resource_summaries(&all_events, &[events[0]]);
+    let names: Vec<_> = events
+        .iter()
+        .map(|event| event["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["daemon_starting", "daemon_ready", "daemon_stopped"]);
+    for event in &events {
+        assert!(event["timestamp_ms"].as_u64().unwrap() > 0);
+        assert_eq!(event["pid"], started["data"]["pid"]);
+        assert_eq!(event["level"], "info");
+        assert_eq!(event["instance"], events[0]["instance"]);
+        assert_eq!(event["instance"].as_str().unwrap().len(), 32);
+    }
+    assert_eq!(events[2]["phase"], "stop_request");
+}
+
+#[test]
+fn failed_foreground_bind_logs_stage_without_config_secrets() {
+    let f = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    fs::write(
+        &f.config,
+        "secret: do-not-log-this-secret\nrules: ['MATCH,DIRECT']\n",
+    )
+    .unwrap();
+    let out = f.command(&[
+        "start",
+        "--foreground",
+        "-c",
+        f.config.to_str().unwrap(),
+        "--port",
+        &port,
+        "--json",
+    ]);
+    assert!(!out.status.success());
+    let all_events = log_events(&f);
+    let events = lifecycle_events(&all_events);
+    assert_resource_summaries(&all_events, &[events[0]]);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event"], "daemon_starting");
+    assert_eq!(events[1]["event"], "daemon_failed");
+    assert_eq!(events[1]["level"], "error");
+    assert_eq!(events[1]["phase"], "mixed_bind");
+    assert_eq!(events[1]["error_kind"], "AddrInUse");
+    assert_eq!(events[1]["instance"], events[0]["instance"]);
+    let output = f.command(&["log", "--json", "--no-follow"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("do-not-log-this-secret"));
+    assert!(!text.contains(f.config.to_str().unwrap()));
+    assert!(!events.iter().any(|event| event["event"] == "daemon_ready"));
+}
+
+#[test]
+fn restart_logs_distinct_instances_and_normal_disconnect_is_not_a_failure() {
+    let f = Fixture::new();
+    let port = free_port().to_string();
+    f.json(&[
+        "start",
+        "-c",
+        f.config.to_str().unwrap(),
+        "--port",
+        &port,
+        "--json",
+    ]);
+    let socket = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    drop(socket);
+    f.json(&["restart", "--json"]);
+    f.json(&["stop", "--json"]);
+    let all_events = log_events(&f);
+    let events = lifecycle_events(&all_events);
+    assert_eq!(events.len(), 6, "{events:?}");
+    assert_resource_summaries(&all_events, &[events[0], events[3]]);
+    for group in events.as_chunks::<3>().0 {
+        assert_eq!(group[0]["event"], "daemon_starting");
+        assert_eq!(group[1]["event"], "daemon_ready");
+        assert_eq!(group[2]["event"], "daemon_stopped");
+        assert_eq!(group[0]["instance"], group[2]["instance"]);
+        assert!(group.iter().all(|event| event["level"] == "info"));
+    }
+    assert_ne!(events[0]["instance"], events[3]["instance"]);
+}
+
 #[test]
 fn background_lifecycle_is_ready_idempotent_and_nonce_bound() {
     let f = Fixture::new();
@@ -475,24 +628,33 @@ fn controller_collision_never_reports_ready_or_falls_back() {
 fn mixed_collision_never_reports_ready_or_falls_back() {
     let f = Fixture::new();
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let out = f.command(&[
-        "start",
-        "-c",
-        f.config.to_str().unwrap(),
-        "--port",
-        &occupied.local_addr().unwrap().port().to_string(),
-        "--json",
-    ]);
-    assert!(
-        !out.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(result["error"]["code"], "START_PORT_IN_USE", "{result}");
-    assert!(!f.runtime.join("zc.daemon.json").exists());
-    assert_eq!(f.json(&["status", "--json"])["data"]["state"], "stopped");
+    let port = occupied.local_addr().unwrap().port();
+    assert_ne!(port, 7899);
+    let port = port.to_string();
+    for foreground in [false, true] {
+        let mut args = vec![
+            "start",
+            "-c",
+            f.config.to_str().unwrap(),
+            "--port",
+            &port,
+            "--json",
+        ];
+        if foreground {
+            args.push("--foreground");
+        }
+        let out = f.command(&args);
+        assert!(
+            !out.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "START_PORT_IN_USE", "{result}");
+        assert!(!f.runtime.join("zc.daemon.json").exists());
+        assert_eq!(f.json(&["status", "--json"])["data"]["state"], "stopped");
+    }
 }
 
 #[test]
@@ -543,6 +705,14 @@ fn unsafe_runtime_paths_are_rejected_and_logs_are_bounded() {
         &free_port().to_string(),
         "--json",
     ]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !log_events(&f)
+        .iter()
+        .any(|e| e["event"] == "runtime_summary" && e["phase"] == "initial")
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    }
     let log = f.runtime.join("zc.log");
     fs::write(&log, b"first\nsecond\nthird\n").unwrap();
     let output = f.command(&["log", "--json", "-n", "2"]);
@@ -568,7 +738,11 @@ fn unsafe_runtime_paths_are_rejected_and_logs_are_bounded() {
     let old_inode = fs::metadata(&log).unwrap().ino();
     fs::write(&log, vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while fs::metadata(&log).unwrap().len() > 8 * 1024 * 1024 {
+    while match fs::metadata(&log) {
+        Ok(metadata) => metadata.len() > 8 * 1024 * 1024,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => panic!("cannot inspect rotated log: {error}"),
+    } {
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(25));
     }

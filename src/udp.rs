@@ -1,5 +1,6 @@
 use crate::{
     dns::Dns,
+    observability::FailureStage,
     outbound::{BoxStream, destination},
     target::Target,
 };
@@ -21,6 +22,15 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+
+#[derive(Debug)]
+pub(crate) struct IdleExpired;
+impl std::fmt::Display for IdleExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UDP receive idle expired")
+    }
+}
+impl std::error::Error for IdleExpired {}
 
 struct Trojan {
     send: mpsc::Sender<Vec<u8>>,
@@ -94,9 +104,13 @@ impl UdpSession {
         context: SharedContext,
         config: &ServerConfig,
         server: &Target,
+        stage: &mut FailureStage,
     ) -> Result<Self> {
         let mut last = None;
-        for ip in dns.resolve(server).await? {
+        *stage = FailureStage::Dns;
+        let addresses = dns.resolve(server).await?;
+        *stage = FailureStage::Connect;
+        for ip in addresses {
             let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
             let socket = match bind_socket(bind).await {
                 Ok(socket) => socket,
@@ -143,6 +157,19 @@ impl UdpSession {
             receive: Mutex::new(Vec::new()),
             send: Mutex::new(()),
         }
+    }
+
+    /// Cancel and join the nested worker before releasing its connection owner.
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        if let Transport::Trojan(trojan) = &mut self.transport {
+            trojan.worker.abort();
+            if let Err(error) = (&mut trojan.worker).await
+                && !error.is_cancelled()
+            {
+                return Err(crate::observability::task_error(error));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the accepted payload length. Trojan accepts into a two-frame queue;
@@ -209,6 +236,7 @@ impl UdpSession {
                     socket
                         .send(&address, payload)
                         .await
+                        .map_err(std::io::Error::from)
                         .context("Shadowsocks UDP send failed")?;
                     Ok(payload.len())
                 }
@@ -240,7 +268,9 @@ impl UdpSession {
                             }
                         }
                         Ok(_) | Err(ProxySocketError::ProtocolError(_)) => {},
-                        Err(error) => return Err(error).context("Shadowsocks UDP receive failed"),
+                        // The library's transparent wrapper skips the inner I/O
+                        // error in source(); retain its kind for classification.
+                        Err(error) => return Err(std::io::Error::from(error)).context("Shadowsocks UDP receive failed"),
                     }
                     // Authentication failures are packet-local, not DIRECT fallback or stream EOF.
                     tokio::task::yield_now().await;
@@ -263,7 +293,7 @@ impl UdpSession {
                 return Ok(Datagram { source: Target::new(address.ip().to_string(), address.port())?,
                     payload: if v6 { ipv6_buffer[..n].to_vec() } else { storage[..n].to_vec() } });
             }
-        }).await.context("UDP receive idle timeout after 300 seconds")?
+        }).await.context(IdleExpired)?
     }
 }
 
@@ -308,7 +338,7 @@ async fn trojan_worker(
                     let mut payload = vec![0; len];
                     reader.read_exact(&mut payload).await.context("truncated Trojan UDP payload")?;
                     Ok(Datagram { source, payload })
-                }).await.context("Trojan UDP frame timeout after 300 seconds")??;
+                }).await.context(IdleExpired)??;
                 match incoming.try_send(Ok(packet)) {
                     Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {},
                     Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),

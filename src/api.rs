@@ -65,12 +65,15 @@ impl Server {
     }
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         let mut tasks = JoinSet::new();
+        let mut result = crate::observability::catch_instance_panic(async {
         tokio::pin!(shutdown);
-        let result = loop {
+        loop {
             tokio::select! {
                 biased;
                 _ = &mut shutdown => break Ok(()),
-                _ = tasks.join_next(), if !tasks.is_empty() => {},
+                ended = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = ended { break Err(crate::observability::task_error(error)); }
+                },
                 accepted = self.listener.accept() => {
                     let (stream, _) = match accepted { Ok(v) => v, Err(e) => break Err(e.into()) };
                     if tasks.len() >= 16 { drop(stream); continue; }
@@ -78,8 +81,17 @@ impl Server {
                     tasks.spawn(async move { let _ = serve(stream, state).await; });
                 }
             }
-        };
-        tasks.shutdown().await;
+        }
+        }).await;
+        tasks.abort_all();
+        while let Some(ended) = tasks.join_next().await {
+            if let Err(error) = ended
+                && !error.is_cancelled()
+                && result.is_ok()
+            {
+                result = Err(crate::observability::task_error(error));
+            }
+        }
         result
     }
 }
@@ -378,4 +390,71 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
     })
     .await??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listener_panic_joins_pending_api_requests() {
+        if std::env::var_os("ZC_EVIDENCE_HARNESS").is_some() {
+            use crate::{
+                fsutil::SecureDir,
+                observability::{Evidence, catch_instance_panic},
+            };
+            let path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let dir = SecureDir::open(&path).unwrap();
+            let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
+            let evidence =
+                Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock).unwrap();
+            // Use the real request handler with its state retained by an active task.
+            let server = Server {
+                listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                state: Arc::new(State {
+                    config: Arc::new(Config::parse("rules: ['MATCH,DIRECT']").unwrap()),
+                    managed: None,
+                    transient: Mutex::new(BTreeSet::new()),
+                }),
+            };
+            let state = Arc::downgrade(&server.state);
+            let mut client = TcpStream::connect(server.local_addr().unwrap())
+                .await
+                .unwrap();
+            client.write_all(b"GET /status HTTP/1.1\r\n").await.unwrap();
+            let result = catch_instance_panic(server.run(async {
+                // Polling only establishes that accept spawned a live handler;
+                // completion below must be synchronous with join, not a retry.
+                while state.strong_count() < 2 {
+                    tokio::task::yield_now().await;
+                }
+                panic!("private-api-listener-panic");
+            }))
+            .await;
+            let remaining = state.strong_count();
+            evidence.finish("runtime", result.as_ref().err()).await;
+            assert_eq!(remaining, 0, "API request survived its listener");
+            assert!(result.is_err());
+            match client.read(&mut [0]).await {
+                Ok(0) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("API socket survived cleanup: {other:?}"),
+            }
+            return;
+        }
+        let (home, output) = crate::observability::tests::harness(
+            "api::tests::listener_panic_joins_pending_api_requests",
+            "api-panic",
+        );
+        assert!(output.status.success(), "{output:?}");
+        let text = std::fs::read_to_string(home.path().join("runtime/zc.log")).unwrap();
+        assert!(!text.contains("private-api-listener-panic"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-api-listener-panic"));
+        let summary: Value = text
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|e| e["event"] == "runtime_summary" && e["phase"] == "final")
+            .unwrap();
+        assert_eq!(summary["panics"], 1);
+    }
 }
