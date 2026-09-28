@@ -164,7 +164,11 @@ Rust YAML 按原 Zig 的“根节点之外最多 128 层”计数（最多 129 �
 
 ## 控制面与仍待验收的差异
 
-CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/README.md)。无 WebSocket、完整 REST v1、第三方 dashboard parity 或 TUI。
+CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/README.md)。连接最小版提供 `connection list/close <id>` 与 `GET /connections`、`DELETE /connections/<id>`，均要求非空 secret 和 Bearer；这是 zc 的有界实例模型，不是 mihomo 连接详情完整兼容。
+
+每个 mixed TCP 任务一个实例绑定 ID，UDP 关联复用控制连接 ID。运行时展开规则索引和实际 leaf 来自同一次匹配/选择；不按当前选择重新计算存量连接。HTTP forward idle 清目标与路由，下一请求再路由；UDP 仅展示首合法包元数据并标记 `first_datagram`，不伪装成每包重新路由。`routed_target` 不是实际远端 IP。DELETE 仅确认关闭请求，先取消数据面并回收 UDP worker，再删除条目；不改变 DIRECT/SS/Trojan half-close 或 AnyTLS FIN 的正常转发语义。
+
+活动记录最多 1024，UDP 仍最多 64，无历史或逐包/逐字节 registry 更新；配置索引避免复制节点凭据，大配置及 JSON 转义计入 4 MiB 响应预算，超限完整 500。无流量计数、全部断开、分页、自动 controller、WebSocket、完整 REST v1、第三方 dashboard parity 或 TUI。
 
 缺省 rules 的审计误判已由严格 parser/旧二进制证据纠正；unmanaged cache/refresh 和 YAML 深度边界已有定向回归。完整诊断精度及其余资源策略差异仍须对齐或明确审批；TLS/DNS 使用成熟 Rust 库也需要互操作与性能证据，而非源码相似性证明。四平台、性能和长稳结论由最终门禁维护。
 

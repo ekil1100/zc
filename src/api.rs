@@ -1,5 +1,5 @@
 //! Bounded, single-request loopback control API.
-use crate::config::Config;
+use crate::{config::Config, connection::ConnectionRegistry};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -35,11 +35,13 @@ struct State {
     config: Arc<Config>,
     managed: Option<Arc<dyn Managed>>,
     transient: Mutex<BTreeSet<String>>,
+    connections: Arc<ConnectionRegistry>,
 }
 impl Server {
     pub async fn bind(
         config: Arc<Config>,
         managed: Option<Arc<dyn Managed>>,
+        connections: Arc<ConnectionRegistry>,
     ) -> Result<Option<Self>> {
         let Some(address) = config.controller_endpoint() else {
             return Ok(None);
@@ -56,6 +58,7 @@ impl Server {
             state: Arc::new(State {
                 config,
                 managed,
+                connections,
                 transient: Mutex::new(BTreeSet::new()),
             }),
         }))
@@ -99,6 +102,7 @@ struct Request {
     method: String,
     path: String,
     authorization: Option<Vec<u8>>,
+    instance: Option<Vec<u8>>,
     body: Vec<u8>,
 }
 #[derive(Clone, Copy)]
@@ -144,7 +148,14 @@ async fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Ht
     }
     let mut length = None;
     let mut authorization = None;
+    let mut instance = None;
     for header in parsed.headers.iter() {
+        if header.name.eq_ignore_ascii_case("x-zc-instance-nonce") {
+            if instance.is_some() {
+                return Err(BAD);
+            }
+            instance = Some(header.value.to_vec());
+        }
         if header.name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(HttpError(501, "Transfer Encoding Unsupported"));
         }
@@ -188,6 +199,7 @@ async fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Ht
         method,
         path,
         authorization,
+        instance,
         body: bytes[header_end..].to_vec(),
     })
 }
@@ -228,8 +240,17 @@ fn decode_group(path: &str) -> Option<String> {
     String::from_utf8(result).ok()
 }
 impl State {
-    fn route(&self, request: Request) -> std::result::Result<Value, HttpError> {
-        if request.method == "PUT" && !self.config.secret().is_empty() {
+    fn route(
+        &self,
+        request: Request,
+        authenticated_connection: &mut bool,
+    ) -> std::result::Result<Value, HttpError> {
+        let connection_request =
+            request.path == "/connections" || request.path.starts_with("/connections/");
+        if connection_request && self.config.secret().is_empty() {
+            return Err(HttpError(403, "Connection secret required"));
+        }
+        if (request.method == "PUT" || connection_request) && !self.config.secret().is_empty() {
             let authorization = request.authorization.as_deref().unwrap_or_default();
             if authorization.len() < 7
                 || !authorization[..7].eq_ignore_ascii_case(b"Bearer ")
@@ -238,7 +259,37 @@ impl State {
                 return Err(HttpError(401, "Unauthorized"));
             }
         }
+        *authenticated_connection = connection_request;
+        if connection_request
+            && request
+                .instance
+                .as_deref()
+                .is_some_and(|nonce| nonce != self.connections.nonce().as_bytes())
+        {
+            return Err(HttpError(409, "Connection instance changed"));
+        }
         match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/connections") => {
+                let mut bounded = BoundedResponse(Vec::new());
+                self.connections
+                    .write_list(&self.config, &mut bounded)
+                    .map_err(|_| HttpError(500, "Response Too Large"))?;
+                serde_json::from_slice(&bounded.0)
+                    .map_err(|_| HttpError(500, "Internal Server Error"))
+            }
+            ("DELETE", path) if path.starts_with("/connections/") => {
+                let id = &path[13..];
+                self.connections.close(id).map_err(|e| match e {
+                    crate::connection::CloseError::Invalid => BAD,
+                    crate::connection::CloseError::Instance => {
+                        HttpError(409, "Connection instance changed")
+                    }
+                    crate::connection::CloseError::Missing => {
+                        HttpError(404, "Connection not found")
+                    }
+                })?;
+                Ok(json!({"id":id, "close_requested":true, "phase":"closing"}))
+            }
             ("GET", "/") => Ok(json!({"version": env!("CARGO_PKG_VERSION"), "hello": "zc"})),
             ("GET", "/version") => Ok(json!({"version": env!("CARGO_PKG_VERSION")})),
             ("GET", "/proxies") => Ok(self.config.proxies_json()),
@@ -357,8 +408,9 @@ impl std::io::Write for BoundedResponse {
     }
 }
 async fn serve(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
+    let mut authenticated_connection = false;
     let result = match timeout(IO_TIMEOUT, read_request(&mut stream)).await {
-        Ok(Ok(request)) => state.route(request),
+        Ok(Ok(request)) => state.route(request, &mut authenticated_connection),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(HttpError(408, "Request Timeout")),
     };
@@ -379,8 +431,13 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
             (code, reason, serde_json::to_vec(&json!({"error": reason}))?)
         }
     };
+    let instance_header = if authenticated_connection {
+        format!("X-Zc-Instance-Nonce: {}\r\n", state.connections.nonce())
+    } else {
+        String::new()
+    };
     let header = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nConnection: close\r\n{instance_header}Content-Length: {}\r\n\r\n",
         body.len()
     );
     timeout(IO_TIMEOUT, async {
@@ -414,6 +471,7 @@ mod tests {
                 state: Arc::new(State {
                     config: Arc::new(Config::parse("rules: ['MATCH,DIRECT']").unwrap()),
                     managed: None,
+                    connections: ConnectionRegistry::new().unwrap(),
                     transient: Mutex::new(BTreeSet::new()),
                 }),
             };

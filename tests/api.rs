@@ -13,7 +13,14 @@ async fn server() -> (
     let address = reservation.local_addr().unwrap();
     drop(reservation);
     let config = Config::parse(&format!("mixed-port: 17891\nexternal-controller: {address}\nsecret: test-secret\nproxy-groups:\n  - name: pick\n    type: select\n    proxies: [DIRECT, REJECT]\nrules: [MATCH,pick]\n").replace("rules: [MATCH,pick]", "rules: ['MATCH,pick']")).unwrap();
-    let server = Server::bind(Arc::new(config), None).await.unwrap().unwrap();
+    let server = Server::bind(
+        Arc::new(config),
+        None,
+        zc::connection::ConnectionRegistry::new().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     (address, tokio::spawn(server.run(std::future::pending())))
 }
 async fn request(address: std::net::SocketAddr, bytes: &[u8]) -> String {
@@ -136,7 +143,14 @@ async fn oversized_response_is_a_complete_500() {
     }
     source.push_str("rules: ['MATCH,DIRECT']\n");
     let config = Config::parse(&source).unwrap();
-    let server = Server::bind(Arc::new(config), None).await.unwrap().unwrap();
+    let server = Server::bind(
+        Arc::new(config),
+        None,
+        zc::connection::ConnectionRegistry::new().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let task = tokio::spawn(server.run(std::future::pending()));
     let response = request(address, b"GET /proxies HTTP/1.1\r\n\r\n").await;
     assert!(response.starts_with("HTTP/1.1 500 Response Too Large"));
@@ -188,4 +202,199 @@ async fn bearer_scheme_is_ascii_case_insensitive_but_secret_is_exact() {
         );
     }
     task.abort();
+}
+
+#[tokio::test]
+async fn connections_require_bearer_and_bind_requests_to_the_instance() {
+    let (address, task) = server().await;
+    for path in [
+        "/connections",
+        "/connections/00000000000000000000000000000000-1",
+    ] {
+        let method = if path == "/connections" {
+            "GET"
+        } else {
+            "DELETE"
+        };
+        for authorization in ["", "Authorization: Bearer wrong\r\n"] {
+            let wire = format!("{method} {path} HTTP/1.1\r\n{authorization}\r\n");
+            let response = request(address, wire.as_bytes()).await;
+            assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+            assert!(
+                !response.to_lowercase().contains("x-zc-instance-nonce:"),
+                "{response}"
+            );
+        }
+    }
+    let response = request(
+        address,
+        b"GET /connections HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.to_lowercase().contains("x-zc-instance-nonce:"));
+    let body: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["connections"], serde_json::json!([]));
+    let response = request(address, b"GET /connections HTTP/1.1\r\nAuthorization: Bearer test-secret\r\nX-Zc-Instance-Nonce: wrong\r\n\r\n").await;
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    let response = request(address, b"DELETE /connections/00000000000000000000000000000000-1 HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n").await;
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn connections_without_secret_are_forbidden_but_legacy_reads_and_put_stay_open() {
+    let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reserve.local_addr().unwrap();
+    drop(reserve);
+    let config=Config::parse(&format!("external-controller: {address}\nproxy-groups: [{{name: pick, type: select, proxies: [DIRECT,REJECT]}}]\nrules: ['MATCH,pick']")).unwrap();
+    let server = Server::bind(
+        Arc::new(config),
+        None,
+        zc::connection::ConnectionRegistry::new().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let task = tokio::spawn(server.run(std::future::pending()));
+    for method in ["GET", "DELETE"] {
+        for auth in ["", "Authorization: Bearer anything\r\n"] {
+            let path = if method == "GET" {
+                "/connections"
+            } else {
+                "/connections/00000000000000000000000000000000-1"
+            };
+            let response = request(
+                address,
+                format!("{method} {path} HTTP/1.1\r\n{auth}\r\n").as_bytes(),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(
+                !response.to_lowercase().contains("x-zc-instance-nonce:"),
+                "{response}"
+            );
+        }
+    }
+    assert!(
+        request(address, b"GET /status HTTP/1.1\r\n\r\n")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        request(
+            address,
+            b"PUT /proxies/pick HTTP/1.1\r\nContent-Length: 17\r\n\r\n{\"name\":\"REJECT\"}"
+        )
+        .await
+        .starts_with("HTTP/1.1 200")
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn instance_header_is_private_to_authenticated_connection_requests() {
+    let (address, task) = server().await;
+    for (wire, status, visible) in [
+        ("GET /version HTTP/1.1\r\n\r\n", 200, false),
+        (
+            "GET /status HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+            200,
+            false,
+        ),
+        (
+            "GET /other HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+            404,
+            false,
+        ),
+        (
+            "PUT /proxies/pick HTTP/1.1\r\nAuthorization: Bearer test-secret\r\nContent-Length: 17\r\n\r\n{\"name\":\"REJECT\"}",
+            200,
+            false,
+        ),
+        (
+            "DELETE /connections/bad HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+            400,
+            true,
+        ),
+        (
+            "GET /connections/missing HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+            404,
+            true,
+        ),
+        (
+            "GET /connections HTTP/1.1\r\nAuthorization: Bearer test-secret\r\nX-Zc-Instance-Nonce: wrong\r\n\r\n",
+            409,
+            true,
+        ),
+        (
+            "GET /connections HTTP/1.1\r\nAuthorization: Bearer test-secret\r\nX-Zc-Instance-Nonce: a\r\nX-Zc-Instance-Nonce: a\r\n\r\n",
+            400,
+            false,
+        ),
+        (
+            "GET /connections HTTP/1.1\r\nAuthorization: Bearer test-secret\r\nContent-Length: 1\r\n\r\n",
+            408,
+            false,
+        ),
+    ] {
+        let response = request(address, wire.as_bytes()).await;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+        assert_eq!(
+            response.to_lowercase().contains("x-zc-instance-nonce:"),
+            visible,
+            "{response}"
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn authenticated_connection_response_limit_retains_instance_header() {
+    let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reserve.local_addr().unwrap();
+    drop(reserve);
+    let name = "n".repeat(2 * 1024 * 1024);
+    let config = Config::parse(&format!(
+        "external-controller: {address}\nsecret: test-secret\nproxies: [{{name: {name}, type: direct}}]\nrules: ['MATCH,{name}']"
+    )).unwrap();
+    let runtime = zc::runtime::Runtime::bind(config, 0).await.unwrap();
+    let mixed = runtime.local_addr().unwrap();
+    let server = Server::bind(runtime.config(), None, runtime.connections())
+        .await
+        .unwrap()
+        .unwrap();
+    let runtime_task = tokio::spawn(runtime.run(std::future::pending()));
+    let api_task = tokio::spawn(server.run(std::future::pending()));
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = origin.local_addr().unwrap();
+    let mut tunnel = TcpStream::connect(mixed).await.unwrap();
+    tunnel
+        .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let (_peer, _) = origin.accept().await.unwrap();
+    let mut established = Vec::new();
+    while !established.ends_with(b"\r\n\r\n") {
+        established.push(tunnel.read_u8().await.unwrap());
+    }
+    assert!(established.starts_with(b"HTTP/1.1 200"));
+    let response = request(
+        address,
+        b"GET /connections HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+    assert!(response.to_lowercase().contains("x-zc-instance-nonce:"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(response.split_once("\r\n\r\n").unwrap().1)
+            .unwrap()["error"],
+        "Response Too Large"
+    );
+    api_task.abort();
+    runtime_task.abort();
 }

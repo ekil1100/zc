@@ -125,7 +125,8 @@ just -- test --test cli
 | 持久代理选择 | ✅ 已实现 | 选择与 exact config revision 绑定，daemon 启动前恢复。 |
 | Daemon 生命周期 CLI | ✅ 已实现 | start/stop/restart/reload/status/log/test/doctor，支持结构化 JSON 输出。 |
 | Minimal REST API | ✅ 已实现 | `/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`。 |
-| mihomo 完整 Controller API | ❌ 未实现 | 没有 `/runtime`、`/profiles`、`/connections`、`/metrics` 等完整资源模型。 |
+| 连接列表与按 ID 关闭 | ✅ 最小版 | `zc connection list/close <id>`；必须显式 controller 与非空 secret，无流量计数或历史。详见 [API](docs/api/README.md)。 |
+| mihomo 完整 Controller API | ❌ 未实现 | 仅提供需鉴权的连接列表及按 ID 关闭，不提供 `/runtime`、`/profiles`、`/metrics` 等完整资源模型。 |
 | WebSocket 事件流 | ❌ 未实现 | 不兼容依赖事件流的 dashboard。 |
 | 第三方 dashboard 兼容 | ❌ 未实现 | minimal API 不等同于 mihomo Controller API。 |
 | 内置 TUI | ❌ 未实现 | 产品表面仅提供 CLI 与 minimal API。 |

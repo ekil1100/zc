@@ -55,6 +55,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("restart", "[-c <config>] [--port <port>]"),
     ("reload", ""),
     ("status", ""),
+    ("connection list", ""),
+    ("connection close", "<id>"),
     ("log", "[-n <lines>] [-f|--no-follow]"),
     ("test", "[-c <config>] [--port <port>]"),
     ("doctor", "[-c <config>]"),
@@ -76,7 +78,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("diag doctor", "[-c <config>]"),
 ];
 fn group(s: &str) -> bool {
-    matches!(s, "config" | "proxy" | "profile" | "diag")
+    matches!(s, "config" | "proxy" | "profile" | "diag" | "connection")
 }
 fn canonical(s: &str) -> &str {
     match s {
@@ -102,7 +104,7 @@ fn help(topic: &str) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n");
         return Ok(format!(
-            "zc {} — proxy runtime\n\nUsage: zc <command> [options]\n\nCommands:\n{commands}\n  config\n  proxy\n  profile\n  diag\n  help\n\nAliases: up = start, down = stop, ls = list\n\nOptions:\n  --json        Machine-readable output\n  --no-color    Disable ANSI colors\n\nExamples:\n  zc help start\n",
+            "zc {} — proxy runtime\n\nUsage: zc <command> [options]\n\nCommands:\n{commands}\n  config\n  proxy\n  profile\n  diag\n  connection\n  help\n\nAliases: up = start, down = stop, ls = list\n\nOptions:\n  --json        Machine-readable output\n  --no-color    Disable ANSI colors\n\nExamples:\n  zc help start\n",
             env!("CARGO_PKG_VERSION")
         ));
     }
@@ -201,6 +203,9 @@ fn parse(path: &str, tokens: &[String]) -> Result<Args> {
             normalized,
             "--override-script" | "--override-arg" | "--override-timeout-ms"
         );
+        if override_flag && path.starts_with("connection ") {
+            return Err(usage(&argument_code(path), path));
+        }
         let takes_value = override_flag
             || match normalized {
                 "-c" => matches!(
@@ -305,6 +310,7 @@ fn parse(path: &str, tokens: &[String]) -> Result<Args> {
         i += 1;
     }
     let (min, max, missing) = match path {
+        "connection close" => (1, 1, "CONNECTION_CLOSE_ID_REQUIRED"),
         "config load" => (1, 1, "CONFIG_LOAD_PATH_REQUIRED"),
         "config download" => (1, 1, "CONFIG_DOWNLOAD_URL_REQUIRED"),
         "config use" => (1, 1, "CONFIG_USE_NAME_REQUIRED"),
@@ -317,6 +323,9 @@ fn parse(path: &str, tokens: &[String]) -> Result<Args> {
     }
     if args.positionals.len() > max || (args.flag("--clear") && !args.positionals.is_empty()) {
         return Err(usage(&argument_code(path), path));
+    }
+    if path == "connection close" && crate::connection::split_id(&args.positionals[0]).is_none() {
+        return Err(usage("CONNECTION_CLOSE_ARGUMENT_INVALID", path));
     }
     Ok(args)
 }
@@ -389,6 +398,19 @@ pub async fn run(tokens: Vec<String>) -> u8 {
         }
         command = canonical(&tokens[0]).into();
         let mut start = 1;
+        if command == "connection"
+            && tokens
+                .get(1)
+                .is_some_and(|v| matches!(v.as_str(), "--json" | "--no-color"))
+            && tokens[1..]
+                .iter()
+                .any(|v| !matches!(v.as_str(), "--json" | "--no-color"))
+            && !tokens[1..]
+                .iter()
+                .any(|v| matches!(v.as_str(), "-h" | "--help"))
+        {
+            return Err(usage("CONNECTION_ARGUMENT_INVALID", "connection"));
+        }
         if group(&command) {
             if tokens.len() == 1
                 || matches!(
@@ -495,6 +517,57 @@ fn map_error(command: &str, error: anyhow::Error) -> Failure {
         Ok(f) => return f,
         Err(e) => e,
     };
+    if command.starts_with("connection ") {
+        let code = error
+            .chain()
+            .find_map(|cause| {
+                let text = cause.to_string();
+                let (code, _) = text.split_once(':')?;
+                code.starts_with("CONNECTION_").then(|| code.to_owned())
+            })
+            .unwrap_or_else(|| "CONNECTION_FAILED".into());
+        let (message, hint) = match code.as_str() {
+            "CONNECTION_NOT_RUNNING" => (
+                "daemon is not running",
+                "start the daemon with an explicitly prepared configuration first",
+            ),
+            "CONNECTION_CONTROLLER_REQUIRED" => (
+                "running configuration has no controller",
+                "configure external-controller and a nonempty secret, then explicitly reprepare with `zc restart -c <config>`; default restart reuses the frozen snapshot",
+            ),
+            "CONNECTION_SECRET_REQUIRED" => (
+                "running configuration requires a nonempty secret",
+                "configure a nonempty secret, then explicitly reprepare with `zc restart -c <config>`; default restart reuses the frozen snapshot",
+            ),
+            "CONNECTION_UNAUTHORIZED" => (
+                "connection access was denied",
+                "verify the running instance and its frozen secret; do not share credentials",
+            ),
+            "CONNECTION_INSTANCE_CHANGED" => (
+                "daemon instance changed or could not be verified",
+                "run `zc connection list` again and use an ID from the current instance",
+            ),
+            "CONNECTION_NOT_FOUND" => (
+                "connection no longer exists",
+                "run `zc connection list` to inspect current connections",
+            ),
+            "CONNECTION_RESPONSE_INVALID" => (
+                "controller response was invalid or exceeded 4 MiB",
+                "verify the controller version and reduce oversized rule or proxy metadata",
+            ),
+            _ => (
+                "connection operation failed",
+                "check `zc status` and the configured controller; no new listener is started",
+            ),
+        };
+        return Failure {
+            code,
+            message: message.into(),
+            hint: hint.into(),
+            exit: 1,
+            data: None,
+        };
+    }
     let text = format!("{error:#}");
     let default_code = match command {
         "start" => "START_FAILED",
@@ -623,6 +696,58 @@ fn map_error(command: &str, error: anyhow::Error) -> Failure {
 fn render_text(command: &str, data: &Value) {
     match command {
         "version" => println!("zc {}", env!("CARGO_PKG_VERSION")),
+        "connection list" => {
+            println!(
+                "ID  SOURCE  PROTOCOL/PHASE  INBOUND  TARGET  ROUTED TARGET  RULE  LEAF  DATAGRAM SOURCE/SCOPE"
+            );
+            if let Some(entries) = data["connections"].as_array() {
+                for entry in entries {
+                    let field = |name: &str| safe_text(entry[name].as_str().unwrap_or("-"));
+                    let target = |name: &str| {
+                        if entry[name].is_object() {
+                            format!(
+                                "{}:{}",
+                                safe_text(entry[name]["host"].as_str().unwrap_or("-")),
+                                entry[name]["port"]
+                            )
+                        } else {
+                            "-".into()
+                        }
+                    };
+                    let rule = if entry["rule"].is_object() {
+                        safe_text(&entry["rule"].to_string())
+                    } else {
+                        "-".into()
+                    };
+                    let proxy = if entry["proxy"].is_object() {
+                        safe_text(&entry["proxy"].to_string())
+                    } else {
+                        "-".into()
+                    };
+                    println!(
+                        "{}  {}  {}/{}  {}  {}  {}  {}  {}  {}/{}",
+                        field("id"),
+                        field("source"),
+                        field("protocol"),
+                        field("phase"),
+                        field("inbound"),
+                        target("target"),
+                        target("routed_target"),
+                        rule,
+                        proxy,
+                        field("datagram_source"),
+                        field("target_scope")
+                    );
+                }
+                if entries.is_empty() {
+                    println!("(no active connections)");
+                }
+            }
+        }
+        "connection close" => println!(
+            "Close requested: {} (closing)",
+            safe_text(data["id"].as_str().unwrap_or("-"))
+        ),
         "config list" => {
             println!("Available configs:\n");
             if let Some(items) = data["configs"].as_array() {
@@ -742,6 +867,10 @@ async fn dispatch(args: &Args) -> Result<Output> {
             json!({"action":"stop","state":"stopped"}),
         ))),
         "status" => Ok(Output::Data(daemon::status().await?)),
+        "connection list" => Ok(Output::Data(daemon::connections(None).await?)),
+        "connection close" => Ok(Output::Data(
+            daemon::connections(Some(&args.positionals[0])).await?,
+        )),
         "restart" | "reload" => {
             let captured = daemon::capture_restart().await?;
             let current = captured.prepared.clone();

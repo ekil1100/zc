@@ -22,13 +22,14 @@ use tokio::{
 
 use crate::{
     config::{Config, MatchContext, ProxyKind},
+    connection::{Guard, Inbound, Phase},
     observability::{FailureStage, Observer},
     outbound::{BoxStream, Connector},
     target::Target,
     udp::{MAX_WIRE_BYTES, UdpSession},
 };
 
-const MAX_CONNECTIONS: usize = 1024;
+const MAX_CONNECTIONS: usize = crate::connection::LIMIT;
 const MAX_UDP_ASSOCIATIONS: usize = 64;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_HEADER: usize = 16 * 1024;
@@ -37,7 +38,14 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub struct Runtime {
     listener: TcpListener,
+    connections: Arc<crate::connection::ConnectionRegistry>,
     context: Arc<ConnectionContext>,
+}
+
+#[derive(Default)]
+struct Session {
+    udp: Option<UdpSession>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 struct ConnectionContext {
@@ -56,6 +64,7 @@ impl Runtime {
             .with_context(|| format!("cannot bind {address}; check the bind address and whether the port is already in use"))?;
         Ok(Self {
             listener,
+            connections: crate::connection::ConnectionRegistry::new()?,
             context: Arc::new(ConnectionContext {
                 observer: None,
                 config: Arc::new(config),
@@ -71,6 +80,15 @@ impl Runtime {
             .expect("observer is attached before runtime sharing")
             .observer = Some(observer);
         self
+    }
+
+    pub(crate) fn with_instance_nonce(mut self, nonce: &str) -> Self {
+        self.connections = crate::connection::ConnectionRegistry::for_instance(nonce.into());
+        self
+    }
+
+    pub fn connections(&self) -> Arc<crate::connection::ConnectionRegistry> {
+        self.connections.clone()
     }
 
     pub fn config(&self) -> Arc<Config> {
@@ -105,6 +123,7 @@ impl Runtime {
                     };
                     let permit = permits.clone().try_acquire_owned()
                         .expect("task count bounds connection permits");
+                    let Some((record, mut cancelled)) = self.connections.register(source) else { drop(client); continue; };
                     let context = self.context.clone();
                     let connection = context.observer.as_ref().map(|observer| observer.connection());
                     let mut stopped = stopped.clone();
@@ -113,21 +132,24 @@ impl Runtime {
                         let _connection = connection;
                         // A Trojan UDP worker must remain owned even when serve is
                         // cancelled or panics, and must be joined before the guard.
-                        let mut session = None;
+                        let mut session = Session::default();
                         let result = crate::observability::catch_instance_panic(async {
                             tokio::select! {
                                 biased;
-                                _ = stopped.changed() => {},
-                                served = serve(client, context.clone(), source, &mut session) => {
+                                _ = stopped.wait_for(|v| *v) => {},
+                                _ = cancelled.wait_for(|v| *v) => {},
+                                served = serve(client, context.clone(), source, &mut session, &record) => {
                                     if let Err(error) = served { context.failure(FailureStage::Ingress, &error); }
                                 }
                             }
                             Ok(())
                         }).await;
-                        let closed = match session.as_mut() {
+                        let closed = match session.udp.as_mut() {
                             Some(session) => session.close().await,
                             None => Ok(()),
                         };
+                        drop(session);
+                        drop(record);
                         result.and(closed)
                     });
                 }
@@ -558,13 +580,16 @@ async fn dial(
     target: &Target,
     source: SocketAddr,
     stage: &mut FailureStage,
+    record: &Guard,
 ) -> Result<Option<BoxStream>> {
     *stage = FailureStage::Dns;
     let route = context
         .config
         .route_with_context(target, &match_context(source))
         .await?;
+    record.routed(&route);
     if matches!(route.proxy.kind, ProxyKind::Reject) {
+        record.phase(Phase::Rejected);
         context.rejected();
         return Ok(None);
     }
@@ -723,8 +748,10 @@ async fn associate(
     requested: SocketAddr,
     source: SocketAddr,
     local: SocketAddr,
-    session: &mut Option<UdpSession>,
+    session: &mut Session,
+    record: &Guard,
 ) -> Result<()> {
+    record.inbound(Inbound::Socks5Udp);
     if !context.config.proxies().iter().any(|proxy| {
         proxy.udp
             && matches!(
@@ -740,10 +767,11 @@ async fn associate(
         timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut control, 2)).await??;
         return Ok(());
     }
-    let Ok(_permit) = context.udp_permits.clone().try_acquire_owned() else {
+    let Ok(permit) = context.udp_permits.clone().try_acquire_owned() else {
         timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut control, 1)).await??;
         return Ok(());
     };
+    session.permit = Some(permit);
     let socket = match UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await {
         Ok(socket) => socket,
         Err(error) => {
@@ -770,7 +798,7 @@ async fn associate(
     tokio::select! {
         biased;
         _ = control.read(&mut byte) => Ok(()),
-        result = udp_relay(socket, &context, source.ip(), requested.port(), session) => result.context(FailureStage::Udp),
+        result = udp_relay(socket, &context, source.ip(), requested.port(), &mut session.udp, record) => result.context(FailureStage::Udp),
     }
 }
 
@@ -780,6 +808,7 @@ async fn udp_relay(
     source_ip: IpAddr,
     requested_port: u16,
     session: &mut Option<UdpSession>,
+    record: &Guard,
 ) -> Result<()> {
     let mut pinned = (requested_port != 0).then_some(SocketAddr::new(source_ip, requested_port));
     let mut storage = vec![0; 65536];
@@ -800,11 +829,14 @@ async fn udp_relay(
                 let Ok((target, payload)) = udp_request(&storage[..len]) else { continue };
                 pinned = Some(sender);
                 let target = if session.is_none() {
+                    record.target(&target, Some(sender), Inbound::Socks5Udp);
                     let mut stage = FailureStage::Dns;
                     let opened = timeout(HANDSHAKE_TIMEOUT, async {
                         let route = context.config.route_with_context(&target, &match_context(sender)).await?;
+                        record.routed(&route);
                         if !route.proxy.udp || !matches!(route.proxy.kind,
                             ProxyKind::Shadowsocks { .. } | ProxyKind::Trojan { .. }) {
+                            record.phase(Phase::Rejected);
                             context.rejected();
                             return Ok(None);
                         }
@@ -814,6 +846,7 @@ async fn udp_relay(
                     context.outcome(stage, &opened);
                     let Ok(Ok(Some((opened, target)))) = opened else { return Ok(()) };
                     *session = Some(opened);
+                    record.phase(Phase::Active);
                     target
                 } else {
                     target
@@ -857,7 +890,8 @@ async fn serve(
     mut client: TcpStream,
     context: Arc<ConnectionContext>,
     source: SocketAddr,
-    session: &mut Option<UdpSession>,
+    session: &mut Session,
+    record: &Guard,
 ) -> Result<()> {
     // accept supplies the stable peer address. Capture the local address before
     // handshake awaits: a reset can make later TCP address queries fail.
@@ -880,14 +914,15 @@ async fn serve(
             SocksRequest::Associate(requested) => {
                 // Control replies are ingress I/O; only actual relay operations
                 // carry Udp context. A vanished TCP peer is not a UDP fault.
-                return associate(client, context, requested, source, local, session).await;
+                return associate(client, context, requested, source, local, session, record).await;
             }
         };
+        record.target(&target, None, Inbound::Socks5Connect);
         // The operation owns its stage across cancellation; no connection shares it.
         let mut stage = FailureStage::Connect;
         let upstream = match timeout(
             HANDSHAKE_TIMEOUT,
-            dial(&context, &target, source, &mut stage),
+            dial(&context, &target, source, &mut stage, record),
         )
         .await
         {
@@ -904,6 +939,7 @@ async fn serve(
                 return Ok(());
             }
         };
+        record.phase(Phase::Active);
         timeout(HANDSHAKE_TIMEOUT, socks_reply(&mut client, 0)).await??;
         return transfer(client, upstream, Vec::new())
             .await
@@ -937,10 +973,19 @@ async fn serve(
                 return Ok(());
             }
         };
+        record.target(
+            &request.target,
+            None,
+            if request.forward.is_some() {
+                Inbound::HttpForward
+            } else {
+                Inbound::HttpConnect
+            },
+        );
         let mut stage = FailureStage::Connect;
         let mut upstream = match timeout(
             HANDSHAKE_TIMEOUT,
-            dial(&context, &request.target, source, &mut stage),
+            dial(&context, &request.target, source, &mut stage, record),
         )
         .await
         {
@@ -956,6 +1001,7 @@ async fn serve(
             }
         };
         let Some(mut forward) = request.forward else {
+            record.phase(Phase::Active);
             timeout(
                 HANDSHAKE_TIMEOUT,
                 write_client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
@@ -985,6 +1031,7 @@ async fn serve(
                 }
             };
         }
+        record.phase(Phase::Active);
         forward.keep_alive &= number < 1023;
         if !forward_http(&mut client, &mut write_client, upstream, forward)
             .await
@@ -992,6 +1039,7 @@ async fn serve(
         {
             return Ok(());
         }
+        record.idle();
     }
     Ok(())
 }

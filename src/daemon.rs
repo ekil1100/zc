@@ -1198,7 +1198,8 @@ async fn run_instance_inner(
     let proxy = Runtime::bind(config, prepared.port)
         .await
         .context("START_PORT_IN_USE: cannot bind mixed listener")?
-        .with_observer(evidence.observer.clone());
+        .with_observer(evidence.observer.clone())
+        .with_instance_nonce(nonce);
     let config = proxy.config();
     let mut invocation = prepared.invocation.clone();
     invocation.prepared = !invocation.foreground;
@@ -1238,6 +1239,7 @@ async fn run_instance_inner(
         } else {
             None
         },
+        proxy.connections(),
     )
     .await?;
     async {
@@ -1553,6 +1555,134 @@ async fn get_runtime_status(endpoint: &str) -> Result<Value> {
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn same_connection_instance(a: &Descriptor, b: &Descriptor) -> bool {
+    a.ready
+        && b.ready
+        && a.pid == b.pid
+        && a.nonce == b.nonce
+        && a.endpoint == b.endpoint
+        && a.identity == b.identity
+}
+
+/// Operate only on the authenticated running instance, never the active profile.
+pub async fn connections(id: Option<&str>) -> Result<Value> {
+    use crate::connection::INSTANCE_HEADER;
+    let runtime = runtime_dir(false)?.context("CONNECTION_NOT_RUNNING: daemon is not running")?;
+    let mut d = observe(&runtime)
+        .context("CONNECTION_INSTANCE_CHANGED: cannot verify runtime")?
+        .filter(|d| d.ready)
+        .context("CONNECTION_NOT_RUNNING: daemon is not running")?;
+    let mut frozen = None;
+    for _ in 0..4 {
+        match prepared_for(&runtime, &d) {
+            Ok(prepared) => {
+                frozen = Some(prepared);
+                break;
+            }
+            Err(error) => {
+                let next = observe(&runtime)
+                    .context("CONNECTION_INSTANCE_CHANGED: cannot verify runtime")?
+                    .context("CONNECTION_INSTANCE_CHANGED: daemon stopped")?;
+                ensure!(
+                    same_connection_instance(&d, &next),
+                    "CONNECTION_INSTANCE_CHANGED: daemon changed"
+                );
+                if d == next {
+                    return Err(error).context(
+                        "CONNECTION_INSTANCE_CHANGED: snapshot could not be authenticated",
+                    );
+                }
+                d = next;
+            }
+        }
+    }
+    let prepared = frozen.context("CONNECTION_INSTANCE_CHANGED: snapshot did not stabilize")?;
+    let endpoint = d
+        .endpoint
+        .as_ref()
+        .context("CONNECTION_CONTROLLER_REQUIRED: no controller")?;
+    let config = parse_config(&prepared)?;
+    ensure!(
+        !config.secret().is_empty(),
+        "CONNECTION_SECRET_REQUIRED: nonempty secret required"
+    );
+    if let Some(id) = id {
+        let (nonce, _) =
+            crate::connection::split_id(id).context("CONNECTION_RESPONSE_INVALID: invalid ID")?;
+        ensure!(
+            nonce == d.nonce,
+            "CONNECTION_INSTANCE_CHANGED: ID belongs to another instance"
+        );
+    }
+    ensure!(
+        observe(&runtime)
+            .context("CONNECTION_INSTANCE_CHANGED: cannot verify runtime")?
+            .as_ref()
+            .is_some_and(|next| same_connection_instance(&d, next)),
+        "CONNECTION_INSTANCE_CHANGED: daemon changed before request"
+    );
+    let client = client()?;
+    let request = match id {
+        Some(id) => client.delete(format!("http://{endpoint}/connections/{id}")),
+        None => client.get(format!("http://{endpoint}/connections")),
+    };
+    let mut response = request
+        .header(INSTANCE_HEADER, &d.nonce)
+        .bearer_auth(config.secret())
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("CONNECTION_FAILED: controller request failed"))?;
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    // Authentication failures intentionally carry no instance identity or trusted body.
+    if !matches!(status, 401 | 403) {
+        ensure!(
+            response.headers().get_all(INSTANCE_HEADER).iter().count() == 1
+                && response
+                    .headers()
+                    .get(INSTANCE_HEADER)
+                    .is_some_and(|v| v.as_bytes() == d.nonce.as_bytes()),
+            "CONNECTION_INSTANCE_CHANGED: controller instance mismatch"
+        );
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("CONNECTION_RESPONSE_INVALID: incomplete response"))?
+        {
+            ensure!(
+                chunk.len() <= (4 * 1024 * 1024usize).saturating_sub(bytes.len()),
+                "CONNECTION_RESPONSE_INVALID: response too large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+    }
+    ensure!(
+        observe(&runtime)
+            .context("CONNECTION_INSTANCE_CHANGED: cannot verify runtime")?
+            .as_ref()
+            .is_some_and(|next| same_connection_instance(&d, next)),
+        "CONNECTION_INSTANCE_CHANGED: daemon changed during request"
+    );
+    match status {
+        200 => {}
+        401 => bail!("CONNECTION_UNAUTHORIZED: unauthorized"),
+        403 => bail!("CONNECTION_SECRET_REQUIRED: secret required"),
+        404 => bail!("CONNECTION_NOT_FOUND: connection not found"),
+        409 => bail!("CONNECTION_INSTANCE_CHANGED: controller rejected instance"),
+        500 => {
+            bail!("CONNECTION_RESPONSE_INVALID: controller could not produce a complete response")
+        }
+        _ => bail!("CONNECTION_FAILED: controller rejected request"),
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("CONNECTION_RESPONSE_INVALID: invalid JSON"))?;
+    ensure!(
+        crate::connection::valid_response(&value, &d.nonce, id),
+        "CONNECTION_RESPONSE_INVALID: invalid schema"
+    );
+    Ok(value)
+}
+
 pub async fn apply_selection(
     identity: &ActiveIdentity,
     generation: u64,

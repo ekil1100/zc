@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Target {
     host: String,
     port: u16,

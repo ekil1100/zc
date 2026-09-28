@@ -4,7 +4,7 @@
 
 ## 完整命令表
 
-所有公开命令支持 `--json`；`-c` 等同于 `--config`。裸 `config/proxy/profile/diag` 输出组帮助并退出 0。每个命令接受 `help`、`--help`、`-h`，帮助请求不执行业务。
+所有公开命令支持 `--json`；`-c` 等同于 `--config`。裸 `config/proxy/profile/diag/connection` 输出组帮助并退出 0。每个命令接受 `help`、`--help`、`-h`，帮助请求不执行业务。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -15,6 +15,8 @@
 | `zc restart [-c <config>] [--port <port>]` | 默认复用运行实例冻结快照；显式来源/override 才重新准备；目标先冻结、后停旧实例，失败尝试精确回滚 |
 | `zc reload` | 重读 tracked source，保留 CLI 端口覆盖；当前成功路径为 restart fallback；未运行返回 `RELOAD_FAILED` |
 | `zc status` | 实际 daemon 状态、uptime、端口、路径、select 当前选择；stopped 也是 exit 0 |
+| `zc connection list` | 列出运行实例的活动连接、来源、协议/阶段、目标、命中运行时规则和实际 leaf；需显式 controller 与非空 secret |
+| `zc connection close <id>` | 按完整实例绑定 ID 请求关闭；成功仅表示已请求，非已回收 |
 | `zc log [-n <lines>] [-f\|--no-follow]` | 文本默认 follow；JSON 默认不 follow，`-f` 可显式启用；默认尾部 50 行 |
 | `zc test [-c <config>] [--port <port>]` | 通过代理端口做真实连通性检查；显式端口或默认 7899；文本/JSON 使用相同检查 |
 | `zc doctor [-c <config>]` | 配置、daemon、端口、连接诊断；运行中使用 descriptor 的实际 mixed 端口 |
@@ -87,6 +89,18 @@ Managed JSON 成功结果提供 `durability_uncertain` 与 `mirror_out_of_sync`�
 malformed/unsupported SS simple-obfs metadata 可在严格 YAML、基础字段/规则/provider 均有效时保留为 **inactive raw recovery revision**。仅该明确插件语义例外可恢复，不允许其他协议、reserved 名称、资源超限或离线 provider 错误混入。首个这类下载不占用首个 runtime-ready 自动激活位置；`download -d`、active update、`use` 返回 `CONFIG_CAPABILITY_UNSUPPORTED` 且保持 authority 不变。用 `config dump -c <name> --no-override` 检视、修复订阅并 update，再显式 use。
 
 普通 dump 脱敏；recovery-only raw text dump 为保留原字节可能含凭据，不应分享。终端不安全控制字符报 `CONFIG_DUMP_UNSAFE_TERMINAL`；重定向可保留原始字节。
+
+## 连接管理最小版
+
+`zc connection list [--json]` 与 `zc connection close <id> [--json]` 对应 minimal API 的 `GET /connections`、`DELETE /connections/<id>`；字段与关闭语义见 [API](../api/README.md#连接模型与关闭语义)。文本展示 ID、TCP 来源、协议/阶段、入站、原始目标、路由后目标、运行时规则、实际 leaf，以及 UDP 首包来源和范围；不安全终端字符转义。JSON 的 `data` 与 API 响应一致，继续使用 `ok/command/data` 信封。未知字段省略，不把未知 leaf 写成 DIRECT。
+
+裸 `connection` 显示组帮助并 exit 0；非法子命令、缺失/非法 ID、多余参数 exit 2。不接受 `-c/--config/--port/--all` 或 override 参数。未运行、无 controller、无 secret、鉴权失败、身份不可验证、记录消失或坏响应均 exit 1，**不能返回假空表**。成功空表仅代表已鉴权的当前实例没有活动记录。
+
+CLI 只用 `observe` 确认的 PID/nonce/endpoint/exact identity 与认证冻结快照取得 secret；不读取当前 active profile 猜测地址。控制请求直连、禁环境代理、禁重定向、网络期限 2 秒、响应上限 4 MiB；发送并校验实例头，拒绝坏 schema 或跨实例 ID。请求前后复查实例身份，但同实例 selection generation 变化不使连接操作失败。DELETE 的旧 ID 防护在服务端副作用之前执行，不能只靠事后复查。
+
+没有 controller 时不自动开端口。若修改 `external-controller/secret`，必须显式重新准备再重启，例如 `zc restart -c <config>`；默认 restart 冻结语义不变，前台实例由 supervisor 按显式来源重新准备。连接列表属于敏感详情，不应公开分享。
+
+HTTP keep-alive 同 ID，下一请求更新路由，idle 清除目标/规则/leaf；UDP 只记录首合法包，并标记 `first_datagram`，关闭整条关联。无流量计数、全部断开、历史、分页、WebSocket 或 TUI。
 
 ## 资源、诊断与运行目录
 

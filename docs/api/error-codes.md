@@ -95,6 +95,28 @@ Rust 命令映射位于 `src/cli.rs`；本字典保留原冻结词汇和验收�
 `START_PORT_INVALID`），message/hint 按 `restart` 渲染。以上 `*_REQUIRED` /
 `*_INVALID` 参数错误均为用法错误，exit 2。
 
+### B2. connection 家族
+
+| code | 触发条件 | 恢复方式 |
+|---|---|---|
+| `CONNECTION_ARGUMENT_INVALID` | 裸组全局选项后仍有非法/多余参数 | 使用 `zc help connection`，exit 2 |
+| `CONNECTION_SUBCOMMAND_UNKNOWN` | 未知子命令 | 仅使用 list 或 close，exit 2 |
+| `CONNECTION_LIST_ARGUMENT_INVALID` | list 的非法参数 | 使用 `zc connection list [--json]`，exit 2 |
+| `CONNECTION_CLOSE_ID_REQUIRED` | 缺少 ID | 从 list 取得 ID，exit 2 |
+| `CONNECTION_CLOSE_ARGUMENT_INVALID` | 非法 ID、额外参数或 `--all` | 使用完整 `<nonce>-<序号>`，exit 2 |
+| `CONNECTION_NOT_RUNNING` | 没有已验证的 ready 实例 | 显式准备配置并启动，exit 1 |
+| `CONNECTION_CONTROLLER_REQUIRED` | 冻结配置没有 controller | 配置 controller/非空 secret 后显式 `restart -c <config>`；默认 restart 复用冻结快照 |
+| `CONNECTION_SECRET_REQUIRED` | 冻结配置无非空 secret，或 API 返回 403 | 配置非空 secret 后显式重新准备重启；不是默认 restart |
+| `CONNECTION_UNAUTHORIZED` | API 返回 401 | 核对运行实例及冻结 secret，不输出或分享凭据 |
+| `CONNECTION_INSTANCE_CHANGED` | PID/nonce/endpoint/exact identity 或快照不可验证、响应实例头缺失/不匹配、旧 ID、API 409 | 重新 list，仅操作当前实例 ID |
+| `CONNECTION_NOT_FOUND` | API 404，连接已回收 | 重新 list；不存在历史记录 |
+| `CONNECTION_RESPONSE_INVALID` | schema/JSON/响应完整性错误、超过 4 MiB 或 API 无法生成完整响应 | 核对 controller 版本，减少过大的节点/规则展示数据 |
+| `CONNECTION_FAILED` | 其他控制请求、超时、文件读取等失败 | 检查 status/controller；不会创建新监听器 |
+
+除明确列出的用法错误外均 exit 1，文本/JSON 同码。错误不回显 secret、目标或控制器响应正文。CLI 的 DELETE 成功仅为 `close_requested:true`，不能自动重试为“已回收”；仍在 closing 的条目可重复请求，消失后 404。
+
+API 保持 `{"error":"…"}`，不发 CLI 信封或上述 code：非空 secret 缺失 403，缺失/错误 Bearer 401，格式错误 400，实例不符 409，条目不存在 404，完整编码超限 500。旧 GET/PUT 鉴权规则不变。协议与元数据详见 [API](README.md)。
+
 ### C. 配置类（CONFIG_*）
 
 | code | message 示例 | hint 示例 |

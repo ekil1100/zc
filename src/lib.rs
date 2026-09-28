@@ -4,6 +4,7 @@ mod anytls;
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod connection;
 pub mod daemon;
 pub mod dns;
 pub mod fsutil;

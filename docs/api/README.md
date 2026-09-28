@@ -13,7 +13,7 @@ rules:
   - MATCH,DIRECT
 ```
 
-非空 `secret` 使所有 PUT 要求 `Authorization: Bearer <secret>`，缺失/错误返回 401；只读端点不要求 Bearer。loopback 不是多用户授权边界，生产应始终配置随机 secret，且不要把只读接口视为私密信息通道。
+非空 `secret` 使所有 PUT 要求 `Authorization: Bearer <secret>`，缺失/错误返回 401；原有只读端点仍不要求 Bearer。连接详情敏感，新增的 `GET /connections` 和 `DELETE /connections/<id>` **必须配置非空 secret 并使用 Bearer**：未配置返回 403，缺失或错误 Bearer 返回 401。loopback 不是多用户授权边界；生产应始终配置随机 secret，不要把原有只读接口视为私密信息通道。
 
 ## 端点
 
@@ -23,10 +23,38 @@ rules:
 | GET | `/version` | 版本 |
 | GET | `/proxies` | 配置节点 |
 | GET | `/rules` | 配置规则 |
+| GET | `/connections` | 当前活动连接快照；强制鉴权，格式见下节 |
+| DELETE | `/connections/<id>` | 请求关闭指定连接；强制鉴权和实例身份检查 |
 | GET | `/status` | 实际运行 config identity 与当前 group selections；`selected_proxies` 按运行配置的代理组声明顺序排列 |
 | PUT | `/proxies/<group>` | body 至少含 `{"name":"proxy"}`；group 支持百分号编码 |
 
 响应由 `serde_json` 序列化，引号、反斜杠、控制字符与 Unicode 正确转义。错误为 `{"error":"…"}`，不是 CLI 的 code/message/hint envelope。
+
+## 连接模型与关闭语义
+
+一条 mixed 接受的 TCP 任务对应一个 `connection`；SOCKS5 UDP 控制关联也使用该 ID。列表为 `{"connections":[...]}`，条目字段如下；握手中尚未知的可选字段省略，不默认填 DIRECT。
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` | `<实例 nonce>-<单调序号>`；实例内不复用，序号溢出拒绝新连接 |
+| `source` | 接受时的 TCP 来源地址及端口；UDP 时仍是控制连接来源 |
+| `protocol` / `phase` | `tcp/udp`；阶段为 `handshake/routing/connecting/active/idle/udp_wait/rejected/closing` |
+| `inbound` | 已识别的 `http_connect/http_forward/socks5_connect/socks5_udp` |
+| `target` | 当前原始目标 `{host,port}`，不含 URL 路径、请求头或正文 |
+| `routed_target` | 单次规则匹配后固定的目标 `{host,port}`；可能是域名或获准 IP，**不是实际远端 IP** |
+| `rule` | `{index,type,payload,target}`，零起始 index 对应本实例 `/rules` 的运行时展开顺序，不是 YAML 行号或 provider 来源 |
+| `proxy` | `{name,type}`，实际 leaf 节点；type 使用 `Direct/Reject/Shadowsocks/Trojan/AnyTLS`，不含凭据 |
+| `datagram_source` / `target_scope` | UDP 首个合法数据报来源；scope 固定为 `first_datagram` |
+
+`routing` 包含可能的规则 DNS 等待；`connecting` 包含出站 DNS、TCP、TLS 或 HTTPS 准备，不细分每个协议内部步骤。`active` 也不保证远端目标已确认成功，例如 AnyTLS 保持乐观开流语义。拒绝状态可能很短暂，列表不是历史记录。
+
+元数据来自实际单次路由与同一次选择读锁，不在查询时重路由、解析 DNS 或按当前选择重算。切组不会改写存量隧道的 leaf。HTTP forward 顺序 keep-alive 使用同一 ID，每个新请求重新路由；等待下一请求时为 `idle`，清除 target、routed_target、rule 和 proxy。UDP 首包前为 `udp_wait`，上述目标和路由字段未知；首合法包固定目标、来源、rule 与 leaf。后续数据报仍可有其他目标，但**列表只代表首包**，不会把新目标搭配旧规则伪装成重新路由。
+
+DELETE 成功返回 `{"id":"…","close_requested":true,"phase":"closing"}`，只表示已请求关闭，不表示资源已回收。重复关闭尚存的 closing 条目可以成功；条目已删除返回 404。关闭 UDP 会关闭整条关联；数据面任务先取消转发，再等待 Trojan UDP worker 回收，最后释放槽位、删除记录与释放观测计数。不强制 abort 整个连接任务，也不把管理取消计为连接故障。
+
+仅连接接口请求通过非空 secret 和 Bearer 鉴权后，响应才携带 `X-Zc-Instance-Nonce`，包括后续的 400/404/409/500。旧 GET、其他路由、未通过鉴权以及 HTTP 读取失败/超时的响应均不带该头。CLI 对 401/403 不依赖实例头，分别返回既有 `CONNECTION_UNAUTHORIZED` / `CONNECTION_SECRET_REQUIRED`，不读取或回显响应正文；成功及所有其他响应仍严格验证唯一且匹配的实例头，保留请求前后的 descriptor 身份复查。连接请求可带同名请求头，带了就必须与实例匹配；重复头为 400，不匹配为 409。CLI 必须发送并检查该头。手工 GET 可省略请求头，但不能省略鉴权。DELETE 无论是否带头，都先检查完整 ID 中的 nonce，旧实例 ID 返回 409，不会只按序号误伤新实例。格式错误的 ID 返回 400。
+
+配置变更后须显式重新准备，例如 `zc restart -c <config>`；默认 `zc restart` 仍复用冻结快照。没有 controller 时不创建临时监听器。无流量计数、全部断开、历史、分页、WebSocket、自动 controller 或 TUI；这不是 mihomo `/connections` 的完整响应兼容实现。
 
 ## managed selection 与 readiness
 
@@ -41,8 +69,8 @@ rules:
 - 同时最多 16 个连接，超出立即关闭。
 - header 最大 16 KiB，body 最大 64 KiB，超限 413。
 - 完整 request 读取期限 2 秒，超时 408。
-- response body 最大 4 MiB，写出期限 2 秒；超限为完整的 500 `Response Too Large`。
+- response body 最大 4 MiB，写出期限 2 秒；超限为完整的 500 `Response Too Large`。连接列表先轻量快照，再借用配置索引通过有界编码器；配置中的巨大名称、规则及 JSON 转义也计费，不先克隆成无界 JSON，不静默截断或省略条目。
 - PUT 必须提供唯一合法 Content-Length；不支持 Transfer-Encoding/chunked，拒绝歧义 framing。
 - 单连接单个 HTTP/1.0 或 HTTP/1.1 request，响应后关闭。
 
-无 WebSocket、`/runtime`、`/profiles`、`/connections`、`/metrics`。不要将该有界控制面当作通用 HTTP 服务。
+无 WebSocket、`/runtime`、`/profiles`、`/metrics`。不要将该有界控制面当作通用 HTTP 服务。

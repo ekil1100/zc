@@ -106,7 +106,24 @@ struct Group {
 // Consumers must dial/encode this target, never the original unresolved destination.
 pub struct Route<'a> {
     pub proxy: &'a Proxy,
+    pub rule_index: usize,
+    pub leaf_index: usize,
     pub target: Target,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct RuleView<'a> {
+    index: usize,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    payload: &'a str,
+    target: &'a str,
+}
+#[derive(serde::Serialize)]
+pub(crate) struct ProxyView<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
 }
 
 #[derive(Default)]
@@ -803,7 +820,7 @@ impl Config {
         }
     }
 
-    fn resolve_proxy(&self, mut index: usize) -> &Proxy {
+    fn resolve_proxy(&self, mut index: usize) -> usize {
         let selections = self
             .selections
             .read()
@@ -811,7 +828,7 @@ impl Config {
         // All edges were checked for cycles at construction, including inactive members.
         for _ in 0..=self.groups.len() {
             if index < self.proxies.len() {
-                return &self.proxies[index];
+                return index;
             }
             let group = index - self.proxies.len();
             index = self.groups[group].members[selections[group]];
@@ -894,6 +911,29 @@ impl Config {
         serde_json::json!({"proxies": proxies})
     }
 
+    pub(crate) fn rule_view(&self, index: usize) -> RuleView<'_> {
+        let rule = &self.rules[index];
+        RuleView {
+            index,
+            kind: &rule.kind,
+            payload: &rule.payload,
+            target: self.node_name(rule.proxy),
+        }
+    }
+    pub(crate) fn proxy_view(&self, index: usize) -> ProxyView<'_> {
+        let proxy = &self.proxies[index];
+        ProxyView {
+            name: &proxy.name,
+            kind: match proxy.kind {
+                ProxyKind::Direct => "Direct",
+                ProxyKind::Reject => "Reject",
+                ProxyKind::Shadowsocks { .. } => "Shadowsocks",
+                ProxyKind::Trojan { .. } => "Trojan",
+                ProxyKind::AnyTls { .. } => "AnyTLS",
+            },
+        }
+    }
+
     pub fn rules_json(&self) -> serde_json::Value {
         let rules: Vec<_> = self.rules.iter().map(|rule| {
             serde_json::json!({"type": rule.kind, "payload": rule.payload, "target": self.node_name(rule.proxy)})
@@ -929,7 +969,7 @@ impl Config {
             .is_none()
             .then(|| canonical_domain(target.host()));
         let mut resolved: Option<Vec<IpAddr>> = None;
-        for rule in &self.rules {
+        for (rule_index, rule) in self.rules.iter().enumerate() {
             let mut pinned = None;
             let matched = match &rule.matcher {
                 Matcher::Match => true,
@@ -1002,8 +1042,11 @@ impl Config {
             };
             if matched {
                 let pinned = pinned.or_else(|| resolved.as_ref().map(|addresses| addresses[0]));
+                let leaf_index = self.resolve_proxy(rule.proxy);
                 return Ok(Route {
-                    proxy: self.resolve_proxy(rule.proxy),
+                    proxy: &self.proxies[leaf_index],
+                    rule_index,
+                    leaf_index,
                     target: match pinned {
                         Some(ip) => Target::new(ip.to_string(), target.port())?,
                         None => target.clone(),

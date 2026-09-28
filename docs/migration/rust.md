@@ -21,7 +21,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 | `src/api.rs` | 有界 loopback minimal HTTP API、Bearer 与 managed generation 校验 |
 | `src/config.rs`、`src/config_provider.rs` | 有界 YAML、规则展开、select 索引与路由 |
 | `src/override_script.rs` | Lua/可执行脚本、canonical materialization、只用于运行时的兼容字段投影 |
-| `src/runtime.rs` | mixed HTTP/SOCKS5、转发、UDP association 生命周期 |
+| `src/runtime.rs`、`src/connection.rs` | mixed HTTP/SOCKS5、转发、UDP association 生命周期，以及实例内有界连接索引与管理取消 |
 | `src/outbound.rs`、`src/anytls.rs`、`src/simple_obfs.rs`、`src/udp.rs` | TCP/TLS、单流 AnyTLS、classic SS、obfs HTTP、SS/Trojan UDP |
 | `src/dns.rs`、`src/target.rs` | 有界异步 DNS、目标校验与路由后地址固定 |
 
@@ -29,12 +29,12 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 
 ## 已接入的用户路径
 
-- 完整命令树：`help/version`、`start/up`、`stop/down`、`restart/reload/status/log/test/doctor`、`config load/list/download/update/use/delete/dump/override`、`proxy/profile list/select/test`、`diag doctor`。详见 [CLI 契约](../cli/spec.md)。
+- 完整命令树：`help/version`、`start/up`、`stop/down`、`restart/reload/status/log/test/doctor`、`config load/list/download/update/use/delete/dump/override`、`proxy/profile list/select/test`、`connection list/close <id>`、`diag doctor`。详见 [CLI 契约](../cli/spec.md)。
 - 托管 profile 的 immutable source、本地 provider assets、metadata、冻结 override 与 desired selections；先提交 durable desired，再尝试 exact revision 的 live apply。
 - 后台或 supervised foreground daemon；监听器绑定和 desired reconciliation 完成后才发布 ready 并开放数据面。控制面只有显式 `127.0.0.1:<port>`，占用即失败。
 - 内置 DIRECT/REJECT、classic AEAD SS、原生 TLS Trojan / AnyTLS TCP；SS 的内建 simple-obfs HTTP；`udp:true` SS/Trojan 经 mixed SOCKS5 UDP ASSOCIATE。
 - select 默认首成员、嵌套组、持久选择、循环/未知引用拒绝；first-match 规则、本地和 unmanaged HTTP rule-provider 展开。
-- minimal API：`/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`，详见 [API](../api/README.md)。
+- minimal API：`/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`、需强制鉴权的 `GET /connections` 与 `DELETE /connections/<id>`，详见 [API](../api/README.md)。
 
 生产默认端口固定 **7899**。`mixed-port` 数值只作配置兼容（含来源中的 0），真正 bind 由 CLI `--port` 或默认值决定；独立 `port`/`socks-port` 不创建 listener。开发显式用非生产端口；冲突不漂移。配置投影不能改变 immutable bytes 或其哈希证明。
 
@@ -202,3 +202,27 @@ cargo clippy --offline --locked --lib --test provider_cache --test service --tes
 - 原始红绿及所有中间失败保留在 `target/anytls-reference/lifecycle/`；修复后 Go 证据为 `target/anytls-reference/rust-e2e-71oo7bem/`；完整索引追加到 `target/anytls-reference/implementation-validation.md`。期间曾有洪泛量未填满传输缓冲、前缀夹具漏发 payload、测试替身缺 trait 导致的失败，均修正后重跑，没有当作通过。
 
 本轮未访问真实 HOME 的 zc 配置或生产端口，未 install/commit/push，未改历史 Zig。以上仍仅为 macOS arm64 本机定向验证；未重新执行完整 core E2E、安装/发布矩阵、四平台原生测试、性能/内存门禁及 24/72h 长稳。短时背压进度测试不是吞吐或抗指纹证明。
+
+
+## P2：连接列表与按 ID 关闭最小版
+
+已接入 `zc connection list`、`zc connection close <id>` 与相同模型的 minimal API。功能、字段和错误契约见 [CLI](../cli/spec.md#连接管理最小版)、[API](../api/README.md#连接模型与关闭语义)、[错误码](../api/error-codes.md#b2-connection-家族)。未增加流量计数、全部断开、历史、分页、WebSocket、自动 controller 或 TUI。
+
+- Runtime 持有实例内 `ConnectionRegistry`，独立注入 API，与 managed selection 权威无关；没有磁盘状态或 Observer 第二份详情表。daemon 在共享和接受连接前绑定既有实例 nonce，不改变 descriptor、snapshot schema 或旧 canonical bytes。ID 为 nonce 加 checked 单调序号，关闭始终检查完整 ID；旧实例 ID 在副作用前拒绝。
+- 记录仅有有限元数据、rule/leaf 索引与取消信号，不克隆包含 password 的 Proxy。每个 TCP 任务一条记录，UDP 关联共用同 ID；上界仍为 1024 任务和 64 UDP。仅在阶段/请求边界更新，查询不重路由、解析 DNS 或重算当前选择。大配置名称和规则通过借用视图有界编码，含 JSON 转义最多 4 MiB；超限完整 500，不省略条目。
+- 新请求的入站类型、目标与清旧路由在同一次锁内更新。HTTP idle 清除目标与路由，下一请求重新决议；UDP 只记录首合法包，后续目标不改写首包规则/leaf。管理取消在外层优先处理，预发布 receiver 并检查当前值；closing 不被后续阶段更新覆盖。外部 RAII guard 留到 `session.close().await`、UDP worker join 和资源释放之后，正常 EOF/拒绝/异常/可捕获 panic 均回收；不 abort 整个连接任务。
+- 新 GET/DELETE 均要求非空 secret 和 Bearer，旧 GET/PUT 不变。CLI 使用已认证的运行快照与 descriptor，直连、禁重定向、2 秒网络期限、4 MiB 响应检查，并前后校验 PID/nonce/endpoint/exact identity；同实例 selection generation 不作为连接身份。不回显目标、凭据或失败响应正文。无 controller/未运行明确失败；修改配置后必须显式重新准备，默认 restart 仍冻结。
+
+### 本机证据与未完成门禁
+
+实现切片先复现：接口 404 而非 401、真实隧道假空列表、UDP 被显示为 TCP、CLI 不认识命令、裸组吞掉非法参数、文本漏掉 UDP 首包来源/范围、错误 controller 的 active 条目缺目标仍被当成功。逐片修复后通过。HTTP forward 转 CONNECT 的过渡另做代码不变量补强：原两次锁更新存在短暂入站/阶段不一致窗口，已合并；其端到端扩展回归原本即通过，不伪称确定性复现该窗口。
+
+本机 macOS arm64、Rust 1.98.1，lib 加 20 个相关 integration suites 共 **275 passed / 1 ignored / 1 filtered**；包含一个仅由父用例启动的外部控制器夹具入口，其子进程断言计在父用例内，不另累加。忽略的是既有真实五分钟 UDP idle；为禁止外网，过滤既有会运行默认外网 doctor 的 CLI diagnostics 用例。其余 CLI/API/daemon、正常 DIRECT/SS/Trojan/obfs half-close、AnyTLS FIN/心跳/生命周期和 UDP 回归均通过。
+
+原子过渡补强后仅重跑受影响的 6 套（connections、connections_cli、API、runtime、socks_udp、anytls_lifecycle），**66 passed / 1 ignored**，未重复扩大整套。后补 CLI 身份定点用例使用真实 CLI 生成的认证快照，在外部 controller 收完请求后发布夹具的下一代 selection 或新实例 descriptor：同实例 generation 改变仍成功，实例 nonce 改变拒绝成功；该用例通过。没有给生产代码增加测试开关。
+
+新增公开回归还覆盖：两条 TCP 只关一条；入站握手、出站 TLS、路由/出站 DNS 的定点取消；零 TTL 下查询不重新解析；旧 ID 防误伤；暂停独立数据面执行器时的重复 closing；UDP 首包固定与 Trojan 部分帧 worker 回收、64 槽位复用；1024/1025 任务准入；大名称与反斜杠 JSON 转义的 4 MiB 拒绝，以及后补恰好 4 MiB 成功、再增加一个节点名字节即拒绝（新增 1 项通过，去重合计 276）；CLI/API 元数据同源、终端方向控制符转义、冻结 secret、拒绝错误 JSON/schema/大小/nonce/重定向。
+
+`cargo fmt --all -- --check` 与 `cargo clippy --offline --locked --all-targets -- -D warnings` 通过；无新增 Python 文件。详细红绿、命令及边界保存于 `target/connections/implementation-validation.md`。所有新增网络夹具仅 loopback，CLI 使用临时 HOME；未 install/commit/push，未读取真实 HOME 的 zc 配置或操作生产 7899/在用实例。
+
+**没有性能通过声明**：阶段锁设计和资源上界测试不替代吞吐、延迟、CPU/RSS 测量。原生待完成 TCP connect 的队列饱和夹具在本机返回 RST，未得到有效取消证据；已保存失败的夹具探索，不把 DNS/TLS 取消冒充原生 connect 定点验证。未执行本轮独立 Go 互操作、四平台原生、完整 E2E/安装/发布矩阵、五分钟 idle 或 24/72 小时长稳；u64 序号溢出由 checked_add 拒绝，未以公开接口执行不可行的穷举连接次数。不宣称 Rust 迁移已完整验收或已部署。
