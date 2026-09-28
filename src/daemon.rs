@@ -1858,6 +1858,7 @@ mod lifecycle_tests {
         dropping: Option<tokio::sync::oneshot::Sender<()>>,
         released: std::sync::mpsc::Receiver<()>,
     }
+    impl crate::outbound::IoStream for DropPanicStream {}
     impl tokio::io::AsyncRead for DropPanicStream {
         fn poll_read(
             mut self: std::pin::Pin<&mut Self>,

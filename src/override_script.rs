@@ -1384,6 +1384,7 @@ fn integer_range(value: &Value, key: &str, max: u64) -> Result<()> {
 }
 fn normalize_config(value: &mut Value) -> Result<()> {
     use serde_json::json;
+    crate::config::validate_anytls_fields(value)?;
     let map = value.as_object_mut().unwrap();
     for (key, default) in [
         ("port", json!(0)),
@@ -1703,6 +1704,13 @@ fn canonical_config_yaml(
                 yaml_field(&mut out, "    ", key, v)?;
             }
         }
+        // Only the new protocol gains a canonical field. Preserve historical
+        // bytes/hashes for every other protocol, even with ignored source keys.
+        if proxy["type"] == "anytls"
+            && let Some(value) = proxy.get("disable-reuse")
+        {
+            yaml_field(&mut out, "    ", "disable-reuse", value)?;
+        }
         if proxy.get("grpc-opts").is_some() {
             out.write_str("    grpc-opts: {}\n").map_err(write_error)?;
         }
@@ -1937,7 +1945,7 @@ fn materializable(value: &Value) -> Result<()> {
     }
     for proxy in value["proxies"].as_array().unwrap() {
         let kind = proxy["type"].as_str().unwrap();
-        if !matches!(kind, "direct" | "reject" | "ss" | "trojan")
+        if !matches!(kind, "direct" | "reject" | "ss" | "trojan" | "anytls")
             || matches!(proxy["name"].as_str(), Some("DIRECT" | "REJECT"))
             || proxy.get("ws-opts").is_some()
             || proxy.get("grpc-opts").is_some()

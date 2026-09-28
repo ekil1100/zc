@@ -65,3 +65,29 @@ just validate
 PR/main 与 tag 的实际任务以 `.github/workflows/ci.yml` / `release.yml` 为准：四平台 native Rust 构建，Linux musl static 检查，真实 release E2E 与安装 smoke；tag 发布先确认对应 main CI 成功。固定默认 7899 的独立 smoke 只在一次性 Linux CI 环境执行。
 
 300 秒 UDP idle 是需显式执行的长等待场景，短回归与默认 ignored 测试不构成其通过证据。`CORE_E2E_RESULT=PASS`、`INSTALLER_E2E_RESULT=PASS` 必须来自对应完整命令的零退出；不能从部分 counter/marker 推导全部门禁或四平台通过。
+
+## AnyTLS 可选独立互操作
+
+```bash
+just anytls-e2e
+# Equivalent after building zc:
+python3 scripts/e2e/run-anytls.py target/debug/zc target/anytls-reference
+```
+
+此入口**不属于**默认 `just e2e`、`just validate` 或当前 CI；普通 `cargo test` 会执行 Rust AnyTLS 配置/字节/生命周期回归，但不会运行官方 Go 门禁。命令不下载、不安装、不自动编译 Go；fixture 缺失、平台无已审查哈希或哈希不符均失败，不以 skip 当作通过。
+
+fixture 是未修改的官方 `cmd/server`：v0.0.13（commit `9666872946857b50a74fdb692896d77b53773cb2`）和 v0.0.5（commit `bcb7b3dc0f74a2ca87c9959b1c3860c555288f1a`）。获取、隔离构建及 Go 工具链校验步骤见 [研究 §7](../research/anytls.md#七独立-go-服务端-fixture-与实测)；两版本均验证官方固定提交的源码归档 SHA，使用上游 go.mod/go.sum、`-mod=readonly -trimpath -buildvcs=false`，不修改源码。显式禁用 VCS 嵌入，避免归档源码拾取父 zc 仓库的 HEAD/dirty 状态；构建固定 `CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOARM64=v8.0`，通过空环境、临时 HOME、`GOENV=off GOTOOLCHAIN=local` 隔离用户配置。manifest 同时记录来源 URL、归档/工具链 SHA 和构建参数。已审查二进制 SHA-256 固定在 `testdata/e2e/anytls-fixtures.json`，当前仅覆盖本机 Go 1.27.1 / darwin-arm64 的构建。其他平台需独立构建、核实来源和嵌入版本后审查新增哈希，不能将现有二进制或一次本机运行当作四平台证据。
+
+本轮已验证两版本在不同路径、父 Git 干净/dirty 状态下重建哈希一致，并通过原 runner 的 SHA 门禁；这不代表完整互通已重跑。实际新产物位于 `target/anytls-reference/loop-round1/fixture-fix/bin/`，最终互通可运行：
+
+```bash
+python3 scripts/e2e/run-anytls.py target/debug/zc target/anytls-reference/loop-round1/fixture-fix
+```
+
+脚本执行前校验全部二进制 SHA-256；官方服务端使用临时自签证书，正向流量必须显式 skip，负向确认默认 TLS 拒绝。另用 Python/OpenSSL 及现有公开测试证书验证可信 TLS、完整认证单 record、默认填充及每节点新 session 更新后的 record，包含原始 MD5（尾部 LF）与纯填充尺寸+7。它不导入生产 codec，也不取代官方 Go 互通。
+
+每个 Go 版本 10 个场景：SOCKS/CONNECT echo、两种入口 server-first、domain/IPv4/IPv6、HTTP forward、错误密码（两入口）、目标失败、默认拒绝自签证书；成功 echo 同时检查本地 FIN 无需回复即可结束。目标失败使用绑定但未 listen 的端口，不误连其他进程；不把 timeout 当成合格的关闭信号。错密码及 TLS 错误检查 origin 连接数不变，防止 DIRECT fallback。
+
+所有子进程 HOME/runtime 和日志位于 `target/anytls-reference/rust-e2e-*`，使用 loopback 非生产端口；finally 终止并等待进程，origin 线程停止并 join。证据为 `results.json`、`record-shapes.json` 和独立服务端/zc 日志；fixture 密码仅为公开测试常量。终态标记 `ANYTLS_E2E_RESULT=PASS` 只来自完整脚本零退出。测试程序、Go 工具链和服务端均不安装、不进入 release archive。
+
+这是两代固定服务端的局部互操作证据，不是池/UDP、透明 half-close、吞吐/短连接性能、抗指纹、四平台或长稳 PASS。

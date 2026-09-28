@@ -79,7 +79,7 @@ just -- test --test cli
 | SOCKS5 outbound | ❌ 未实现 | 配置准入阶段拒绝。 |
 | VMess | ❌ 未实现 | 未通过标准 wire 与互操作验证。 |
 | VLESS | ❌ 未实现 | 未完成主流 transport 与互操作验证。 |
-| AnyTLS | ❌ 未实现 | 保留代码不构成运行时支持。 |
+| AnyTLS | ⚠️ 部分实现 | 原生 TLS/TCP；每流独占 session，无池/复用/UDP；乐观开流，FIN 非 half-close。固定 Go v0.0.13/v0.0.5 本机互通已验证，详见[兼容边界](docs/compat/mihomo-clash.md#anytls单流原生-tlstcp)。 |
 | mihomo 的其他 outbound 协议 | ❌ 未实现 | 未列出的协议均不作为已支持能力。 |
 
 ### 代理组

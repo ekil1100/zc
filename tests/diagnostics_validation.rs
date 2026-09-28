@@ -399,3 +399,20 @@ async fn sanitizing_terminal_controls_does_not_enlarge_the_original_byte_budget(
     );
     assert_eq!(data["config_diagnostics_truncated"], true);
 }
+
+#[tokio::test]
+async fn doctor_reports_anytls_fields_and_explicit_tls_downgrade() {
+    let data = diagnose("proxies: [{name: edge, type: anytls, server: localhost, port: 443, password: '', sni: 'bad_name', skip-cert-verify: true}]\nrules: ['MATCH,edge']\n").await;
+    assert_eq!(data["config_ok"], false);
+    let errors = data["config_errors"].to_string();
+    assert!(
+        errors.contains("AnyTLS") && errors.contains("password") && errors.contains("sni"),
+        "{data}"
+    );
+    assert!(
+        data["config_warnings"]
+            .to_string()
+            .contains("AnyTLS proxy 'edge': skip-cert-verify=true"),
+        "{data}"
+    );
+}

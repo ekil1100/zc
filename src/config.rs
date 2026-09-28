@@ -433,6 +433,8 @@ struct RawProxy {
     udp: bool,
     #[serde(default, deserialize_with = "present")]
     plugin: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    disable_reuse: Option<bool>,
     #[serde(default, alias = "plugin_opts", deserialize_with = "present")]
     plugin_opts: Option<RawObfs>,
 }
@@ -452,6 +454,11 @@ impl RawProxy {
             .is_some_and(|network| network != "tcp")
         {
             bail!("only native proxy transport is supported; use network: tcp");
+        }
+        if self.disable_reuse.is_some()
+            && (self.kind != "anytls" || self.disable_reuse != Some(true))
+        {
+            bail!("disable-reuse is supported only as true for AnyTLS");
         }
         let obfs = match (self.plugin.as_deref(), self.plugin_opts) {
             (None, None) => None,
@@ -510,23 +517,32 @@ impl RawProxy {
                     cipher: cipher.into(),
                 }
             }
-            "trojan" => {
-                if self.tls == Some(false) || self.cipher.is_some() {
-                    bail!("Trojan requires native TLS without cipher metadata");
+            "trojan" | "anytls" => {
+                let protocol = if self.kind == "anytls" {
+                    "AnyTLS"
+                } else {
+                    "Trojan"
+                };
+                if self.kind == "anytls" && (self.udp || self.tls == Some(true)) {
+                    bail!("AnyTLS supports native TLS/TCP only, without UDP or TLS options");
+                }
+                if (self.kind == "trojan" && self.tls == Some(false)) || self.cipher.is_some() {
+                    bail!("{protocol} requires native TLS without cipher metadata");
                 }
                 if let Some(sni) = &self.sni {
                     if sni.ends_with('.') || sni.parse::<IpAddr>().is_ok() {
                         bail!(
-                            "Trojan SNI must be a DNS hostname without a trailing root dot, not an IP address"
+                            "{protocol} SNI must be a DNS hostname without a trailing root dot, not an IP address"
                         );
                     }
-                    Target::new(sni.clone(), 1)
-                        .map_err(|_| anyhow!("Trojan SNI must be a valid ASCII DNS hostname"))?;
+                    Target::new(sni.clone(), 1).map_err(|_| {
+                        anyhow!("{protocol} SNI must be a valid ASCII DNS hostname")
+                    })?;
                 } else if self.skip_cert_verify != Some(true)
                     && self.server.parse::<IpAddr>().is_ok()
                 {
                     bail!(
-                        "verified Trojan IP server requires SNI matching the certificate's DNS hostname"
+                        "verified {protocol} IP server requires SNI matching the certificate's DNS hostname"
                     );
                 }
                 let tls_name = self.sni.as_deref().unwrap_or(&self.server);
@@ -534,17 +550,29 @@ impl RawProxy {
                     tls_name.strip_suffix('.').unwrap_or(tls_name),
                 )
                 .map_err(|_| {
-                    anyhow!("invalid Trojan TLS server name; configure a valid SNI hostname")
+                    anyhow!("invalid {protocol} TLS server name; configure a valid SNI hostname")
                 })?;
-                ProxyKind::Trojan {
-                    server: self.server,
-                    port: self.port,
-                    password: self.password,
-                    sni: self.sni,
-                    skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                if self.kind == "anytls" {
+                    ProxyKind::AnyTls {
+                        server: self.server,
+                        port: self.port,
+                        password: self.password,
+                        sni: self.sni,
+                        skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                    }
+                } else {
+                    ProxyKind::Trojan {
+                        server: self.server,
+                        port: self.port,
+                        password: self.password,
+                        sni: self.sni,
+                        skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                    }
                 }
             }
-            _ => bail!("unsupported proxy type; only direct, reject, ss and trojan are supported"),
+            _ => bail!(
+                "unsupported proxy type; only direct, reject, ss, trojan and anytls are supported"
+            ),
         };
         Ok(Proxy {
             name: self.name,
@@ -588,6 +616,13 @@ pub enum ProxyKind {
         password: String,
         cipher: String,
     },
+    AnyTls {
+        server: String,
+        port: u16,
+        password: String,
+        sni: Option<String>,
+        skip_cert_verify: bool,
+    },
     Trojan {
         server: String,
         port: u16,
@@ -614,6 +649,7 @@ impl Config {
 
     fn parse_inner(source: &str, assets: Option<&BTreeMap<String, Vec<u8>>>) -> Result<Self> {
         let document = parse_document(source)?;
+        validate_anytls_fields(&document)?;
         // Preserve resource failures before untagged deserialization erases their cause.
         for (field, limit) in [
             ("proxies", MAX_MIXED_PROXIES),
@@ -848,6 +884,7 @@ impl Config {
         let proxies: Vec<_> = self.proxies.iter().skip(2).map(|proxy| {
             let (kind, server, port) = match &proxy.kind {
                 ProxyKind::Shadowsocks { server, port, .. } => ("Shadowsocks", server.as_str(), *port),
+                ProxyKind::AnyTls { server, port, .. } => ("AnyTLS", server.as_str(), *port),
                 ProxyKind::Trojan { server, port, .. } => ("Trojan", server.as_str(), *port),
                 ProxyKind::Direct => ("Direct", "", 0),
                 ProxyKind::Reject => ("Reject", "", 0),
@@ -1270,4 +1307,35 @@ fn geoip_country(ip: IpAddr) -> Option<&'static str> {
         .iter()
         .find(|&&(start, end, _)| (start..=end).contains(&ip))
         .map(|entry| entry.2)
+}
+
+// Validate before canonical writers discard fields, including unselected nodes.
+// Inert false/zero fields also occur in the existing normalized internal document.
+pub(crate) fn validate_anytls_fields(document: &serde_json::Value) -> Result<()> {
+    for proxy in document["proxies"].as_array().into_iter().flatten() {
+        if proxy["type"] != "anytls" {
+            continue;
+        }
+        let fields = proxy
+            .as_object()
+            .ok_or_else(|| anyhow!("invalid AnyTLS node"))?;
+        for (key, value) in fields {
+            let allowed = match key.as_str() {
+                "name" | "type" | "server" | "port" | "password" | "sni" | "skip-cert-verify" => {
+                    true
+                }
+                "network" => value == "tcp",
+                "udp" | "tls" => value == false,
+                "alterId" => value == 0,
+                "disable-reuse" => value == true,
+                _ => false,
+            };
+            if !allowed {
+                bail!(
+                    "UnsupportedCapability: AnyTLS supports only native TLS/TCP fields; no pooling, UDP or extended TLS options"
+                );
+            }
+        }
+    }
+    Ok(())
 }

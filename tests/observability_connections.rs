@@ -155,45 +155,47 @@ fn reject_and_clean_disconnect_are_not_faults() {
 #[test]
 fn actual_tls_handshake_failure_is_classified() {
     use std::io::{Read, Write};
-    let f = Fixture::new();
-    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    fs::write(&f.config, format!("proxies:\n  - name: private-proxy\n    type: trojan\n    server: 127.0.0.1\n    port: {}\n    password: private-password\n    skip-cert-verify: true\nrules: ['MATCH,private-proxy']\n", upstream.local_addr().unwrap().port())).unwrap();
-    let port = free_port();
-    f.json(&[
-        "start",
-        "-c",
-        f.config.to_str().unwrap(),
-        "--port",
-        &port.to_string(),
-        "--json",
-    ]);
-    let server = std::thread::spawn(move || {
-        let (mut socket, _) = upstream.accept().unwrap();
-        socket
+    for protocol in ["trojan", "anytls"] {
+        let f = Fixture::new();
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        fs::write(&f.config, format!("proxies:\n  - name: private-proxy\n    type: {protocol}\n    server: 127.0.0.1\n    port: {}\n    password: private-password\n    skip-cert-verify: true\nrules: ['MATCH,private-proxy']\n", upstream.local_addr().unwrap().port())).unwrap();
+        let port = free_port();
+        f.json(&[
+            "start",
+            "-c",
+            f.config.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+            "--json",
+        ]);
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut hello = [0; 4096];
+            assert!(socket.read(&mut hello).unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 400 Not TLS\r\n\r\n").unwrap();
+        });
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut hello = [0; 4096];
-        assert!(socket.read(&mut hello).unwrap() > 0);
-        socket.write_all(b"HTTP/1.1 400 Not TLS\r\n\r\n").unwrap();
-    });
-    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    client.write_all(b"CONNECT private-target.invalid:443 HTTP/1.1\r\nHost: private-target.invalid:443\r\n\r\n").unwrap();
-    let mut response = String::new();
-    client.read_to_string(&mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 502"));
-    server.join().unwrap();
-    f.json(&["stop", "--json"]);
-    let events = log_events(&f);
-    assert!(
-        events
-            .iter()
-            .any(|e| e["event"] == "connection_failed" && e["stage"] == "tls"),
-        "{events:?}"
-    );
-    assert!(!format!("{events:?}").contains("private-"));
+        client.write_all(b"CONNECT private-target.invalid:443 HTTP/1.1\r\nHost: private-target.invalid:443\r\n\r\n").unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"));
+        server.join().unwrap();
+        f.json(&["stop", "--json"]);
+        let events = log_events(&f);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["event"] == "connection_failed" && e["stage"] == "tls"),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains("private-"));
+    }
 }
 
 #[test]
@@ -1360,4 +1362,115 @@ fn shadowsocks_resets_without_incomplete_incoming_units_are_not_faults() {
         peer.join().unwrap();
     }
     assert_transfer_failures(&f, 0);
+}
+
+#[test]
+fn anytls_fin_is_orderly_but_eof_reset_alert_and_synack_are_private_transfer_failures() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::{
+        io::{Read, Write},
+        sync::Arc,
+    };
+    let f = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(&f.config, format!("proxies: [{{name: edge, type: anytls, server: 127.0.0.1, port: {}, password: private-password, skip-cert-verify: true}}]\nrules: ['MATCH,edge']",listener.local_addr().unwrap().port())).unwrap();
+    let cert =
+        CertificateDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-cert.pem")).unwrap();
+    let key =
+        PrivateKeyDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-key.pem")).unwrap();
+    let tls = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap(),
+    );
+    let server = std::thread::spawn(move || {
+        for case in 0..6 {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut s = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(tls.clone()).unwrap(),
+                socket,
+            );
+            let mut auth = [0; 64];
+            s.read_exact(&mut auth).unwrap();
+            assert_eq!(&auth[32..34], &[0, 30]);
+            for expected in [4, 1, 2] {
+                loop {
+                    let mut h = [0; 7];
+                    s.read_exact(&mut h).unwrap();
+                    let mut body = vec![0; u16::from_be_bytes([h[5], h[6]]) as usize];
+                    s.read_exact(&mut body).unwrap();
+                    if h[0] == 0 {
+                        continue;
+                    }
+                    assert_eq!(h[0], expected);
+                    break;
+                }
+            }
+            s.write_all(b"\x02\0\0\0\x01\0\x02ok").unwrap();
+            let tail: &[u8] = match case {
+                0 => b"\x03\0\0\0\x01\0\0",
+                1 => b"",
+                2 | 3 => b"\x02\0\0\0\x01\0\x10partial",
+                4 => b"\x05\0\0\0\0\0\x0eprivate-secret",
+                _ => b"\x0a\0\0\0\0\0\x03v=2\x07\0\0\0\x01\0\x0eprivate-target",
+            };
+            s.write_all(tail).unwrap();
+            s.flush().unwrap();
+            // Ensure the complete preceding PSH reached the caller before injecting RST.
+            if case == 3 {
+                std::thread::sleep(Duration::from_millis(30));
+                rustix::net::sockopt::set_socket_linger(&s.sock, Some(Duration::ZERO)).unwrap();
+            } else if case != 0 {
+                s.conn.send_close_notify();
+                s.flush().unwrap();
+            }
+        }
+    });
+    let port = free_port();
+    f.json(&[
+        "start",
+        "-c",
+        f.config.to_str().unwrap(),
+        "--port",
+        &port.to_string(),
+        "--json",
+    ]);
+    for _ in 0..6 {
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"CONNECT private-target.invalid:443 HTTP/1.1\r\nHost: private-target.invalid:443\r\n\r\n").unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0; 1];
+            client.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 200"));
+        let mut payload = [0; 2];
+        client.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"ok");
+        let mut tail = Vec::new();
+        let _ = client.read_to_end(&mut tail);
+        assert!(tail.is_empty());
+    }
+    server.join().unwrap();
+    f.json(&["stop", "--json"]);
+    let events = log_events(&f);
+    let summary = events
+        .iter()
+        .find(|e| e["event"] == "runtime_summary" && e["phase"] == "final")
+        .unwrap();
+    assert_eq!(summary["failures_by_stage"]["transfer"], 5, "{events:?}");
+    assert_eq!(summary["active_connections"], 0);
+    assert!(!format!("{events:?}").contains("private-"));
 }

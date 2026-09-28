@@ -361,15 +361,23 @@ fn check_proxy(proxy: &Value, index: usize, duplicate: bool, report: &mut Diagno
         error!(report, "Duplicate proxy name: '{}'", name);
     }
     let kind = proxy["type"].as_str().unwrap_or("");
-    if kind == "trojan" && proxy["skip-cert-verify"] == true {
-        warning!(
-            report,
-            "Trojan proxy '{}': skip-cert-verify=true disables TLS certificate verification",
-            name
-        );
+    if matches!(kind, "trojan" | "anytls") && proxy["skip-cert-verify"] == true {
+        if kind == "anytls" {
+            warning!(
+                report,
+                "AnyTLS proxy '{}': skip-cert-verify=true disables TLS certificate verification",
+                name
+            );
+        } else {
+            warning!(
+                report,
+                "Trojan proxy '{}': skip-cert-verify=true disables TLS certificate verification",
+                name
+            );
+        }
     }
     let mut invalid = false;
-    if matches!(kind, "ss" | "trojan") {
+    if matches!(kind, "ss" | "trojan" | "anytls") {
         let server = proxy["server"].as_str().unwrap_or("");
         let server_invalid = !server.is_empty()
             && (server.len() > 253
@@ -385,7 +393,11 @@ fn check_proxy(proxy: &Value, index: usize, duplicate: bool, report: &mut Diagno
                     "Shadowsocks proxy '{}': server cannot be empty", name
                 );
             } else {
-                error!(report, "Trojan proxy '{}': server cannot be empty", name);
+                if kind == "anytls" {
+                    error!(report, "AnyTLS proxy '{}': server cannot be empty", name);
+                } else {
+                    error!(report, "Trojan proxy '{}': server cannot be empty", name);
+                }
             }
         } else if kind == "ss" && server_invalid {
             invalid = true;
@@ -404,7 +416,11 @@ fn check_proxy(proxy: &Value, index: usize, duplicate: bool, report: &mut Diagno
             if kind == "ss" {
                 error!(report, "Shadowsocks proxy '{}': password is required", name);
             } else {
-                error!(report, "Trojan proxy '{}': password is required", name);
+                if kind == "anytls" {
+                    error!(report, "AnyTLS proxy '{}': password is required", name);
+                } else {
+                    error!(report, "Trojan proxy '{}': password is required", name);
+                }
             }
         } else if password.chars().any(char::is_control) {
             invalid = true;
@@ -417,14 +433,22 @@ fn check_proxy(proxy: &Value, index: usize, duplicate: bool, report: &mut Diagno
             invalid = true;
             error!(report, "Shadowsocks proxy '{}': cipher is required", name);
         }
-        if kind == "trojan" {
+        if matches!(kind, "trojan" | "anytls") {
             if server_invalid {
                 invalid = true;
-                error!(
-                    report,
-                    "Trojan proxy '{}': server must be a valid IP literal or RFC hostname (1-253 bytes)",
-                    name
-                );
+                if kind == "anytls" {
+                    error!(
+                        report,
+                        "AnyTLS proxy '{}': server must be a valid IP literal or RFC hostname (1-253 bytes)",
+                        name
+                    );
+                } else {
+                    error!(
+                        report,
+                        "Trojan proxy '{}': server must be a valid IP literal or RFC hostname (1-253 bytes)",
+                        name
+                    );
+                }
             }
             if let Some(sni) = proxy["sni"].as_str() {
                 if sni.len() > 253
@@ -433,18 +457,35 @@ fn check_proxy(proxy: &Value, index: usize, duplicate: bool, report: &mut Diagno
                     || crate::target::Target::new(sni, 1).is_err()
                 {
                     invalid = true;
-                    error!(
-                        report,
-                        "Trojan proxy '{}': sni must be a valid RFC hostname (1-253 bytes; no IP, wildcard, whitespace, or control characters)",
-                        name
-                    );
+                    if kind == "anytls" {
+                        error!(
+                            report,
+                            "AnyTLS proxy '{}': sni must be a valid RFC hostname (1-253 bytes; no IP, wildcard, whitespace, or control characters)",
+                            name
+                        );
+                    } else {
+                        error!(
+                            report,
+                            "Trojan proxy '{}': sni must be a valid RFC hostname (1-253 bytes; no IP, wildcard, whitespace, or control characters)",
+                            name
+                        );
+                    }
                 }
             } else if proxy["skip-cert-verify"] != true && server.parse::<IpAddr>().is_ok() {
                 invalid = true;
-                error!(
-                    report,
-                    "Trojan proxy '{}': verified IP server requires an explicit hostname sni", name
-                );
+                if kind == "anytls" {
+                    error!(
+                        report,
+                        "AnyTLS proxy '{}': verified IP server requires an explicit hostname sni",
+                        name
+                    );
+                } else {
+                    error!(
+                        report,
+                        "Trojan proxy '{}': verified IP server requires an explicit hostname sni",
+                        name
+                    );
+                }
             }
         }
     }

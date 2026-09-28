@@ -1,5 +1,6 @@
 //! Proxy runtime, immutable configuration storage, and command services.
 
+mod anytls;
 pub mod api;
 pub mod cli;
 pub mod config;

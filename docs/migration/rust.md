@@ -22,7 +22,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 | `src/config.rs`、`src/config_provider.rs` | 有界 YAML、规则展开、select 索引与路由 |
 | `src/override_script.rs` | Lua/可执行脚本、canonical materialization、只用于运行时的兼容字段投影 |
 | `src/runtime.rs` | mixed HTTP/SOCKS5、转发、UDP association 生命周期 |
-| `src/outbound.rs`、`src/simple_obfs.rs`、`src/udp.rs` | TCP/TLS、classic SS、obfs HTTP、SS/Trojan UDP |
+| `src/outbound.rs`、`src/anytls.rs`、`src/simple_obfs.rs`、`src/udp.rs` | TCP/TLS、单流 AnyTLS、classic SS、obfs HTTP、SS/Trojan UDP |
 | `src/dns.rs`、`src/target.rs` | 有界异步 DNS、目标校验与路由后地址固定 |
 
 生产只交付 `zc`。`examples/` 下的 origin、obfs、SS UDP 程序是独立测试 helper，不安装、不导入生产协议实现作为 oracle。
@@ -32,7 +32,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 - 完整命令树：`help/version`、`start/up`、`stop/down`、`restart/reload/status/log/test/doctor`、`config load/list/download/update/use/delete/dump/override`、`proxy/profile list/select/test`、`diag doctor`。详见 [CLI 契约](../cli/spec.md)。
 - 托管 profile 的 immutable source、本地 provider assets、metadata、冻结 override 与 desired selections；先提交 durable desired，再尝试 exact revision 的 live apply。
 - 后台或 supervised foreground daemon；监听器绑定和 desired reconciliation 完成后才发布 ready 并开放数据面。控制面只有显式 `127.0.0.1:<port>`，占用即失败。
-- 内置 DIRECT/REJECT、classic AEAD SS、原生 TLS Trojan TCP；SS 的内建 simple-obfs HTTP；`udp:true` SS/Trojan 经 mixed SOCKS5 UDP ASSOCIATE。
+- 内置 DIRECT/REJECT、classic AEAD SS、原生 TLS Trojan / AnyTLS TCP；SS 的内建 simple-obfs HTTP；`udp:true` SS/Trojan 经 mixed SOCKS5 UDP ASSOCIATE。
 - select 默认首成员、嵌套组、持久选择、循环/未知引用拒绝；first-match 规则、本地和 unmanaged HTTP rule-provider 展开。
 - minimal API：`/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`，详见 [API](../api/README.md)。
 
@@ -58,7 +58,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 ## 成熟 Rust 依赖与行为差异
 
 - Tokio 负责可取消 socket、deadline 和任务回收；旧 Zig poll、独立 TLS I/O thread 等内部实现说明不再适用。
-- rustls / tokio-rustls 使用系统信任根，支持安全默认 TLS 1.2/1.3；Trojan 默认验证身份，显式 `skip-cert-verify:true` 才关闭链/身份校验，仍验证握手签名。不是照搬 Zig 的 `allow_truncation_attacks` 或自制 KeyUpdate 实现。
+- rustls / tokio-rustls 使用系统信任根，支持安全默认 TLS 1.2/1.3；Trojan / AnyTLS 默认验证身份，显式 `skip-cert-verify:true` 才关闭链/身份校验，仍验证握手签名。不是照搬 Zig 的 `allow_truncation_attacks` 或自制 KeyUpdate 实现。
 - `shadowsocks` crate 承担 classic AEAD TCP/UDP 加密与 framing，不重写密码协议；simple-obfs HTTP 由 zc 的有界适配器包装 TCP，UDP 不经过 obfs。
 - Hickory 读取系统 DNS 配置与 hosts，网络查询异步且有 2 秒 deadline、64 query slots、最多 64 地址；缓存容量配置为 64，不是瞬时硬内存上限。它不等同于 libc/NSS、mDNS 或完整 split-DNS；配置/hosts 不自动重载，无 nameserver 时拒绝，不回退公共 DNS。
 - Lua 5.4 通过 `mlua` 内嵌，在独立 worker 中执行，不要求系统 `lua/luajit`。脚本仍属于受信任代码，不是安全沙箱。
@@ -71,7 +71,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 2. **HTTP provider**：unmanaged 已接入 root-contained 安全磁盘 cache、interval 刷新、普通 HTTP 失败时的已验证缓存回退，以及独立 `test` 的 missing-only 策略；doctor 只检查声明。managed 仍拒绝引用 remote 的离线发布，不修改冻结 revision。详情及更严格的路径限制见 [兼容说明](../compat/mihomo-clash.md#rule-provider-与离线托管)。不提供 curl fallback。
 3. **资源行为差异**：共享 collection/provider/展开上界已接入；YAML 已对齐原 Zig 根外 128 层；其余 parser events/nodes/scalar budgets 仍有差异。mixed 连接任务 1024 / 握手 10 秒（原为 128 / 5 秒）。这需要显式评审，不能宣称资源行为完全等价。
 4. **CLI/缺省行为细节**：doctor 的多错误汇总、支持范围内的 warnings、原 source-text migration hints 及 256 条/512 bytes 错误优先预算已补齐；加载失败与语义检查失败保持分离，证据及保留差异见下节“doctor validator 诊断验收”。停止态保留显式 `mixed_port:null`；启动与重启的未转交 snapshot 由作用域 guard 清理，停止超时和取消不再遗留 staged 文件。缺省 rules 的旧审计结论已纠正：`config.zig::load/parseDocument` 的严格 CLI 路径本来就补 REJECT，DIRECT 只属于 legacy parser；原 dump 字节及真实路由已对照，不修改 canonical/hash。
-5. 不支持 HTTP/SOCKS5 outbound、VMess/VLESS/AnyTLS、SS AEAD-2022、通用 SIP003、obfs TLS、Trojan WS/gRPC、非 select 策略组、TUN/透明代理、完整 DNS、proxy-provider、TUI 或完整 mihomo Controller。订阅的 `dns/hosts/sniffer/profile/experimental/unified-delay/clash-for-android` 七个顶层字段现接受并仅在运行时投影中跳过，原始数据不重写；具体行为及待支持项见[兼容字段清单](../compat/mihomo-clash.md#接受但暂不执行的订阅字段)。其余能力准入不放宽。
+5. 不支持 HTTP/SOCKS5 outbound、VMess/VLESS、SS AEAD-2022、通用 SIP003、obfs TLS、Trojan WS/gRPC、非 select 策略组、TUN/透明代理、完整 DNS、proxy-provider、TUI 或完整 mihomo Controller。订阅的 `dns/hosts/sniffer/profile/experimental/unified-delay/clash-for-android` 七个顶层字段现接受并仅在运行时投影中跳过，原始数据不重写；具体行为及待支持项见[兼容字段清单](../compat/mihomo-clash.md#接受但暂不执行的订阅字段)。其余能力准入不放宽。
 6. UDP ingress 不支持 DIRECT、分片或 standalone socks-port。首个合法包固定实际 leaf，后续包不重新路由或 fallback；64 association、300 秒 idle、65507-byte wire 上界必须由真实边界测试验收。
 
 ## 验证入口与剩余门禁
@@ -110,7 +110,7 @@ just migrator-test
 本节关闭此前“仅首个语义错误、warnings/migration_hints 为空”的具体 doctor 缺口，不宣称整个迁移完成。实现位于 `src/config/diagnostics.rs`，仅接入 `service::diagnose_config` 与 doctor 输出；不改变配置发布、provider 准备、cache 或 daemon，不生成可用于路由的部分配置。
 
 - **语义诊断**：累计基础字段、代理必填项/身份、重复名称、组冲突/空组/引用、规则 payload/provider/target 错误；复用核心 typed proxy/group/provider/rule 校验，并继续拒绝所有分支上的组循环。语法、字段类型/规则格式及能力准入仍走既有加载失败路径，不把未知规则修成有效规则，也不以 hints 掩盖 unsupported 错误。语义无效仍由 config check 导致 `CHECKS_FAILED`。
-- **warnings**：恢复 `allow-lan:false` 忽略非 `*` bind-address、两个 idle session 参数 `<=5` 秒的原兼容提示，以及 Trojan 关闭证书验证的警告。不启用 AnyTLS，不修改原文件或 immutable revision 的 canonical bytes；CLI 端口选择已清除的 port/socks-port 不捏造 ignored-port warnings。
+- **warnings**：恢复 `allow-lan:false` 忽略非 `*` bind-address、两个 idle session 参数 `<=5` 秒的原兼容提示，以及 Trojan 关闭证书验证的警告。当时尚未启用 AnyTLS，不修改原文件或 immutable revision 的 canonical bytes；CLI 端口选择已清除的 port/socks-port 不捏造 ignored-port warnings。
 - **预算**：errors/warnings 合计最多 256 条；后来的错误替换末尾 warning，独立 `has_errors` 不依赖保留条数。每条最多 512 UTF-8 bytes；超长值按原模板将所有参数替换成 `...`，追加精确后缀 ` ... [truncated]`，不先分配完整超长消息。数量或字节省略均置 `config_diagnostics_truncated`。控制字符清理前的原始字节也计费。
 - **migration hints**：保留 `doctor_cli.zig::collectMigrationHints` 的四条固定英文文案、顺序、显式原始文件路径与 1 MiB 上限；仍是文本子串扫描，注释也可能触发，默认 profile 不扫描。override 的 effective bytes 不冒充原提示来源。提示不是支持承诺；当时实际 `tun/dns/proxy-providers` 声明均明确拒绝；后续订阅兼容调整仅让 `dns` 接受但忽略，`tun/proxy-providers` 仍拒绝。文本与 JSON 展示同一份有界 errors/warnings/hints。
 
@@ -172,3 +172,33 @@ cargo clippy --offline --locked --lib --test provider_cache --test service --tes
 原 reviewer `/tmp/zc-provider-review.Gt5FOY/probe.rs` 在 `/tmp/zc-cache-repair-probe/probe.rs` 仅适配新增参数，并避免提前拒绝后 join 未使用的 HTTP listener，重新链接修复后的库：`case` 与 `expand` 均拒绝且 `source_unchanged=true/cache_unchanged=true`，`mode` 为 `world_writable_cache_accepted=false`；`races` 中 symlink/hardlink/FIFO/ancestor 均拒绝，root swap 仍写 held root，全部 `outside_unchanged=true`。
 
 边界：完整配置校验先于任何候选发布，但逐文件写入不是多文件事务；后续 I/O、晚出现的文件身份碰撞或 durability uncertain 不保证回滚之前已可见的写入。没有新性能 PASS，既有性能仍慢于 Zig；全局回归、四平台、真实安装回滚与 24/72 小时长稳门禁仍待独立完成，不宣称完整 Rust 迁移验收。
+
+## AnyTLS 原生 TCP 首版
+
+`src/anytls.rs` 直接持有现有 rustls/Tokio TLS stream，无 worker、池、复用或 UDP；每条应用 TCP 流独占一个 session，id=1。认证一次 TLS 写，Settings/SYN/地址主动发送；v1/v2 乐观开流、控制帧、v2 心跳、默认 padding 和每节点后续 session 更新已接入。`md-5 0.11.0` 由已有锁定间接依赖改为显式直接依赖，lock 只新增根 package 依赖项，现有第三方通知已包含其 MIT/Apache-2.0 全文。
+
+配置在 canonical 丢字段前拒绝未支持字段与未选节点，包含 override；诊断增加 AnyTLS 必填字段与 TLS 降级警告。既有 canonical/hash、全局 idle 默认、SS 和 runtime UDP SS/Trojan 白名单不改。混合配置即使允许 UDP ASSOCIATE，路由选到 AnyTLS 仍终止，不 fallback。
+
+### 本机定向证据
+
+- 配置准入、协议接入和 AnyTLS 诊断切片先观测失败再通过；另有背压取消/继续写的真实回归：仅 flush 后 Drop 在本机使对端停在最后一个数据帧，改为 FIN 后完成 TLS/套接字写侧 shutdown 再释放后通过，逐帧核对无重发/丢字节。新增 canonical 回归先复现 `disable-reuse` 误改变其他协议字节，再将该字段序列化限定为 AnyTLS，保持旧协议哈希输入不变。
+- Rust 公共配置/准备、Connector、真实 mixed 和 CLI 日志边界覆盖 strict/canonical/override、可信/错身份/未知 CA、TLS 1.2/1.3 错误签名、独立字节 framing、分片/合并/空 PSH/大 payload、padding 原始 MD5/隔离/资源拒绝、FIN/EOF/RST/Alert/SYNACK、双任务唤醒、慢读慢写、取消 Drop、并发独占 session、UDP 拒绝与故障脱敏。
+- 执行 `just anytls-e2e` 的等价 Python 脚本，固定官方 Go v0.0.13 和 v0.0.5 在 macOS arm64 本机通过：每版本 10 个场景，包含 SOCKS/HTTP CONNECT echo 与 server-first、domain/IPv4/IPv6、HTTP forward、本地 FIN 收尾、错密码、目标失败及默认拒绝自签证书。独立可信 OpenSSL 另验证两个 session 的认证、默认 padding 与服务器更新后的实际 TLS record（纯 Waste 为尺寸+7）。脚本保留日志和结果至 `target/anytls-reference/rust-e2e-*`。
+
+最终定向 Rust 回归首轮 **215 passed / 1 ignored**（lib 加 14 个相关 integration suites）；canonical 修正后重跑 `anytls_config/config_parity/override_script` 为 **51 passed**，含一个新增用例，去重共 **216** 项通过。忽略项是既有真实五分钟 UDP idle，不宣称本轮已跑。`cargo fmt --all`、`cargo clippy --offline --locked --all-targets -- -D warnings`、新 Python 脚本 Ruff 0.16.8 检查/格式和 Justfile 契约 15 tests 均通过；未重新执行完整 core E2E/安装/发布矩阵。详细命令及本机日志索引保留于 `target/anytls-reference/implementation-validation.md`，长期测试入口和 fixture 哈希则在仓库内。
+
+**保留边界**：FIN 是整流关闭，不承诺半关闭后的响应；CONNECT/SOCKS 成功是乐观准备完成，不是统一的远端 dial 成功确认。padding 的本地资源限制、拒绝字段详见 [兼容说明](../compat/mihomo-clash.md#anytls单流原生-tlstcp)。AnyTLS Go 门禁是显式可选命令，未纳入 `just e2e` / `just validate` / 发布 CI；生产交付不带 Go。仅固定 fixture 哈希的 macOS arm64 已执行，不宣称其他平台、完整规范合规、抗审查、性能等价或 24/72h 长稳通过。
+
+### AnyTLS 生命周期修复后的定向验收
+
+上节 **216 项**和首版 Go/OpenSSL 结果保留为生命周期修复前证据，不代表已经覆盖以下三个缺陷。后续独立核查复现：心跳回复依赖背压上行导致双向等待；FIN 后迟到写触发 BrokenPipe 丢掉中继已收到的下行尾部；FIN 后仍等待客户端写侧 EOF。
+
+修复仅增加 AnyTLS 的有界心跳队列及 `IoStream::whole_close()` 可选终态通知。公共 `runtime::transfer` 与 HTTP forward 在终态停止轮询上行，排尽下行后结束；HTTPS 包裹层透传通知。DIRECT/SS/Trojan 保持原半关闭策略，不统一吞 BrokenPipe 或 TLS 截断。测试另实证 HTTP 请求头和 CONNECT 已缓存前缀需要在等待更多输入前 flush，已同步修复；没有增加后台任务或改变 daemon 生命周期。`src/daemon.rs` 仅给既有测试替身补一行显式 `IoStream` 实现。
+
+- 三个缺陷先通过公共 Connector + 实际 transfer 入口变红，再逐片修绿。下行丢失用 `duplex(1)` 和对端观察到 TLS 释放的屏障精确触发；结束后检查迟到上行没有被读取。背压用真实 TCP/TLS、服务端 16 KiB 收发缓冲、实际 Pending 写及双向各 16776960 字节；保留无心跳对照，不用 sleep 猜测触发时机。超时仅作失败看门狗。
+- `tests/anytls_lifecycle.rs` 共 **8 项**：三个主回归，加控制洪泛拒绝、取消释放、本地 shutdown 保留 65534 字节尾部、mixed CONNECT/SOCKS 前缀、HTTP/HTTPS 未完成上传时完整转发提前响应。整套连续 **20 轮通过**；32 个合法排队心跳按序响应，洪泛超限明确失败。
+- 重新运行首版同范围 lib + 15 个 integration suites：**224 passed / 1 ignored**。ignored 仍为既有真实五分钟 UDP idle，本轮未执行，不计通过。原 DIRECT/SS/Trojan/obfs 半关闭、HTTP framing/100-continue/keep-alive、协议错误分类及 UDP 回归均通过。
+- `cargo fmt --all -- --check`、`cargo clippy --offline --locked --all-targets -- -D warnings` 通过。先 `cargo build --offline --locked` 更新 binary，再执行 `python3 scripts/e2e/run-anytls.py target/debug/zc target/anytls-reference`：固定官方 Go 两版本各 **10 场景通过**，可信 OpenSSL 默认/更新 padding record 通过。
+- 原始红绿及所有中间失败保留在 `target/anytls-reference/lifecycle/`；修复后 Go 证据为 `target/anytls-reference/rust-e2e-71oo7bem/`；完整索引追加到 `target/anytls-reference/implementation-validation.md`。期间曾有洪泛量未填满传输缓冲、前缀夹具漏发 payload、测试替身缺 trait 导致的失败，均修正后重跑，没有当作通过。
+
+本轮未访问真实 HOME 的 zc 配置或生产端口，未 install/commit/push，未改历史 Zig。以上仍仅为 macOS arm64 本机定向验证；未重新执行完整 core E2E、安装/发布矩阵、四平台原生测试、性能/内存门禁及 24/72h 长稳。短时背压进度测试不是吞吐或抗指纹证明。

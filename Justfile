@@ -77,6 +77,10 @@ e2e: build helper-test
     bash scripts/e2e/run-core.sh "$PWD/target/debug/zc" "$PWD/target/debug/examples/e2e_origin" "$PWD/target/debug/examples/e2e_obfs_oracle" "$PWD/target/debug/examples/e2e_ss_udp_oracle" "$PWD/target/e2e-fixtures" "$PWD/testdata/e2e"
     TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)" python3 scripts/e2e/run-rust-tcp.py target/debug/zc target/e2e-fixtures
 
+# Optional AnyTLS gate; requires locally built, SHA256-pinned Go fixtures (not in e2e/CI).
+anytls-e2e: build
+    python3 scripts/e2e/run-anytls.py target/debug/zc target/anytls-reference
+
 # Exercise installer rollback in temporary directories, never the real HOME.
 install-test: build e2e-helpers
     bash scripts/install/run-all-regression.sh

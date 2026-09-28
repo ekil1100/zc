@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -36,8 +37,29 @@ use crate::{
     target::Target,
 };
 
-pub trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> IoStream for T {}
+pub trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {
+    /// Some protocols close both directions together. On true, stop polling
+    /// uploads but drain the reader and any relay-buffered download before exit.
+    /// None preserves ordinary TCP half-close. Errors are still reported by I/O.
+    fn whole_close(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        None
+    }
+}
+impl IoStream for TcpStream {}
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> IoStream for ProxyClientStream<S> {}
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> IoStream for crate::simple_obfs::HttpObfsStream<S> {}
+impl<S: IoStream + ?Sized> IoStream for Box<S> {
+    fn whole_close(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        (**self).whole_close()
+    }
+}
+// HTTPS absolute-form wraps the outbound in another TLS stream. Do not erase
+// the underlying AnyTLS whole-close notification at that boundary.
+impl<S: IoStream> IoStream for tokio_rustls::client::TlsStream<S> {
+    fn whole_close(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.get_ref().0.whole_close()
+    }
+}
 pub type BoxStream = Box<dyn IoStream>;
 
 // An incoming protocol unit was interrupted. Retain only its I/O kind, never
@@ -132,6 +154,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SsReadProgress<S> {
 pub struct Connector {
     dns: Arc<Dns>,
     ss_context: OnceLock<SharedContext>,
+    anytls_padding: HashMap<String, crate::anytls::SharedPadding>,
     tls_unverified: Option<TlsConnector>,
     tls_verified: Option<TlsConnector>,
 }
@@ -153,15 +176,24 @@ impl Connector {
                 sni,
                 skip_cert_verify,
                 ..
+            }
+            | ProxyKind::AnyTls {
+                server,
+                sni,
+                skip_cert_verify,
+                ..
             } = &proxy.kind
             {
-                trojan_server_name(server, sni.as_deref(), *skip_cert_verify)?;
+                tls_server_name(server, sni.as_deref(), *skip_cert_verify)?;
             }
         }
         let needs_unverified = config.proxies().iter().any(|proxy| {
             matches!(
                 proxy.kind,
                 ProxyKind::Trojan {
+                    skip_cert_verify: true,
+                    ..
+                } | ProxyKind::AnyTls {
                     skip_cert_verify: true,
                     ..
                 }
@@ -182,6 +214,9 @@ impl Connector {
             matches!(
                 proxy.kind,
                 ProxyKind::Trojan {
+                    skip_cert_verify: false,
+                    ..
+                } | ProxyKind::AnyTls {
                     skip_cert_verify: false,
                     ..
                 }
@@ -209,6 +244,12 @@ impl Connector {
             None
         };
         Ok(Self {
+            anytls_padding: config
+                .proxies()
+                .iter()
+                .filter(|p| matches!(p.kind, ProxyKind::AnyTls { .. }))
+                .map(|p| (p.name.clone(), crate::anytls::default_padding()))
+                .collect(),
             dns: config.dns.clone(),
             ss_context: OnceLock::new(),
             tls_unverified,
@@ -233,6 +274,7 @@ impl Connector {
         validate_obfs(proxy)?;
         match &proxy.kind {
             ProxyKind::Direct => crate::udp::UdpSession::direct(self.dns.clone()).await,
+            ProxyKind::AnyTls { .. } => bail!("AnyTLS UDP is not supported"),
             ProxyKind::Reject => bail!("UDP connection rejected by REJECT routing rule"),
             ProxyKind::Shadowsocks {
                 server,
@@ -377,6 +419,44 @@ impl Connector {
                     .context("cannot flush Shadowsocks destination header")?;
                 Ok(Box::new(stream))
             }
+            ProxyKind::AnyTls {
+                server,
+                port,
+                password,
+                sni,
+                skip_cert_verify,
+            } => {
+                let name = tls_server_name(server, sni.as_deref(), *skip_cert_verify)?;
+                let padding = self
+                    .anytls_padding
+                    .get(&proxy.name)
+                    .context("AnyTLS proxy was not prepared by this Connector")?
+                    .clone();
+                let tls = if *skip_cert_verify {
+                    &self.tls_unverified
+                } else {
+                    &self.tls_verified
+                };
+                let tls = tls
+                    .as_ref()
+                    .context("AnyTLS TLS configuration is unavailable")?;
+                let socket = self
+                    .dial(server, *port, stage)
+                    .await
+                    .context("AnyTLS server TCP connection failed")?;
+                *stage = FailureStage::Tls;
+                let stream = tls
+                    .connect(name, socket)
+                    .await
+                    .context("AnyTLS TLS handshake failed; check certificate, trust roots and sni")
+                    .context(FailureStage::Tls)?;
+                *stage = FailureStage::Connect;
+                Ok(Box::new(
+                    crate::anytls::AnyTls::open(Box::new(stream), password, target, padding)
+                        .await
+                        .context("cannot prepare AnyTLS session")?,
+                ))
+            }
             ProxyKind::Trojan { .. } => self.trojan_stream(proxy, Some(target), stage).await,
         }
     }
@@ -397,7 +477,7 @@ impl Connector {
         else {
             bail!("Trojan transport requires a Trojan proxy");
         };
-        let name = trojan_server_name(server, sni.as_deref(), *skip_cert_verify)?;
+        let name = tls_server_name(server, sni.as_deref(), *skip_cert_verify)?;
         let tls = if *skip_cert_verify {
             &self.tls_unverified
         } else {
@@ -496,25 +576,23 @@ impl ServerCertVerifier for SkipServerIdentity {
     }
 }
 
-fn trojan_server_name(
+fn tls_server_name(
     server: &str,
     sni: Option<&str>,
     skip_cert_verify: bool,
 ) -> Result<ServerName<'static>> {
     if let Some(name) = sni {
         if name.ends_with('.') || name.parse::<IpAddr>().is_ok() {
-            bail!(
-                "Trojan sni must be a DNS hostname without a trailing root dot, not an IP address"
-            );
+            bail!("TLS sni must be a DNS hostname without a trailing root dot, not an IP address");
         }
-        Target::new(name, 1).context("Trojan sni must be a valid ASCII DNS hostname")?;
+        Target::new(name, 1).context("TLS sni must be a valid ASCII DNS hostname")?;
     }
     if sni.is_none() && !skip_cert_verify && server.parse::<IpAddr>().is_ok() {
-        bail!("verified Trojan IP server requires sni; configure the certificate's DNS hostname");
+        bail!("verified TLS IP server requires sni; configure the certificate's DNS hostname");
     }
     let name = sni.unwrap_or(server);
     ServerName::try_from(name.strip_suffix('.').unwrap_or(name).to_owned())
-        .context("invalid Trojan TLS server name; configure a valid sni hostname")
+        .context("invalid TLS server name; configure a valid sni hostname")
 }
 
 fn ss_method(cipher: &str) -> Result<CipherKind> {

@@ -1171,6 +1171,7 @@ async fn copy_chunked(
             bail!("invalid chunk delimiter");
         }
         writer.write_all(&crlf).await?;
+        writer.flush().await?;
     }
     bail!("HTTP chunk count exceeds limit")
 }
@@ -1270,6 +1271,7 @@ async fn forward_http(
     upstream: BoxStream,
     forward: Forward,
 ) -> Result<bool> {
+    let mut whole_close = upstream.whole_close();
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let mut upstream = ActiveIo {
         stream: upstream,
@@ -1288,6 +1290,9 @@ async fn forward_http(
         let mut read_upstream = BufReader::new(read_upstream);
         let upload = async {
             write_upstream.write_all(&forward.header).await?;
+            // Buffered outbounds must expose headers before waiting for a body
+            // (100-continue or an early final response may arrive first).
+            write_upstream.flush().await?;
             if forward.chunked {
                 copy_chunked(&mut read_client, &mut write_upstream, 16 * 1024 * 1024).await?;
             } else {
@@ -1300,6 +1305,12 @@ async fn forward_http(
         tokio::pin!(upload, download);
         tokio::select! {
             biased;
+            _ = whole_closed(&mut whole_close) => {
+                // Do not let a late body write discard an already received response.
+                // An incomplete upload also forbids parsing another keep-alive request.
+                download.await?;
+                Ok(false)
+            }
             result = &mut upload => {
                 result?;
                 download.await
@@ -1401,7 +1412,25 @@ async fn idle_expired(last_activity: Arc<Mutex<Instant>>) {
     }
 }
 
-async fn transfer(client: TcpStream, upstream: BoxStream, prefix: Vec<u8>) -> Result<()> {
+async fn whole_closed(signal: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match signal {
+        Some(signal) => {
+            // The sender is owned by the stream, which outlives this wait.
+            let _ = signal.wait_for(|closed| *closed).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Relay an ingress stream through a connected outbound, including buffered ingress bytes.
+/// Ordinary outbounds retain half-close. Whole-close outbounds stop upload on
+/// their notification, drain received download, then return without ingress EOF.
+pub async fn transfer(
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    upstream: BoxStream,
+    prefix: Vec<u8>,
+) -> Result<()> {
+    let mut whole_close = upstream.whole_close();
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let mut client = ActiveIo {
         stream: client,
@@ -1412,8 +1441,32 @@ async fn transfer(client: TcpStream, upstream: BoxStream, prefix: Vec<u8>) -> Re
         last_activity: last_activity.clone(),
     };
     let transfer = async {
-        upstream.write_all(&prefix).await?;
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        if whole_close.is_none() {
+            upstream.write_all(&prefix).await?;
+            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+            return Ok(());
+        }
+        let (mut read_client, mut write_client) = tokio::io::split(&mut client);
+        let (mut read_upstream, mut write_upstream) = tokio::io::split(&mut upstream);
+        let upload = async {
+            write_upstream.write_all(&prefix).await?;
+            write_upstream.flush().await?;
+            tokio::io::copy(&mut read_client, &mut write_upstream).await?;
+            write_upstream.shutdown().await
+        };
+        let download = async {
+            tokio::io::copy(&mut read_upstream, &mut write_client).await?;
+            write_client.shutdown().await
+        };
+        tokio::pin!(upload, download);
+        tokio::select! {
+            biased;
+            // FIN may have been consumed by the download's read-ahead while its
+            // writer was Pending. Check the signal BEFORE polling another upload.
+            _ = whole_closed(&mut whole_close) => download.await?,
+            result = &mut upload => { result?; download.await?; }
+            result = &mut download => { result?; }
+        }
         Ok(())
     };
     tokio::select! {

@@ -33,21 +33,41 @@
 
 | 能力 | Rust 候选边界 |
 | --- | --- |
-| HTTP CONNECT / SOCKS5 CONNECT | 双向 TCP tunnel，保留 half-close；SOCKS5 无用户认证 |
+| HTTP CONNECT / SOCKS5 CONNECT | 双向 TCP tunnel；除 AnyTLS 外保留 half-close；SOCKS5 无用户认证 |
 | HTTP forward | absolute-form HTTP/HTTPS；有界 Content-Length/chunked request、100-continue、顺序 keep-alive；每连接最多 1024 请求；拒绝冲突 framing/Host、非法 trailer、Upgrade |
 | DIRECT / REJECT | 内置字面量可用；REJECT 是终态，不因目标为私网/loopback 改写为 DIRECT |
 | 用户命名 `type: direct/reject` | 已由独立变更支持，可作为命名叶节点及 select 成员；本轮不重复实现 |
 | SS classic AEAD | `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`；`chacha20-poly1305` 是同一 wire alias |
 | simple-obfs | 只支持下述内建 HTTP 形状，仅包装 SS TCP |
 | Trojan | 原生 TLS/TCP，password/server/port/sni/skip-cert-verify；另有受限 UDP association |
-| HTTP/SOCKS5 outbound、VMess/VLESS/AnyTLS | 不支持；保留历史代码不构成启用 |
+| AnyTLS | 原生 TLS/TCP，单流独占 session；详见下节，无复用/UDP |
+| HTTP/SOCKS5 outbound、VMess/VLESS | 不支持；保留历史代码不构成启用 |
 | SS AEAD-2022、外部 SIP003、obfs TLS、Trojan WS/gRPC | 不支持，拒绝而非降级 |
 
 HTTP CONNECT 的请求目标必须包含显式端口（例如 `CONNECT example.com:443`）。为兼容 Node/Undici/Pi，`Host: example.com` 省略端口时按请求目标端口校验；域名、IPv4 和带方括号的 IPv6 均支持。不同主机、冲突的显式端口、非法/重复 Host 及 HTTP/1.1 缺失 Host 仍拒绝；不改变规则匹配、出站目标或非 CONNECT 的 Host 校验。
 
 HTTP request header 最多 16 KiB，request body 最多 16 MiB；chunk framing/trailer 也有计数/字节上界。response 按流转发，不应把 request body 上界误称 response 总大小上界。mixed 最多 1024 connection tasks，入站握手 10 秒，路由与出站准备另有 10 秒 deadline，TCP 转发空闲期限 15 分钟。退出取消并回收任务，不承诺 drain 完全部存量流量。这些数值不同于原 Zig 的 128 workers / 5 秒，仍须资源评审。
 
-TLS 使用 rustls / tokio-rustls、系统信任根、安全默认 TLS 1.2/1.3；不继承 Zig TLS 派生实现的 poll/partial-record/KeyUpdate 限制说明。Trojan server 必须是合法 IP 或 RFC hostname，DNS server 尾点在派生身份时去除；显式 SNI 必须是无尾点的 DNS hostname，不接受 IP/wildcard/控制字符。验证证书的 IP server 须显式 SNI。仅 `skip-cert-verify:true` 关闭链和身份校验，握手签名仍验证；这是安全降级，不是默认行为。uTLS/Reality/mTLS/任意 ALPN 配置不在支持范围。
+TLS 使用 rustls / tokio-rustls、系统信任根、安全默认 TLS 1.2/1.3；不继承 Zig TLS 派生实现的 poll/partial-record/KeyUpdate 限制说明。Trojan / AnyTLS server 必须是合法 IP 或 RFC hostname，DNS server 尾点在派生身份时去除；显式 SNI 必须是无尾点的 DNS hostname，不接受 IP/wildcard/控制字符。验证证书的 IP server 须显式 SNI。仅 `skip-cert-verify:true` 关闭链和身份校验，握手签名仍验证；这是安全降级，不是默认行为。uTLS/Reality/mTLS/任意 ALPN 配置不在支持范围。
+
+### AnyTLS：单流原生 TLS/TCP
+
+每条应用 TCP 流新建一个 TLS session，stream id 固定为 1；不建立池、不复用、不提供 UDP/UoT。支持 `name/type/server/port/password/sni/skip-cert-verify`、`network: tcp`、`udp: false`；`disable-reuse` 缺省即禁用复用，显式值只接受 `true`。这与 mihomo 默认复用不同，不能称为完整 AnyTLS 合规或等价性能。
+
+- 默认验证 TLS 身份及握手签名；仅显式 `skip-cert-verify: true` 降低链/身份校验，不跳过握手签名。身份/SNI 约束同 Trojan。
+- 拒绝节点级池参数、`disable-reuse: false`、UDP、ALPN、指纹、自由 client metadata、扩展 TLS/transport 参数及未知字段，包括未选节点。原始 source 和 override 有效输入在 canonical 丢字段前检查。现有规范化占位 `tls: false` / `alterId: 0` 不表示关闭 TLS 或开启另一协议；其他值拒绝。顶层 idle-session 兼容默认值不变，不启用 AnyTLS 池，也不改变既有 canonical bytes/hash。
+- 完整认证块为原始 SHA-256 摘要、BE16 padding 长度和 padding，一次提交 TLS。随后主动发送 Settings → SYN → PSH 地址，支持 IPv4/IPv6/domain，服务端先发无需客户端先送 payload。
+- **乐观开流**：写完准备数据即可向 mixed CONNECT/SOCKS 返回成功，不等待 v2 ServerSettings/SYNACK，因此兼容 v1。后续 Alert、非空 SYNACK 或未收到 FIN 的 session EOF/RST 是连接错误，不回退 DIRECT、不重放请求；v1 目标失败可能仅返回 FIN，无法提供精确原因。
+- **FIN 是整流关闭，不是半关闭**。本地 shutdown 排空已接受字节，发送一次 FIN，完成 TLS/套接字写侧 shutdown 后释放 session，不等待 FIN 回应；已组装 PSH 的未读尾部仍可读取。远端 FIN 后立即停止新增上行，按序排尽 FIN 前已收到的数据（包括中继的下行缓冲），再返回 EOF 并结束中继，不等待客户端写侧 EOF 或 15 分钟 idle。独立流接口仍拒绝迟到写；中继不能通过忽略任意 BrokenPipe 丢下行，也不能假装接受并丢弃上行。依赖“发送 EOF 后才收到响应”的应用不在透明支持范围内；其他协议的 half-close 不变。
+- 适配器直接持有 TLS，无后台 worker；每次仅缓存一个待发送分组、一个待接收帧及最多 **32 个排队心跳 ID**，另可有一个已进入发送分组的心跳回复。所有分组串行发送，部分写游标不重置、不交错数据与控制帧；控制写 Pending 时仍读取后续 PSH/FIN。队列满后再收到 HeartRequest 明确终止，不阻塞全部读取或无限积累。帧 body 上限 65535 bytes，大 payload 分 PSH；文本控制帧上限 4096 bytes，每 poll 最多处理 32 个帧后让出调度。合法 v2 心跳按序回显 id；非法方向/id/长度、重复版本/ACK、截断均终止。慢读/慢写有背压，取消 Drop 直接释放连接。
+- 初始使用官方默认 padding；服务端更新按节点线程安全保存，仅后续 session 使用，MD5 对**原始字节**计算（含末尾 LF）。本地准入：方案最多 4096 bytes、`stop` 为 1–32、分组索引小于 stop、每组最多 16 项，正向范围 `min<=max`；认证组仅一个尺寸、最多 4062 bytes，普通片最多 16384 bytes；所有尺寸上界加各自 7-byte 帧开销的总和最多 65536 bytes。缺省分组不填充；认证组缺省为零填充。超过预算或非法更新终止当前 session，不污染原方案。
+- 随机范围与固定 Go 实现一致为 `[min,max)`，相等时固定；`c` 在无真实数据时停止后续填充。纯填充分支发送 body 长度为所选尺寸的 Waste，所以 TLS 明文长度为 **尺寸+7**。每个发送分组最多一个 65542-byte 数据帧加 64 KiB padding 预算；这不是整个 TLS/内核缓冲的总内存承诺，也不保证所有方案尺寸等于 TLS record 尺寸。
+
+中继通过 `IoStream::whole_close()` 的可选单向终态通知识别 AnyTLS；默认无通知的 DIRECT/SS/Trojan 仍使用原 TCP half-close 转发。公共 `runtime::transfer` 是 CONNECT/SOCKS 共用入口；直接把 AnyTLS 交给 Tokio 通用 `copy_bidirectional` 不具备这项终态处理。HTTP forward 同样在整流终态停止上传、排完响应，未完成请求体不得复用为下一请求；HTTPS 包裹层透传通知，但不放宽内层 TLS 截断检查。请求头和 CONNECT 已缓存前缀在等待更多输入前 flush，避免缓冲出站阻塞提前响应或 100-continue。
+
+生命周期修复后的公共回归位于 `tests/anytls_lifecycle.rs`：真实 TCP/TLS 双向各约 16 MiB（无心跳对照、1/32 心跳）、容量 1 的迟到上传/下行排尽、FIN 后无入站 EOF、控制洪泛、取消、本地 shutdown 尾部及 mixed CONNECT/SOCKS/HTTP/HTTPS。macOS arm64 已连续运行 20 轮；不是性能或四平台门禁。
+
+独立官方 `anytls-go v0.0.13` / `v0.0.5` 已在本机通过真实 mixed echo/server-first、HTTP forward、错密码与目标失败等用例；可信 OpenSSL fixture 另测单次认证写、默认/更新 padding 的实际 TLS record。版本、哈希、可选命令及未纳入默认 CI 的边界见 [E2E](../reliability/e2e.md#anytls-可选独立互操作)。协议来源见 [研究](../research/anytls.md)。未证明抗指纹效果、四平台或长稳。
 
 ### simple-obfs HTTP
 
@@ -70,7 +90,7 @@ mixed SOCKS5 CMD=0x03 仅用于显式 `udp:true` 的 SS classic AEAD 或原生 T
 
 - TCP control peer IP 绑定 association；请求非零 source port 时约束该端口，否则首个完全合法、同 IP 数据报固定 source port。
 - 首个合法 datagram 执行规则与 select 解析并固定实际 leaf；后续 datagram 可有其他目标，但复用同一 outbound session，不重新选组、不 fallback。
-- DIRECT、group→DIRECT、REJECT、非 `udp:true` leaf 结束 association，不提供 DIRECT UDP ingress。内部测试/transport helper 有直连 UDP 不代表公开入口支持。
+- DIRECT、group→DIRECT、REJECT、AnyTLS、非 `udp:true` leaf 结束 association，不提供 DIRECT UDP ingress。内部测试/transport helper 有直连 UDP 不代表公开入口支持。
 - 最多 64 associations，第 65 个返回 general failure；control close 立即取消 DNS/open/send/relay 并释放 slot，另有 300 秒单调时钟 idle。
 - SOCKS 与 SS wire 单包上界均为 65507 bytes，按实际 address/cipher overhead 检查；坏 RSV/FRAG/ATYP/长度、SS bad tag 或截短 salt/tag 按 packet 丢弃；不分片、不重组、不积累无界队列。
 
@@ -94,7 +114,7 @@ domain 先按原域名匹配规则，再本地解析成 IP frame 兼容主流服
 - **严格 CLI 基线**：缺失 `rules`、显式 `[]`、非空规则缺终态 MATCH 均补 `MATCH,REJECT`；重复/非尾部 MATCH 拒绝。原 `config.zig::load()` 已调用严格 `parseDocument()`，只有不用于 CLI 的 legacy `parse()` 在字段缺失时补 DIRECT。旧二进制 dump 与真实 loopback 路由均确认严格语义；Rust canonical bytes/hash 不因此改变。
 - mixed HTTP/SOCKS 提供目标端口与来源 IP/端口；不提供进程名，`PROCESS-NAME` 的可解析性不等于实际进程规则生效。
 - GEOIP 保留原有静态 IPv4 heuristic table，不是完整地理库；IPv6 不完整。`no-resolve` 避免为相应 IP/GEOIP 规则解析域名。
-- 为 IP 规则解析后使用同一 DNS 快照，获准 IP 固定给后续 DIRECT/SS/Trojan dial/encode，不重解析并选择未获准地址。
+- 为 IP 规则解析后使用同一 DNS 快照，获准 IP 固定给后续 DIRECT/SS/Trojan/AnyTLS dial/encode，不重解析并选择未获准地址。
 
 Hickory 从系统 DNS 配置/hosts 初始化，网络查询非阻塞；2 秒 lookup deadline，64 query slots，每个并行 A/AAAA lookup 占 2 slots，最多保留 64 地址，取消释放 slot。cache size 配置为 64，但不是瞬时硬内存上界。系统/hosts 不自动重载，不等价于 libc/NSS、mDNS 或完整 split-DNS；没有 nameserver 时拒绝，不暗用公共 DNS。
 

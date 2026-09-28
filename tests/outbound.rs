@@ -141,13 +141,16 @@ async fn shadowsocks_sends_destination_before_server_first_payload_and_preserves
 }
 
 fn trojan_config(port: u16, skip_cert_verify: bool) -> Config {
+    native_tls_config(port, skip_cert_verify, "trojan")
+}
+fn native_tls_config(port: u16, skip_cert_verify: bool, protocol: &str) -> Config {
     let skip = if skip_cert_verify {
         "    skip-cert-verify: true\n"
     } else {
         ""
     };
     Config::parse(&format!(
-        "proxies:\n  - name: trojan\n    type: trojan\n    server: 127.0.0.1\n    port: {port}\n    password: password\n    sni: front.example\n{skip}rules: ['MATCH,trojan']\n"
+        "proxies:\n  - name: trojan\n    type: {protocol}\n    server: 127.0.0.1\n    port: {port}\n    password: password\n    sni: front.example\n{skip}rules: ['MATCH,trojan']\n"
     )).unwrap()
 }
 
@@ -365,7 +368,7 @@ impl rustls::sign::Signer for CorruptSigner {
 }
 
 #[tokio::test]
-async fn trojan_skip_identity_still_rejects_invalid_tls12_and_tls13_signatures() {
+async fn native_tls_skip_identity_still_rejects_invalid_tls12_and_tls13_signatures() {
     use rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
         sign::{CertifiedKey, SingleCertAndKey},
@@ -373,42 +376,46 @@ async fn trojan_skip_identity_still_rejects_invalid_tls12_and_tls13_signatures()
     use std::sync::Arc;
 
     timeout(Duration::from_secs(5), async {
-        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
-            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-            let cert =
-                CertificateDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-cert.pem"))
-                    .unwrap();
-            let key =
-                PrivateKeyDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-key.pem"))
-                    .unwrap();
-            let signing_key = provider.key_provider.load_private_key(key).unwrap();
-            let certified_key =
-                CertifiedKey::new(vec![cert], Arc::new(CorruptSigningKey(signing_key)));
-            let server_config = rustls::ServerConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[version])
-                .unwrap()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key)));
-            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let config = trojan_config(listener.local_addr().unwrap().port(), true);
-            let peer = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                assert!(acceptor.accept(stream).await.is_err());
-            });
-            let connector = Connector::new(&config).unwrap();
-            let proxy = config
-                .proxies()
-                .iter()
-                .find(|p| p.name == "trojan")
+        for protocol in ["trojan", "anytls"] {
+            for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+                let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+                let cert = CertificateDer::from_pem_slice(include_bytes!(
+                    "../testdata/e2e/trojan-cert.pem"
+                ))
                 .unwrap();
-            let target = Target::new("example.com", 443).unwrap();
-            let error = match connector.connect(proxy, &target).await {
-                Ok(_) => panic!("skip-cert-verify must still verify handshake signatures"),
-                Err(error) => format!("{error:#}"),
-            };
-            assert!(error.contains("BadSignature"), "{error}");
-            peer.await.unwrap();
+                let key =
+                    PrivateKeyDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-key.pem"))
+                        .unwrap();
+                let signing_key = provider.key_provider.load_private_key(key).unwrap();
+                let certified_key =
+                    CertifiedKey::new(vec![cert], Arc::new(CorruptSigningKey(signing_key)));
+                let server_config = rustls::ServerConfig::builder_with_provider(provider)
+                    .with_protocol_versions(&[version])
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key)));
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let config =
+                    native_tls_config(listener.local_addr().unwrap().port(), true, protocol);
+                let peer = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    assert!(acceptor.accept(stream).await.is_err());
+                });
+                let connector = Connector::new(&config).unwrap();
+                let proxy = config
+                    .proxies()
+                    .iter()
+                    .find(|p| p.name == "trojan")
+                    .unwrap();
+                let target = Target::new("example.com", 443).unwrap();
+                let error = match connector.connect(proxy, &target).await {
+                    Ok(_) => panic!("skip-cert-verify must still verify handshake signatures"),
+                    Err(error) => format!("{error:#}"),
+                };
+                assert!(error.contains("BadSignature"), "{error}");
+                peer.await.unwrap();
+            }
         }
     })
     .await
