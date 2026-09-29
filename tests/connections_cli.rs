@@ -623,3 +623,61 @@ fn cli_and_api_share_udp_metadata_and_text_escapes_terminal_controls() {
     f.ok(&["connection", "close", id, "--json"]);
     assert!(matches!(control.read(&mut [0]), Ok(0) | Err(_)));
 }
+
+#[test]
+fn managed_start_persists_auto_secret_and_connections_authenticate_without_source_rewrite() {
+    let f = Fixture::new();
+    let controller = free_port();
+    let source = format!(
+        "external-controller: 127.0.0.1:{controller}\nproxy-groups: [{{name: pick, type: select, proxies: [DIRECT, REJECT]}}]\nrules: ['MATCH,pick']\n"
+    );
+    let path = f.home.path().join("managed.yaml");
+    std::fs::write(&path, &source).unwrap();
+    f.ok(&["config", "load", path.to_str().unwrap(), "--json"]);
+    let root = f.home.path().join(".config/zc");
+    let store = zc::store::Store::open(&root).unwrap();
+    let before = store.load().unwrap();
+    let p = &before.catalog.profiles[0];
+    let bundle = store.read_bundle(&p.key, &p.head).unwrap();
+    let mirror = std::fs::read(root.join("meta.json")).unwrap();
+    let port = free_port();
+    f.ok(&["start", "--port", &port.to_string(), "--json"]);
+    let mut connection = pending(port);
+    let entry = one(&f);
+    f.ok(&[
+        "connection",
+        "close",
+        entry["id"].as_str().unwrap(),
+        "--json",
+    ]);
+    assert!(matches!(connection.read(&mut [0]), Ok(0) | Err(_)));
+    let after = store.load().unwrap();
+    let serialized = serde_json::to_value(&after.catalog.profiles[0]).unwrap();
+    let secret = serialized["auto_controller_secret"].as_str().unwrap();
+    assert_eq!(secret.len(), 64);
+    assert_eq!(std::fs::read(root.join("meta.json")).unwrap(), mirror);
+    let view = store.read_bundle(&p.key, &p.head).unwrap();
+    assert_eq!(view.content_digest, bundle.content_digest);
+    assert_eq!(view.bundle, bundle.bundle);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    for args in [
+        vec!["config", "dump"],
+        vec!["config", "dump", "--no-override"],
+        vec!["log", "--no-follow"],
+    ] {
+        let out = f.run(&args);
+        assert!(out.status.success(), "{out:?}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(secret));
+    }
+    let mut anonymous = TcpStream::connect(("127.0.0.1", controller)).unwrap();
+    anonymous
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    anonymous
+        .write_all(b"GET /connections HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    anonymous.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+}

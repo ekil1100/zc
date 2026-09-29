@@ -226,3 +226,15 @@ cargo clippy --offline --locked --lib --test provider_cache --test service --tes
 `cargo fmt --all -- --check` 与 `cargo clippy --offline --locked --all-targets -- -D warnings` 通过；无新增 Python 文件。详细红绿、命令及边界保存于 `target/connections/implementation-validation.md`。所有新增网络夹具仅 loopback，CLI 使用临时 HOME；未 install/commit/push，未读取真实 HOME 的 zc 配置或操作生产 7899/在用实例。
 
 **没有性能通过声明**：阶段锁设计和资源上界测试不替代吞吐、延迟、CPU/RSS 测量。原生待完成 TCP connect 的队列饱和夹具在本机返回 RST，未得到有效取消证据；已保存失败的夹具探索，不把 DNS/TLS 取消冒充原生 connect 定点验证。未执行本轮独立 Go 互操作、四平台原生、完整 E2E/安装/发布矩阵、五分钟 idle 或 24/72 小时长稳；u64 序号溢出由 checked_add 拒绝，未以公开接口执行不可行的穷举连接次数。不宣称 Rust 迁移已完整验收或已部署。
+
+## 自动 controller secret 的状态兼容与回退
+
+托管 profile 的可选 `auto_controller_secret` 位于 schema-2 catalog 的 Profile 末尾；缺省不序列化，因此旧 catalog 的 canonical bytes/state token 保持不变，**不增加 catalog schema 版本**。新 reader 向后读取旧 Rust/Zig 状态，但不是双向兼容：旧 Rust 的 `deny_unknown_fields` 会拒绝含新字段的 catalog。回退必须先安全停止实例并恢复**完整旧状态备份**（含 catalog、revisions 与相应运行状态），不能仅替换 binary、从 `meta.json` 镜像恢复或手工删字段。损坏/空值/null/非小写 64 位 hex/错误类型/重复/未知字段拒绝，不删除重建、不生成替代 key。
+
+首次实际托管运行准备中，仅当已有 controller 且缺少非空显式 secret，才在全部配置校验后持久生成 32 随机字节。显式非空值逐字节优先，旧自动值仍保留；更新/override/选择/重命名不轮换，delete+reimport 为新生命周期。只读/诊断、已运行 start、默认 restart 不生成；没有 controller 仍无 listener，不增加默认控制端口。source/materialization/assets/revision/hash 与兼容 mirror 不变，自动值不注入 dump/日志/Debug/环境/命令行。
+
+自动 key 的使用不能仅依赖 Store 进程内的 `durability_uncertain`：首次 commit 的 receipt 若目录 fsync 失败，准备报错而不停止旧实例，已可见 key 留存；以后任意进程复用该值前都在 catalog 锁内重新同步 authority 目录。CAS 精确绑定 token/key/head，冲突失败而不覆盖赢家。后续 bind 失败不会撤销或轮换 key。start 的准备副作用现在位于既有 launch/instance 锁的所有权边界内，后台仍通过 stdin 交接同一实例锁；foreground 运行前释放 launch 锁但始终保留实例锁。已运行或竞争未获所有权的 start 不准备、不写 key，foreground 也不执行 override；restart 仍先完成准备和持久确认再停止旧实例。
+
+运行快照独立冻结实际采用的自动 secret overlay，**有 overlay 必须 schema 2**，防止旧 Rust 的宽松 Prepared reader 忽略字段而无 secret 启动。新 reader 严格区分 schema 1（无 overlay）和 schema 2（完整合法 overlay，仅 managed、有 controller、原 source 无非空显式 secret）；坏字段、null、缺失及 HMAC 篡改均拒绝，解码错误不输出字段值。没有 overlay 继续 schema 1；旧 Rust 和认证 legacy Zig YAML 保持原 source secret，不查询新 profile 状态。需要启用自动值须显式 `restart -c <profile>`；默认 restart、readiness/selection 重写及失败回滚保留冻结认证。当前 head 已变更时既有 readiness 拒绝及精确回滚策略不变。
+
+实现与验收记录：`target/profile-secret/implementation-validation.md`；新增公共边界测试为 `tests/profile_secret.rs`、`tests/store.rs` 与 `tests/connections_cli.rs`。旧 Rust/Zig binary 对照为显式可选用例，普通测试不自动构建或运行历史 binary。仅临时 HOME/loopback，未安装或操作在用实例；本轮不声称性能、四平台、安装回滚或 24/72 小时长稳通过。

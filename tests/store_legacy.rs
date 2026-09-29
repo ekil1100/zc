@@ -327,6 +327,7 @@ fn zig_legacy_keys_251_through_255_remain_readable_and_deletable() {
                 storage_id: id.into(),
                 head: head.into(),
                 desired: Desired::default(),
+                auto_controller_secret: None,
             }],
         };
         state_file(

@@ -15,7 +15,8 @@ pub struct Invocation {
     pub port_override: Option<u16>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Prepared {
     pub source: String,
     pub assets: BTreeMap<String, String>,
@@ -25,6 +26,28 @@ pub struct Prepared {
     pub invocation: Invocation,
     pub port: u16,
     pub override_options: CliOptions,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_secret_overlay"
+    )]
+    pub controller_secret: Option<store::AutoControllerSecret>,
+}
+fn deserialize_secret_overlay<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<store::AutoControllerSecret>, D::Error> {
+    // Missing is legacy; explicit null is corruption, never a fallback.
+    store::AutoControllerSecret::deserialize(deserializer).map(Some)
+}
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prepared")
+            .field("identity", &self.identity)
+            .field("generation", &self.generation)
+            .field("port", &self.port)
+            .field("controller_secret", &self.controller_secret)
+            .finish_non_exhaustive()
+    }
 }
 
 use crate::{
@@ -367,8 +390,9 @@ fn parse_config(prepared: &Prepared) -> Result<Config> {
         .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
         .collect();
     let runtime_source = crate::override_script::runtime_source(prepared.source.as_bytes())?;
-    let config = Config::parse_with_assets(&runtime_source, &assets)
+    let mut config = Config::parse_with_assets(&runtime_source, &assets)
         .context("START_CONFIG_INVALID: invalid prepared configuration")?;
+    crate::service::apply_controller_secret(prepared, &mut config)?;
     config.set_selections(&selection_map(&prepared.selections)?)?;
     ensure!(
         config
@@ -422,7 +446,11 @@ fn snapshot_key(dir: &SecureDir, create: bool) -> Result<Vec<u8>> {
 }
 fn save_snapshot(dir: &SecureDir, prepared: Prepared, nonce: &str) -> Result<String> {
     let bytes = encode(&Snapshot {
-        schema_version: 1,
+        schema_version: if prepared.controller_secret.is_some() {
+            2
+        } else {
+            1
+        },
         nonce: nonce.into(),
         prepared,
     })?;
@@ -467,11 +495,24 @@ fn load_snapshot(dir: &SecureDir, name: &str, nonce: &str) -> Result<Prepared> {
         ),
         "START_SNAPSHOT_INVALID: snapshot authentication failed"
     );
-    let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+    let snapshot: Snapshot = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("START_SNAPSHOT_INVALID: invalid snapshot fields"))?;
     ensure!(
-        snapshot.schema_version == 1 && snapshot.nonce == nonce,
-        "START_SNAPSHOT_INVALID: snapshot nonce mismatch"
+        snapshot.nonce == nonce
+            && matches!(
+                (
+                    snapshot.schema_version,
+                    snapshot.prepared.controller_secret.is_some()
+                ),
+                (1, false) | (2, true)
+            ),
+        "START_SNAPSHOT_INVALID: invalid snapshot schema or nonce"
     );
+    if snapshot.prepared.controller_secret.is_some() {
+        parse_config(&snapshot.prepared).map_err(|_| {
+            anyhow::anyhow!("START_SNAPSHOT_INVALID: invalid controller secret overlay")
+        })?;
+    }
     Ok(snapshot.prepared)
 }
 fn decode_hex(text: &str, limit: usize) -> Result<String> {
@@ -645,6 +686,7 @@ fn load_zig_prepared(dir: &SecureDir, name: &str, descriptor: &Descriptor) -> Re
         invocation: invocation.clone(),
         port,
         override_options: CliOptions::default(),
+        controller_secret: None,
     })
 }
 fn remove_descriptor_snapshot(runtime: &Directory, d: &Descriptor) {
@@ -789,49 +831,39 @@ pub async fn capture_restart() -> Result<RestartCapture> {
         prepared,
     })
 }
-pub async fn current_prepared() -> Result<Option<Prepared>> {
-    let Some(runtime) = runtime_dir(false)? else {
-        return Ok(None);
-    };
-    let Some(d) = observe(&runtime)?.filter(|d| d.ready) else {
-        return Ok(None);
-    };
-    let prepared = prepared_for(&runtime, &d)?;
-    ensure!(
-        observe(&runtime)?.as_ref() == Some(&d),
-        "RUNTIME_IDENTITY_CHANGED: instance changed"
-    );
-    Ok(Some(prepared))
-}
-
-pub async fn start(prepared: Prepared) -> Result<Value> {
+pub async fn start(options: crate::service::PrepareOptions) -> Result<Value> {
     let runtime = runtime_dir(true)?.context("runtime unavailable")?;
     let _launch = runtime
         .dir
         .lock("zc.launch.lock", START_WAIT + Duration::from_secs(2))?;
-    start_locked(&runtime, prepared, false, true).await
-}
-async fn start_locked(
-    runtime: &Directory,
-    prepared: Prepared,
-    exact: bool,
-    idempotent: bool,
-) -> Result<Value> {
-    if let Some(d) = observe(runtime)?.filter(|d| d.ready) {
-        ensure!(
-            idempotent,
-            "RESTART_FAILED: another runtime instance appeared; it was not stopped"
-        );
-        return Ok(json!({"pid": d.pid, "detail": "already_running"}));
+    match acquire_start(&runtime).await? {
+        StartOwnership::Running(pid) => Ok(json!({"pid":pid,"detail":"already_running"})),
+        StartOwnership::Owned(lock) => {
+            let prepared = crate::service::prepare(options).await?;
+            spawn_owned(&runtime, prepared, lock, false).await
+        }
     }
+}
+
+enum StartOwnership {
+    Running(u32),
+    Owned(FileLock),
+}
+// Caller holds zc.launch.lock. The instance lock, not the launch lock alone,
+// excludes older foreground binaries that do not participate in launch locking.
+async fn acquire_start(runtime: &Directory) -> Result<StartOwnership> {
     let deadline = Instant::now() + START_WAIT;
-    while lock_held(&runtime.dir)? {
+    loop {
         if let Some(d) = observe(runtime)?.filter(|d| d.ready) {
+            prepared_for(runtime, &d)?;
             ensure!(
-                idempotent,
-                "RESTART_FAILED: another runtime instance appeared; it was not stopped"
+                observe(runtime)?.as_ref() == Some(&d),
+                "RUNTIME_IDENTITY_CHANGED: instance changed"
             );
-            return Ok(json!({"pid":d.pid,"detail":"already_running"}));
+            return Ok(StartOwnership::Running(d.pid));
+        }
+        if !lock_held(&runtime.dir)? {
+            break;
         }
         ensure!(
             Instant::now() < deadline,
@@ -839,8 +871,9 @@ async fn start_locked(
         );
         sleep(Duration::from_millis(25)).await;
     }
-    parse_config(&prepared)?;
     let lock = runtime.dir.lock("zc.lock", LOCK_WAIT)?;
+    runtime.dir.validate_path(&runtime.path)?;
+    lock.validate(&runtime.dir, "zc.lock")?;
     // Validate again after acquiring ownership, before deleting only dead artifacts.
     if let Some(old) = pid(&runtime.dir)? {
         ensure!(
@@ -859,6 +892,23 @@ async fn start_locked(
         }
     }
     drop(_descriptor_guard);
+    Ok(StartOwnership::Owned(lock))
+}
+async fn start_locked(runtime: &Directory, prepared: Prepared, exact: bool) -> Result<Value> {
+    let StartOwnership::Owned(lock) = acquire_start(runtime).await? else {
+        bail!("RESTART_FAILED: another runtime instance appeared; it was not stopped");
+    };
+    spawn_owned(runtime, prepared, lock, exact).await
+}
+async fn spawn_owned(
+    runtime: &Directory,
+    prepared: Prepared,
+    lock: FileLock,
+    exact: bool,
+) -> Result<Value> {
+    parse_config(&prepared)?;
+    runtime.dir.validate_path(&runtime.path)?;
+    lock.validate(&runtime.dir, "zc.lock")?;
     let nonce = fsutil::nonce()?;
     let name = save_snapshot(&runtime.dir, prepared, &nonce)?;
     let mut owned = PendingLaunch(None, Some((&runtime.dir, &nonce, &name)));
@@ -970,20 +1020,23 @@ pub async fn run_child(snapshot_name: &str, nonce: &str) -> Result<()> {
     }
     result
 }
-pub async fn run_foreground(mut prepared: Prepared) -> Result<()> {
+pub async fn run_foreground(options: crate::service::PrepareOptions) -> Result<()> {
+    let runtime = runtime_dir(true)?.context("runtime unavailable")?;
+    let launch = runtime
+        .dir
+        .lock("zc.launch.lock", START_WAIT + Duration::from_secs(2))?;
+    let StartOwnership::Owned(lock) = acquire_start(&runtime).await? else {
+        bail!("START_FAILED: daemon already running");
+    };
+    let mut prepared = crate::service::prepare(options).await?;
     prepared.invocation.foreground = true;
     prepared.invocation.prepared = false;
     parse_config(&prepared)?;
-    let runtime = runtime_dir(true)?.context("runtime unavailable")?;
-    let lock = runtime
-        .dir
-        .lock("zc.lock", LOCK_WAIT)
-        .context("START_FAILED: daemon already running")?;
-    if let Some(old) = pid(&runtime.dir)? {
-        ensure!(!alive(old), "RUNTIME_IDENTITY_CHANGED: unverified live PID");
-    }
     let nonce = fsutil::nonce()?;
     let name = save_snapshot(&runtime.dir, prepared.clone(), &nonce)?;
+    // Keep instance ownership throughout the foreground lifetime, but allow
+    // other lifecycle callers to observe/reject it without waiting for exit.
+    drop(launch);
     run_instance(&runtime, prepared, &name, &nonce, lock, false).await
 }
 
@@ -1086,13 +1139,14 @@ fn desired_guard(identity: &ActiveIdentity) -> Result<Option<(store::Desired, Fi
         let before = store.load()?;
         let root = SecureDir::open(store.root_path())?;
         let guard = root.lock("state-v2.lock", LOCK_WAIT)?;
-        let current: store::Catalog =
-            serde_json::from_slice(&root.read("state-v2.json", 4 * 1024 * 1024)?)?;
+        let current = root.read("state-v2.json", 4 * 1024 * 1024)?;
         guard.validate(&root, "state-v2.lock")?;
-        if current != before.catalog {
+        // Compare strict canonical bytes, not permissive Option/null equality.
+        if current != encode(&before.catalog)? {
             continue;
         }
-        let Some(profile) = current
+        let Some(profile) = before
+            .catalog
             .profiles
             .iter()
             .find(|p| p.key == identity.key && p.head == identity.revision)
@@ -1276,6 +1330,10 @@ async fn run_instance_inner(
             let _ = evidence.ready();
         }
         drop(authority);
+        if prepared.invocation.foreground {
+            let address = std::net::SocketAddr::new(config.bind_address(), prepared.port);
+            eprintln!("Runtime listening on {address} (foreground)");
+        }
         scope.phase = "runtime";
         scope.tasks.spawn(proxy.run(wait_shutdown(scope.shutdown.subscribe())));
         if let Some(controller) = controller { scope.tasks.spawn(controller.run(wait_shutdown(scope.shutdown.subscribe()))); }
@@ -1449,13 +1507,13 @@ pub async fn restart_checked(captured: RestartCapture, prepared: Prepared) -> Re
     if let Some(d) = &previous {
         stop_instance(&runtime, d).await?;
     }
-    let result = start_locked(&runtime, target, false, false).await;
+    let result = start_locked(&runtime, target, false).await;
     drop(staged);
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
             if let Some(previous) = previous_prepared {
-                match start_locked(&runtime, previous, true, false).await {
+                match start_locked(&runtime, previous, true).await {
                     Ok(_) => bail!("{error:#}; previous snapshot restored"),
                     Err(rollback) => {
                         bail!("{error:#}; rollback failed: {rollback:#}")

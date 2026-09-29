@@ -105,8 +105,8 @@ Rust 命令映射位于 `src/cli.rs`；本字典保留原冻结词汇和验收�
 | `CONNECTION_CLOSE_ID_REQUIRED` | 缺少 ID | 从 list 取得 ID，exit 2 |
 | `CONNECTION_CLOSE_ARGUMENT_INVALID` | 非法 ID、额外参数或 `--all` | 使用完整 `<nonce>-<序号>`，exit 2 |
 | `CONNECTION_NOT_RUNNING` | 没有已验证的 ready 实例 | 显式准备配置并启动，exit 1 |
-| `CONNECTION_CONTROLLER_REQUIRED` | 冻结配置没有 controller | 配置 controller/非空 secret 后显式 `restart -c <config>`；默认 restart 复用冻结快照 |
-| `CONNECTION_SECRET_REQUIRED` | 冻结配置无非空 secret，或 API 返回 403 | 配置非空 secret 后显式重新准备重启；不是默认 restart |
+| `CONNECTION_CONTROLLER_REQUIRED` | 冻结配置没有 controller | 配置 controller 后显式 `restart -c <config>`；托管自动提供 secret，非托管还需手工配置；默认 restart 冻结 |
+| `CONNECTION_SECRET_REQUIRED` | 冻结配置无非空 secret，或 API 返回 403 | 托管显式 `restart -c <profile>` 启用自动值；非托管先配置非空 secret；不是默认 restart |
 | `CONNECTION_UNAUTHORIZED` | API 返回 401 | 核对运行实例及冻结 secret，不输出或分享凭据 |
 | `CONNECTION_INSTANCE_CHANGED` | PID/nonce/endpoint/exact identity 或快照不可验证、响应实例头缺失/不匹配、旧 ID、API 409 | 重新 list，仅操作当前实例 ID |
 | `CONNECTION_NOT_FOUND` | API 404，连接已回收 | 重新 list；不存在历史记录 |

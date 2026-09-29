@@ -76,3 +76,5 @@
 ## 待确认
 
 AnyTLS 首版范围已确定；后续是否需要连接复用、UDP 或更多 TLS 选项，按真实使用需求决定。Trojan 的实际传输组合尚未核对，不预设 WS/gRPC 或其他协议的优先级。
+
+- P2 托管 profile 自动 controller secret 已接入：仅已有 controller 的实际运行准备生成、持久复用且冻结鉴权；不自动加端口，旧快照须显式重新准备升级。本轮不安装，证据见 `target/profile-secret/implementation-validation.md`。

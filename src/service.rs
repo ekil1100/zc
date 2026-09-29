@@ -37,6 +37,7 @@ pub struct Loaded {
     pub identity: Option<ActiveIdentity>,
     pub desired: Desired,
     pub source_path: Option<String>,
+    pub state_token: Option<store::StateToken>,
 }
 
 pub fn key(name: &str) -> &str {
@@ -130,6 +131,7 @@ pub fn load(selector: Option<&str>) -> Result<Loaded> {
             identity: Some(identity),
             desired: profile.desired.clone(),
             source_path: selector.map(str::to_owned),
+            state_token: Some(snapshot.token),
         });
     }
     let path = std::path::absolute(selector.context("configuration path required")?)?;
@@ -142,6 +144,7 @@ pub fn load(selector: Option<&str>) -> Result<Loaded> {
         identity: None,
         desired: Desired::default(),
         source_path: Some(path.to_string_lossy().into_owned()),
+        state_token: None,
     })
 }
 
@@ -298,34 +301,69 @@ pub async fn prepare_loaded(loaded: Loaded, options: PrepareOptions) -> Result<P
             .map(|s| (s.group.clone(), s.proxy.clone()))
             .collect(),
     )?;
+    ensure!(
+        config
+            .controller_endpoint()
+            .is_none_or(|a| a.port() != port),
+        "START_PORT_CONFLICT: mixed and controller ports must differ"
+    );
+    let assets = assets
+        .into_iter()
+        .map(|(k, v)| Ok((k, String::from_utf8(v).context("provider must be UTF-8")?)))
+        .collect::<Result<_>>()?;
+    let actual_run = matches!(
+        options.command.as_str(),
+        "start" | "restart" | "reload" | "config update" | "config override"
+    );
+    let mut state_token = loaded.state_token;
     let mut generation = loaded.desired.generation;
     if selections != loaded.desired.selections
-        && matches!(
-            options.command.as_str(),
-            "start" | "restart" | "reload" | "config update" | "config override"
-        )
+        && actual_run
         && let Some(identity) = &loaded.identity
     {
         let store = existing_store()?.context("managed catalog disappeared during preparation")?;
-        let snapshot = store.load()?;
-        store.select(
-            &snapshot.token,
+        let receipt = store.select(
+            state_token
+                .as_ref()
+                .context("managed state token required")?,
             &identity.key,
             &identity.revision,
             generation,
             selections.clone(),
         )?;
+        if let Some(error) = receipt.durability_error {
+            return Err(error).context("prepared selections durability unconfirmed");
+        }
+        state_token = Some(receipt.token);
         generation = generation
             .checked_add(1)
             .context("selection generation exhausted")?;
     }
+    let controller_secret =
+        if actual_run && config.controller_endpoint().is_some() && config.secret().is_empty() {
+            if let Some(identity) = &loaded.identity {
+                let store =
+                    existing_store()?.context("managed catalog disappeared during preparation")?;
+                Some(
+                    store.ensure_auto_controller_secret(
+                        state_token
+                            .as_ref()
+                            .context("managed state token required")?,
+                        &identity.key,
+                        &identity.revision,
+                    )?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
     let source_path = loaded.source_path;
     Ok(Prepared {
         source,
-        assets: assets
-            .into_iter()
-            .map(|(k, v)| Ok((k, String::from_utf8(v).context("provider must be UTF-8")?)))
-            .collect::<Result<_>>()?,
+        assets,
+        controller_secret,
         identity: loaded.identity,
         generation,
         selections,
@@ -360,7 +398,8 @@ pub fn prepared_config(prepared: &Prepared) -> Result<Config> {
         .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
         .collect();
     let runtime_source = override_script::runtime_source(prepared.source.as_bytes())?;
-    let config = Config::parse_with_assets(&runtime_source, &assets)?;
+    let mut config = Config::parse_with_assets(&runtime_source, &assets)?;
+    apply_controller_secret(prepared, &mut config)?;
     config.set_selections(
         &prepared
             .selections
@@ -369,6 +408,27 @@ pub fn prepared_config(prepared: &Prepared) -> Result<Config> {
             .collect(),
     )?;
     Ok(config)
+}
+
+/// Only authenticated prepared state may supply this runtime-only overlay.
+pub(crate) fn apply_controller_secret(prepared: &Prepared, config: &mut Config) -> Result<()> {
+    if let Some(secret) = &prepared.controller_secret {
+        ensure!(
+            prepared
+                .identity
+                .as_ref()
+                .is_some_and(|i| store::valid_key(&i.key)
+                    && i.revision.len() == 32
+                    && i.revision
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+                && config.controller_endpoint().is_some()
+                && config.secret().is_empty(),
+            "START_SNAPSHOT_INVALID: invalid controller secret overlay"
+        );
+        config.set_runtime_controller_secret(secret);
+    }
+    Ok(())
 }
 
 pub fn source_root(path: &str) -> PathBuf {

@@ -10,12 +10,12 @@
 | --- | --- |
 | `zc help [command [subcommand]]`、`zc --help`、`zc -h` | 帮助写 stdout；未知主题 `HELP_TOPIC_UNKNOWN`，exit 2 |
 | `zc version`、`zc --version` | 版本写 stdout，exit 0 |
-| `zc start [-c <config>] [--port <port>] [--foreground]` | 别名 `up`；默认后台，父进程完成准备后启动认证快照；已运行返回成功 `detail:already_running` |
+| `zc start [-c <config>] [--port <port>] [--foreground]` | 别名 `up`；默认后台，取得启动所有权后准备并启动认证快照；已运行时后台成功返回 `detail:already_running`，前台拒绝，两者均不准备配置 |
 | `zc stop` | 别名 `down`；只停止当前 PID/nonce 绑定实例并清理对应 snapshot；已停止成功 `detail:already_stopped` |
 | `zc restart [-c <config>] [--port <port>]` | 默认复用运行实例冻结快照；显式来源/override 才重新准备；目标先冻结、后停旧实例，失败尝试精确回滚 |
 | `zc reload` | 重读 tracked source，保留 CLI 端口覆盖；当前成功路径为 restart fallback；未运行返回 `RELOAD_FAILED` |
 | `zc status` | 实际 daemon 状态、uptime、端口、路径、select 当前选择；stopped 也是 exit 0 |
-| `zc connection list` | 列出运行实例的活动连接、来源、协议/阶段、目标、命中运行时规则和实际 leaf；需显式 controller 与非空 secret |
+| `zc connection list` | 列出运行实例的活动连接、来源、协议/阶段、目标、命中运行时规则和实际 leaf；需显式 controller；托管自动 secret 或非空显式 secret |
 | `zc connection close <id>` | 按完整实例绑定 ID 请求关闭；成功仅表示已请求，非已回收 |
 | `zc log [-n <lines>] [-f\|--no-follow]` | 文本默认 follow；JSON 默认不 follow，`-f` 可显式启用；默认尾部 50 行 |
 | `zc test [-c <config>] [--port <port>]` | 通过代理端口做真实连通性检查；显式端口或默认 7899；文本/JSON 使用相同检查 |
@@ -50,7 +50,7 @@
 
 ### readiness 与安全停止
 
-1. 父进程完成来源、providers、override、desired 的校验和冻结。
+1. start 在既有 `zc.launch.lock` 协调下先取得 `zc.lock` 启动所有权，再完成来源、providers、override、desired 的校验和冻结；已运行或竞争未获所有权时不执行 override、不生成自动 key。前台同样遵守此边界，在运行实例前释放短期 launch 锁，全程保留实例锁。restart 的先准备、后停旧实例顺序不变。
 2. 子进程验证快照、继承 lock，绑定全部 listener，发布 `ready:false` descriptor。
 3. 在 catalog authority 保护下完成 exact desired reconciliation；提升为 `ready:true` 后才运行数据面/API accept loop。DIRECT/REJECT 也不能绕过就绪门槛。
 4. `status/start` 以 ready descriptor 而非单独 PID 或监听 socket 判断 running。
@@ -81,6 +81,18 @@ selection 先以 state token（format/sequence/digest）CAS 提交，绑定 exac
 `status` 文本在 daemon/PID/端口之后显示 `Selected proxies:`，按运行配置中代理组的声明顺序，以 `代理组 -> 所选节点或组成员` 逐行列出实际运行选择（多个组可能选择不同成员，不虚构全局唯一节点）。运行状态不可读时显示 `(unavailable)`；已停止或没有代理组选择时显示 `(none)`。名称中的中文、国旗及组合 Emoji 原样输出 UTF-8；仅控制字符和不安全的方向控制符做终端安全转义，Emoji 的具体显示效果取决于终端与字体。JSON 结构保持不变，`selected_proxies` 数组同样按运行配置的组声明顺序排列；需运行新版 daemon 才会生成新的顺序。
 
 `status` 的 `active_config/selected_proxies` 是实际运行状态，不是当前 catalog active 的替身；通过匹配 descriptor 的 controller 查询。controller 不可用时保留实例 identity、选择为空、`runtime_state_available:false`，不能猜 endpoint。来源标记为 `persisted/transient/default`。停止时保留显式 `mixed_port:null`，运行时为实际端口；该字段不受通用 null 过滤影响，公开 CLI 回归已覆盖。
+
+### 托管 profile 的自动 controller secret
+
+只在**实际运行准备**（start、显式来源 restart、reload、运行中 update/override 的 apply）且有效配置已有 `external-controller`、`secret` 缺失或为空时，首次生成 32 随机字节（64 位小写 hex）。先完成配置、provider、override、端口与选择校验，再通过 catalog 锁及 exact token/key/head CAS 持久化；冲突明确失败，重新准备后复用赢家。**不自动添加 controller，也不添加 9090 或任何其他默认监听端口**；没有 controller 时连接命令仍报 controller 缺失。非托管 `-c <文件>` 保持原有行为，需要手工配置非空 secret。
+
+自动值只属于 `state-v2.json` 的可选 profile 字段 `auto_controller_secret`，不写入 `meta.json`、immutable source/materialization/assets 或内容摘要。显式非空 secret 逐字节优先；显式值存在期间仍保留旧自动值，移除后复用。订阅更新、override、选择及重命名不轮换；删除后重新导入是新生命周期。普通 dump、日志、Debug、环境与命令行不注入或披露自动值。
+
+load/list/dump/use、proxy 查询/选择及诊断不生成；已运行 start（含被拒绝的 foreground）、默认 restart 也不隐式升级。已有 daemon 时 foreground 不执行任何一次性 override；竞争中返回 `already_running` 或因未取得所有权而拒绝的 start 不持久化 key。旧实例缺 secret 时，托管用户须显式 `zc restart -c <profile>`（前台由 supervisor 按来源重新准备）。默认 restart 与失败回滚继续使用原冻结认证；新 active/head 不替换运行实例的 secret。
+
+新自动值的 authority rename 可见但目录 fsync 失败时，拒绝本次准备，旧实例不停止；不删除或轮换可见 key。后续进程复用已有值也必须在 catalog 锁内重新同步 authority 目录。后续 listener bind 失败不撤销已持久 key。此处比普通状态提交的 durability warning 更严格：未经持久确认的 key 不进入 Prepared。
+
+采用自动值的认证快照使用 schema 2，冻结独立 secret overlay；只修改运行时私有 secret，不修改冻结 source。无 overlay 仍写 schema 1；旧 Rust/旧 Zig 快照缺字段时只采用原 source 的 secret，不查 profile、不补 key。schema 1 不允许 overlay；schema 2 必须包含合法非空 overlay、managed identity、原 source 已有 controller 且没有非空显式 secret。缺失/null/错误字段、非法语义和 HMAC 篡改均拒绝，无来源回退。readiness/选择快照重写及回滚保留实际冻结值。旧 binary 与新状态的回退限制见[迁移说明](../migration/rust.md#自动-controller-secret-的状态兼容与回退)。
 
 ### durability 与恢复
 

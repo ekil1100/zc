@@ -50,6 +50,38 @@ pub struct Desired {
     pub generation: u64,
     pub selections: Vec<Selection>,
 }
+/// A persisted automatic credential. Debug never exposes its bytes.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct AutoControllerSecret(String);
+impl fmt::Debug for AutoControllerSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+impl<'de> Deserialize<'de> for AutoControllerSecret {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err(serde::de::Error::custom(
+                "invalid automatic controller secret",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+impl AutoControllerSecret {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -57,6 +89,8 @@ pub struct Profile {
     pub storage_id: String,
     pub head: String,
     pub desired: Desired,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_controller_secret: Option<AutoControllerSecret>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -936,6 +970,7 @@ impl Store {
                     generation: u64::from(metadata.selections.is_some()),
                     selections,
                 },
+                auto_controller_secret: None,
             });
             if legacy.metadata.active.as_deref() == Some(key) && ready {
                 catalog.active = Some(ActiveIdentity {
@@ -1155,6 +1190,8 @@ impl Store {
             storage_id: storage_id(key),
             head: revision.clone(),
             desired,
+            auto_controller_secret: index
+                .and_then(|i| catalog.profiles[i].auto_controller_secret.clone()),
         };
         if let Some(i) = index {
             catalog.profiles[i] = profile;
@@ -1263,6 +1300,40 @@ impl Store {
             view.frozen_override,
         )?;
         self.commit(catalog, &_guard)
+    }
+    /// Return a credential only after confirming authority durability under the CAS lock.
+    /// A failed sync leaves a visible key intact; a new reader must resync it, not rotate it.
+    pub fn ensure_auto_controller_secret(
+        &self,
+        expected: &StateToken,
+        key: &str,
+        head: &str,
+    ) -> Result<AutoControllerSecret> {
+        let guard = self.lock()?;
+        let mut catalog = self.expected(expected)?;
+        let profile = catalog
+            .profiles
+            .iter_mut()
+            .find(|p| p.key == key)
+            .ok_or(StoreError::ProfileNotFound)?;
+        ensure!(profile.head == head, StoreError::Conflict);
+        self.read_bundle(key, head)?;
+        if let Some(secret) = &profile.auto_controller_secret {
+            guard.validate(&self.root, "state-v2.lock")?;
+            self.root
+                .sync()
+                .context("automatic controller secret durability unconfirmed")?;
+            return Ok(secret.clone());
+        }
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+        let secret = AutoControllerSecret(hex(&bytes));
+        profile.auto_controller_secret = Some(secret.clone());
+        let receipt = self.commit(catalog, &guard)?;
+        if let Some(error) = receipt.durability_error {
+            return Err(error).context("automatic controller secret durability unconfirmed");
+        }
+        Ok(secret)
     }
     pub fn select(
         &self,

@@ -664,3 +664,255 @@ fn runtime_capture_cannot_bypass_catalog_remote_admission() {
         assert!(!store.root_path().join("profiles").exists());
     }
 }
+
+#[test]
+fn automatic_controller_secret_is_durable_cas_state_not_revision_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    install_golden(&root);
+    let store = Store::open(&root).unwrap();
+    let before = store.load().unwrap();
+    assert_eq!(
+        std::fs::read(root.join("state-v2.json")).unwrap(),
+        ZIG_STATE.as_bytes()
+    );
+    let view = store.read_bundle("home", GOLDEN_REVISION).unwrap();
+    let secret = store
+        .ensure_auto_controller_secret(&before.token, "home", GOLDEN_REVISION)
+        .unwrap();
+    let value = serde_json::to_value(&secret).unwrap();
+    let text = value.as_str().unwrap();
+    assert_eq!(text.len(), 64);
+    assert!(
+        text.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    );
+    assert!(!format!("{secret:?}").contains(text));
+    let after = store.load().unwrap();
+    assert_eq!(after.catalog.sequence, 8);
+    assert_eq!(after.catalog.profiles[0].head, GOLDEN_REVISION);
+    assert_eq!(
+        after.catalog.profiles[0].auto_controller_secret.as_ref(),
+        Some(&secret)
+    );
+    assert!(!format!("{:?}", after.catalog).contains(text));
+    assert_eq!(
+        store
+            .read_bundle("home", GOLDEN_REVISION)
+            .unwrap()
+            .content_digest,
+        view.content_digest
+    );
+    assert_eq!(
+        store.read_bundle("home", GOLDEN_REVISION).unwrap().bundle,
+        view.bundle
+    );
+    assert!(
+        store
+            .ensure_auto_controller_secret(&before.token, "home", GOLDEN_REVISION)
+            .is_err()
+    );
+    assert!(
+        store
+            .ensure_auto_controller_secret(&after.token, "home", &"0".repeat(32))
+            .is_err()
+    );
+    let reopened = Store::open(&root).unwrap();
+    assert_eq!(
+        reopened
+            .ensure_auto_controller_secret(&after.token, "home", GOLDEN_REVISION)
+            .unwrap(),
+        secret
+    );
+    assert_eq!(reopened.load().unwrap().token, after.token);
+}
+
+#[test]
+fn automatic_controller_secret_survives_profile_changes_but_not_delete_reimport() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    install_golden(&root);
+    let store = Store::open(&root).unwrap();
+    let secret = store
+        .ensure_auto_controller_secret(&store.load().unwrap().token, "home", GOLDEN_REVISION)
+        .unwrap();
+    let bundle = Bundle::from_memory(
+        b"secret: explicit\nrules: ['MATCH,REJECT']\n",
+        None,
+        Default::default(),
+    )
+    .unwrap();
+    store
+        .publish(
+            &store.load().unwrap().token,
+            "home",
+            Some(GOLDEN_REVISION),
+            &bundle,
+            Metadata::default(),
+            true,
+        )
+        .unwrap();
+    let p = store.get("home").unwrap();
+    assert_eq!(p.auto_controller_secret.as_ref(), Some(&secret));
+    store
+        .select(&store.load().unwrap().token, "home", &p.head, 0, vec![])
+        .unwrap();
+    store
+        .rename(&store.load().unwrap().token, "home", &p.head, "renamed")
+        .unwrap();
+    let p = store.get("renamed").unwrap();
+    assert_eq!(p.auto_controller_secret.as_ref(), Some(&secret));
+    store
+        .publish(
+            &store.load().unwrap().token,
+            "other",
+            None,
+            &bundle,
+            Metadata::default(),
+            false,
+        )
+        .unwrap();
+    let other = store.get("other").unwrap();
+    assert_ne!(
+        store
+            .ensure_auto_controller_secret(&store.load().unwrap().token, "other", &other.head)
+            .unwrap(),
+        secret
+    );
+    store
+        .delete(&store.load().unwrap().token, "renamed", &p.head)
+        .unwrap();
+    store
+        .publish(
+            &store.load().unwrap().token,
+            "renamed",
+            None,
+            &bundle,
+            Metadata::default(),
+            true,
+        )
+        .unwrap();
+    let new = store.get("renamed").unwrap();
+    assert!(new.auto_controller_secret.is_none());
+    assert_ne!(
+        store
+            .ensure_auto_controller_secret(&store.load().unwrap().token, "renamed", &new.head)
+            .unwrap(),
+        secret
+    );
+    assert!(store.read_bundle("renamed", &p.head).is_ok());
+}
+
+#[test]
+fn malformed_automatic_secrets_are_never_repaired_or_disclosed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    install_golden(&root);
+    let store = Store::open(&root).unwrap();
+    let before = store.load().unwrap();
+    let dir = zc::fsutil::SecureDir::open(&root).unwrap();
+    for extra in [
+        r#""auto_controller_secret":null"#.to_owned(),
+        r#""auto_controller_secret":"""#.into(),
+        format!(r#""auto_controller_secret":"{}""#, "A".repeat(64)),
+        r#""auto_controller_secret":"PRIVATE_INVALID_SECRET""#.into(),
+        r#""auto_controller_secret":42"#.into(),
+        r#""auto_controller_secret":{"PRIVATE_INVALID_SECRET":true}"#.into(),
+        format!(
+            r#""auto_controller_secret":"{}","auto_controller_secret":"{}""#,
+            "a".repeat(64),
+            "a".repeat(64)
+        ),
+        r#""unknown_secret":"PRIVATE_INVALID_SECRET""#.into(),
+    ] {
+        let bytes = ZIG_STATE.replace(
+            "\"selections\":[]}}]",
+            &format!("\"selections\":[]}},{extra}}}]"),
+        );
+        dir.atomic_write("state-v2.json", bytes.as_bytes()).unwrap();
+        let error = store.load().unwrap_err();
+        assert!(!format!("{error:#}").contains("PRIVATE_INVALID_SECRET"));
+        assert!(
+            store
+                .ensure_auto_controller_secret(&before.token, "home", GOLDEN_REVISION)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.join("state-v2.json")).unwrap(),
+            bytes.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn automatic_secret_cas_child() {
+    let Some(root) = std::env::var_os("ZC_SECRET_CAS_ROOT") else {
+        return;
+    };
+    let store = Store::open(&root).unwrap();
+    let before = store.load().unwrap();
+    let id = std::env::var("ZC_SECRET_CAS_ID").unwrap();
+    std::fs::write(store.root_path().join(format!("ready-{id}")), b"").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !store.root_path().join("go").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let result = store.ensure_auto_controller_secret(&before.token, "home", GOLDEN_REVISION);
+    let outcome = match result {
+        Ok(_) => "committed",
+        Err(e)
+            if e.downcast_ref::<zc::store::StoreError>()
+                == Some(&zc::store::StoreError::Conflict) =>
+        {
+            "conflict"
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    };
+    let current = store.load().unwrap();
+    let reused = Store::open(root)
+        .unwrap()
+        .ensure_auto_controller_secret(&current.token, "home", GOLDEN_REVISION)
+        .unwrap();
+    assert_eq!(
+        current.catalog.profiles[0].auto_controller_secret.as_ref(),
+        Some(&reused)
+    );
+    std::fs::write(store.root_path().join(format!("result-{id}")), outcome).unwrap();
+}
+
+#[test]
+fn automatic_secret_cross_process_cas_has_one_winner_and_loser_reuses_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    install_golden(&root);
+    let spawn = |id: &str| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "automatic_secret_cas_child", "--nocapture"])
+            .env("HOME", temp.path())
+            .env("ZC_SECRET_CAS_ROOT", &root)
+            .env("ZC_SECRET_CAS_ID", id)
+            .spawn()
+            .unwrap()
+    };
+    let mut a = spawn("a");
+    let mut b = spawn("b");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !(root.join("ready-a").exists() && root.join("ready-b").exists()) {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::fs::write(root.join("go"), b"").unwrap();
+    assert!(a.wait().unwrap().success());
+    assert!(b.wait().unwrap().success());
+    let mut results = [
+        std::fs::read_to_string(root.join("result-a")).unwrap(),
+        std::fs::read_to_string(root.join("result-b")).unwrap(),
+    ];
+    results.sort();
+    assert_eq!(results, ["committed", "conflict"]);
+    assert_eq!(
+        Store::open(root).unwrap().load().unwrap().catalog.sequence,
+        8
+    );
+}

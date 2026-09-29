@@ -803,6 +803,13 @@ impl Config {
         self.controller
     }
 
+    /// Does not change the parsed document or canonical materialization.
+    pub(crate) fn set_runtime_controller_secret(
+        &mut self,
+        secret: &crate::store::AutoControllerSecret,
+    ) {
+        self.secret = secret.expose().to_owned();
+    }
     pub fn secret(&self) -> &str {
         &self.secret
     }

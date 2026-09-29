@@ -7,7 +7,7 @@
 - 一个 mixed HTTP/SOCKS5 listener，默认 loopback。生产默认端口 **7899**；只有 CLI `--port` 控制实际端口。来源 `mixed-port`（含 0）只作兼容声明，准备时规范化；开发显式使用其他端口。
 - 同文件存在 mixed 声明时，`port/socks-port` 是 ignored compatibility declarations；没有 mixed 的 standalone 入口拒绝。`redir-port/tproxy-port` 不创建 listener，TUN 不支持。
 - `allow-lan:false` 的规范运行时投影绑定 loopback；`allow-lan:true` 才允许 LAN。没有入站认证，不应暴露给不可信客户端。
-- `external-controller` 仅接受 `127.0.0.1:<port>`；必须精确绑定，不漂移、不静默关闭。
+- `external-controller` 仅接受 `127.0.0.1:<port>`；必须精确绑定，不漂移、不静默关闭。托管 profile 仅在已有 controller 且无非空显式 secret 的实际运行准备时，生成并持久复用自动 secret；显式值优先且不抹掉旧自动值。不会添加 controller/默认控制端口，非托管文件保持手工配置。
 - `mode/log-level` 接受合法兼容声明；不要据此宣称完整 mihomo 模式调度或动态日志级别。当前路由由规则决定。
 - `dns`（含 fake-ip、enhanced-mode、nameserver-policy）、`hosts`、`sniffer`、`profile`、`experimental`、`unified-delay`、`clash-for-android` 接受但不执行，见下方清单；`proxy-providers` 仍拒绝。`external-ui` 等兼容元数据不代表托管 dashboard。
 - `src/override_script.rs::runtime_source` 只投影已经校验的兼容字段给 `src/config.rs`；immutable source/materialization 的规范字节及内容摘要不能被运行时投影改写。
@@ -164,11 +164,13 @@ Rust YAML 按原 Zig 的“根节点之外最多 128 层”计数（最多 129 �
 
 ## 控制面与仍待验收的差异
 
-CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/README.md)。连接最小版提供 `connection list/close <id>` 与 `GET /connections`、`DELETE /connections/<id>`，均要求非空 secret 和 Bearer；这是 zc 的有界实例模型，不是 mihomo 连接详情完整兼容。
+CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/README.md)。连接最小版提供 `connection list/close <id>` 与 `GET /connections`、`DELETE /connections/<id>`，均要求非空运行时 secret（托管自动值或显式值）和 Bearer；这是 zc 的有界实例模型，不是 mihomo 连接详情完整兼容。
 
 每个 mixed TCP 任务一个实例绑定 ID，UDP 关联复用控制连接 ID。运行时展开规则索引和实际 leaf 来自同一次匹配/选择；不按当前选择重新计算存量连接。HTTP forward idle 清目标与路由，下一请求再路由；UDP 仅展示首合法包元数据并标记 `first_datagram`，不伪装成每包重新路由。`routed_target` 不是实际远端 IP。DELETE 仅确认关闭请求，先取消数据面并回收 UDP worker，再删除条目；不改变 DIRECT/SS/Trojan half-close 或 AnyTLS FIN 的正常转发语义。
 
 活动记录最多 1024，UDP 仍最多 64，无历史或逐包/逐字节 registry 更新；配置索引避免复制节点凭据，大配置及 JSON 转义计入 4 MiB 响应预算，超限完整 500。无流量计数、全部断开、分页、自动 controller、WebSocket、完整 REST v1、第三方 dashboard parity 或 TUI。
+
+自动 secret 是 zc 的 profile 生命周期能力，不改 mihomo/clash 原始配置字节、materialization、assets 或 hash，不写入兼容 `meta.json`。订阅更新/override/选择/重命名不轮换，删除重新导入才开始新生命周期。只读操作、已运行 start（含 foreground 拒绝）和旧快照默认 restart 不升级；显式重新准备才启用。start 先取得实例启动所有权再准备，已有 daemon 时连一次性 override 也不执行，竞争失败方不写自动 key。schema-2 overlay 的完整校验、冻结鉴权及回退约束见 [CLI](../cli/spec.md#托管-profile-的自动-controller-secret) 与 [迁移说明](../migration/rust.md#自动-controller-secret-的状态兼容与回退)。
 
 缺省 rules 的审计误判已由严格 parser/旧二进制证据纠正；unmanaged cache/refresh 和 YAML 深度边界已有定向回归。完整诊断精度及其余资源策略差异仍须对齐或明确审批；TLS/DNS 使用成熟 Rust 库也需要互操作与性能证据，而非源码相似性证明。四平台、性能和长稳结论由最终门禁维护。
 

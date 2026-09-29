@@ -267,6 +267,7 @@ async fn managed_deferred_remote_metadata_never_fetches_or_mutates_revision_inpu
             }),
             desired: Desired::default(),
             source_path: None,
+            state_token: None,
         },
         PrepareOptions {
             port: Some(23457),

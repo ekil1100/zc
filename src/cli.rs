@@ -533,11 +533,11 @@ fn map_error(command: &str, error: anyhow::Error) -> Failure {
             ),
             "CONNECTION_CONTROLLER_REQUIRED" => (
                 "running configuration has no controller",
-                "configure external-controller and a nonempty secret, then explicitly reprepare with `zc restart -c <config>`; default restart reuses the frozen snapshot",
+                "configure external-controller, then explicitly reprepare with `zc restart -c <config>`; managed profiles supply a secret, unmanaged files also need a nonempty secret; default restart reuses the frozen snapshot",
             ),
             "CONNECTION_SECRET_REQUIRED" => (
                 "running configuration requires a nonempty secret",
-                "configure a nonempty secret, then explicitly reprepare with `zc restart -c <config>`; default restart reuses the frozen snapshot",
+                "for a managed profile, explicitly reprepare with `zc restart -c <profile>` to enable its automatic secret; unmanaged files need a nonempty secret first; default restart reuses the frozen snapshot",
             ),
             "CONNECTION_UNAUTHORIZED" => (
                 "connection access was denied",
@@ -824,40 +824,12 @@ async fn dispatch(args: &Args) -> Result<Output> {
     match args.path.as_str() {
         "version" => Ok(Output::Data(json!({"version":env!("CARGO_PKG_VERSION")}))),
         "start" => {
-            if !args.flag("--foreground")
-                && let Some(current) = daemon::current_prepared().await?
-            {
-                return Ok(Output::Data(extend(
-                    daemon::start(current).await?,
-                    json!({"action":"start","state":"running"}),
-                )));
-            }
-            let prepared = service::prepare(args.prepare()).await?;
             if args.flag("--foreground") {
-                let address = std::net::SocketAddr::new(
-                    service::prepared_config(&prepared)?.bind_address(),
-                    prepared.port,
-                );
-                let foreground = daemon::run_foreground(prepared);
-                tokio::pin!(foreground);
-                let mut announced = false;
-                let mut tick = tokio::time::interval(Duration::from_millis(25));
-                loop {
-                    tokio::select! {
-                        result = &mut foreground => { result?; break; },
-                        _ = tick.tick(), if !announced => {
-                            if let Ok(state) = daemon::status().await
-                                && state["state"] == "running" && state["pid"] == std::process::id() {
-                                    eprintln!("Runtime listening on {address} (foreground)");
-                                    announced = true;
-                                }
-                        }
-                    }
-                }
+                daemon::run_foreground(args.prepare()).await?;
                 Ok(Output::Silent)
             } else {
                 Ok(Output::Data(extend(
-                    daemon::start(prepared).await?,
+                    daemon::start(args.prepare()).await?,
                     json!({"action":"start","state":"running"}),
                 )))
             }
@@ -1408,6 +1380,7 @@ async fn apply_revision(
         identity: Some(new.clone()),
         desired: p.desired.clone(),
         source_path: Some(new.key.clone()),
+        state_token: Some(snapshot.token.clone()),
     };
     let prepared = service::prepare_loaded(
         loaded,

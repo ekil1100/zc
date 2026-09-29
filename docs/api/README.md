@@ -13,7 +13,11 @@ rules:
   - MATCH,DIRECT
 ```
 
-非空 `secret` 使所有 PUT 要求 `Authorization: Bearer <secret>`，缺失/错误返回 401；原有只读端点仍不要求 Bearer。连接详情敏感，新增的 `GET /connections` 和 `DELETE /connections/<id>` **必须配置非空 secret 并使用 Bearer**：未配置返回 403，缺失或错误 Bearer 返回 401。loopback 不是多用户授权边界；生产应始终配置随机 secret，不要把原有只读接口视为私密信息通道。
+非空 `secret` 使所有 PUT 要求 `Authorization: Bearer <secret>`，缺失/错误返回 401；原有只读端点仍不要求 Bearer。连接详情敏感，新增的 `GET /connections` 和 `DELETE /connections/<id>` **必须具有非空运行时 secret 并使用 Bearer**：未配置返回 403，缺失或错误 Bearer 返回 401。loopback 不是多用户授权边界；非托管配置应始终配置随机 secret，不要把原有只读接口视为私密信息通道。
+
+托管 profile 在首次实际运行准备时，若已有 controller 而 secret 缺失/为空，会自动生成并持久保存 64 位小写 hex secret；显式非空 secret 优先，自动值保留供以后复用。CLI connection/selection 从认证运行快照取实际值，无需用户复制 key；订阅更新、override、选择和重命名不轮换。key 不进入普通 dump、日志或兼容镜像；非托管 `-c` 文件仍须手工配置。
+
+不自动配置 controller 或任何默认控制端口。旧快照、默认 restart 和已运行 start 不补认证；托管升级须显式 `zc restart -c <profile>`。带自动 secret 的快照使用 schema 2，读取严格鉴权、校验完整 overlay；不使用当前 active/head 的 key 代替运行快照。持久性未确认时拒绝新准备并保留旧实例；完整生命周期见 [CLI 契约](../cli/spec.md#托管-profile-的自动-controller-secret)。Bearer 与实例 nonce 规则不变。
 
 ## 端点
 
