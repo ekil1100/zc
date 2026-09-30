@@ -30,7 +30,7 @@ Options:
   -h, --help             Show help
 
 This command records measurements. It does not claim performance PASS/FAIL and
-never writes docs/perf/reports/latest.json or history automatically.
+never writes .agents/perf/reports/latest.json or history automatically.
 EOF
 }
 
@@ -142,7 +142,7 @@ if [[ "$SUBJECT_COMMIT" != "$ACTUAL_HEAD" ]]; then
   fi
   while IFS= read -r -d '' changed_path; do
     case "$changed_path" in
-      docs/perf/reports/README.md|docs/migration/performance.md|scripts/perf/run-control-plane-baseline.sh|examples/perf_runner.rs)
+      .agents/perf/reports/README.md|.agents/migration/performance.md|scripts/perf/run-control-plane-baseline.sh|examples/perf_runner.rs)
         ;;
       *)
         echo "subject differs from harness by non-harness source: $changed_path" >&2
@@ -160,12 +160,23 @@ elif [[ "$OUTPUT" != /* ]]; then
   OUTPUT="$ROOT_DIR/$OUTPUT"
 fi
 
-case "$OUTPUT" in
-  "$ROOT_DIR/docs/perf/reports/"*)
-    echo "refusing to overwrite tracked perf reports; use target/perf or /tmp" >&2
-    exit 2
-    ;;
-esac
+# Resolve aliases and compare existing directory identities on all filesystems.
+OUTPUT="$(python3 - "$OUTPUT" "$ROOT_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+output = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[2])
+if any(
+    ancestor == protected
+    or (ancestor.exists() and protected.exists() and ancestor.samefile(protected))
+    for ancestor in (output, *output.parents)
+    for protected in (root / "docs", root / ".agents")
+):
+    sys.exit("refusing to overwrite public docs or internal archives; use target/perf or /tmp")
+print(output)
+PY
+)" || { echo "unable to select output path" >&2; exit 2; }
 
 mkdir -p "$(dirname "$OUTPUT")"
 tmp_output="${OUTPUT}.tmp.$$"

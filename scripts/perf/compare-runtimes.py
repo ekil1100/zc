@@ -182,8 +182,15 @@ def main():
         parser.error("at least five samples and positive iterations required")
     binaries = {"zig": args.zig.resolve(), "rust": args.rust.resolve()}
     output = args.output.resolve()
-    if ROOT / "docs" in output.parents:
-        parser.error("exploratory artifacts must not overwrite tracked reports")
+    if any(
+        ancestor == protected
+        or (ancestor.exists() and protected.exists() and ancestor.samefile(protected))
+        for ancestor in (output, *output.parents)
+        for protected in (ROOT / "docs", ROOT / ".agents")
+    ):
+        parser.error(
+            "exploratory artifacts must not overwrite public docs or internal archives"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     before = source_state()
     build_evidence = {"performed": False}

@@ -369,7 +369,8 @@ check_placeholder_perf_absent() {
     "scripts/${reg_name}.sh" \
     "scripts/perf/${base_name}.sh" \
     "scripts/perf/${check_name}.sh" \
-    "docs/perf/reports/latest.json"
+    "docs/perf/reports/latest.json" \
+    ".agents/perf/reports/latest.json"
   do
     if [[ -e "$ROOT_DIR/$f" ]]; then
       bad "still present: $f"
@@ -391,20 +392,20 @@ check_placeholder_perf_absent() {
   if command -v rg >/dev/null 2>&1; then
     if rg -n -e "$pat_pass" -e "$pat_rule" -e "$pat_base" \
         -g '!scripts/eval/selfcheck.sh' \
-        "$ROOT_DIR/scripts" "$ROOT_DIR/docs/perf/reports/README.md" >/dev/null 2>&1; then
+        "$ROOT_DIR/scripts" "$ROOT_DIR/.agents/perf/reports/README.md" >/dev/null 2>&1; then
       scan_rc=1
       rg -n -e "$pat_pass" -e "$pat_rule" -e "$pat_base" \
         -g '!scripts/eval/selfcheck.sh' \
-        "$ROOT_DIR/scripts" "$ROOT_DIR/docs/perf/reports/README.md" >&2 || true
+        "$ROOT_DIR/scripts" "$ROOT_DIR/.agents/perf/reports/README.md" >&2 || true
     fi
   else
     if grep -R -n -E "$pat_pass|$pat_rule|$pat_base" \
         --exclude='selfcheck.sh' \
-        "$ROOT_DIR/scripts" "$ROOT_DIR/docs/perf/reports/README.md" >/dev/null 2>&1; then
+        "$ROOT_DIR/scripts" "$ROOT_DIR/.agents/perf/reports/README.md" >/dev/null 2>&1; then
       scan_rc=1
       grep -R -n -E "$pat_pass|$pat_rule|$pat_base" \
         --exclude='selfcheck.sh' \
-        "$ROOT_DIR/scripts" "$ROOT_DIR/docs/perf/reports/README.md" >&2 || true
+        "$ROOT_DIR/scripts" "$ROOT_DIR/.agents/perf/reports/README.md" >&2 || true
     fi
   fi
   if [[ $scan_rc -ne 0 ]]; then

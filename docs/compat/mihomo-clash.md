@@ -1,6 +1,6 @@
 # mihomo/clash 兼容边界
 
-本文描述 Rust 候选实现与原基线要求，**不是完整 mihomo 替代声明，也不是最终验收报告**。实现差异列在末节及 [迁移说明](../migration/rust.md)，原协议研究、日期化报告保留其历史 provenance。
+本文描述 Rust 候选的配置与运行时支持边界，**不是完整 mihomo 替代声明，也不代表正式发布验证已经完成**。
 
 ## 配置、入口与能力准入
 
@@ -10,22 +10,22 @@
 - `external-controller` 仅接受 `127.0.0.1:<port>`；必须精确绑定，不漂移、不静默关闭。托管 profile 仅在已有 controller 且无非空显式 secret 的实际运行准备时，生成并持久复用自动 secret；显式值优先且不抹掉旧自动值。不会添加 controller/默认控制端口，非托管文件保持手工配置。
 - `mode/log-level` 接受合法兼容声明；不要据此宣称完整 mihomo 模式调度或动态日志级别。当前路由由规则决定。
 - `dns`（含 fake-ip、enhanced-mode、nameserver-policy）、`hosts`、`sniffer`、`profile`、`experimental`、`unified-delay`、`clash-for-android` 接受但不执行，见下方清单；`proxy-providers` 仍拒绝。`external-ui` 等兼容元数据不代表托管 dashboard。
-- `src/override_script.rs::runtime_source` 只投影已经校验的兼容字段给 `src/config.rs`；immutable source/materialization 的规范字节及内容摘要不能被运行时投影改写。
+- 运行时只使用已经校验的兼容字段；原始配置和规范化配置的字节及内容摘要不会被运行时投影改写。
 - 未启用的 outbound/group/plugin 在准备或准入时明确拒绝，绝不回退 DIRECT。用户声明的精确名称 `DIRECT/REJECT` 保留，不能覆盖内置字面量。
 
 ## 接受但暂不执行的订阅字段
 
 以下七个**顶层字段**不会阻止配置加载、启动或 doctor 检查；仅在运行时投影中跳过，不修改原文件、托管 revision 的 source/materialization 或其内容摘要。它们仍受全文 YAML 语法、重复键、alias、深度和资源限制约束，但暂不校验其内部功能 schema。接受声明不表示相关功能生效。
 
-| 字段 | 当前行为 | 后续待支持 |
+| 字段 | 当前行为 | 不代表支持的能力 |
 | --- | --- | --- |
 | `dns` | 使用现有系统 DNS 路径，不应用本段配置 | 自定义解析器、fake-ip、nameserver-policy 等 |
 | `hosts` | 不应用配置内映射；系统 hosts 路径不变 | 配置级静态域名映射 |
 | `sniffer` | 不嗅探应用层协议或改写目标 | 协议嗅探与目标覆盖 |
 | `profile` | 不应用本段选项；zc 自身持久选择逻辑不变 | store-selected/store-fake-ip 等兼容语义 |
-| `experimental` | 不应用实验选项 | 逐项评估，不能据字段存在宣称支持 |
+| `experimental` | 不应用实验选项 | 不能据字段存在宣称支持实验功能 |
 | `unified-delay` | 不改变延迟测量 | 统一延迟测量语义 |
-| `clash-for-android` | 不应用 Android 客户端选项 | 评估有意义的跨平台选项；Android 不在生产目标内 |
+| `clash-for-android` | 不应用 Android 客户端选项 | Android 客户端功能；Android 不在生产目标内 |
 
 这是明确列举的兼容例外，不是忽略所有未知字段。未列出的未知字段、`tun`、`proxy-providers`、不支持的节点协议/插件/策略组以及错误规则仍拒绝；不会把未实现的出站替换为 DIRECT。override patch 的字段许可范围也不因此扩大。
 
@@ -36,17 +36,17 @@
 | HTTP CONNECT / SOCKS5 CONNECT | 双向 TCP tunnel；除 AnyTLS 外保留 half-close；SOCKS5 无用户认证 |
 | HTTP forward | absolute-form HTTP/HTTPS；有界 Content-Length/chunked request、100-continue、顺序 keep-alive；每连接最多 1024 请求；拒绝冲突 framing/Host、非法 trailer、Upgrade |
 | DIRECT / REJECT | 内置字面量可用；REJECT 是终态，不因目标为私网/loopback 改写为 DIRECT |
-| 用户命名 `type: direct/reject` | 已由独立变更支持，可作为命名叶节点及 select 成员；本轮不重复实现 |
+| 用户命名 `type: direct/reject` | 可作为命名叶节点及 select 成员 |
 | SS classic AEAD | `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`；`chacha20-poly1305` 是同一 wire alias |
 | simple-obfs | 只支持下述内建 HTTP 形状，仅包装 SS TCP |
 | Trojan | 原生 TLS/TCP，password/server/port/sni/skip-cert-verify；另有受限 UDP association |
 | AnyTLS | 原生 TLS/TCP，单流独占 session；详见下节，无复用/UDP |
-| HTTP/SOCKS5 outbound、VMess/VLESS | 不支持；保留历史代码不构成启用 |
+| HTTP/SOCKS5 outbound、VMess/VLESS | 不支持 |
 | SS AEAD-2022、外部 SIP003、obfs TLS、Trojan WS/gRPC | 不支持，拒绝而非降级 |
 
 HTTP CONNECT 的请求目标必须包含显式端口（例如 `CONNECT example.com:443`）。为兼容 Node/Undici/Pi，`Host: example.com` 省略端口时按请求目标端口校验；域名、IPv4 和带方括号的 IPv6 均支持。不同主机、冲突的显式端口、非法/重复 Host 及 HTTP/1.1 缺失 Host 仍拒绝；不改变规则匹配、出站目标或非 CONNECT 的 Host 校验。
 
-HTTP request header 最多 16 KiB，request body 最多 16 MiB；chunk framing/trailer 也有计数/字节上界。response 按流转发，不应把 request body 上界误称 response 总大小上界。mixed 最多 1024 connection tasks，入站握手 10 秒，路由与出站准备另有 10 秒 deadline，TCP 转发空闲期限 15 分钟。退出取消并回收任务，不承诺 drain 完全部存量流量。这些数值不同于原 Zig 的 128 workers / 5 秒，仍须资源评审。
+HTTP request header 最多 16 KiB，request body 最多 16 MiB；chunk framing/trailer 也有计数/字节上界。response 按流转发，不应把 request body 上界误称 response 总大小上界。mixed 最多 1024 connection tasks，入站握手 10 秒，路由与出站准备另有 10 秒 deadline，TCP 转发空闲期限 15 分钟。退出取消并回收任务，不承诺 drain 完全部存量流量。
 
 TLS 使用 rustls / tokio-rustls、系统信任根、安全默认 TLS 1.2/1.3；不继承 Zig TLS 派生实现的 poll/partial-record/KeyUpdate 限制说明。Trojan / AnyTLS server 必须是合法 IP 或 RFC hostname，DNS server 尾点在派生身份时去除；显式 SNI 必须是无尾点的 DNS hostname，不接受 IP/wildcard/控制字符。验证证书的 IP server 须显式 SNI。仅 `skip-cert-verify:true` 关闭链和身份校验，握手签名仍验证；这是安全降级，不是默认行为。uTLS/Reality/mTLS/任意 ALPN 配置不在支持范围。
 
@@ -63,11 +63,9 @@ TLS 使用 rustls / tokio-rustls、系统信任根、安全默认 TLS 1.2/1.3；
 - 初始使用官方默认 padding；服务端更新按节点线程安全保存，仅后续 session 使用，MD5 对**原始字节**计算（含末尾 LF）。本地准入：方案最多 4096 bytes、`stop` 为 1–32、分组索引小于 stop、每组最多 16 项，正向范围 `min<=max`；认证组仅一个尺寸、最多 4062 bytes，普通片最多 16384 bytes；所有尺寸上界加各自 7-byte 帧开销的总和最多 65536 bytes。缺省分组不填充；认证组缺省为零填充。超过预算或非法更新终止当前 session，不污染原方案。
 - 随机范围与固定 Go 实现一致为 `[min,max)`，相等时固定；`c` 在无真实数据时停止后续填充。纯填充分支发送 body 长度为所选尺寸的 Waste，所以 TLS 明文长度为 **尺寸+7**。每个发送分组最多一个 65542-byte 数据帧加 64 KiB padding 预算；这不是整个 TLS/内核缓冲的总内存承诺，也不保证所有方案尺寸等于 TLS record 尺寸。
 
-中继通过 `IoStream::whole_close()` 的可选单向终态通知识别 AnyTLS；默认无通知的 DIRECT/SS/Trojan 仍使用原 TCP half-close 转发。公共 `runtime::transfer` 是 CONNECT/SOCKS 共用入口；直接把 AnyTLS 交给 Tokio 通用 `copy_bidirectional` 不具备这项终态处理。HTTP forward 同样在整流终态停止上传、排完响应，未完成请求体不得复用为下一请求；HTTPS 包裹层透传通知，但不放宽内层 TLS 截断检查。请求头和 CONNECT 已缓存前缀在等待更多输入前 flush，避免缓冲出站阻塞提前响应或 100-continue。
+AnyTLS 整流关闭时，CONNECT/SOCKS 和 HTTP forward 均停止上传并排完已接收响应；未完成的 HTTP 请求体不得复用为下一请求。HTTPS 仍检查内层 TLS 截断。DIRECT/SS/Trojan 保留 TCP half-close 转发，不采用 AnyTLS 的整流关闭语义。请求头和 CONNECT 已缓存前缀会及时发送，避免阻塞服务端提前响应或 100-continue。
 
-生命周期修复后的公共回归位于 `tests/anytls_lifecycle.rs`：真实 TCP/TLS 双向各约 16 MiB（无心跳对照、1/32 心跳）、容量 1 的迟到上传/下行排尽、FIN 后无入站 EOF、控制洪泛、取消、本地 shutdown 尾部及 mixed CONNECT/SOCKS/HTTP/HTTPS。macOS arm64 已连续运行 20 轮；不是性能或四平台门禁。
-
-独立官方 `anytls-go v0.0.13` / `v0.0.5` 已在本机通过真实 mixed echo/server-first、HTTP forward、错密码与目标失败等用例；可信 OpenSSL fixture 另测单次认证写、默认/更新 padding 的实际 TLS record。版本、哈希、可选命令及未纳入默认 CI 的边界见 [E2E](../reliability/e2e.md#anytls-可选独立互操作)。协议来源见 [研究](../research/anytls.md)。未证明抗指纹效果、四平台或长稳。
+不保证抗指纹效果、与 mihomo 等价的性能或长期稳定性。
 
 ### simple-obfs HTTP
 
@@ -80,7 +78,7 @@ plugin-opts:
 
 两个字段必须显式存在。host 为 1–255 bytes，不含 CR/LF/NUL。`plugin_opts` map alias 可接受并规范成 `plugin-opts`；冲突 alias、非 map、SIP003 scalar 字符串、未知模式/plugin、缺 host、非 SS plugin 均拒绝。不启动外部 plugin，也不退化为 plain SS。
 
-HTTP 首帧、Content-Length、分片 response header 与同 read 尾部由 `src/simple_obfs.rs` 有界处理；协议 oracle 的故意错误请求（如 ContentLengthMismatch）是负向验收，不应解释成生产 obfs 故障。wire 依据见 [研究](../research/shadowsocks-simple-obfs-udp.md)。
+HTTP 首帧、Content-Length、分片 response header 与同次读取的尾部数据均作有界处理。
 
 仅明确 malformed/unsupported SS obfs metadata 可作为 inactive raw recovery revision 保存；严格 YAML、字段、规则/provider 和资源 gate 仍必须通过。`download -d`、active update、use 不能激活此 revision；修复 source 后 update/use。其他协议错误没有这一恢复豁免。
 
@@ -90,7 +88,7 @@ mixed SOCKS5 CMD=0x03 仅用于显式 `udp:true` 的 SS classic AEAD 或原生 T
 
 - TCP control peer IP 绑定 association；请求非零 source port 时约束该端口，否则首个完全合法、同 IP 数据报固定 source port。
 - 首个合法 datagram 执行规则与 select 解析并固定实际 leaf；后续 datagram 可有其他目标，但复用同一 outbound session，不重新选组、不 fallback。
-- DIRECT、group→DIRECT、REJECT、AnyTLS、非 `udp:true` leaf 结束 association，不提供 DIRECT UDP ingress。内部测试/transport helper 有直连 UDP 不代表公开入口支持。
+- DIRECT、group→DIRECT、REJECT、AnyTLS、非 `udp:true` leaf 结束 association，不提供 DIRECT UDP ingress。
 - 最多 64 associations，第 65 个返回 general failure；control close 立即取消 DNS/open/send/relay 并释放 slot，另有 300 秒单调时钟 idle。
 - SOCKS 与 SS wire 单包上界均为 65507 bytes，按实际 address/cipher overhead 检查；坏 RSV/FRAG/ATYP/长度、SS bad tag 或截短 salt/tag 按 packet 丢弃；不分片、不重组、不积累无界队列。
 
@@ -102,7 +100,7 @@ mixed SOCKS5 CMD=0x03 仅用于显式 `udp:true` 的 SS classic AEAD 或原生 T
 
 专用 TLS/TCP stream 请求：`SHA224_HEX(password) | CRLF | CMD=0x03 | 0.0.0.0:0 | CRLF`。datagram frame：`SOCKS_ADDR | PAYLOAD_LEN_BE16 | CRLF | PAYLOAD`，payload 后无额外分隔符。支持 IPv4/domain/IPv6、空 payload；非法 CRLF、ATYP、长度和中途 EOF 结束 association，不做 stream 重同步。
 
-domain 先按原域名匹配规则，再本地解析成 IP frame 兼容主流服务端；session 缓存最后一个 domain/port 结果。Rust 使用异步单一 worker 独占 stream、有界双向各 2-frame channel，满时丢包；不沿用 Zig 的 256 KiB I/O thread 描述。wire 依据见 [研究](../research/trojan-udp.md)。实际 IPv6 可达性依赖服务端 egress；300 秒 idle 需单独真实等待验证，短测试不能替代。
+domain 先按原域名匹配规则，再本地解析成 IP frame 兼容主流服务端；session 缓存最后一个 domain/port 结果。使用异步单一 worker 独占 stream、有界双向各 2-frame channel，满时丢包。实际 IPv6 可达性依赖服务端 egress。
 
 ## 代理组、规则与 DNS
 
@@ -111,7 +109,7 @@ domain 先按原域名匹配规则，再本地解析成 IP frame 兼容主流服
 支持解析与匹配：`DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD`、`IP-CIDR/IP-CIDR6`、`DST-PORT/SRC-PORT`（含范围）、`SRC-IP-CIDR`、`PROCESS-NAME`、`GEOIP`、`RULE-SET`、`MATCH`。
 
 - 声明顺序 first-match，域名 ASCII 大小写不敏感、忽略末尾 root dot；无匹配拒绝，不任意 fallback DIRECT。
-- **严格 CLI 基线**：缺失 `rules`、显式 `[]`、非空规则缺终态 MATCH 均补 `MATCH,REJECT`；重复/非尾部 MATCH 拒绝。原 `config.zig::load()` 已调用严格 `parseDocument()`，只有不用于 CLI 的 legacy `parse()` 在字段缺失时补 DIRECT。旧二进制 dump 与真实 loopback 路由均确认严格语义；Rust canonical bytes/hash 不因此改变。
+- **CLI 规则默认值**：缺失 `rules`、显式 `[]`、非空规则缺终态 MATCH 均补 `MATCH,REJECT`；重复/非尾部 MATCH 拒绝。
 - mixed HTTP/SOCKS 提供目标端口与来源 IP/端口；不提供进程名，`PROCESS-NAME` 的可解析性不等于实际进程规则生效。
 - GEOIP 保留原有静态 IPv4 heuristic table，不是完整地理库；IPv6 不完整。`no-resolve` 避免为相应 IP/GEOIP 规则解析域名。
 - 为 IP 规则解析后使用同一 DNS 快照，获准 IP 固定给后续 DIRECT/SS/Trojan/AnyTLS dial/encode，不重解析并选择未获准地址。
@@ -140,7 +138,7 @@ HTTP(S) 请求总期限 30 秒（包括迟到的 headers/body）、最多 5 次 
 
 同步同时保留 source 16 MiB、4096 declarations/assets、raw aggregate 64 MiB、normalized 与 expanded budgets。失败 response body 也计费；无法精确获知失败传输量时保守扣除该请求剩余窗口，再检查缓存预算。冻结结果不受随后源文件/cache 编辑影响；managed source/materialization/revision 不就地刷新。
 
-这些安全路径限制比旧 Zig 接受任意绝对路径更严格；没有迁移旧 cwd/绝对路径 cache，也没有 curl fallback。HTTP 状态/候选/写入失败策略来自原 `syncRuleProviderFilesIfNeededWithLimits`、`downloadRuleProviderFileUsing` 和 `publishRuleProviderFile`，不是将所有失败统称 best-effort。
+不会自动迁移旧 cwd/绝对路径缓存，也没有 curl 回退。请按上述来源根目录与相对路径要求配置缓存。
 
 ## 配置资源上界
 
@@ -160,9 +158,9 @@ HTTP(S) 请求总期限 30 秒（包括迟到的 headers/body）、最多 5 次 
 
 这些是同时生效的最大值，不保证达到某个局部上界时仍能绕过另一全文上界。重复 RULE-SET/target 重复计费；classical entry 用完整 normalized 长度保守预检。provider-name 索引与完整 count/byte plan 在展开 reserve/clone 前检查，资源错误不能回退 legacy line parser，也不截断或部分发布。
 
-Rust YAML 按原 Zig 的“根节点之外最多 128 层”计数（最多 129 个 collection frame），block/flow 与 JSON-looking 文档共享此边界。复杂 YAML 使用受限 16 MiB 栈的解析线程，普通原生 JSON 快路径保留自身递归保护，超出该快路径的合法深度交给同样有界的 YAML parser。仍限制 events 1600000、nodes 524289、scalar 合计 16 MiB，禁 anchors/aliases/merge keys/duplicate keys；其他资源计数不宣称与 Zig 完全一致。source 16 MiB+1 使用 `CONFIG_*_TOO_LARGE`，collection/provider/展开超限映射 `CONFIG_*_LIMIT_EXCEEDED`，细节见 [错误码](../api/error-codes.md)。逻辑拒绝必须保持 authority 与 revision tree 不变；存储 I/O 故障可能产生已验证但不可达对象，不能混淆。
+YAML 按“根节点之外最多 128 层”计数（最多 129 个 collection frame），block/flow 与 JSON-looking 文档共享此边界。复杂 YAML 使用受限 16 MiB 栈的解析线程，普通原生 JSON 快路径保留自身递归保护，超出该快路径的合法深度交给同样有界的 YAML parser。仍限制 events 1600000、nodes 524289、scalar 合计 16 MiB，禁 anchors/aliases/merge keys/duplicate keys。source 16 MiB+1 使用 `CONFIG_*_TOO_LARGE`，collection/provider/展开超限映射 `CONFIG_*_LIMIT_EXCEEDED`，细节见 [错误码](../api/error-codes.md)。逻辑拒绝必须保持 authority 与 revision tree 不变；存储 I/O 故障可能产生已验证但不可达对象，不能混淆。
 
-## 控制面与仍待验收的差异
+## 控制面与支持限制
 
 CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/README.md)。连接最小版提供 `connection list/close <id>` 与 `GET /connections`、`DELETE /connections/<id>`，均要求非空运行时 secret（托管自动值或显式值）和 Bearer；这是 zc 的有界实例模型，不是 mihomo 连接详情完整兼容。
 
@@ -170,16 +168,16 @@ CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/
 
 活动记录最多 1024，UDP 仍最多 64，无历史或逐包/逐字节 registry 更新；配置索引避免复制节点凭据，大配置及 JSON 转义计入 4 MiB 响应预算，超限完整 500。无流量计数、全部断开、分页、自动 controller、WebSocket、完整 REST v1、第三方 dashboard parity 或 TUI。
 
-自动 secret 是 zc 的 profile 生命周期能力，不改 mihomo/clash 原始配置字节、materialization、assets 或 hash，不写入兼容 `meta.json`。订阅更新/override/选择/重命名不轮换，删除重新导入才开始新生命周期。只读操作、已运行 start（含 foreground 拒绝）和旧快照默认 restart 不升级；显式重新准备才启用。start 先取得实例启动所有权再准备，已有 daemon 时连一次性 override 也不执行，竞争失败方不写自动 key。schema-2 overlay 的完整校验、冻结鉴权及回退约束见 [CLI](../cli/spec.md#托管-profile-的自动-controller-secret) 与 [迁移说明](../migration/rust.md#自动-controller-secret-的状态兼容与回退)。
+自动 secret 是 zc 的 profile 生命周期能力，不改 mihomo/clash 原始配置字节、materialization、assets 或 hash，不写入兼容 `meta.json`。订阅更新/override/选择/重命名不轮换，删除重新导入才开始新生命周期。只读操作、已运行 start（含 foreground 拒绝）和旧快照默认 restart 不升级；显式重新准备才启用。start 先取得实例启动所有权再准备，已有 daemon 时连一次性 override 也不执行，竞争失败方不写自动 key。状态校验、冻结鉴权及回退约束见 [CLI](../cli/spec.md#托管-profile-的自动-controller-secret)。
 
-缺省 rules 的审计误判已由严格 parser/旧二进制证据纠正；unmanaged cache/refresh 和 YAML 深度边界已有定向回归。完整诊断精度及其余资源策略差异仍须对齐或明确审批；TLS/DNS 使用成熟 Rust 库也需要互操作与性能证据，而非源码相似性证明。四平台、性能和长稳结论由最终门禁维护。
+完整诊断等价性、四平台、性能和长期稳定性尚不能保证；使用成熟 TLS/DNS 库不代表已经完成这些验证。
 
-[配置 migrator](migrator-rules-quickref.md) 是独立 lint 工具；其可识别字段/类型不代表运行时启用。机器规则词汇包括 `PORT_TYPE_INT`、`LOG_LEVEL_ENUM`、`PROXY_GROUP_TYPE_CHECK`、`DNS_FIELD_CHECK`、`DNS_NAMESERVER_FORMAT`、`PROXY_GROUP_EMPTY_PROXIES`、`TUN_ENABLE_CHECK`、`EXTERNAL_CONTROLLER_FORMAT`、`ALLOW_LAN_BIND_CONFLICT`、`RULE_PROVIDER_REF_CHECK`、`PROXY_NODE_FIELDS_CHECK`、`SS_CIPHER_ENUM_CHECK`、`VMESS_UUID_FORMAT_CHECK`、`MIXED_PORT_CONFLICT_CHECK`、`MODE_ENUM_CHECK`、`PROXY_NAME_UNIQUENESS_CHECK`、`PORT_RANGE_CHECK`、`SS_PROTOCOL_CHECK`、`VMESS_ALTERID_RANGE_CHECK`、`TROJAN_FIELDS_CHECK`、`RULES_FORMAT_CHECK`、`VLESS_FIELDS_CHECK`、`PROXY_GROUP_REF_CHECK`、`YAML_SYNTAX_CHECK`、`SUBSCRIPTION_URL_CHECK`、`WS_OPTS_FORMAT_CHECK`、`TLS_SNI_CHECK`、`UNSUPPORTED_PROXY_TYPE_CHECK`、`PORT_CONFLICT_CHECK`。迁移工具与运行时边界仍需独立回归。
+[配置 migrator](migrator-rules-quickref.md) 是独立 lint 工具；其可识别字段/类型不代表运行时启用。机器规则词汇包括 `PORT_TYPE_INT`、`LOG_LEVEL_ENUM`、`PROXY_GROUP_TYPE_CHECK`、`DNS_FIELD_CHECK`、`DNS_NAMESERVER_FORMAT`、`PROXY_GROUP_EMPTY_PROXIES`、`TUN_ENABLE_CHECK`、`EXTERNAL_CONTROLLER_FORMAT`、`ALLOW_LAN_BIND_CONFLICT`、`RULE_PROVIDER_REF_CHECK`、`PROXY_NODE_FIELDS_CHECK`、`SS_CIPHER_ENUM_CHECK`、`VMESS_UUID_FORMAT_CHECK`、`MIXED_PORT_CONFLICT_CHECK`、`MODE_ENUM_CHECK`、`PROXY_NAME_UNIQUENESS_CHECK`、`PORT_RANGE_CHECK`、`SS_PROTOCOL_CHECK`、`VMESS_ALTERID_RANGE_CHECK`、`TROJAN_FIELDS_CHECK`、`RULES_FORMAT_CHECK`、`VLESS_FIELDS_CHECK`、`PROXY_GROUP_REF_CHECK`、`YAML_SYNTAX_CHECK`、`SUBSCRIPTION_URL_CHECK`、`WS_OPTS_FORMAT_CHECK`、`TLS_SNI_CHECK`、`UNSUPPORTED_PROXY_TYPE_CHECK`、`PORT_CONFLICT_CHECK`。
 
 ### 诊断的实际契约
 
 `doctor` 保留配置与连接两个 gating checks：daemon stopped 合法；运行中端口不可达才使连接 check 失败。`network_ok` 仍真实探测 `1.1.1.1:443`，200 ms，但不 gating。显式/默认 `config_source` 为原来的 `custom/default`。语法/I/O 失败返回 `DIAG_DOCTOR_FAILED`，显式 override 保留对应错误码，上表兼容字段不构成配置错误；已识别的能力准入失败返回 `CONFIG_CAPABILITY_UNSUPPORTED`，不捏造字段诊断；可解析但语义无效时返回 `CHECKS_FAILED`，`config_errors` 给出具体错误，文本和 JSON 使用同一条消息，512 UTF-8 bytes 上限并明确标记截断。
 
-`test/proxy test/profile test` 加载失败使用 `PROXY_CONFIG_LOAD_FAILED`；端口不可达时不跑外网 targets。七个默认目标、至少一个目标成功才通过 connectivity 的判定保持不变。按 `test_cli.zig::getIpGeoInfo` 对齐 IP/Location JSON：成功含 `ip`（无 query 时 `unknown`），不含 `latency_ms`；其他成功 target 含 latency。502 失败，403 等非 502 响应仍算连通；文本显示同一 IP/latency/reason，连接期限 5 秒、geo 总期限 90 秒、其余目标 5 秒。新增公开 `doctor_diagnostics` / `diagnostic_target_probe` 接口仅供传入真实本地测试 probe target，不增加 CLI/env 开关，也不改变命令默认目标。
+`test/proxy test/profile test` 加载失败使用 `PROXY_CONFIG_LOAD_FAILED`；端口不可达时不跑外网 targets。七个默认目标、至少一个目标成功才通过 connectivity 的判定保持不变。IP/Location JSON：成功含 `ip`（无 query 时 `unknown`），不含 `latency_ms`；其他成功 target 含 latency。502 失败，403 等非 502 响应仍算连通；文本显示同一 IP/latency/reason，连接期限 5 秒、geo 总期限 90 秒、其余目标 5 秒。
 
-多错误汇总、支持范围内的 warnings 和 source-text migration hints 已补齐；errors/warnings 合计最多 256 条、每条 512 bytes，错误优先，省略必须显式标记。与旧 validator 的精确差异及直接证据见 [doctor 诊断验收](../migration/rust.md#doctor-validator-诊断验收)。geo 文本的城市/地区附加信息及 curl 特有的底层错误细分未逐项复刻，不宣称所有诊断文字完全等价。
+诊断提供多错误汇总、支持范围内的 warnings 和原始配置迁移提示；errors/warnings 合计最多 256 条、每条 512 bytes，错误优先，省略必须显式标记。geo 文本的城市/地区附加信息及 curl 特有的底层错误细分未逐项复刻，不宣称所有诊断文字完全等价。

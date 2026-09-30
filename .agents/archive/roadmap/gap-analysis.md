@@ -64,11 +64,11 @@ zclash 当前的核心差距并非“完全缺功能”，而是：
 仅当以下条件全部满足，才进入 Phase 1：
 
 1. **文档基线完成**  
-   - `docs/benchmark/baseline.md` 已完成并包含 必补/增强/可延后 + P0/P1/P2 标注。
+   - `.agents/archive/benchmark/baseline.md` 已完成并包含 必补/增强/可延后 + P0/P1/P2 标注。
 
 2. **场景与指标可执行**  
-   - `docs/benchmark/scenarios.md` 覆盖 6 类核心场景；
-   - `docs/benchmark/metrics.md` 至少 5 项关键指标具备 p50/p95 + baseline/target（当前已 6 项）。
+   - `.agents/archive/benchmark/scenarios.md` 覆盖 6 类核心场景；
+   - `.agents/archive/benchmark/metrics.md` 至少 5 项关键指标具备 p50/p95 + baseline/target（当前已 6 项）。
 
 3. **任务验收规则生效**  
    - `TASKS.md` 中 P0 任务具备 Acceptance Criteria；

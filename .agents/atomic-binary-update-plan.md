@@ -902,10 +902,10 @@ README.md
 CHANGELOG.md
 docs/install/README.md
 docs/cli/spec.md
-docs/cli/ux-workflow.md
+.agents/cli/ux-workflow.md
 docs/api/README.md
 docs/api/error-codes.md
-docs/reliability/e2e.md
+.agents/reliability/e2e.md
 ```
 
 ---

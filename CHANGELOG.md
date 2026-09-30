@@ -76,7 +76,7 @@
 - **Session multiplexing + idle pool**: one authenticated TLS session is reused across connections (single-active-stream-per-session, anytls-go parity) instead of a full TLS+auth handshake per connection. A per-session background recv-loop demultiplexes frames; an idle-session pool with a reaper honors `idle-session-check-interval` / `idle-session-timeout` / `min-idle-session` (config keys, seconds; sub-5s values clamp to 30). SYN-DONE bounded wait on reused streams.
 - **UoT v2 UDP relay**: SOCKS5 UDP ASSOCIATE inbound bridged to sing UDP-over-TCP v2 over an AnyTLS stream. Per-proxy `udp: true` flag; routing picks the proxy by matching the first datagram's real target against the rule engine.
 - **Anti-fingerprint / correctness fixes**: omit SNI for IP-literal servers (an IP in ClientHello is an abnormal handshake); surface the server `alert` (cmd 5) reason instead of discarding it; bounded TCP keepalive on the upstream proxy socket; honor half-close (per-stream FIN) on the relay path.
-- Known TLS-stack limitations (uTLS fingerprint, ALPN, TLS-version control, mTLS, Reality) are documented in [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md) and [`docs/anytls/session-multiplexing-design.md`](docs/anytls/session-multiplexing-design.md).
+- Known TLS-stack limitations (uTLS fingerprint, ALPN, TLS-version control, mTLS, Reality) are documented in [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md) and [the internal AnyTLS session design](.agents/anytls/session-multiplexing-design.md).
 
 ### Added
 - `zc reload` for hot-reloading the current config into the running daemon (falls back to restart when hot reload is unavailable).
@@ -107,12 +107,12 @@
 - Align v1.0 release planning with code-first validation.
 - Require Zig 0.16.0+ across project policy, CI, release workflow, and package metadata.
 - Remove TUI from the v1.0 scope and from CLI help/dispatch.
-- Replace stale root `ROADMAP.md` / `TASKS.md` planning entry points with `docs/README.md` and `docs/roadmap/v1.0.md`.
+- Replace stale root `ROADMAP.md` / `TASKS.md` planning entry points with `docs/README.md` and the v1.0 roadmap (now `.agents/roadmap/v1.0.md`).
 - Reframe public documentation around the currently implemented CLI, daemon runtime, minimal API, install validation, and compatibility boundaries.
 - Run unit tests through an isolated test root and emit `zc test --json` success payloads on stdout.
 
 ### Archived
-- Move stale install, benchmark, roadmap, API versioning, TUI, and historical agent planning drafts under `docs/archive/`.
+- Move stale install, benchmark, roadmap, API versioning, TUI, and historical agent planning drafts under `docs/archive/` (now `.agents/archive/`).
 - Archive the old full API v1 OpenAPI draft because it described endpoints and WebSocket events that are not implemented in v1.0.
 
 ## [0.1.0] - 2025-12

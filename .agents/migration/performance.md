@@ -1,6 +1,8 @@
 # Rust 迁移：性能与可靠性工具验收
 
-## 最新构建候选：`bdefd33` macOS 15 + 延迟 framework
+> 本文保存历史实验、原始数据与当时的放行判断，不是当前排期。后续确认的[开发优先级](../development-priorities.md)已替代“Rust 必须追平 Zig”的要求：性能排在功能之后，优先 Rust 自身 CPU/内存与实际瓶颈；毫秒级命令差距不阻塞功能建设。下文的“仍不放行”“不能直接合入性能门禁”属于当时判断，不是现行要求。原始结果不改写为 PASS，正式资源基线与长稳仍需独立证据。
+
+## 最近记录的构建候选：`bdefd33` macOS 15 + 延迟 framework
 
 **启动已有改善，性能门禁仍不放行。** 用户已批准最低 macOS 15；本轮使用该提交的干净源码快照，按已提交的默认 Release 构建，不添加临时链接开关。完整 snapshot manifest 包含 `.cargo/config.toml`；源码、输入快照及二进制前后 hash 不变。
 
@@ -112,7 +114,7 @@ python3 scripts/perf/compare-runtimes.py \
 - 快路径有意只处理 ASCII（排除原始 DEL）且数值均可表示为 i64 的 JSON；其他输入仍由完整严格 YAML parser 处理。这样保留 literal Unicode 的 YAML 换行/字符准入，以及浮点、大整数解释，不把解析器切换变成 canonical 内容变更。标量对照回归覆盖转义控制字符、surrogate pair、DEL、NEL/LS、整数边界和浮点。
 - `src/main.rs`：短 CLI 使用 current-thread Tokio；daemon/foreground 保持 multithread；同步 override worker 在创建 async runtime 前分流。未改生命周期 CAS、daemon lock 继承、worker 限制、下载重试或 TLS 实现。
 
-主迁移/兼容文档先前的“命名节点未实现”条目由本节证据更新；本任务仅拥有本文件，`docs/migration/rust.md`、`docs/compat/mihomo-clash.md` 的汇总同步留给父任务。
+主迁移/兼容文档先前的“命名节点未实现”条目由本节证据更新；本任务仅拥有本文件，`.agents/migration/rust.md`、`docs/compat/mihomo-clash.md` 的汇总同步留给父任务。
 
 ### 定位证据
 

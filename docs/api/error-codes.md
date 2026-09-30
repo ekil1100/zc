@@ -1,6 +1,6 @@
 # CLI/API 错误码
 
-Rust 命令映射位于 `src/cli.rs`；本字典保留原冻结词汇和验收目标，不表示每个历史内部错误名都已逐点迁移。当前差异见 [迁移说明](../migration/rust.md)。message/hint 列是英文输出示例，不要求逐字相同。
+本字典说明公开错误码及处理方式；历史内部错误名不保证逐项出现在当前输出中。message/hint 列是英文输出示例，不要求逐字相同。
 
 ## 1) 目标
 
@@ -36,7 +36,7 @@ Rust 命令映射位于 `src/cli.rs`；本字典保留原冻结词汇和验收�
 
 ---
 
-## 3) CLI 冻结错误码与验收目标
+## 3) CLI 错误码
 
 ### A. 全局（dispatch / help / version）
 
@@ -285,23 +285,16 @@ override flag 本身的解析错误（`--override-script`/`--override-arg` 缺�
 
 ## 5) 设计原则
 
-1. `code` 稳定：供前端/脚本分支判断（冻结词汇，见 `docs/cli/ux-workflow.md` 第 3 节）。
+1. `code` 稳定：供前端/脚本分支判断。
 2. `message` 可读：一句话说清发生了什么。
 3. `hint` 可执行：给用户下一步动作。
 4. 尽量避免返回裸异常名（例如 `FileNotFound`）给最终用户；CLI 在 envelope 之外可经 stderr 附加真实错误名作诊断。
 
 ---
 
-## 6) API 文档对齐
+## 6) API 与诊断边界
 
-- 当前 v1.0 active API 文档入口是 `docs/api/README.md`。
-- 旧 OpenAPI 草案已归档到 `docs/archive/api/openapi.yaml`，不再作为当前契约。
-- 新增错误码时，必须同步更新本字典，并在对应 CLI/API 文档中说明可触发场景。
-
-## 7) Rust 对齐边界
-
-1. `src/api.rs` 保持 `{"error":"…"}` 简单响应，不承诺 CLI envelope。
-2. Rust CLI 回归位于 `tests/cli.rs`、`tests/cli_managed.rs`，daemon/CAS 另有独立测试；仍需完整原 core E2E 证明冻结码一致。
-3. 上文 typed resource error 名称来自原规范；Rust 部分边界使用字符串映射到公开 `CONFIG_*_LIMIT_EXCEEDED`，不能把内部类型一致性当作已完成。
-4. 原 validator 的有界多条详细诊断仍是验收目标，Rust 部分路径只发概括性错误；不要据字段存在宣称诊断精度已等价。
-5. `durability_uncertain:true` 是可见提交成功但持久性未确认，不应改成失败后自动重试发布；`mirror_out_of_sync:true` 也不代表 catalog commit 失败。
+- HTTP API 使用 `{"error":"…"}` 简单响应，不承诺 CLI envelope；端点及状态码见 [Minimal API](README.md)。
+- 配置资源超限使用公开 `CONFIG_*_LIMIT_EXCEEDED` 等错误码，脚本不应依赖内部 Rust 错误类型名称。
+- 部分配置加载路径只返回概括性错误；doctor 的详细诊断范围见 [CLI](../cli/spec.md)。
+- `durability_uncertain:true` 是可见提交成功但持久性未确认，不应当作失败后自动重试发布；`mirror_out_of_sync:true` 也不代表 catalog commit 失败。

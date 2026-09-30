@@ -43,6 +43,6 @@
 
 ## 5. 下一步（与 P0-4 对齐）
 
-- 将本表分级同步到 `docs/roadmap/gap-analysis.md`
+- 将本表分级同步到 `.agents/archive/roadmap/gap-analysis.md`
 - 基于该分级冻结 Phase 1 入口条件
 - 按 P0 优先项回填 baseline 实测数据

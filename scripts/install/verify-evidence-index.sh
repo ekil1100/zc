@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-HISTORY="$ROOT/docs/install/evidence/history"
-LATEST="$ROOT/docs/install/evidence/latest"
+HISTORY="$ROOT/.agents/install/evidence/history"
+LATEST="$ROOT/.agents/install/evidence/latest"
 INDEX="$HISTORY/index.jsonl"
 missing=()
 [[ -f "$INDEX" ]] || missing+=("index_missing")

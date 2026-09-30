@@ -4,7 +4,7 @@
 
 **能做“每条 TCP 代理连接独占一条 TLS 连接、只承载一个 AnyTLS stream”的首版，并与固定版本官方 Go 服务端互操作；不能把它称为完整 AnyTLS 合规实现，也不能承诺透明 TCP 半关闭。** 官方协议仍要求连接复用，但官方 `anytls-go v0.0.13` 客户端已经提供 `-dr` 禁用复用，mihomo 也有 `disable-reuse`。[P][GC][MC]
 
-本研究日期为 **2026-09-28**，zc 基线为 `8e3e85cae2e412f6d3306e0cb5e2264efdaf0403`。先阅读了 [兼容边界](../compat/mihomo-clash.md)、[Rust 迁移](../migration/rust.md) 及 [CLI 契约](../cli/spec.md)。这是新增出站的设计依据，**不是已实现或已通过 Rust 验收的声明**；当前文档中的 AnyTLS 不支持状态不变。
+本研究日期为 **2026-09-28**，zc 基线为 `8e3e85cae2e412f6d3306e0cb5e2264efdaf0403`。先阅读了 [兼容边界](../../docs/compat/mihomo-clash.md)、[Rust 迁移](../migration/rust.md) 及 [CLI 契约](../../docs/cli/spec.md)。这是新增出站的设计依据，**不是已实现或已通过 Rust 验收的声明**；当前文档中的 AnyTLS 不支持状态不变。
 
 | 问题 | 精确结论 |
 | --- | --- |
@@ -427,10 +427,10 @@ done
 [RS4]: https://github.com/cfal/shoes/blob/60ed3838b346268615c81e4eace4e15e717da23e/Cargo.toml
 [GODL]: https://go.dev/dl/#go1.27.1
 [LOCK]: ../../Cargo.lock
-[CLI]: ../cli/spec.md#稳定性日志
+[CLI]: ../../docs/cli/spec.md#稳定性日志
 
 ## 后续实现与生命周期修复说明
 
 本文前述研究和建议保留为实现前记录。首版实现后，独立核查实际复现了第四节要求中的三个缺口：心跳写背压阻断读取、FIN 后迟到上行使通用中继丢下行、FIN 后中继继续等待入站 EOF。修复后通过可选整流终态通知停止上行并排尽下行；心跳队列有硬上限且不再以写完成作为继续读的前提。该通知也经 HTTP forward 和 HTTPS 包裹层传递，不放宽其他协议半关闭或 TLS 错误。
 
-当前实现边界以 [兼容说明](../compat/mihomo-clash.md#anytls单流原生-tlstcp) 为准；修复前后结果分别保留于 [迁移验收](../migration/rust.md#anytls-生命周期修复后的定向验收)。首版 216 项不能替代生命周期回归；修复后定向 Rust 224 项通过、五分钟 UDP idle 未跑，固定 Go 两版及 OpenSSL 重新通过，仍未证明四平台、性能或长稳。
+当前实现边界以 [兼容说明](../../docs/compat/mihomo-clash.md#anytls单流原生-tlstcp) 为准；修复前后结果分别保留于 [迁移验收](../migration/rust.md#anytls-生命周期修复后的定向验收)。首版 216 项不能替代生命周期回归；修复后定向 Rust 224 项通过、五分钟 UDP idle 未跑，固定 Go 两版及 OpenSSL 重新通过，仍未证明四平台、性能或长稳。

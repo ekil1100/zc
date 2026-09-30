@@ -10,7 +10,7 @@
 
 ## Rust 候选版本
 
-当前开发与交付入口使用 Rust `1.0.1`：完整 CLI、托管 revision、daemon、minimal API、mixed TCP 与受限 UDP 已接入。**实现覆盖不等于迁移验收完成**；四平台、性能、长稳和最终回归状态见 [迁移说明](docs/migration/rust.md)。原 Zig 文件暂留作行为对照，不参与默认构建或运行时回退。
+当前开发与交付入口使用 Rust `1.0.1`：完整 CLI、托管 revision、daemon、minimal API、mixed TCP 与受限 UDP 已接入。**实现覆盖不等于迁移验收完成**；当前候选尚未完成正式发布验证，不作四平台、性能或长稳保证。使用方式与支持边界请从[文档目录](docs/README.md)查看。默认构建与运行不依赖 Zig。
 
 ```bash
 just build                   # target/debug/zc
@@ -42,7 +42,7 @@ just run path/to/config.yaml 17891
 just -- test --test cli
 ```
 
-`just` 列出全部任务；`just fmt` 会格式化 Rust 源码。默认任务纯 Rust；临时 `zig-*` 任务只供历史对照，不能代替候选版本验收。`just install` 构建 Release 并安装到 `~/.local/bin/zc`，不自动停启 daemon，拒绝覆盖仍在运行的目标。候选试用使用 `just install --target-dir /tmp/zc-candidate/bin`，不要覆盖生产安装。
+`just` 列出全部任务；`just fmt` 会格式化 Rust 源码。默认任务使用 Rust。`just install` 构建 Release 并安装到 `~/.local/bin/zc`，不自动停启 daemon，拒绝覆盖仍在运行的目标。候选试用使用 `just install --target-dir /tmp/zc-candidate/bin`，不要覆盖生产安装。
 
 生产默认 mixed 端口为 **7899**；配置中的 `mixed-port` 数值不覆盖它。开发必须显式传 `--port` 或使用 `just run`（默认 `17890`，拒绝 `7899`）。端口冲突只报错，不漂移。测试使用临时 HOME/runtime，不读写真实用户状态。
 
@@ -79,7 +79,7 @@ just -- test --test cli
 | SOCKS5 outbound | ❌ 未实现 | 配置准入阶段拒绝。 |
 | VMess | ❌ 未实现 | 未通过标准 wire 与互操作验证。 |
 | VLESS | ❌ 未实现 | 未完成主流 transport 与互操作验证。 |
-| AnyTLS | ⚠️ 部分实现 | 原生 TLS/TCP；每流独占 session，无池/复用/UDP；乐观开流，FIN 非 half-close。固定 Go v0.0.13/v0.0.5 本机互通已验证，详见[兼容边界](docs/compat/mihomo-clash.md#anytls单流原生-tlstcp)。 |
+| AnyTLS | ⚠️ 部分实现 | 原生 TLS/TCP；每流独占 session，无池/复用/UDP；乐观开流，FIN 非 half-close。详见[兼容边界](docs/compat/mihomo-clash.md#anytls单流原生-tlstcp)。 |
 | mihomo 的其他 outbound 协议 | ❌ 未实现 | 未列出的协议均不作为已支持能力。 |
 
 ### 代理组
@@ -131,6 +131,6 @@ just -- test --test cli
 | 第三方 dashboard 兼容 | ❌ 未实现 | minimal API 不等同于 mihomo Controller API。 |
 | 内置 TUI | ❌ 未实现 | 产品表面仅提供 CLI 与 minimal API。 |
 
-内置 `DIRECT`/`REJECT` 字面量可用；用户命名的 `type: direct/reject` 节点仍待补齐，不能据此表宣称已迁移。
+内置 `DIRECT`/`REJECT` 字面量可用；用户命名节点的支持边界见[兼容说明](docs/compat/mihomo-clash.md#tcp-与出站)。
 
 详细边界见 [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md)，实际 API 见 [`docs/api/README.md`](docs/api/README.md)。

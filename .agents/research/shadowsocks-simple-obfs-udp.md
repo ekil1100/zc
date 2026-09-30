@@ -1,6 +1,6 @@
 # Research: simple-obfs HTTP、capability gate 与 Shadowsocks AEAD UDP（2017）
 
-> 保留原协议研究及设计建议，不能把建议或历史验证当作 Rust 完成声明。当前只接受 map 形式 plugin options，不支持 SIP003 scalar 字符串；实际边界见 [兼容说明](../compat/mihomo-clash.md)。
+> 保留原协议研究及设计建议，不能把建议或历史验证当作 Rust 完成声明。当前只接受 map 形式 plugin options，不支持 SIP003 scalar 字符串；实际边界见 [兼容说明](../../docs/compat/mihomo-clash.md)。
 
 ## Summary
 

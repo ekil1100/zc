@@ -1,5 +1,7 @@
 # Rust 迁移：候选实现与验收边界
 
+> 本文为内部实现与分阶段验收记录，不决定任务顺序。安排下一步先读[开发优先级](../development-priorities.md)；各轮测试、性能和未安装说明仅适用于其记录的候选与场景，不代表当前部署状态。
+
 ## 状态与验收原则
 
 当前 Cargo 包版本 `1.0.1`，不是仅提供 `start --foreground` 的实验 TCP 切片。CLI、托管配置、daemon、minimal API、simple-obfs 和受限 UDP 已接入 Rust；默认构建、测试、E2E、安装回归及发布配置均使用 Rust。**接入不等于验收完成，也不等于已发布。**
@@ -29,12 +31,12 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 
 ## 已接入的用户路径
 
-- 完整命令树：`help/version`、`start/up`、`stop/down`、`restart/reload/status/log/test/doctor`、`config load/list/download/update/use/delete/dump/override`、`proxy/profile list/select/test`、`connection list/close <id>`、`diag doctor`。详见 [CLI 契约](../cli/spec.md)。
+- 完整命令树：`help/version`、`start/up`、`stop/down`、`restart/reload/status/log/test/doctor`、`config load/list/download/update/use/delete/dump/override`、`proxy/profile list/select/test`、`connection list/close <id>`、`diag doctor`。详见 [CLI 契约](../../docs/cli/spec.md)。
 - 托管 profile 的 immutable source、本地 provider assets、metadata、冻结 override 与 desired selections；先提交 durable desired，再尝试 exact revision 的 live apply。
 - 后台或 supervised foreground daemon；监听器绑定和 desired reconciliation 完成后才发布 ready 并开放数据面。控制面只有显式 `127.0.0.1:<port>`，占用即失败。
 - 内置 DIRECT/REJECT、classic AEAD SS、原生 TLS Trojan / AnyTLS TCP；SS 的内建 simple-obfs HTTP；`udp:true` SS/Trojan 经 mixed SOCKS5 UDP ASSOCIATE。
 - select 默认首成员、嵌套组、持久选择、循环/未知引用拒绝；first-match 规则、本地和 unmanaged HTTP rule-provider 展开。
-- minimal API：`/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`、需强制鉴权的 `GET /connections` 与 `DELETE /connections/<id>`，详见 [API](../api/README.md)。
+- minimal API：`/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`、需强制鉴权的 `GET /connections` 与 `DELETE /connections/<id>`，详见 [API](../../docs/api/README.md)。
 
 生产默认端口固定 **7899**。`mixed-port` 数值只作配置兼容（含来源中的 0），真正 bind 由 CLI `--port` 或默认值决定；独立 `port`/`socks-port` 不创建 listener。开发显式用非生产端口；冲突不漂移。配置投影不能改变 immutable bytes 或其哈希证明。
 
@@ -65,13 +67,13 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 
 ## 已对齐能力与仍有差异的边界
 
-完整边界与资源上限见 [兼容说明](../compat/mihomo-clash.md)。功能接入和本机测试通过，不等于全部迁移验收完成：
+完整边界与资源上限见 [兼容说明](../../docs/compat/mihomo-clash.md)。功能接入和本机测试通过，不等于全部迁移验收完成：
 
 1. **命名 direct/reject 节点**：已支持真实叶节点、规则与 select 引用，精确保留名 `DIRECT/REJECT` 仍禁止声明；Config/CLI/真实 socket 回归已覆盖。
-2. **HTTP provider**：unmanaged 已接入 root-contained 安全磁盘 cache、interval 刷新、普通 HTTP 失败时的已验证缓存回退，以及独立 `test` 的 missing-only 策略；doctor 只检查声明。managed 仍拒绝引用 remote 的离线发布，不修改冻结 revision。详情及更严格的路径限制见 [兼容说明](../compat/mihomo-clash.md#rule-provider-与离线托管)。不提供 curl fallback。
+2. **HTTP provider**：unmanaged 已接入 root-contained 安全磁盘 cache、interval 刷新、普通 HTTP 失败时的已验证缓存回退，以及独立 `test` 的 missing-only 策略；doctor 只检查声明。managed 仍拒绝引用 remote 的离线发布，不修改冻结 revision。详情及更严格的路径限制见 [兼容说明](../../docs/compat/mihomo-clash.md#rule-provider-与离线托管)。不提供 curl fallback。
 3. **资源行为差异**：共享 collection/provider/展开上界已接入；YAML 已对齐原 Zig 根外 128 层；其余 parser events/nodes/scalar budgets 仍有差异。mixed 连接任务 1024 / 握手 10 秒（原为 128 / 5 秒）。这需要显式评审，不能宣称资源行为完全等价。
 4. **CLI/缺省行为细节**：doctor 的多错误汇总、支持范围内的 warnings、原 source-text migration hints 及 256 条/512 bytes 错误优先预算已补齐；加载失败与语义检查失败保持分离，证据及保留差异见下节“doctor validator 诊断验收”。停止态保留显式 `mixed_port:null`；启动与重启的未转交 snapshot 由作用域 guard 清理，停止超时和取消不再遗留 staged 文件。缺省 rules 的旧审计结论已纠正：`config.zig::load/parseDocument` 的严格 CLI 路径本来就补 REJECT，DIRECT 只属于 legacy parser；原 dump 字节及真实路由已对照，不修改 canonical/hash。
-5. 不支持 HTTP/SOCKS5 outbound、VMess/VLESS、SS AEAD-2022、通用 SIP003、obfs TLS、Trojan WS/gRPC、非 select 策略组、TUN/透明代理、完整 DNS、proxy-provider、TUI 或完整 mihomo Controller。订阅的 `dns/hosts/sniffer/profile/experimental/unified-delay/clash-for-android` 七个顶层字段现接受并仅在运行时投影中跳过，原始数据不重写；具体行为及待支持项见[兼容字段清单](../compat/mihomo-clash.md#接受但暂不执行的订阅字段)。其余能力准入不放宽。
+5. 不支持 HTTP/SOCKS5 outbound、VMess/VLESS、SS AEAD-2022、通用 SIP003、obfs TLS、Trojan WS/gRPC、非 select 策略组、TUN/透明代理、完整 DNS、proxy-provider、TUI 或完整 mihomo Controller。订阅的 `dns/hosts/sniffer/profile/experimental/unified-delay/clash-for-android` 七个顶层字段现接受并仅在运行时投影中跳过，原始数据不重写；具体行为及待支持项见[兼容字段清单](../../docs/compat/mihomo-clash.md#接受但暂不执行的订阅字段)。其余能力准入不放宽。
 6. UDP ingress 不支持 DIRECT、分片或 standalone socks-port。首个合法包固定实际 leaf，后续包不重新路由或 fallback；64 association、300 秒 idle、65507-byte wire 上界必须由真实边界测试验收。
 
 ## 验证入口与剩余门禁
@@ -132,9 +134,9 @@ just migrator-test
 
 ## 稳定性观测
 
-Rust 实例已接入生命周期、连接故障分类及限频合并、异常退出诊断、脱敏 panic 记录、CPU/RSS 周期摘要和有界日志轮转；命令仍为 `zc log`，不新增配置开关或完整监控 API。连接热路径只更新计数，独立线程负责采样与写入。具体字段、归档、采样精度及不可用行为见[运行时稳定性观测](../reliability/observability.md)。
+Rust 实例已接入生命周期、连接故障分类及限频合并、异常退出诊断、脱敏 panic 记录、CPU/RSS 周期摘要和有界日志轮转；命令仍为 `zc log`，不新增配置开关或完整监控 API。连接热路径只更新计数，独立线程负责采样与写入。具体字段、归档、采样精度及不可用行为见[运行时稳定性观测](../../docs/reliability/observability.md)。
 
-这不替代长稳、四平台、性能和发布门禁，也未更新本机在用二进制。本轮复现的停止确认与 descriptor 退出清理竞态已通过共享既有读写锁修复，并有确定性红绿回归；它不自动关闭历史 Intel CI 的其他失败。记录、迭代检视后 175 项相关测试及检视前 Release 短测边界见上述文档。
+这不替代长稳、四平台、性能和发布门禁，也未更新本机在用二进制。本轮复现的停止确认与 descriptor 退出清理竞态已通过共享既有读写锁修复，并有确定性红绿回归；它不自动关闭历史 Intel CI 的其他失败。记录、迭代检视后 175 项相关测试及检视前 Release 短测边界见[观测验收记录](../observability-validation.md)。
 
 ## cache safety review 闭环
 
@@ -187,7 +189,7 @@ cargo clippy --offline --locked --lib --test provider_cache --test service --tes
 
 最终定向 Rust 回归首轮 **215 passed / 1 ignored**（lib 加 14 个相关 integration suites）；canonical 修正后重跑 `anytls_config/config_parity/override_script` 为 **51 passed**，含一个新增用例，去重共 **216** 项通过。忽略项是既有真实五分钟 UDP idle，不宣称本轮已跑。`cargo fmt --all`、`cargo clippy --offline --locked --all-targets -- -D warnings`、新 Python 脚本 Ruff 0.16.8 检查/格式和 Justfile 契约 15 tests 均通过；未重新执行完整 core E2E/安装/发布矩阵。详细命令及本机日志索引保留于 `target/anytls-reference/implementation-validation.md`，长期测试入口和 fixture 哈希则在仓库内。
 
-**保留边界**：FIN 是整流关闭，不承诺半关闭后的响应；CONNECT/SOCKS 成功是乐观准备完成，不是统一的远端 dial 成功确认。padding 的本地资源限制、拒绝字段详见 [兼容说明](../compat/mihomo-clash.md#anytls单流原生-tlstcp)。AnyTLS Go 门禁是显式可选命令，未纳入 `just e2e` / `just validate` / 发布 CI；生产交付不带 Go。仅固定 fixture 哈希的 macOS arm64 已执行，不宣称其他平台、完整规范合规、抗审查、性能等价或 24/72h 长稳通过。
+**保留边界**：FIN 是整流关闭，不承诺半关闭后的响应；CONNECT/SOCKS 成功是乐观准备完成，不是统一的远端 dial 成功确认。padding 的本地资源限制、拒绝字段详见 [兼容说明](../../docs/compat/mihomo-clash.md#anytls单流原生-tlstcp)。AnyTLS Go 门禁是显式可选命令，未纳入 `just e2e` / `just validate` / 发布 CI；生产交付不带 Go。仅固定 fixture 哈希的 macOS arm64 已执行，不宣称其他平台、完整规范合规、抗审查、性能等价或 24/72h 长稳通过。
 
 ### AnyTLS 生命周期修复后的定向验收
 
@@ -206,7 +208,7 @@ cargo clippy --offline --locked --lib --test provider_cache --test service --tes
 
 ## P2：连接列表与按 ID 关闭最小版
 
-已接入 `zc connection list`、`zc connection close <id>` 与相同模型的 minimal API。功能、字段和错误契约见 [CLI](../cli/spec.md#连接管理最小版)、[API](../api/README.md#连接模型与关闭语义)、[错误码](../api/error-codes.md#b2-connection-家族)。未增加流量计数、全部断开、历史、分页、WebSocket、自动 controller 或 TUI。
+已接入 `zc connection list`、`zc connection close <id>` 与相同模型的 minimal API。功能、字段和错误契约见 [CLI](../../docs/cli/spec.md#连接管理最小版)、[API](../../docs/api/README.md#连接模型与关闭语义)、[错误码](../../docs/api/error-codes.md#b2-connection-家族)。未增加流量计数、全部断开、历史、分页、WebSocket、自动 controller 或 TUI。
 
 - Runtime 持有实例内 `ConnectionRegistry`，独立注入 API，与 managed selection 权威无关；没有磁盘状态或 Observer 第二份详情表。daemon 在共享和接受连接前绑定既有实例 nonce，不改变 descriptor、snapshot schema 或旧 canonical bytes。ID 为 nonce 加 checked 单调序号，关闭始终检查完整 ID；旧实例 ID 在副作用前拒绝。
 - 记录仅有有限元数据、rule/leaf 索引与取消信号，不克隆包含 password 的 Proxy。每个 TCP 任务一条记录，UDP 关联共用同 ID；上界仍为 1024 任务和 64 UDP。仅在阶段/请求边界更新，查询不重路由、解析 DNS 或重算当前选择。大配置名称和规则通过借用视图有界编码，含 JSON 转义最多 4 MiB；超限完整 500，不省略条目。

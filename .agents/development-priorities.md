@@ -1,5 +1,7 @@
 # 开发优先级
 
+本文是已确认开发排序的唯一入口。发布验收、研究方案和历史路线图各自保留证据，不覆盖这里的排期；排序变更须经用户确认。
+
 ## 总原则
 
 **稳定性 > 功能 > 性能。**
@@ -38,15 +40,17 @@
 - 用户确认常用协议为 SS、Trojan、AnyTLS，先实现 AnyTLS。只读检查当前运行 profile 对应配置，90 个 SS 节点均为 `aes-128-gcm`，当前选中 SS 也是该算法；已有支持，无需优先补 AEAD-2022。未记录节点地址、密码或订阅信息。
 - **AnyTLS 原生 TLS/TCP 首版已实现，本轮未安装**：严格配置准入、默认 TLS 身份验证、v1/v2 乐观开流、默认 padding 与每节点服务端更新、故障观测。每条出站独占 TLS 会话，无连接池、复用或 UDP；FIN 是整流关闭，不承诺透明 TCP 半关闭。
 - 独立检查复现的心跳背压死锁、FIN 后迟到上行丢尾部及中继滞留均已修复并复核。相关 Rust 测试 224 项通过，既有五分钟 UDP idle 未运行；严格 all-targets Clippy、格式检查通过。官方 Go v0.0.13/v0.0.5 各 10 场景、独立 TLS record 检查通过；入口为 `just anytls-e2e`，尚未纳入默认 CI。随后两轮检视修复 chunked 块尾刷新与 Go 夹具构建受父仓库状态影响的问题；45 项定向回归、重建夹具互通及独立复核通过，第二轮无新问题。
-- 保留正常 HTTP keep-alive：完整响应后的下一请求使用新出站，不把它当成旧 AnyTLS 中继滞留。嵌套 TLS 的全部关闭调度、四平台、性能及长稳未获完整证明。支持边界见 `docs/compat/mihomo-clash.md`，验证记录见 `docs/migration/rust.md`。
+- 保留正常 HTTP keep-alive：完整响应后的下一请求使用新出站，不把它当成旧 AnyTLS 中继滞留。嵌套 TLS 的全部关闭调度、四平台、性能及长稳未获完整证明。支持边界见 `docs/compat/mihomo-clash.md`，验证记录见 `.agents/migration/rust.md`。
 
 ## P2：连接管理最小版
 
 - **已实现，未安装**：`zc connection list` / `zc connection close <id>`，对应强制非空 secret + Bearer 的 minimal API；CLI/API 同一份实例连接模型，展示来源、协议/阶段、目标、运行时展开规则与实际 leaf。
 - HTTP keep-alive 每请求更新、idle 清目标；UDP 记录首包并固定 leaf，按 ID 关闭整条关联。实例 nonce 防止重启后旧 ID 误伤；取消后等待 UDP worker 回收再删除条目。不新增磁盘状态，不复制节点凭据，不逐包更新详情表。
 - 无 controller 或未运行时明确失败，不自动新开端口。配置变更必须显式重新准备重启，默认 restart 继续复用冻结快照。
-- 本机相关回归 275 项通过，后补精确 4 MiB 响应边界 1 项通过，去重 276 项；1 项五分钟 idle 忽略，1 项默认外网诊断按隔离约束过滤；原子请求元数据补强后 66 项受影响回归通过。另有 controller 响应期间 selection generation/实例变更的定点 CLI 验证。独立核查发现的 UDP 响应缺项/协议矛盾校验缺口已补红绿回归并修复，最终 25 项受影响回归通过。后续两轮检视又修复实例头向未鉴权响应披露、帮助参数次序误拒，25 项相关回归及 28 个 CLI 组合通过，第二轮无新问题。格式及严格 all-targets Clippy 通过。证据见 `docs/migration/rust.md` 与 `target/connections/implementation-validation.md`。
+- 本机相关回归 275 项通过，后补精确 4 MiB 响应边界 1 项通过，去重 276 项；1 项五分钟 idle 忽略，1 项默认外网诊断按隔离约束过滤；原子请求元数据补强后 66 项受影响回归通过。另有 controller 响应期间 selection generation/实例变更的定点 CLI 验证。独立核查发现的 UDP 响应缺项/协议矛盾校验缺口已补红绿回归并修复，最终 25 项受影响回归通过。后续两轮检视又修复实例头向未鉴权响应披露、帮助参数次序误拒，25 项相关回归及 28 个 CLI 组合通过，第二轮无新问题。格式及严格 all-targets Clippy 通过。证据见 `.agents/migration/rust.md` 与 `target/connections/implementation-validation.md`。
 - 本版不做流量计数、全部断开、历史、分页、WebSocket、自动 controller 或 TUI。没有新的性能、四平台或长稳通过结论；未操作用户在用实例。
+
+- 托管 profile 自动 controller secret 已接入：仅已有 controller 的实际运行准备生成、持久复用且冻结鉴权；不自动加端口，旧快照须显式重新准备升级。本轮不安装，证据见 `target/profile-secret/implementation-validation.md`。
 
 ## 降低优先级的平台事项
 
@@ -57,7 +61,7 @@
 - **残余风险**：当前候选在自定义系统信任下的证书接受、拒绝和首次使用行为尚未完整验收。可能遗漏合法证书被错误拒绝，或不可信证书被错误接受等缺陷，但目前没有证据证明这些缺陷实际存在。本机日常使用正常只能证明已走过的路径，不能代替正负用例。
 - **发布边界**：继续保留已通过的普通 TLS 回归；当前 macOS 原生信任门禁仍标记为阻塞，不宣称完整平台验收通过。若要在证据未齐时发布，须另行明确支持范围与风险接受，本文不自动豁免发布门禁。
 
-依据：`docs/reliability/platform-diagnostics.md`、`docs/reliability/read-capture.md`、`docs/migration/completion.md`。
+依据：`.agents/reliability/platform-diagnostics.md`、`.agents/reliability/read-capture.md`、`.agents/migration/completion.md`。
 
 ## 暂缓事项
 
@@ -76,5 +80,3 @@
 ## 待确认
 
 AnyTLS 首版范围已确定；后续是否需要连接复用、UDP 或更多 TLS 选项，按真实使用需求决定。Trojan 的实际传输组合尚未核对，不预设 WS/gRPC 或其他协议的优先级。
-
-- P2 托管 profile 自动 controller secret 已接入：仅已有 controller 的实际运行准备生成、持久复用且冻结鉴权；不自动加端口，旧快照须显式重新准备升级。本轮不安装，证据见 `target/profile-secret/implementation-validation.md`。

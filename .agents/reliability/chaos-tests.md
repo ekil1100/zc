@@ -74,7 +74,7 @@
 - `recover_actions[]`（已执行恢复动作）
 - `note`
 
-建议输出到：`docs/perf/reports/history/` 对应 run 文件，字段以追加方式扩展。
+建议输出到：`.agents/perf/reports/history/` 对应 run 文件，字段以追加方式扩展。
 
 ---
 
@@ -159,7 +159,7 @@
 - FAIL：回滚超时、回滚后健康检查失败，或指标持续越阈值
 
 ### 8.4 依赖关系（与故障注入首轮结果）
-- 输入依赖：`docs/perf/reports/history/*chaos-round*.json`
+- 输入依赖：`.agents/perf/reports/history/*chaos-round*.json`
 - 要求：从首轮结果中复用 `failed_fields` 与 `recover_actions` 作为回滚触发样本依据
 
 ---
@@ -208,10 +208,10 @@
   - 磁盘剩余空间满足归档增长（建议 > 2GB）
   - 进程与系统监控可用（CPU/内存/网络）
 - 阈值检查：
-  - 沿用 24h 通过批次阈值（见本文件上文判定标准与 `docs/perf/reports/README.md` 中 control-plane 记录说明；placeholder latest 已移除）
+  - 沿用 24h 通过批次阈值（见本文件上文判定标准与 `.agents/perf/reports/README.md` 中 control-plane 记录说明；placeholder latest 已移除）
   - 若需调整阈值，需先记录原因与回收条件
 - 归档路径检查：
-  - `docs/perf/reports/history/` 可写
+  - `.agents/perf/reports/history/` 可写
   - 命名模式：`*soak-72h-*.json`
 
 启动条件（Start Gate）：

@@ -33,7 +33,7 @@
 | Correctness | CI: `zig build -Dcpu=baseline` + `zig build test -Dcpu=baseline` | unit + process + oracle unit seams；eval 复用相同命令 |
 | Contract smoke | `tools/config-migrator/run-all.sh`, `scripts/install/run-all-regression.sh` | eval 直接包装现有入口，不复制测试本体 |
 | Beta aggregate | `scripts/run-beta-gate.sh`, `scripts/run-full-validation.sh` | 保留现有入口；eval 不再套一层 aggregate，避免重复执行与结果漂移 |
-| Interop | `zig build e2e` / `e2e-release`, `docs/reliability/e2e.md` | gold standard；本地 `e2e`，现有 CI 继续跑 `e2e-release` |
+| Interop | `zig build e2e` / `e2e-release`, `.agents/reliability/e2e.md` | gold standard；本地 `e2e`，现有 CI 继续跑 `e2e-release` |
 | Perf record | `scripts/perf/run-control-plane-baseline.sh`, `src/perf_runner.zig` | facts only；要求 clean worktree；不作阈值判定 |
 | Perf placeholder | `scripts/perf-regression.sh`, `scripts/perf/run-baseline.sh`, tracked `docs/perf/reports/latest.json` | **必须直接删除**，不保留 tombstone/成功 shim |
 | Reliability | `scripts/reliability/*`, soak/chaos docs | 当前 `run-chaos-round.sh` 是 simulated PASS，不可包装为 eval 通过 |

@@ -1,10 +1,10 @@
 # CLI UX 对齐工作流 — 验收标准
 
-> 历史 Zig CLI 决策/验收记录；保留当时源码引用与 follow-up，不代表 Rust 的完成状态。当前实现与差异见 [CLI 契约](spec.md) 和 [Rust 迁移](../migration/rust.md)。
+> 历史 Zig CLI 决策/验收记录；保留当时源码引用与 follow-up，不代表 Rust 的完成状态。当前实现与差异见 [CLI 契约](../../docs/cli/spec.md) 和 [Rust 迁移](../migration/rust.md)。
 > 生成时间：2026-06-11；完成：2026-06-12
 > 状态：**全部批次（1-5）完成**，代码已落地；本文件保留为决策/验收记录
 > 目标：CLI 直觉、错误可操作、`--json` 对 agent 友好 —— 对齐 AGENTS.md 的产品原则。
-> 实现后的对外契约见 [`spec.md`](spec.md)。
+> 实现后的对外契约见 [`../../docs/cli/spec.md`](../../docs/cli/spec.md)。
 
 ## 1. 目标契约（Target contract）
 
@@ -90,7 +90,7 @@
 - `zc status --json | jq -e '.ok and .command=="status"'`；
 - 失败路径恰好一行 JSON、exit ≠ 0、无 Zig stack trace；
 - `zc start --help`/`zc log --help` 只打印帮助；
-- 当时的 `just install` 全程可用（历史验收记录；Rust 迁移期间已移除此命令，当前安装步骤见 [`../install/README.md`](../install/README.md)）；
+- 当时的 `just install` 全程可用（历史验收记录；Rust 迁移期间已移除此命令，当前安装步骤见 [`../../docs/install/README.md`](../../docs/install/README.md)）；
 - `zclash.service` / `build-deb.sh` / podman e2e 改用 `--foreground` 后通过。
 
 ### Batch 3 — config 树 ✅ 完成

@@ -8,7 +8,7 @@ ENV_REG="$ROOT_DIR/scripts/install/verify-install-env.sh"
 
 TARGET_DIR="/tmp/zc-beta"
 OUT_DIR="/tmp/zc-beta-checklist"
-ARCHIVE_ROOT="$ROOT_DIR/docs/install/evidence/history"
+ARCHIVE_ROOT="$ROOT_DIR/.agents/install/evidence/history"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -104,7 +104,7 @@ cp "$D1_OUT" "$ARCHIVE_DIR/"
 cp "$D2_OUT" "$ARCHIVE_DIR/"
 cp "$REPORT" "$ARCHIVE_DIR/summary.json"
 
-LATEST_LINK="$ROOT_DIR/docs/install/evidence/latest"
+LATEST_LINK="$ROOT_DIR/.agents/install/evidence/latest"
 rm -rf "$LATEST_LINK"
 ln -s "$ARCHIVE_DIR" "$LATEST_LINK"
 

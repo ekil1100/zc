@@ -60,7 +60,7 @@ INSTALL_ACTION=upgrade
 
 1. **一键诊断**：`bash scripts/install/trial-healthcheck.sh --target-dir ~/.local/bin/zclash`
 2. **回滚清理**：`bash scripts/install/oc-run.sh rollback --target-dir ~/.local/bin/zclash`
-3. **提反馈**：复制 `docs/install/trial-feedback-template.md` 填写后发给开发者
+3. **提反馈**：复制 `.agents/archive/install/trial-feedback-template.md` 填写后发给开发者
 
 ## 全套回归（可选，验证安装链路完整性）
 

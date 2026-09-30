@@ -93,9 +93,14 @@ def main():
     output = (
         args.output or ROOT / f"target/reliability/soak-{time.time_ns()}.json"
     ).resolve()
-    if output == ROOT or ROOT / "docs" in output.parents:
+    if output == ROOT or any(
+        ancestor == protected
+        or (ancestor.exists() and protected.exists() and ancestor.samefile(protected))
+        for ancestor in (output, *output.parents)
+        for protected in (ROOT / "docs", ROOT / ".agents")
+    ):
         parser.error(
-            "write exploratory output under target/ or a temporary directory, not docs/"
+            "write exploratory output under target/ or a temporary directory, not docs/ or .agents/"
         )
     output.parent.mkdir(parents=True, exist_ok=True)
     binary = ROOT / "target/release/zc"

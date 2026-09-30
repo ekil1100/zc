@@ -8,4 +8,4 @@ The archived `api/openapi.yaml` file is a historical full API v1 draft. It is no
 
 They are **not** v1.0 commitments.
 
-Current docs start at [`../README.md`](../README.md).
+Current docs start at [`../../docs/README.md`](../../docs/README.md).

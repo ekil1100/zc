@@ -1103,10 +1103,9 @@ Justfile
 README.md
 CHANGELOG.md
 docs/install/README.md
-docs/cli/README.md
 docs/cli/spec.md
-docs/cli/ux-workflow.md
-docs/reliability/e2e.md
+.agents/cli/ux-workflow.md
+.agents/reliability/e2e.md
 docs/api/error-codes.md
 docs/compat/mihomo-clash.md
 ```

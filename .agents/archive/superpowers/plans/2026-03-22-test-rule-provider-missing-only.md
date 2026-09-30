@@ -41,7 +41,7 @@ Expected: PASS for new and existing tests except unrelated known baseline failur
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/config.zig src/main.zig docs/cli/spec.md docs/config/override.md TASKS.md docs/superpowers/plans/2026-03-22-test-rule-provider-missing-only.md
+git add src/config.zig src/main.zig docs/cli/spec.md docs/config/override.md TASKS.md .agents/archive/superpowers/plans/2026-03-22-test-rule-provider-missing-only.md
 git commit -m "fix: avoid refreshing cached rule providers during zc test"
 ```
 

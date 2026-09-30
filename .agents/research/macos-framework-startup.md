@@ -25,7 +25,7 @@ CI/Release 显式选择可用的 Xcode 26.3，实际是否支持以链接和产�
 
 ## 范围、来源与工件
 
-2026-09-17；完整阅读了 [`diagnosis-cli-cost/REPORT.md`](../../target/perf/diagnosis-cli-cost/REPORT.md)、仓库 `AGENTS.md` 和已有 `docs/research/` 记录。沿用“结论—来源—实现选择—验证—限制”的研究文档约定。
+2026-09-17；完整阅读了 [`diagnosis-cli-cost/REPORT.md`](../../target/perf/diagnosis-cli-cost/REPORT.md)、仓库 `AGENTS.md` 和已有 `.agents/research/` 记录。沿用“结论—来源—实现选择—验证—限制”的研究文档约定。
 
 本轮仅新增本文；全部探针、下载的原始资料、日志、冻结副本位于：
 

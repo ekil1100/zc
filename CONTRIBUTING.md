@@ -28,20 +28,16 @@
 ### 开发环境
 
 ```bash
-# 克隆仓库
-git clone https://github.com/ekil1100/zclash.git
-cd zclash
+# Clone the repository.
+git clone https://github.com/ekil1100/zc.git
+cd zc
 
-# 安装依赖
-# - Zig 0.15.0+
-# - git
-
-# 构建
-zig build
-
-# 运行测试
-zig build test
+# Build and test with the committed Cargo.lock.
+just build
+just test
 ```
+
+工具链、原生依赖和支持平台见[构建指南](docs/install/README.md#从源码构建)。开发入口见 [AGENTS.md](AGENTS.md)；安排任务先读[已确认优先级](.agents/development-priorities.md)，内部验证方法见[开发文档导航](.agents/README.md)。
 
 ### 提交前格式检查
 
@@ -85,7 +81,7 @@ just python-check  # 只检查格式和基础静态错误
   - `refactor: 重构`
 
 - **代码风格**: 遵循项目现有风格
-  - 使用 `zig fmt` 格式化
+  - 使用 `just fmt` 格式化 Rust，`just python-fmt` 格式化 Python
   - 函数和变量使用 snake_case
   - 类型使用 PascalCase
 
@@ -98,7 +94,7 @@ just python-check  # 只检查格式和基础静态错误
 
 ### PR 检查清单
 
-- [ ] 代码通过 `zig build test`
+- [ ] 相关测试与 `just check` 通过
 - [ ] 新功能包含测试
 - [ ] 文档已更新（如需要）
 - [ ] 提交信息符合规范
@@ -108,7 +104,8 @@ just python-check  # 只检查格式和基础静态错误
 文档改进同样受欢迎！
 
 - 发现文档错误？直接提 Issue 或 PR
-- 希望添加示例？提交到 `docs/examples/`
+- 面向用户的安装、使用、配置、API 和排障说明放 `docs/`；配置脚本示例放 `docs/config/examples/`
+- 开发计划、设计研究、实现进度、测试验收与历史材料放 `.agents/`，同步对应导航和链接
 - 翻译文档？请联系维护者
 
 ## 测试贡献

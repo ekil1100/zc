@@ -1,6 +1,6 @@
 # AnyTLS Session Multiplexing — Implementation-Ready Design (Stage C)
 
-> 历史 Zig 设计方案，保留原文作审查依据，不是当前 Rust 架构或已启用能力。AnyTLS 仍不支持；当前边界见 [兼容说明](../compat/mihomo-clash.md)。
+> 历史 Zig 设计方案，保留原文作审查依据，不是当前 Rust 架构或已启用能力。AnyTLS 仍不支持；当前边界见 [兼容说明](../../docs/compat/mihomo-clash.md)。
 
 Status: revised after adversarial review. Resolves all 8 must-fix blockers and
 bakes in the locked decisions. Grounded against the actual zc tree

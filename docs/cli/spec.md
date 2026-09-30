@@ -1,6 +1,6 @@
 # zc CLI 契约
 
-当前 Rust 入口是 `src/main.rs` / `src/cli.rs`；命令表生成帮助，服务编排位于 `src/service.rs`，实例生命周期位于 `src/daemon.rs`，持久权威位于 `src/store.rs`。本文件保留原 CLI 行为契约；[迁移说明](../migration/rust.md) 单独列出尚未对齐的差异，不以实现缺口改写规范。历史决策见 [UX 工作流](ux-workflow.md)，冻结错误码见 [字典](../api/error-codes.md)。
+本文件说明 CLI 命令、输出格式、配置与实例管理行为。协议与配置支持范围见[兼容说明](../compat/mihomo-clash.md)，错误码见[字典](../api/error-codes.md)。
 
 ## 完整命令表
 
@@ -70,7 +70,7 @@
 
 catalog 位于 `$HOME/.config/zc/state-v2.json`，schema 2 为唯一权威，引用 immutable revisions。`meta.json` 与 `configs/` 是兼容镜像，损坏或不可写不改变健康 catalog 的权威。旧 metadata/configs 与 schema-1 authority 在 shared legacy cutover lock 下接管；已存在 schema-2 与 revision 必须通过原格式、canonical bytes、哈希校验。未知格式、损坏 catalog 或缺失 revision 都失败，禁止删除重建或默认 DIRECT 回退。
 
-原生 Rust 与旧 Zig prepared snapshot 的认证格式、两种 nonce 的区别见 [迁移说明](../migration/rust.md#已有数据与实例安全)。原始配置、provider、脚本与 materialization 只写入新 revision，不就地覆盖旧 revision。
+原生 Rust 运行快照与旧 Zig prepared snapshot 均须通过认证及实例身份校验；旧快照的文件 nonce 与 descriptor nonce 可以独立，不能通过改写快照绕过校验。原始配置、provider、脚本与 materialization 只写入新 revision，不就地覆盖旧 revision。
 
 新配置名剥除一个 `.yaml` 后须为 1–250 字节有效 UTF-8，排除 `.`、`..`、控制/双向字符、`/`、`\`；非法名称在网络/文件操作前报 `CONFIG_NAME_INVALID`。已有 251–255 字节 key 保持可读可删除，不允许创建同类新 key，mirror 可报告不同步。
 
@@ -92,7 +92,7 @@ load/list/dump/use、proxy 查询/选择及诊断不生成；已运行 start（�
 
 新自动值的 authority rename 可见但目录 fsync 失败时，拒绝本次准备，旧实例不停止；不删除或轮换可见 key。后续进程复用已有值也必须在 catalog 锁内重新同步 authority 目录。后续 listener bind 失败不撤销已持久 key。此处比普通状态提交的 durability warning 更严格：未经持久确认的 key 不进入 Prepared。
 
-采用自动值的认证快照使用 schema 2，冻结独立 secret overlay；只修改运行时私有 secret，不修改冻结 source。无 overlay 仍写 schema 1；旧 Rust/旧 Zig 快照缺字段时只采用原 source 的 secret，不查 profile、不补 key。schema 1 不允许 overlay；schema 2 必须包含合法非空 overlay、managed identity、原 source 已有 controller 且没有非空显式 secret。缺失/null/错误字段、非法语义和 HMAC 篡改均拒绝，无来源回退。readiness/选择快照重写及回滚保留实际冻结值。旧 binary 与新状态的回退限制见[迁移说明](../migration/rust.md#自动-controller-secret-的状态兼容与回退)。
+采用自动值的认证快照使用 schema 2，冻结独立 secret overlay；只修改运行时私有 secret，不修改冻结 source。无 overlay 仍写 schema 1；旧 Rust/旧 Zig 快照缺字段时只采用原 source 的 secret，不查 profile、不补 key。schema 1 不允许 overlay；schema 2 必须包含合法非空 overlay、managed identity、原 source 已有 controller 且没有非空显式 secret。缺失/null/错误字段、非法语义和 HMAC 篡改均拒绝，无来源回退。readiness/选择快照重写及回滚保留实际冻结值。旧 binary 与新状态的回退限制见[升级与回退](../install/README.md#状态兼容与回退)。
 
 ### durability 与恢复
 
@@ -118,7 +118,7 @@ HTTP keep-alive 同 ID，下一请求更新路由，idle 清除目标/规则/lea
 
 配置/每个 provider source 为 16 MiB，上界探测不能把长文件截成合法前缀；完整 collection/provider/展开限制见 [兼容说明](../compat/mihomo-clash.md#配置资源上界)。超限在 revision 发布、listener/dial 前拒绝；config load/download/update 映射 `CONFIG_*_LIMIT_EXCEEDED`，完整 source 大小独立为 `CONFIG_*_TOO_LARGE`。malformed raw recovery 也不能绕过上界。已有 catalog 超出 1024 selections 属损坏，不是可忽略的用户 limit。
 
-doctor 最多保留 256 条 errors/warnings 合计、每条 512 rendered bytes，错误优先并可替换末尾 warning；有效性独立于保留条数。超长消息使用原模板省略参数并追加 ` ... [truncated]`，数量或字节省略均以 `config_diagnostics_truncated` 明示。文本/JSON 同源输出多错误、warnings 与 migration hints；凭据不回显，终端控制字符清理。hints 保留原显式文件的 1 MiB 文本扫描规则（包括注释），不表示启用所提及的能力，unsupported 声明仍拒绝。加载失败不伪造语义诊断，语义错误保持 `CHECKS_FAILED`。证据与原 Zig 的精确差异见 [doctor 诊断验收](../migration/rust.md#doctor-validator-诊断验收)；其他配置加载命令的诊断精度不由此宣称完成。
+doctor 最多保留 256 条 errors/warnings 合计、每条 512 rendered bytes，错误优先并可替换末尾 warning；有效性独立于保留条数。超长消息使用原模板省略参数并追加 ` ... [truncated]`，数量或字节省略均以 `config_diagnostics_truncated` 明示。文本/JSON 同源输出多错误、warnings 与 migration hints；凭据不回显，终端控制字符清理。hints 保留原显式文件的 1 MiB 文本扫描规则（包括注释），不表示启用所提及的能力，unsupported 声明仍拒绝。加载失败不伪造语义诊断，语义错误保持 `CHECKS_FAILED`。上述详细诊断仅描述 doctor；其他配置加载命令可能只返回概括性错误。
 
 `test/proxy test/profile test` 含 `daemon_state/selected_proxies/ports/checks/targets`，文本并发探测按完成顺序输出；任何失败的 check 返回 `CHECKS_FAILED` + data，exit 1。单项 target 与聚合 check 不应混为一谈。`doctor` 含 `proxy_reachable/network_ok/config_ok/config_diagnostics_truncated`，文本冻结标签 `Config:/Daemon:/PID:/Port:/Connection:`。这些诊断会发起真实网络探测，不属于纯离线验证。
 
