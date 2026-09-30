@@ -8,7 +8,10 @@ use hickory_resolver::{
 };
 use tokio::{sync::Semaphore, time::timeout};
 
-use crate::{observability::FailureStage, target::Target};
+use crate::{
+    observability::{FailureSource, FailureStage},
+    target::Target,
+};
 
 const LIMIT: usize = 64;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -73,7 +76,10 @@ impl Dns {
         self.resolve_inner(target).await.map_err(|error| {
             // Preserve the public resolver diagnostic while carrying a typed stage.
             let message = error.to_string();
-            error.context(FailureStage::Dns).context(message)
+            error
+                .context(FailureStage::Dns)
+                .context(FailureSource::Target)
+                .context(message)
         })
     }
 

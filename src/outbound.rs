@@ -33,7 +33,7 @@ use tokio_rustls::TlsConnector;
 use crate::{
     config::{Config, Proxy, ProxyKind},
     dns::Dns,
-    observability::FailureStage,
+    observability::{FailureContext, FailureSource, FailureStage},
     target::Target,
 };
 
@@ -260,7 +260,7 @@ impl Connector {
     /// Open a datagram association without sending a payload. Each send_to must
     /// receive the routed target, because a session can carry multiple destinations.
     pub async fn open_udp(&self, proxy: &Proxy, target: &Target) -> Result<crate::udp::UdpSession> {
-        let mut stage = FailureStage::Udp;
+        let mut stage = FailureStage::Udp.into();
         self.open_udp_observed(proxy, target, &mut stage).await
     }
 
@@ -268,9 +268,10 @@ impl Connector {
         &self,
         proxy: &Proxy,
         _target: &Target,
-        stage: &mut FailureStage,
+        stage: &mut FailureContext,
     ) -> Result<crate::udp::UdpSession> {
-        *stage = FailureStage::Udp;
+        stage.stage = FailureStage::Udp;
+        stage.source = FailureSource::Proxy;
         validate_obfs(proxy)?;
         match &proxy.kind {
             ProxyKind::Direct => crate::udp::UdpSession::direct(self.dns.clone()).await,
@@ -297,12 +298,14 @@ impl Connector {
                             .clone(),
                         &config,
                         &Target::new(server.clone(), *port)?,
-                        stage,
+                        &mut stage.stage,
                     ),
                 )
                 .await
-                .with_context(|| *stage)
-                .context("UDP setup timed out after 10 seconds")?
+                .with_context(|| stage.stage)
+                .context("UDP setup timed out after 10 seconds")
+                .map_err(|error| stage.source.context(error))?
+                .map_err(|error| stage.source.context(error))
             }
             ProxyKind::Trojan { .. } => {
                 if !proxy.udp {
@@ -313,15 +316,17 @@ impl Connector {
                     self.trojan_stream(proxy, None, stage),
                 )
                 .await
-                .with_context(|| *stage)
-                .context("UDP setup timed out after 10 seconds")??;
+                .with_context(|| stage.stage)
+                .context("UDP setup timed out after 10 seconds")
+                .map_err(|error| stage.source.context(error))?
+                .map_err(|error| stage.source.context(error))?;
                 Ok(crate::udp::UdpSession::trojan(self.dns.clone(), stream))
             }
         }
     }
 
     pub async fn connect(&self, proxy: &Proxy, target: &Target) -> Result<BoxStream> {
-        let mut stage = FailureStage::Connect;
+        let mut stage = FailureStage::Connect.into();
         self.connect_observed(proxy, target, &mut stage).await
     }
 
@@ -329,22 +334,29 @@ impl Connector {
         &self,
         proxy: &Proxy,
         target: &Target,
-        stage: &mut FailureStage,
+        stage: &mut FailureContext,
     ) -> Result<BoxStream> {
-        *stage = FailureStage::Connect;
+        stage.stage = FailureStage::Connect;
+        stage.source = if matches!(proxy.kind, ProxyKind::Direct) {
+            FailureSource::Target
+        } else {
+            FailureSource::Proxy
+        };
         timeout(
             Duration::from_secs(10),
             self.connect_inner(proxy, target, stage),
         )
         .await
-        .with_context(|| *stage)
-        .context("outbound setup timed out after 10 seconds; check DNS and proxy reachability")?
+        .with_context(|| stage.stage)
+        .context("outbound setup timed out after 10 seconds; check DNS and proxy reachability")
+        .map_err(|error| stage.source.context(error))?
+        .map_err(|error| stage.source.context(error))
     }
 
-    async fn dial(&self, host: &str, port: u16, stage: &mut FailureStage) -> Result<TcpStream> {
-        *stage = FailureStage::Dns;
+    async fn dial(&self, host: &str, port: u16, stage: &mut FailureContext) -> Result<TcpStream> {
+        stage.stage = FailureStage::Dns;
         let addresses = self.dns.resolve(&Target::new(host, port)?).await?;
-        *stage = FailureStage::Connect;
+        stage.stage = FailureStage::Connect;
         let mut last_error = None;
         for ip in addresses {
             match TcpStream::connect(SocketAddr::new(ip, port)).await {
@@ -362,7 +374,7 @@ impl Connector {
         &self,
         proxy: &Proxy,
         target: &Target,
-        stage: &mut FailureStage,
+        stage: &mut FailureContext,
     ) -> Result<BoxStream> {
         validate_obfs(proxy)?;
         match &proxy.kind {
@@ -407,6 +419,7 @@ impl Connector {
                     &config,
                     destination(target),
                 );
+                stage.source = FailureSource::ProxyProtocol;
                 // Unlike write_all(&[]), write(&[]) polls AsyncWrite and sends the SS address.
                 // Server-first protocols must receive this header before the caller writes payload.
                 stream
@@ -444,13 +457,14 @@ impl Connector {
                     .dial(server, *port, stage)
                     .await
                     .context("AnyTLS server TCP connection failed")?;
-                *stage = FailureStage::Tls;
+                stage.stage = FailureStage::Tls;
                 let stream = tls
                     .connect(name, socket)
                     .await
                     .context("AnyTLS TLS handshake failed; check certificate, trust roots and sni")
                     .context(FailureStage::Tls)?;
-                *stage = FailureStage::Connect;
+                stage.stage = FailureStage::Connect;
+                stage.source = FailureSource::ProxyProtocol;
                 Ok(Box::new(
                     crate::anytls::AnyTls::open(Box::new(stream), password, target, padding)
                         .await
@@ -465,7 +479,7 @@ impl Connector {
         &self,
         proxy: &Proxy,
         target: Option<&Target>,
-        stage: &mut FailureStage,
+        stage: &mut FailureContext,
     ) -> Result<BoxStream> {
         let ProxyKind::Trojan {
             server,
@@ -488,13 +502,14 @@ impl Connector {
             .dial(server, *port, stage)
             .await
             .context("Trojan server TCP connection failed; check server reachability")?;
-        *stage = FailureStage::Tls;
+        stage.stage = FailureStage::Tls;
         let mut stream = tls
             .connect(name, socket)
             .await
             .context("Trojan TLS handshake failed; check server certificate, trust roots and sni")
             .context(FailureStage::Tls)?;
-        *stage = FailureStage::Connect;
+        stage.stage = FailureStage::Connect;
+        stage.source = FailureSource::ProxyProtocol;
         let mut request = format!("{:x}\r\n", Sha224::digest(password.as_bytes())).into_bytes();
         if let Some(target) = target {
             request.push(1);
@@ -749,6 +764,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_preparation_finishes_at_protocol_not_tcp_or_tls_boundary() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        timeout(Duration::from_secs(5), async {
+            let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions().unwrap().with_no_client_auth()
+                .with_single_cert(vec![CertificateDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-cert.pem")).unwrap()], PrivateKeyDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-key.pem")).unwrap()).unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+            for protocol in ["ss", "trojan", "anytls"] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let options = if protocol == "ss" { "cipher: aes-128-gcm" } else { "skip-cert-verify: true" };
+                let config = Config::parse(&format!("proxies: [{{name: edge, type: {protocol}, server: 127.0.0.1, port: {}, password: private-password, {options}}}]\nrules: ['MATCH,edge']", listener.local_addr().unwrap().port())).unwrap();
+                let connector = Connector::new(&config).unwrap();
+                let target = Target::new("private-target.invalid", 443).unwrap();
+                let route = config.route(&target).await.unwrap();
+                let mut context = FailureStage::Connect.into();
+                let peer = async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    // Hold the transport open without an application ACK.
+                    if protocol == "ss" { (Some(socket), None) }
+                    else { (None, Some(acceptor.accept(socket).await.unwrap())) }
+                };
+                let (opened, _peer) = tokio::join!(connector.connect_observed(route.proxy, &target, &mut context), peer);
+                assert!(opened.is_ok());
+                assert!(matches!(context.stage, FailureStage::Connect));
+                assert!(matches!(context.source, FailureSource::ProxyProtocol));
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn silent_tls_preserves_stage_for_connector_and_caller_deadlines() {
         timeout(Duration::from_secs(13), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -774,7 +819,7 @@ mod tests {
                 }
             });
             let cancelled = async {
-                let mut stage = FailureStage::Connect;
+                let mut stage = FailureStage::Connect.into();
                 // Routing consumes part of the unchanged outer ten-second budget.
                 // This makes the caller deadline win over Connector's own timer.
                 let result = timeout(Duration::from_secs(10), async {
@@ -782,7 +827,8 @@ mod tests {
                     connector.connect_observed(route.proxy, &target, &mut stage).await
                 }).await;
                 assert!(result.is_err(), "the caller deadline must win");
-                assert!(matches!(stage, FailureStage::Tls));
+                assert!(matches!(stage.stage, FailureStage::Tls));
+                assert!(matches!(stage.source, FailureSource::Proxy));
             };
             let started = std::time::Instant::now();
             let (tcp, udp, ()) = tokio::join!(
@@ -795,6 +841,7 @@ mod tests {
                 assert!(error.to_string().contains("timed out after 10 seconds"));
                 assert!(error.is::<tokio::time::error::Elapsed>());
                 assert!(matches!(error.downcast_ref::<FailureStage>(), Some(FailureStage::Tls)));
+                assert!(matches!(error.downcast_ref::<FailureSource>(), Some(FailureSource::Proxy)));
             }
             peer.await.unwrap();
         }).await.unwrap();

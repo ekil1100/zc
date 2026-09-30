@@ -43,7 +43,22 @@ ready 发布后的日志写入是尽力操作，不因日志锁竞争让已发�
 
 ## 连接计数与故障分类
 
-故障阶段固定为 `ingress/dns/connect/tls/transfer/udp`。DNS、上游拨号、TLS 握手及转发使用真实错误分类，超时保留当前操作阶段；每个连接独立记录阶段，不因并发串台。原协议超时预算、回复码、路由和重试策略不因观测而放宽。
+故障阶段固定为 `ingress/dns/connect/tls/transfer/udp`。`connection_failed` 与 `connection_failure_summary` 附加有限 `source` 字段，表示失败时正在执行的操作对象；它与 `stage` 一起解释，不代表已确定网络或服务端根因：
+
+| `stage` | `source` | 观测边界 |
+| --- | --- | --- |
+| `dns` | `target` | 本地解析目标域名：地址规则分流、DIRECT 拨号或 Trojan UDP 目标解析 |
+| `dns` | `proxy` | 本地解析代理节点入口域名，包括 SS/Trojan UDP 建立 |
+| `connect` | `target` | DIRECT 目标 TCP 连接 |
+| `connect` | `proxy` | 代理节点入口 TCP 连接；SS UDP 则为本地 UDP socket 建立/关联，成功不证明节点可达 |
+| `tls` | `proxy` | zc 与 Trojan/AnyTLS 节点的 TLS 握手 |
+| `connect` | `proxy_protocol` | TCP（以及需要时的 TLS）建立后，发送 SS 目标头、Trojan 请求或 AnyTLS 开流数据 |
+| `tls` | `target` | absolute-form HTTPS 转发中，由 zc 主动执行的目标 TLS 握手 |
+| 任意既有阶段 | `unspecified` | 该操作边界没有更细来源证据；普通入站、转发及 UDP 会话错误保留原分类 |
+
+例如 `stage=connect, source=proxy, error_kind=TimedOut` 表示等待节点入口连接超时，区别于 `stage=dns, source=proxy` 的入口域名解析失败。超时保留当前操作的阶段和来源；每条连接独立维护，不因并发串台。原协议超时预算、回复码、路由和地址尝试策略保持不变。
+
+`proxy_protocol` 只标识本地协议准备期间的失败。SS/Trojan/AnyTLS 写出准备数据后，服务端后续拒绝、协议截断等仍按实际发生的 `transfer/udp` 阶段记录，无法从这些错误统一推断远端 DNS、目标 TCP 或认证失败。DNS 返回可用格式的错误地址仍是解析成功；CONNECT/SOCKS 隧道中由客户端执行的目标 TLS（包括证书不匹配）也不属于 zc 的 TLS 握手观测。这里不提供 DNS 错答检测、公共 DNS 回退、额外重试、TLS 降级或自动切节点。
 
 - `active_connections` 是当前 mixed TCP 连接任务数，包含 SOCKS UDP association 的控制连接；不等于独立 UDP socket 数或目标数。
 - `total_connections` 是本实例累计接受的 mixed TCP 连接数；任务退出、取消或 panic 后释放活动计数。
@@ -52,7 +67,7 @@ ready 发布后的日志写入是尽力操作，不因日志锁竞争让已发�
 - 普通 EOF、reset、客户端断开及正常 idle 到期不刷故障；HTTP 长度、响应头或 chunk framing 截断（含读取中 reset）、SS 短 salt 和 obfs 截断响应仍计入转发故障。读取中的协议截断与写向已关闭客户端的普通错误分开处理；不能仅凭普通 reset 推断上游质量。SOCKS UDP 控制连接取消不计为 UDP transport 故障。
 - UDP 丢弃非法数据包等原协议行为保持，不把所有静默丢包都宣称为已记录故障，也不把无响应 UDP 包等同于已证实的网络故障。
 
-连接热路径只更新有限原子计数，不写磁盘。固定 6 个阶段 × 16 个错误类别，不按任意主机或错误文本建立无界 map。reporter 每 100ms 读取计数：同类故障首条单独记录，其余每 30 秒合并，退出时补最后增量。统计总数不因限频丢失，但磁盘故障可能使记录缺失。panic 首次单独记录，累计数量保留在摘要中。
+连接热路径只更新有限原子计数，不写磁盘。固定 6 个阶段 × 4 个来源 × 16 个错误类别，不按任意主机或错误文本建立无界 map。reporter 每 100ms 读取计数：相同 `(stage, source, error_kind)` 的首次故障单独记录，其余每 30 秒合并，退出时补最后增量；`count/total` 属于该组合，不把不同来源合并。`runtime_summary` 的 `failures/failures_by_stage` 继续累计所有来源，每次故障只计一次。统计总数不因限频丢失，但磁盘故障可能使记录缺失。panic 首次单独记录，累计数量保留在摘要中。
 
 ## CPU 与内存
 

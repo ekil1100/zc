@@ -105,6 +105,7 @@ fn refused_upstream_is_logged_without_request_secrets() {
     assert!(
         events.iter().any(|e| e["event"] == "connection_failed"
             && e["stage"] == "connect"
+            && e["source"] == "target"
             && e["error_kind"] == "ConnectionRefused"),
         "{events:?}"
     );
@@ -189,9 +190,9 @@ fn actual_tls_handshake_failure_is_classified() {
         f.json(&["stop", "--json"]);
         let events = log_events(&f);
         assert!(
-            events
-                .iter()
-                .any(|e| e["event"] == "connection_failed" && e["stage"] == "tls"),
+            events.iter().any(|e| e["event"] == "connection_failed"
+                && e["stage"] == "tls"
+                && e["source"] == "proxy"),
             "{events:?}"
         );
         assert!(!format!("{events:?}").contains("private-"));
@@ -241,7 +242,104 @@ fn udp_open_failure_is_accounted_without_leaking_target() {
     assert!(
         events.iter().any(|e| e["event"] == "connection_failed"
             && e["stage"] == "connect"
+            && e["source"] == "proxy"
             && e["error_kind"] == "ConnectionRefused"),
+        "{events:?}"
+    );
+    assert!(!format!("{events:?}").contains("private-"));
+}
+
+#[test]
+fn target_and_proxy_refusals_have_separate_bounded_counts() {
+    use std::io::{Read, Write};
+    let f = Fixture::new();
+    let closed = free_port();
+    fs::write(&f.config, format!("proxies: [{{name: private-edge, type: ss, server: 127.0.0.1, port: {closed}, password: private-password, cipher: aes-128-gcm}}]\nrules: ['DST-PORT,{closed},DIRECT', 'MATCH,private-edge']\n")).unwrap();
+    let port = start_fixture(&f);
+    for _ in 0..16 {
+        for target in [
+            format!("127.0.0.1:{closed}"),
+            "private-target.invalid:443".to_owned(),
+        ] {
+            let mut client = tcp_client(port);
+            write!(
+                client,
+                "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 502"));
+        }
+    }
+    f.json(&["stop", "--json"]);
+    let events = log_events(&f);
+    for source in ["target", "proxy"] {
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                (e["event"] == "connection_failed" || e["event"] == "connection_failure_summary")
+                    && e["stage"] == "connect"
+                    && e["source"] == source
+                    && e["error_kind"] == "ConnectionRefused"
+            })
+            .collect();
+        assert_eq!(
+            failures
+                .iter()
+                .map(|e| e["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            16
+        );
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|e| e["event"] == "connection_failed")
+                .count(),
+            1
+        );
+        assert_eq!(failures.len(), 2, "only first and final summary expected");
+        assert_eq!(failures.last().unwrap()["total"], 16);
+    }
+    let summary = events
+        .iter()
+        .find(|e| e["event"] == "runtime_summary" && e["phase"] == "final")
+        .unwrap();
+    assert_eq!(summary["failures"], 32);
+    assert_eq!(summary["failures_by_stage"]["connect"], 32);
+    assert!(!format!("{events:?}").contains("private-"));
+}
+
+#[test]
+fn absolute_https_target_tls_is_not_proxy_tls() {
+    use std::io::{Read, Write};
+    let f = Fixture::new();
+    fs::write(&f.config, "rules: ['MATCH,DIRECT']\n").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = listener.local_addr().unwrap();
+    let port = start_fixture(&f);
+    let mut client = tcp_client(port);
+    write!(
+        client,
+        "GET https://{target}/private-path HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut server = accept_upstream(&listener);
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut hello = [0; 4096];
+    assert!(server.read(&mut hello).unwrap() > 0);
+    server.write_all(b"HTTP/1.1 400 Not TLS\r\n\r\n").unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 502"));
+    f.json(&["stop", "--json"]);
+    let events = log_events(&f);
+    assert!(
+        events.iter().any(|e| e["event"] == "connection_failed"
+            && e["stage"] == "tls"
+            && e["source"] == "target"),
         "{events:?}"
     );
     assert!(!format!("{events:?}").contains("private-"));
@@ -660,6 +758,7 @@ fn stalled_trojan_tls_keeps_its_stage_and_original_deadline_per_operation() {
         .filter(|e| {
             (e["event"] == "connection_failed" || e["event"] == "connection_failure_summary")
                 && e["stage"] == "tls"
+                && e["source"] == "proxy"
                 && e["error_kind"] == "TimedOut"
         })
         .map(|e| e["count"].as_u64().unwrap())
@@ -729,6 +828,15 @@ fn assert_transfer_failures(f: &Fixture, expected: u64) {
         "{events:?}"
     );
     assert_eq!(summary["active_connections"], 0);
+    for event in events
+        .iter()
+        .filter(|e| e["event"] == "connection_failed" || e["event"] == "connection_failure_summary")
+    {
+        assert_eq!(
+            event["source"], "unspecified",
+            "prepare source must not leak into transfer"
+        );
+    }
     assert!(!format!("{events:?}").contains("private-"));
 }
 

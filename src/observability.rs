@@ -78,6 +78,58 @@ impl fmt::Display for FailureStage {
 }
 impl std::error::Error for FailureStage {}
 
+// Source is an operation boundary, not a diagnosis of a remote failure.
+const SOURCES: [FailureSource; 4] = [
+    FailureSource::Unspecified,
+    FailureSource::Target,
+    FailureSource::Proxy,
+    FailureSource::ProxyProtocol,
+];
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum FailureSource {
+    Unspecified,
+    Target,
+    Proxy,
+    ProxyProtocol,
+}
+impl FailureSource {
+    pub(crate) fn context(self, error: anyhow::Error) -> anyhow::Error {
+        // Retain the caller's diagnostic; only the typed source reaches the log.
+        let message = error.to_string();
+        error.context(self).context(message)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Target => "target",
+            Self::Proxy => "proxy",
+            Self::ProxyProtocol => "proxy_protocol",
+        }
+    }
+}
+impl fmt::Display for FailureSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+impl std::error::Error for FailureSource {}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct FailureContext {
+    pub stage: FailureStage,
+    pub source: FailureSource,
+}
+impl From<FailureStage> for FailureContext {
+    fn from(stage: FailureStage) -> Self {
+        Self {
+            stage,
+            source: FailureSource::Unspecified,
+        }
+    }
+}
+
 fn error_index(error: &anyhow::Error) -> usize {
     // Only typed, finite categories are retained; never format any error or context.
     let kind = error
@@ -113,7 +165,7 @@ pub(crate) struct Observer {
     total: AtomicU64,
     rejected: AtomicU64,
     panics: AtomicU64,
-    failures: [[AtomicU64; KINDS.len()]; STAGES.len()],
+    failures: [[[AtomicU64; KINDS.len()]; SOURCES.len()]; STAGES.len()],
 }
 impl Observer {
     fn new() -> Self {
@@ -122,7 +174,9 @@ impl Observer {
             total: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             panics: AtomicU64::new(0),
-            failures: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            failures: std::array::from_fn(|_| {
+                std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
+            }),
         }
     }
     pub(crate) fn connection(self: &Arc<Self>) -> ConnectionGuard {
@@ -130,8 +184,10 @@ impl Observer {
         increment(&self.total);
         ConnectionGuard(self.clone())
     }
-    pub(crate) fn failure(&self, stage: FailureStage, error: &anyhow::Error) {
-        increment(&self.failures[stage as usize][error_index(error)]);
+    pub(crate) fn failure(&self, context: FailureContext, error: &anyhow::Error) {
+        increment(
+            &self.failures[context.stage as usize][context.source as usize][error_index(error)],
+        );
     }
     pub(crate) fn rejected(&self) {
         increment(&self.rejected);
@@ -472,8 +528,8 @@ struct Reporter {
     log: Arc<EventLog>,
     observer: Arc<Observer>,
     started: Instant,
-    reported: [[u64; KINDS.len()]; STAGES.len()],
-    last_report: [[Instant; KINDS.len()]; STAGES.len()],
+    reported: [[[u64; KINDS.len()]; SOURCES.len()]; STAGES.len()],
+    last_report: [[[Instant; KINDS.len()]; SOURCES.len()]; STAGES.len()],
     previous: Option<(Instant, Resources)>,
     panic_reported: bool,
 }
@@ -484,8 +540,8 @@ impl Reporter {
             log,
             observer,
             started,
-            reported: [[0; KINDS.len()]; STAGES.len()],
-            last_report: [[started; KINDS.len()]; STAGES.len()],
+            reported: [[[0; KINDS.len()]; SOURCES.len()]; STAGES.len()],
+            last_report: [[[started; KINDS.len()]; SOURCES.len()]; STAGES.len()],
             previous: None,
             panic_reported: false,
         }
@@ -549,31 +605,34 @@ impl Reporter {
     }
     fn failures(&mut self, final_report: bool) {
         let now = Instant::now();
-        for (stage, counters) in self.observer.failures.iter().enumerate() {
-            for (kind, counter) in counters.iter().enumerate() {
-                let total = counter.load(Ordering::Relaxed);
-                if total > 0 && self.reported[stage][kind] == 0 {
-                    let _ = self.log.event(json!({
+        for (stage, sources) in self.observer.failures.iter().enumerate() {
+            for (source, counters) in sources.iter().enumerate() {
+                for (kind, counter) in counters.iter().enumerate() {
+                    let total = counter.load(Ordering::Relaxed);
+                    if total > 0 && self.reported[stage][source][kind] == 0 {
+                        let _ = self.log.event(json!({
                         "level":"error", "event":"connection_failed",
-                        "stage":STAGES[stage].label(), "error_kind":KINDS[kind],
+                        "stage":STAGES[stage].label(), "source":SOURCES[source].label(), "error_kind":KINDS[kind],
                         "count":1, "total":1,
                     }));
-                    self.reported[stage][kind] = 1;
-                    self.last_report[stage][kind] = now;
-                }
-                let old = self.reported[stage][kind];
-                if total > old
-                    && (final_report
-                        || now.duration_since(self.last_report[stage][kind]) >= SAMPLE_INTERVAL)
-                {
-                    let _ = self.log.event(json!({
+                        self.reported[stage][source][kind] = 1;
+                        self.last_report[stage][source][kind] = now;
+                    }
+                    let old = self.reported[stage][source][kind];
+                    if total > old
+                        && (final_report
+                            || now.duration_since(self.last_report[stage][source][kind])
+                                >= SAMPLE_INTERVAL)
+                    {
+                        let _ = self.log.event(json!({
                         "level":"error", "event":"connection_failure_summary",
-                        "stage":STAGES[stage].label(), "error_kind":KINDS[kind],
+                        "stage":STAGES[stage].label(), "source":SOURCES[source].label(), "error_kind":KINDS[kind],
                         "count":total.saturating_sub(old), "total":total,
                     }));
-                    // A failed sink must not cause an unbounded retry storm either.
-                    self.reported[stage][kind] = total;
-                    self.last_report[stage][kind] = now;
+                        // A failed sink must not cause an unbounded retry storm either.
+                        self.reported[stage][source][kind] = total;
+                        self.last_report[stage][source][kind] = now;
+                    }
                 }
             }
         }
@@ -594,7 +653,7 @@ impl Reporter {
         let mut failures_by_stage = serde_json::Map::new();
         let mut failures = 0_u64;
         for (stage, counters) in self.observer.failures.iter().enumerate() {
-            let total = counters.iter().fold(0_u64, |sum, count| {
+            let total = counters.iter().flatten().fold(0_u64, |sum, count| {
                 sum.saturating_add(count.load(Ordering::Relaxed))
             });
             failures_by_stage.insert(STAGES[stage].label().into(), json!(total));

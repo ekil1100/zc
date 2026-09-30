@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     config::{Config, MatchContext, ProxyKind},
     connection::{Guard, Inbound, Phase},
-    observability::{FailureStage, Observer},
+    observability::{FailureContext, FailureSource, FailureStage, Observer},
     outbound::{BoxStream, Connector},
     target::Target,
     udp::{MAX_WIRE_BYTES, UdpSession},
@@ -176,11 +176,17 @@ impl ConnectionContext {
         }
     }
 
-    fn failure(&self, fallback: FailureStage, error: &anyhow::Error) {
+    fn failure(&self, fallback: impl Into<FailureContext>, error: &anyhow::Error) {
+        let fallback = fallback.into();
         let stage = error
             .downcast_ref::<FailureStage>()
             .copied()
-            .unwrap_or(fallback);
+            .unwrap_or(fallback.stage);
+        let source = error
+            .downcast_ref::<FailureSource>()
+            .copied()
+            .unwrap_or(fallback.source);
+        let failure = FailureContext { stage, source };
         // A raw tunnel's orderly EOF is Ok, not UnexpectedEof. At Transfer that
         // error comes from protocol framing (HTTP, SS, obfs or TLS), not shutdown.
         // Incomplete ingress handshakes and unframed peer resets remain normal.
@@ -216,16 +222,16 @@ impl ConnectionContext {
                 )
             {
                 // Normalize nested deadlines only for evidence, not wire replies.
-                observer.failure(stage, &io::Error::from(io::ErrorKind::TimedOut).into());
+                observer.failure(failure, &io::Error::from(io::ErrorKind::TimedOut).into());
             } else {
-                observer.failure(stage, error);
+                observer.failure(failure, error);
             }
         }
     }
 
     fn outcome<T>(
         &self,
-        stage: FailureStage,
+        stage: impl Into<FailureContext>,
         result: &Result<Result<T>, tokio::time::error::Elapsed>,
     ) {
         match result {
@@ -579,10 +585,13 @@ async fn dial(
     context: &ConnectionContext,
     target: &Target,
     source: SocketAddr,
-    stage: &mut FailureStage,
+    stage: &mut FailureContext,
     record: &Guard,
 ) -> Result<Option<BoxStream>> {
-    *stage = FailureStage::Dns;
+    *stage = FailureContext {
+        stage: FailureStage::Dns,
+        source: FailureSource::Target,
+    };
     let route = context
         .config
         .route_with_context(target, &match_context(source))
@@ -830,7 +839,7 @@ async fn udp_relay(
                 pinned = Some(sender);
                 let target = if session.is_none() {
                     record.target(&target, Some(sender), Inbound::Socks5Udp);
-                    let mut stage = FailureStage::Dns;
+                    let mut stage = FailureContext { stage: FailureStage::Dns, source: FailureSource::Target };
                     let opened = timeout(HANDSHAKE_TIMEOUT, async {
                         let route = context.config.route_udp_with_context(&target, &match_context(sender)).await?;
                         record.routed(&route);
@@ -918,8 +927,8 @@ async fn serve(
             }
         };
         record.target(&target, None, Inbound::Socks5Connect);
-        // The operation owns its stage across cancellation; no connection shares it.
-        let mut stage = FailureStage::Connect;
+        // The operation owns its context across cancellation; no connection shares it.
+        let mut stage = FailureStage::Connect.into();
         let upstream = match timeout(
             HANDSHAKE_TIMEOUT,
             dial(&context, &target, source, &mut stage, record),
@@ -982,7 +991,7 @@ async fn serve(
                 Inbound::HttpConnect
             },
         );
-        let mut stage = FailureStage::Connect;
+        let mut stage = FailureStage::Connect.into();
         let mut upstream = match timeout(
             HANDSHAKE_TIMEOUT,
             dial(&context, &request.target, source, &mut stage, record),
@@ -1021,7 +1030,13 @@ async fn serve(
             {
                 Ok(Ok(stream)) => stream,
                 result => {
-                    context.outcome(FailureStage::Tls, &result);
+                    context.outcome(
+                        FailureContext {
+                            stage: FailureStage::Tls,
+                            source: FailureSource::Target,
+                        },
+                        &result,
+                    );
                     timeout(
                         HANDSHAKE_TIMEOUT,
                         http_reply(&mut write_client, "502 Bad Gateway"),
@@ -1532,17 +1547,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
-    async fn local_silent_dns_is_classified_for_routing_and_outbound() {
-        timeout(Duration::from_secs(8), async {
-            for rules in [
-                "rules: ['IP-CIDR,127.0.0.0/8,DIRECT', 'MATCH,REJECT']",
-                "rules: ['MATCH,DIRECT']",
-            ] {
+    async fn layered_dns_and_protocol_failures_are_private_and_counted() {
+        timeout(Duration::from_secs(25), async {
+            let mut cases = vec![
+                ("rules: ['IP-CIDR,127.0.0.0/8,DIRECT', 'MATCH,REJECT']".to_owned(), "target", false),
+                ("rules: ['MATCH,DIRECT']".to_owned(), "target", false),
+            ];
+            for protocol in ["ss", "trojan", "anytls"] {
+                let options = if protocol == "ss" { "cipher: aes-128-gcm" } else { "skip-cert-verify: true" };
+                for udp in [false, true] {
+                    if udp && protocol == "anytls" { continue; }
+                    cases.push((format!("proxies: [{{name: private-edge, type: {protocol}, server: private-proxy.example., port: 443, password: private-password, udp: {udp}, {options}}}]\nrules: ['MATCH,private-edge']"), "proxy", udp));
+                }
+            }
+            for (rules, source, udp) in cases {
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 let mut server = NameServerConfig::udp(socket.local_addr().unwrap().ip());
                 server.connections[0].port = socket.local_addr().unwrap().port();
                 let dns = Dns::from_config(ResolverConfig::from_name_servers(vec![server])).unwrap();
-                let config = Config::parse(rules).unwrap().with_dns(dns);
+                let config = Config::parse(&rules).unwrap().with_dns(dns);
                 let temp = tempfile::tempdir().unwrap();
                 let path = temp.path().canonicalize().unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1554,24 +1577,207 @@ mod tests {
                 let (stop, stopped) = tokio::sync::oneshot::channel();
                 let task = tokio::spawn(runtime.run(async { let _ = stopped.await; }));
                 let mut client = TcpStream::connect(address).await.unwrap();
-                client.write_all(b"CONNECT private-target.example.:443 HTTP/1.1\r\nHost: private-target.example.:443\r\nProxy-Authorization: Basic private-auth\r\n\r\n").await.unwrap();
+                let _udp_client = if udp {
+                    client.write_all(&[5, 1, 0]).await.unwrap();
+                    let mut method = [0; 2];
+                    client.read_exact(&mut method).await.unwrap();
+                    assert_eq!(method, [5, 0]);
+                    client.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                    let mut reply = [0; 10];
+                    client.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+                    let relay = SocketAddr::from(([127, 0, 0, 1], u16::from_be_bytes([reply[8], reply[9]])));
+                    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    sender.send_to(&[0, 0, 0, 1, 127, 0, 0, 1, 0, 53, 1], relay).await.unwrap();
+                    Some(sender)
+                } else {
+                    client.write_all(b"CONNECT private-target.example.:443 HTTP/1.1\r\nHost: private-target.example.:443\r\nProxy-Authorization: Basic private-auth\r\n\r\n").await.unwrap();
+                    None
+                };
                 // The query must reach only the configured loopback resolver.
                 let mut packet = [0; 4096];
                 let (count, _) = socket.recv_from(&mut packet).await.unwrap();
                 let query = hickory_resolver::proto::op::Message::from_vec(&packet[..count]).unwrap();
-                assert_eq!(query.queries[0].name().to_string(), "private-target.example.");
+                assert_eq!(query.queries[0].name().to_string(), if source == "proxy" { "private-proxy.example." } else { "private-target.example." });
                 let mut response = String::new();
                 client.read_to_string(&mut response).await.unwrap();
-                assert!(response.starts_with("HTTP/1.1 502"));
+                if udp { assert!(response.is_empty()); } else { assert!(response.starts_with("HTTP/1.1 502")); }
                 stop.send(()).unwrap();
                 task.await.unwrap().unwrap();
                 evidence.finish("stop_request", None).await;
                 let log = std::fs::read_to_string(path.join("zc.log")).unwrap();
                 let events: Vec<Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
                 assert!(events.iter().any(|event| event["event"] == "connection_failed"
-                    && event["stage"] == "dns" && event["error_kind"] == "TimedOut"), "{events:?}");
+                    && event["stage"] == "dns" && event["source"] == source
+                    && event["error_kind"] == "TimedOut"), "{events:?}");
                 assert!(!log.contains("private-"));
+                let summary = events.iter().find(|event| event["event"] == "runtime_summary" && event["phase"] == "final").unwrap();
+                assert_eq!(summary["failures"], 1);
+                assert_eq!(summary["failures_by_stage"]["dns"], 1);
             }
+            trojan_udp_target_dns_is_not_proxy_dns().await;
+            protocol_prepare_write_failure_is_not_a_normal_disconnect().await;
         }).await.unwrap();
+    }
+
+    async fn protocol_prepare_write_failure_is_not_a_normal_disconnect() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = SecureDir::open_owned_absolute(&path, false).unwrap();
+        let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
+        let evidence = Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock).unwrap();
+        let runtime = Runtime::bind(Config::parse("rules: ['MATCH,DIRECT']").unwrap(), 0)
+            .await
+            .unwrap()
+            .with_observer(evidence.observer.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut transport = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let _peer = listener.accept().await.unwrap();
+        transport.shutdown().await.unwrap();
+        // Isolate the protocol writer at its existing transport boundary. Connector's
+        // source transitions have a separate real TCP/TLS test; this is not a TLS test.
+        let target = Target::new("private-target.invalid", 443).unwrap();
+        let error = crate::anytls::AnyTls::open(
+            Box::new(transport),
+            "private-password",
+            &target,
+            crate::anytls::default_padding(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        let error = FailureSource::ProxyProtocol
+            .context(anyhow::Error::from(error).context("private-transport-diagnostic"));
+        assert_eq!(error.to_string(), "private-transport-diagnostic");
+        runtime.context.failure(FailureStage::Connect, &error);
+        evidence.finish("stop_request", None).await;
+        let log = std::fs::read_to_string(path.join("zc.log")).unwrap();
+        let events: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "connection_failed"
+                    && event["stage"] == "connect"
+                    && event["source"] == "proxy_protocol"
+                    && event["error_kind"] == "BrokenPipe"),
+            "{events:?}"
+        );
+        let summary = events
+            .iter()
+            .find(|event| event["event"] == "runtime_summary" && event["phase"] == "final")
+            .unwrap();
+        assert_eq!(summary["failures"], 1);
+        assert!(!log.contains("private-"));
+    }
+
+    async fn trojan_udp_target_dns_is_not_proxy_dns() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut server = NameServerConfig::udp(socket.local_addr().unwrap().ip());
+        server.connections[0].port = socket.local_addr().unwrap().port();
+        let dns = Dns::from_config(ResolverConfig::from_name_servers(vec![server])).unwrap();
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Config::parse(&format!("proxies: [{{name: private-edge, type: trojan, server: 127.0.0.1, port: {}, password: private-password, udp: true, skip-cert-verify: true}}]\nrules: ['MATCH,private-edge']", peer.local_addr().unwrap().port())).unwrap().with_dns(dns);
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![
+                CertificateDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-cert.pem"))
+                    .unwrap(),
+            ],
+            PrivateKeyDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-key.pem"))
+                .unwrap(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = SecureDir::open_owned_absolute(&path, false).unwrap();
+        let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
+        let evidence = Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock).unwrap();
+        let runtime = Runtime::bind(config, 0)
+            .await
+            .unwrap()
+            .with_observer(evidence.observer.clone());
+        let address = runtime.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(runtime.run(async {
+            let _ = stopped.await;
+        }));
+        let mut control = TcpStream::connect(address).await.unwrap();
+        control
+            .write_all(&[5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0; 12];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply[..6], &[5, 0, 5, 0, 0, 1]);
+        let relay = SocketAddr::from(([127, 0, 0, 1], u16::from_be_bytes([reply[10], reply[11]])));
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let name = b"private-target.example.";
+        let mut packet = vec![0, 0, 0, 3, name.len() as u8];
+        packet.extend_from_slice(name);
+        packet.extend_from_slice(&[0, 53, 1]);
+        udp.send_to(&packet, relay).await.unwrap();
+        let (stream, _) = peer.accept().await.unwrap();
+        let mut tls = acceptor.accept(stream).await.unwrap();
+        // The proxy handshake succeeds before target DNS is attempted.
+        tls.read_exact(&mut [0; 68]).await.unwrap();
+        let mut packet = [0; 4096];
+        let (count, _) = socket.recv_from(&mut packet).await.unwrap();
+        let query = hickory_resolver::proto::op::Message::from_vec(&packet[..count]).unwrap();
+        assert_eq!(
+            query.queries[0].name().to_string(),
+            "private-target.example."
+        );
+        // Read the bounded public evidence, not an internal counter or a guessed sleep.
+        loop {
+            let log = std::fs::read_to_string(path.join("zc.log")).unwrap();
+            if log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|event| event["event"] == "connection_failed")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        evidence.finish("stop_request", None).await;
+        let log = std::fs::read_to_string(path.join("zc.log")).unwrap();
+        let events: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "connection_failed"
+                    && event["stage"] == "dns"
+                    && event["source"] == "target"
+                    && event["error_kind"] == "TimedOut"),
+            "{events:?}"
+        );
+        let summary = events
+            .iter()
+            .find(|event| event["event"] == "runtime_summary" && event["phase"] == "final")
+            .unwrap();
+        assert_eq!(summary["failures"], 1);
+        assert_eq!(summary["failures_by_stage"]["dns"], 1);
+        assert_eq!(summary["active_connections"], 0);
+        assert!(!log.contains("private-"));
     }
 }
