@@ -229,7 +229,11 @@ async fn route_snapshot_survives_zero_ttl_and_connector_does_not_resolve_it_agai
     };
     use zc::{config::Config, outbound::Connector};
     timeout(Duration::from_secs(5), async {
-        for rule in ["IP-CIDR,127.0.0.1/32,DIRECT", "IP-CIDR,192.0.2.0/24,REJECT"] {
+        for rule in [
+            "IP-CIDR,127.0.0.1/32,DIRECT",
+            "IP-CIDR,192.0.2.0/24,REJECT",
+            "IP-CIDR,192.0.2.0/24,DIRECT",
+        ] {
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let config = Config::parse(&format!(
                 "rules: ['{rule}', 'DOMAIN,snapshot.example.,DIRECT']"

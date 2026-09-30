@@ -832,7 +832,7 @@ async fn udp_relay(
                     record.target(&target, Some(sender), Inbound::Socks5Udp);
                     let mut stage = FailureStage::Dns;
                     let opened = timeout(HANDSHAKE_TIMEOUT, async {
-                        let route = context.config.route_with_context(&target, &match_context(sender)).await?;
+                        let route = context.config.route_udp_with_context(&target, &match_context(sender)).await?;
                         record.routed(&route);
                         if !route.proxy.udp || !matches!(route.proxy.kind,
                             ProxyKind::Shadowsocks { .. } | ProxyKind::Trojan { .. }) {

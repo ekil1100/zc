@@ -16,7 +16,7 @@
 ## 专题与历史
 
 - 协议研究：`research/`；AnyTLS 复用设计：`anytls/`。
-- 故障定位和平台测试：`reliability/`；观测闭环记录：[observability-validation](observability-validation.md)。
+- 故障定位和平台测试：`reliability/`；观测闭环记录：[observability-validation](observability-validation.md)；[TCP 代理 DNS 错地址修复](reliability/dns-routing-fix.md)。
 - 协议与配置历史验证：[compat-validation](compat-validation.md)。
 - 热升级等候选方案：本目录下 `*-plan.md`、`*-research.md`；存在方案不等于已批准执行，也不改变开发优先级。
 - 原路线图：`roadmap/`；CLI 历史决策：`cli/ux-workflow.md`；更早的方案与报告：`archive/`。其中历史完成标记不能作为当前候选的验收证据。

@@ -112,7 +112,12 @@ domain 先按原域名匹配规则，再本地解析成 IP frame 兼容主流服
 - **CLI 规则默认值**：缺失 `rules`、显式 `[]`、非空规则缺终态 MATCH 均补 `MATCH,REJECT`；重复/非尾部 MATCH 拒绝。
 - mixed HTTP/SOCKS 提供目标端口与来源 IP/端口；不提供进程名，`PROCESS-NAME` 的可解析性不等于实际进程规则生效。
 - GEOIP 保留原有静态 IPv4 heuristic table，不是完整地理库；IPv6 不完整。`no-resolve` 避免为相应 IP/GEOIP 规则解析域名。
-- 为 IP 规则解析后使用同一 DNS 快照，获准 IP 固定给后续 DIRECT/SS/Trojan/AnyTLS dial/encode，不重解析并选择未获准地址。
+- 为 IP/GEOIP 规则解析时，同一次路由使用同一 DNS 快照；真正命中地址规则时固定该规则匹配的 IP，不用快照首地址替代。最终走 DIRECT，或已检查的地址规则包含 REJECT、其他代理、任意代理组时，也继续固定快照地址，防止远端重新解析绕过这些规则。
+- **TCP 的直连分流例外**：原目标是域名，已检查且需要解析的 IP/GEOIP 规则全部直接指向 DIRECT（包含命名 `type: direct` 叶节点）、均未命中，随后非地址规则选中 SS/Trojan/AnyTLS 时，保留原域名交给代理节点解析。最终通过 select 选到上述代理也适用；前置地址规则引用 select 则保守保留 IP 固定，即使该组当前选中 DIRECT。`no-resolve` 规则不参与域名地址检查；规则命中之后的后缀不影响此前决议。UDP 保持原快照行为。
+
+例如 `GEOIP,CN,DIRECT` 后接 `MATCH,Proxies`：本地 DNS 判断不走直连后，不再把该查询的地址强塞给 TCP 代理，避免错误本地 DNS 应答导致代理连接错站、出现证书域名不匹配。此时按本地结果选择一次出站，**不根据远端最终 IP 重新分流**。若前置规则需要保护某个拒绝网段或指定其他代理，则仍固定已检查地址，不用远端 DNS 绕过约束。
+
+这不是 DNS 错误检测、重试或公共 DNS 回退：本地解析超时、失败、空结果或资源超限仍拒绝；错误结果若已命中 DIRECT/IP 规则也不改走代理。TLS 校验不变，不应关闭证书校验来处理域名不匹配。
 
 Hickory 从系统 DNS 配置/hosts 初始化，网络查询非阻塞；2 秒 lookup deadline，64 query slots，每个并行 A/AAAA lookup 占 2 slots，最多保留 64 地址，取消释放 slot。cache size 配置为 64，但不是瞬时硬内存上界。系统/hosts 不自动重载，不等价于 libc/NSS、mDNS 或完整 split-DNS；没有 nameserver 时拒绝，不暗用公共 DNS。
 

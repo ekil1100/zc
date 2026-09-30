@@ -966,10 +966,29 @@ impl Config {
             .await
     }
 
+    /// Route a TCP destination, preserving remote DNS after pure DIRECT splits.
     pub async fn route_with_context(
         &self,
         target: &Target,
         context: &MatchContext<'_>,
+    ) -> Result<Route<'_>> {
+        self.route_inner(target, context, true).await
+    }
+
+    /// UDP keeps its existing address snapshot semantics, including Trojan UDP.
+    pub async fn route_udp_with_context(
+        &self,
+        target: &Target,
+        context: &MatchContext<'_>,
+    ) -> Result<Route<'_>> {
+        self.route_inner(target, context, false).await
+    }
+
+    async fn route_inner(
+        &self,
+        target: &Target,
+        context: &MatchContext<'_>,
+        mut remote_domain_allowed: bool,
     ) -> Result<Route<'_>> {
         let literal_ip = target.host().parse::<IpAddr>().ok();
         let domain = literal_ip
@@ -977,6 +996,24 @@ impl Config {
             .then(|| canonical_domain(target.host()));
         let mut resolved: Option<Vec<IpAddr>> = None;
         for (rule_index, rule) in self.rules.iter().enumerate() {
+            if matches!(
+                &rule.matcher,
+                Matcher::Ip {
+                    no_resolve: false,
+                    ..
+                } | Matcher::GeoIp {
+                    no_resolve: false,
+                    ..
+                }
+            ) {
+                // Only statically DIRECT address rules are routing hints. A reject,
+                // another proxy, or a mutable group keeps the checked IP snapshot.
+                // Accumulate across the whole visited prefix, not only the DNS trigger.
+                remote_domain_allowed &= self
+                    .proxies
+                    .get(rule.proxy)
+                    .is_some_and(|proxy| matches!(proxy.kind, ProxyKind::Direct));
+            }
             let mut pinned = None;
             let matched = match &rule.matcher {
                 Matcher::Match => true,
@@ -1048,8 +1085,23 @@ impl Config {
                     .is_some_and(|domain| domain.contains(keyword)),
             };
             if matched {
-                let pinned = pinned.or_else(|| resolved.as_ref().map(|addresses| addresses[0]));
                 let leaf_index = self.resolve_proxy(rule.proxy);
+                let remote_domain = remote_domain_allowed
+                    && matches!(
+                        self.proxies[leaf_index].kind,
+                        ProxyKind::Shadowsocks { .. }
+                            | ProxyKind::Trojan { .. }
+                            | ProxyKind::AnyTls { .. }
+                    );
+                // A matching IP/GEOIP rule always pins its matching address. Only an
+                // unmatched pure DIRECT prefix may leave a TCP proxy target as a name.
+                let pinned = pinned.or_else(|| {
+                    if remote_domain {
+                        None
+                    } else {
+                        resolved.as_ref().map(|addresses| addresses[0])
+                    }
+                });
                 return Ok(Route {
                     proxy: &self.proxies[leaf_index],
                     rule_index,
