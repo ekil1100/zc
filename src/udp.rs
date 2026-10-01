@@ -8,15 +8,19 @@ use anyhow::{Context, Result, bail};
 use shadowsocks::{
     config::ServerConfig,
     context::SharedContext,
-    relay::udprelay::proxy_socket::{ProxySocket, ProxySocketError, UdpSocketType},
+    relay::udprelay::{
+        DatagramReceive, DatagramSend,
+        proxy_socket::{ProxySocket, ProxySocketError, UdpSocketType},
+    },
 };
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, Interest, ReadBuf},
     net::UdpSocket,
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -45,6 +49,51 @@ impl Drop for Trojan {
     }
 }
 
+// Share one registered socket with the codec and the error-readiness waiter.
+// The codec's poll-based receive path does not observe Linux error-only events.
+struct SharedUdpSocket(Arc<UdpSocket>);
+
+impl DatagramReceive for SharedUdpSocket {
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.0.poll_recv(cx, buf)
+    }
+
+    fn poll_recv_from(
+        &self,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<SocketAddr>> {
+        self.0.poll_recv_from(cx, buf)
+    }
+
+    fn poll_recv_ready(&self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        self.0.poll_recv_ready(cx)
+    }
+}
+
+impl DatagramSend for SharedUdpSocket {
+    fn poll_send(&self, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.0.poll_send(cx, buf)
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        self.0.poll_send_to(cx, buf, target)
+    }
+
+    fn poll_send_ready(&self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        self.0.poll_send_ready(cx)
+    }
+}
+
 enum Transport {
     Trojan(Trojan),
     Direct {
@@ -52,7 +101,8 @@ enum Transport {
         ipv6: Option<UdpSocket>,
     },
     Shadowsocks {
-        socket: ProxySocket<shadowsocks::net::UdpSocket>,
+        socket: ProxySocket<SharedUdpSocket>,
+        io: Arc<UdpSocket>,
         overhead: usize,
     },
 }
@@ -121,6 +171,7 @@ impl UdpSession {
             };
             match socket.connect(SocketAddr::new(ip, server.port())).await {
                 Ok(()) => {
+                    let io = Arc::new(socket);
                     return Ok(Self {
                         dns,
                         transport: Transport::Shadowsocks {
@@ -128,8 +179,9 @@ impl UdpSession {
                                 UdpSocketType::Client,
                                 context,
                                 config,
-                                socket.into(),
+                                SharedUdpSocket(io.clone()),
                             ),
+                            io,
                             overhead: config.method().salt_len() + 16,
                         },
                         receive: Mutex::new(vec![0; 65536]),
@@ -228,7 +280,9 @@ impl UdpSession {
                         .send_to(payload, SocketAddr::new(ip, target.port()))
                         .await?)
                 }
-                Transport::Shadowsocks { socket, overhead } => {
+                Transport::Shadowsocks {
+                    socket, overhead, ..
+                } => {
                     let address = destination(target);
                     if payload.len() + address.serialized_len() + overhead > MAX_WIRE_BYTES {
                         bail!("Shadowsocks UDP wire datagram exceeds 65507 bytes");
@@ -259,9 +313,20 @@ impl UdpSession {
             .try_lock()
             .context("only one UDP receiver may wait per session")?;
         timeout(IDLE_TIMEOUT, async {
-            if let Transport::Shadowsocks { socket, .. } = &self.transport {
+            if let Transport::Shadowsocks { socket, io, .. } = &self.transport {
                 loop {
-                    match socket.recv(&mut storage).await {
+                    let received = tokio::select! {
+                        received = socket.recv(&mut storage) => received,
+                        error = io.async_io(Interest::ERROR, || {
+                            io.take_error()?.ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
+                        }) => {
+                            // Another I/O operation may consume SO_ERROR first;
+                            // WouldBlock clears stale readiness instead of spinning.
+                            let error = match error { Ok(error) | Err(error) => error };
+                            return Err(error).context("Shadowsocks UDP receive failed");
+                        }
+                    };
+                    match received {
                         Ok((n, source, wire)) if wire <= MAX_WIRE_BYTES => {
                             if let Ok(source) = address_target(source) {
                                 return Ok(Datagram { source, payload: storage[..n].to_vec() });
