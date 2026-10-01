@@ -101,6 +101,12 @@
 
 本机新回归、真实服务生命周期场景、定向 Clippy、Ruff 与格式通过。证据：`target/linux-ci-fixes/manager-proc-race-{red,green}.log`；原失败：`c3f9552-linux-x64.log`。Linux 复核待记录，不将该竞态的确定性复现等同于已证明原 CI 唯一根因。
 
+### `d84d4f5` 双架构完整 Rust 通过
+
+[CI 36939801302](https://github.com/ekil1100/zc/actions/runs/36939801302) 的 Linux x64/arm64 **全部 Rust 测试通过**，含服务 37 项、完整中断/超时矩阵与 procfs 新回归；交付契约、beta 契约及独立 core/TCP 互操作通过。普通发布候选的安装、信号、13 项安全拒绝及真实 daemon 保护均通过。剩余阻塞位于单独打包的 `e2e_service_install` 测试程序，它的 ELF debug 信息同样超过 128 MiB。
+
+将 `test-release-service.py` 的 Linux helper 也复制到私有临时文件后移除 debug sections，增加原 Cargo 文件 SHA256 不变断言；后续全部字节等同性、旧版恢复、服务状态与信号断言继续针对实际打包候选执行。安装器大小门限及生产代码保持不变。原始日志：`target/linux-ci-fixes/d84d4f5-linux-{x64,arm64}.log`；定向 Linux 安装复核与完整产物步骤待记录。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。

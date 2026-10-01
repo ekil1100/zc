@@ -16,6 +16,17 @@ import tarfile
 import time
 
 repo, fixture, root = (pathlib.Path(arg).resolve() for arg in sys.argv[1:])
+if sys.platform.startswith("linux"):
+    # This separate test binary is also packaged as a release candidate.
+    # Keep the shared Cargo artifact intact and preserve the real size gate.
+    original_digest = hashlib.sha256(fixture.read_bytes()).digest()
+    prepared = root / "release-service-fixture"
+    shutil.copyfile(fixture, prepared)
+    prepared.chmod(0o700)
+    subprocess.run(["strip", "--strip-debug", prepared], check=True)
+    assert hashlib.sha256(fixture.read_bytes()).digest() == original_digest
+    fixture = prepared
+    print(f"ROOT_SERVICE_FIXTURE_BYTES={fixture.stat().st_size}")
 version = subprocess.check_output([fixture, "--version"], text=True).strip().split()[1]
 package = f"zc-v{version}-{'macos' if sys.platform == 'darwin' else 'linux'}-"
 package += {"arm64": "arm64", "aarch64": "arm64", "x86_64": "amd64"}[os.uname().machine]
