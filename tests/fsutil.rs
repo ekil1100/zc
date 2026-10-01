@@ -110,6 +110,8 @@ fn dirfd_writes_do_not_follow_replaced_paths_and_lock_identity_is_checked() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("private");
     let dir = SecureDir::create(&root).unwrap();
+    // This case tests lock identity, not initial durable-file creation latency.
+    dir.write_new("lock", b"").unwrap();
     let guard = dir.lock("lock", Duration::from_millis(30)).unwrap();
     fs::rename(root.join("lock"), root.join("old-lock")).unwrap();
     dir.write_new("lock", b"").unwrap();
