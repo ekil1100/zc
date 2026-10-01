@@ -49,7 +49,7 @@
 | 同样 16 KiB buffer，改在 listen 前设置 | 通过 | 通过 | 通过 |
 | accept 后改设 256 KiB 接收 buffer（仅诊断） | 通过 | 通过 | 通过 |
 
-根因在测试建连顺序：accept 后缩小 Linux 接收窗口会产生与预期不同的窗口更新行为。正式修复仅将相同的 16 KiB 收发 buffer 提前到 `TcpSocket` 的 listen 前设置，供全部生命周期 peer 共用；本地 ingress listener 不改。Linux [tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html) 也要求在 listen/connect 前设置 socket buffer。各变体均保留原期限、payload 与完整性断言，未采用增大 buffer 的诊断变体。修正后的本机生命周期 19 项、格式与定向 Clippy 通过；完整 Linux CI 待后续记录。
+根因在测试建连顺序：accept 后缩小 Linux 接收窗口会产生与预期不同的窗口更新行为。正式修复仅将相同的 16 KiB 收发 buffer 提前到 `TcpSocket` 的 listen 前设置，供全部生命周期 peer 共用；HTTP/HTTPS 场景的应用客户端也在 connect 前设置原来的 16 KiB 接收 buffer，本地 ingress listener 不改。Linux [tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html) 也要求在 listen/connect 前设置 socket buffer。各变体均保留原期限、payload 与完整性断言，未采用增大 buffer 的诊断变体。修正后的本机生命周期 19 项、格式与定向 Clippy 通过；`a0cedbb` 的 [CI 36929343148](https://github.com/ekil1100/zc/actions/runs/36929343148) 中 arm64 生命周期套件改善为 18 passed / 1 failed；剩余 HTTP/HTTPS 超时来自应用客户端仍在 connect 后缩小接收 buffer，已按同一原则修正，期限与 2 MiB 响应断言保留。完整 Linux CI 待后续记录。
 
 诊断只是定位证据，不是整个 Linux 验收通过。所有变体日志保留于 `target/linux-ci-fixes/socket-diagnostics/`。
 

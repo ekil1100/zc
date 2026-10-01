@@ -494,8 +494,9 @@ async fn mixed_http_and_https_forward_drain_early_response_with_upload_still_ope
                 s.write_all(b"\x03\0\0\0\x01\0\0").await.unwrap(); s.flush().await.unwrap();
                 let _ = s.read_to_end(&mut Vec::new()).await;
             });
-            let mut app = TcpStream::connect(address).await.unwrap();
-            rustix::net::sockopt::set_socket_recv_buffer_size(&app,16*1024).unwrap();
+            let app = tokio::net::TcpSocket::new_v4().unwrap();
+            app.set_recv_buffer_size(16 * 1024).unwrap();
+            let mut app = app.connect(address).await.unwrap();
             let scheme = if secure { "https" } else { "http" };
             app.write_all(format!("POST {scheme}://localhost.localdomain:443/early HTTP/1.1\r\nHost: localhost.localdomain:443\r\nContent-Length: 16777216\r\n\r\n").as_bytes()).await.unwrap();
             assert_eq!(http_head(&mut app).await,b"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\n\r\n");
