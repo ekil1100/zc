@@ -109,7 +109,8 @@ jobs:
           "$BINARY" --version
           bash scripts/e2e/run-core.sh "$PWD/$BINARY" "$PWD/target/debug/examples/e2e_origin" "$PWD/target/debug/examples/e2e_obfs_oracle" "$PWD/target/debug/examples/e2e_ss_udp_oracle" "$PWD/target/e2e-fixtures" "$PWD/testdata/e2e"
           TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)" python3 scripts/e2e/run-rust-tcp.py "$BINARY" target/e2e-fixtures
-          bash scripts/install/test-oneline-installer.sh "$PWD/$BINARY" "$PWD/target/debug/examples/e2e_origin"
+          ZC_INSTALL_SERVICE_FIXTURE="$PWD/target/debug/examples/e2e_service_install" \
+            bash scripts/install/test-oneline-installer.sh "$PWD/$BINARY" "$PWD/target/debug/examples/e2e_origin"
       - name: Verify native macOS first use in disposable runner
         if: runner.os == 'macOS'
         run: python3 scripts/ci/test-macos-native.py --ephemeral-runner --target ${{ matrix.target }}

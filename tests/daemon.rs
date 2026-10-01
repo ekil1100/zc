@@ -938,3 +938,63 @@ fn log_follow_keeps_partial_lines_and_reopens_a_rebuilt_runtime_directory() {
     drop(child);
     thread.join().unwrap();
 }
+
+#[test]
+fn early_foreground_and_background_failures_leave_no_runtime_snapshot() {
+    let f = Fixture::new();
+    let bin = f.home.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let binary = bin.join("zc");
+    fs::copy(env!("CARGO_BIN_EXE_zc"), &binary).unwrap();
+    let run = |foreground: bool| {
+        let mut args = vec![
+            "start",
+            "-c",
+            f.config.to_str().unwrap(),
+            "--port",
+            "17898",
+            "--json",
+        ];
+        if foreground {
+            args.push("--foreground");
+        }
+        Command::new(&binary)
+            .args(args)
+            .env("HOME", &f.home)
+            .env("XDG_RUNTIME_DIR", &f.runtime)
+            .output()
+            .unwrap()
+    };
+    let assert_clean = || {
+        assert!(!fs::read_dir(&f.runtime).unwrap().any(|e| {
+            e.unwrap()
+                .path()
+                .extension()
+                .is_some_and(|s| s == "snapshot")
+        }));
+    };
+    let bin_fd = zc::fsutil::SecureDir::open_owned_absolute(&bin, false).unwrap();
+    let lease = bin_fd
+        .lock(".zc.binary.lock", Duration::from_secs(1))
+        .unwrap();
+    for foreground in [true, false] {
+        let out = run(foreground);
+        assert!(!out.status.success(), "{out:?}");
+        assert_clean();
+    }
+    drop(lease);
+    let log = f.runtime.join("zc.log");
+    if log.exists() {
+        fs::remove_file(&log).unwrap();
+    }
+    fs::create_dir(&log).unwrap();
+    for foreground in [true, false] {
+        let out = run(foreground);
+        assert!(!out.status.success(), "{out:?}");
+        assert_clean();
+    }
+    fs::remove_dir(log).unwrap();
+    assert!(run(false).status.success());
+    f.json(&["stop", "--json"]);
+    assert_clean();
+}

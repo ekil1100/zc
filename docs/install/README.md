@@ -67,9 +67,11 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 
 安装器先将 `latest` 解析为不可变 tag，再下载版本化归档及 SHA-256 文件。校验文件缺失、摘要不匹配、异常归档或 `zc --version` 自检失败都会保留旧程序并非零退出。替换使用目标目录内的临时文件、单安装器锁、旧二进制备份和原子 rename；发布后检查失败会恢复备份。
 
-安装目标是 symlink、仍有可见进程执行该目标、无法确认 stopped 或无法检查进程身份时，拒绝覆盖。即使 runtime 路径已经变化、`zc status` 报告 stopped，旧 inode 的遗留进程仍会阻止替换。先用旧程序或 supervisor 停止实例；无法追踪的实例须先核对 PID、路径和端口，再显式停止。异常断电留下的 `.zc.install.lock` 只能在确认其 owner PID 和安装进程均已不存在后手动删除。
+对通过 `zc service` 注册、且已确认属于当前安装路径及 HOME/runtime 的运行服务，独立安装器自动通过管理器停止、发布并恢复原冻结调用；这是冷升级，现有连接可能中断。首次安装或原本停止的服务保持停止。
 
-安装阶段需要 POSIX sh、curl、tar、awk、mktemp 和 sha256sum/shasum/openssl 之一。Linux 进程检查需要 `/proc` 和 readlink，macOS 需要 lsof；这些不是安装后代理运行时的依赖。
+手动启动或归属未知的运行实例需要先用原方式停止；安装器保留旧程序并拒绝自动停止或覆盖。安装目标是符号链接、注册或快照损坏、存在其他 runtime 的遗留进程，或无法检查进程身份时，同样拒绝替换。即使 `zc status` 报告 stopped，旧 inode 的遗留进程仍会阻止替换。无法追踪的实例须先核对 PID、路径和端口，再显式停止。异常断电留下的 `.zc.install.lock` 只能在确认其 owner PID 和安装进程均已不存在后手动删除。
+
+安装阶段需要 POSIX sh、`/bin/bash`（检查进程组与内嵌发布器）、curl、tar、awk、mktemp 和 sha256sum/shasum/openssl 之一。Linux 进程检查需要 `/proc` 和 readlink，macOS 需要 lsof；这些不是安装后代理运行时的依赖。
 
 ## Homebrew
 
@@ -97,9 +99,36 @@ just install --target-dir /tmp/zc-candidate/bin
 /tmp/zc-candidate/bin/zc --version
 ```
 
-`just install` 先执行 `just release`，再调用现有本地安装脚本；构建失败不会继续安装。无参数时安装到 `$HOME/.local/bin/zc`，可能替换已有的停止态安装，因此候选试用应始终显式指定独立目录。不会自动停止、启动或重启 daemon；运行中的目标、符号链接目标或无法确认进程状态时均拒绝安装，错误会传递给 `just`。发布前后检查进程身份，检查失败保留或恢复旧二进制。这只是显式安装入口，不代表正式发布验证已经通过。
+`just install` 先执行 `just release`，再调用本地安装脚本。安装器把候选复制到目标目录内的私有临时文件，执行版本、冻结状态兼容检查，macOS Mach-O 还检查签名；全部成功后才考虑停止服务。构建、候选检查失败保持旧二进制与运行实例。
+
+无参数目标为 `$HOME/.local/bin/zc`；候选试用仍应显式指定独立 HOME、runtime 和安装目录。首次安装保持停止；停止态升级保持停止。对通过 `zc service` 注册、且安装路径/HOME/runtime 与调用环境一致的运行实例，安装器通过服务管理器停止，使用已有 staging/rename 发布，再恢复原冻结调用。保留自启动偏好、认证配置、端口、runtime 和已应用节点选择，不使用 plain `zc start` 或当前 active profile 恢复。
+
+发布或启动失败时尝试恢复旧二进制与精确旧调用。恢复成功仍非零退出并报 `SERVICE_INSTALL_ROLLED_BACK`；恢复失败报 `SERVICE_RECOVERY_FAILED`，保留目标目录的 `.zc.recovery.*` 和服务状态供核查。若原本停止，恢复过程也保持停止。目录中的 `.zc.install.guard/.zc.binary.lock` 为稳定锁，正常安装后保留；临时候选及成功事务的备份会清理。异常中断或恢复失败需要先核对状态和保留工件，再决定恢复，勿盲删状态或直接用默认配置启动。
+
+### 安装中断与恢复
+
+本地安装入口单独处理 SIGINT（Ctrl-C）和 SIGTERM，其他 CLI 命令的信号行为保持原样。接收中断后暂停推进升级，终止正在执行的管理器/检查/发布命令进程组，等待直接子进程退出并回收，再执行恢复；恢复期间继续等待收尾。每次外部命令最多 15 秒，清理的直接子进程回收另限 1 秒，readiness 最多 10 秒；这不是整个安装事务的总期限。
+
+中断仍非零退出：进入事务前可报 `SERVICE_INSTALL_INTERRUPTED`；恢复成功报 `SERVICE_INSTALL_ROLLED_BACK`，原因明确含 `SERVICE_INSTALL_INTERRUPTED`；恢复失败报 `SERVICE_RECOVERY_FAILED` 并保留工件。停止前中断且原实例身份仍一致时保持其 PID；已停止才恢复原调用。若新实例已经出现，但管理器结果丢失、尚未捕获本次启动 PID，安装器保留备份并报恢复失败，不通过猜测停止该实例。先检查服务和管理器，再决定显式 stop/restart。命令组终止或直接子进程回收本身失败时，保留恢复工件并停止后续自动发布/恢复，先处理遗留命令进程。
+
+命令组清理覆盖同用户、留在该进程组的发布脚本与辅助进程；受信任的自定义发布钩子应前台完成，保持用户身份和进程组。自行 `setsid`/后台脱离或提权的钩子不在此保证内。管理器启动的 daemon 由管理器独立托管，其停止仍走服务身份核对。
+
+**SIGKILL、断电及进程崩溃需要人工核查**，进程无法自行执行恢复；SIGKILL 还可能留下独立发布进程组。不要立即重跑安装或仅凭锁已释放就覆盖目标：
+
+1. 保留安装目录里的 `.zc.recovery.*`、`.zc.candidate.*`、`zc.tmp.*`、`zc.backup.*`，以及完整服务目录和 runtime；稳定 `.zc.install.guard/.zc.binary.lock` 保持原 inode。
+2. 用 `ps -axo pid,ppid,pgid,command` 核对本次安装及发布脚本的实际路径、参数和进程组；确认并结束遗留发布组，等待其退出，再检查目标。只操作已核对的本次安装进程，勿按名称批量终止。
+3. 使用原 HOME/runtime 和注册安装路径检查 `zc service status --json`，同时检查用户管理器的 PID/状态；若 binary 无法执行，先保留文件并由管理器核对、停止明确属于此注册的任务。身份不符或状态损坏时保留现场，先解决证据缺口。
+4. 对照升级前记录/备份确认正确的 `.zc.recovery.*` 二进制及完整冻结状态。在已确认服务和发布进程都停止、没有并发安装后，以同目录 staging/rename 恢复已验证旧二进制；恢复完整状态时遵守下方格式兼容约束。最后显式 `zc service start` 使用冻结调用，检查端口、选择和自启动偏好，再清理已确认无用的工件。
+
+这些工件提供恢复输入，未提供自动 SIGKILL 恢复日志或通用一键回退。必要输入缺失、格式不兼容或无法证明进程归属时，继续保留现场而非按 active/default 配置启动。
+
+手动启动的目标维持安全拒绝，并提示显式迁移：先确认原 namespace 和调用参数，用原方式停止，再运行 `zc service start -c <config> --port <port>`。符号链接/外来目标、坏注册/快照、其他 runtime 的遗留进程、竞争中的新实例或无法检查进程时同样拒绝替换。安装器不会自动停止这些实例。
+
+这是**自动保持状态的冷升级**，连接可能关闭，不提供热升级承诺。`just install` 与独立 Release 安装器使用同一套服务升级事务；Homebrew 仍由包管理器管理，不属于该自动服务升级入口。用户服务定义和命令见 [CLI](../cli/spec.md#当前用户服务)。
 
 额外参数原样传给 `scripts/install/local-dev-install.sh`。脚本默认源是 `target/release/zc`，可用 `--source <path>` 显式指定；自定义 Cargo 输出位置时也须指定对应产物。试用时应使用独立 HOME 和显式安装目标。
+
+独立 Release 安装器先完成下载、校验和版本自检，再确认候选支持 `zc-release-install-v1`。版本与安装契约检查各限 15 秒；检查期间收到 SIGINT/SIGTERM 时取消检查，终止检查进程组并回收直接子进程后退出，保持旧目标且不进入发布。该清理覆盖留在检查进程组中的子进程；自行脱离进程组的程序以及 SIGKILL、断电仍需人工核查。支持的候选使用与 `just install` 相同的服务升级事务：保留运行/停止状态、登录自启、配置、端口和已应用选择；中断时等待恢复完成后再清理下载文件。不支持该契约的旧版候选在停止或替换前拒绝，并提示显式停止、备份完整状态后手动回退。不支持的候选不会退回旧的强制覆盖流程。
 
 ## 状态兼容与回退
 
@@ -113,7 +142,7 @@ just install --target-dir /tmp/zc-candidate/bin
 
 `XDG_RUNTIME_DIR` 必须为绝对、规范化路径，由当前 euid 所有且权限为 `0700`。未设置时使用规范化 `$HOME/.local/state/zc/runtime`；HOME 必须由当前 euid 所有且不得由 group/other 写入。隔离试用时应使用独立 HOME 和 runtime，避免读写生产状态。
 
-systemd unit 使用 `RuntimeDirectory=zc`、`RuntimeDirectoryMode=0700` 和 `XDG_RUNTIME_DIR=/run/zc`。自定义 unit 须保持等价约束，不要让多个 OS 用户共用 runtime 目录。
+`zc service` 使用登录用户的管理器，注册时固定 zc 的 HOME/runtime，并在生成的定义中显式传入；Linux 管理器自身的 bus 路径独立于该 runtime。无需 `/run/zc`、系统级 `RuntimeDirectory`、sudo 或 linger。自定义 supervisor 须保持等价的文件权限和单实例约束，不要让多个 OS 用户共用 runtime 目录。
 
 ## 其他渠道
 

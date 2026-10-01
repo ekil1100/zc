@@ -117,6 +117,33 @@
 
 API 保持 `{"error":"…"}`，不发 CLI 信封或上述 code：非空 secret 缺失 403，缺失/错误 Bearer 401，格式错误 400，实例不符 409，条目不存在 404，完整编码超限 500。旧 GET/PUT 鉴权规则不变。协议与元数据详见 [API](README.md)。
 
+### B3. service 与本地冷升级
+
+| code | 触发条件 | 恢复方式 |
+|---|---|---|
+| `SERVICE_SUBCOMMAND_UNKNOWN` / `SERVICE_ARGUMENT_INVALID` / `SERVICE_<ACTION>_ARGUMENT_INVALID` | 未知动作、缺值、非法端口或多余参数 | 使用 `zc help service`；用法错误 exit 2 |
+| `SERVICE_USER_REQUIRED` / `SERVICE_HOME_MISMATCH` | root 或 HOME 与操作系统登录用户不一致 | 用原登录用户及其 HOME；环境覆盖不授予服务管理权限 |
+| `SERVICE_NOT_REGISTERED` | 未注册却请求 restart | 显式 `zc service start -c <config> --port <port>` |
+| `SERVICE_OWNED` | 普通生命周期命令触及注册 runtime | 使用对应 service 命令；重新准备来源须显式 `-c` |
+| `SERVICE_MANUAL_INSTANCE` | 服务/安装操作遇到手动或其他调用 | 确认原 namespace，按原方式停止，再显式迁移；原实例保留 |
+| `SERVICE_EXECUTABLE_PATH_UNSUPPORTED` | Linux 二进制绝对路径含引号或反斜杠 | 在不含这些字符的路径安装后注册；空格、`$`、`%` 可用；拒绝先于配置准备与服务状态创建 |
+| `SERVICE_TARGET_MISMATCH` | 二进制路径、HOME、runtime 或平台与注册不一致 | 使用已注册安装及其环境，勿换 namespace 绕过 |
+| `SERVICE_STATE_INVALID` / `SERVICE_FOREIGN` | 注册、快照、定义缺失/损坏/内容或调用不符 | 保留现场，核查所有权及备份，不删除重建 |
+| `SERVICE_RUNNING` | start/enable 试图修改运行中配置 | 使用显式 service restart，或先停止再配置 |
+| `SERVICE_INSTANCE_MISMATCH` / `SERVICE_CONTENDED` | 管理器/daemon 身份不符、并发启动/发布 | 检查两个状态及实际进程；未证明的实例不会被停止 |
+| `SERVICE_MANAGER_UNAVAILABLE` / `SERVICE_MANAGER_FAILED` | 管理器不可执行、登录域不可用、拒绝访问或返回异常 | 检查当前用户登录会话及管理器；与 unit 不存在分开处理 |
+| `SERVICE_MANAGER_TIMEOUT` / `SERVICE_MANAGER_OUTPUT_LIMIT` | 单次命令超过 15 秒或单流输出超过 64 KiB | 检查管理器健康；输出正文不会回显 |
+| `SERVICE_START_FAILED` / `SERVICE_STOP_FAILED` | 未取得真实 readiness 或停止证明 | 停止失败恢复原注册/启动许可；若已停止，确认状态后显式 start；结果不明先核对管理器与实例 |
+| `SERVICE_START_FAILED_ROLLED_BACK` | service restart 新调用失败，旧调用已恢复 | 修复目标输入后重试；命令仍 exit 1 |
+| `SERVICE_CANDIDATE_INVALID` / `SERVICE_TARGET_INVALID` / `SERVICE_PUBLISH_FAILED` | 候选检查、安装目标或安全 staging 失败 | 保留旧安装，核查候选、目标权限与遗留进程 |
+| `SERVICE_INSTALL_INTERRUPTED` | 本地安装收到 SIGINT/SIGTERM | 等待命令回收与恢复结果；作为回滚/恢复失败的原因保留，不强杀恢复过程 |
+| `SERVICE_COMMAND_CLEANUP_FAILED` | 命令组终止或直接子进程回收失败 | 保留工件并核对遗留发布进程；锁释放本身不证明发布已结束 |
+| `SERVICE_INSTALL_ROLLED_BACK` | 冷升级失败，旧二进制与原启停状态已恢复 | 修复原因后重试；不会按默认 profile 启动 |
+| `SERVICE_RECOVERY_FAILED` | 旧二进制/精确调用恢复失败 | 保留 `.zc.recovery.*`、注册和认证快照，先核查状态再恢复 |
+| `SERVICE_FAILED` | 其他服务文件系统或状态检查失败 | 检查路径、权限、注册及日志，保留现场 |
+
+除用法错误外均 exit 1；服务命令沿用公开 CLI JSON 信封，不新增 HTTP API。冻结配置准备可能沿用既有 `CONFIG_*` / `START_*` 错误；锁或文件系统错误可通过 `SERVICE_FAILED` 报告。安装内部入口输出脱敏英文错误并返回非零，`just` 传播失败。
+
 ### C. 配置类（CONFIG_*）
 
 | code | message 示例 | hint 示例 |

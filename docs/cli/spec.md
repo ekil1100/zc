@@ -4,7 +4,7 @@
 
 ## 完整命令表
 
-所有公开命令支持 `--json`；`-c` 等同于 `--config`。裸 `config/proxy/profile/diag/connection` 输出组帮助并退出 0。每个命令接受 `help`、`--help`、`-h`，帮助请求不执行业务。
+所有公开命令支持 `--json`；`-c` 等同于 `--config`。裸 `config/proxy/profile/diag/connection/service` 输出组帮助并退出 0。每个命令接受 `help`、`--help`、`-h`，帮助请求不执行业务。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -14,6 +14,12 @@
 | `zc stop` | 别名 `down`；只停止当前 PID/nonce 绑定实例并清理对应 snapshot；已停止成功 `detail:already_stopped` |
 | `zc restart [-c <config>] [--port <port>]` | 默认复用运行实例冻结快照；显式来源/override 才重新准备；目标先冻结、后停旧实例，失败尝试精确回滚 |
 | `zc reload` | 重读 tracked source，保留 CLI 端口覆盖；当前成功路径为 restart fallback；未运行返回 `RELOAD_FAILED` |
+| `zc service start [-c <config>] [--port <port>]` | 首次注册并启动当前用户服务；以后复用注册快照；保留自启动偏好 |
+| `zc service stop` | 通过用户服务管理器停止，保留登录自启动偏好 |
+| `zc service restart [-c <config>] [--port <port>]` | 冷重启，保留自启动偏好；默认复用冻结输入，失败尝试恢复旧调用 |
+| `zc service enable [-c <config>] [--port <port>]` | 注册或设置登录自启动，保持当前启停状态 |
+| `zc service disable` | 关闭登录自启动，保持当前启停状态 |
+| `zc service status` | 分开报告 registered、loaded、running、enabled；管理器不可用明确失败 |
 | `zc status` | 实际 daemon 状态、uptime、端口、路径、select 当前选择；stopped 也是 exit 0 |
 | `zc connection list` | 列出运行实例的活动连接、来源、协议/阶段、目标、命中运行时规则和实际 leaf；需显式 controller；托管自动 secret 或非空显式 secret |
 | `zc connection close <id>` | 按完整实例绑定 ID 请求关闭；成功仅表示已请求，非已回收 |
@@ -34,7 +40,7 @@
 | `zc profile list/select/test` | `proxy` 的别名组，共用 handler；共享选择错误使用 `PROXY_*` |
 | `zc diag doctor [-c <config>]` | `zc doctor` 的别名路径 |
 
-未知 flag、多余位置参数、缺值/非法参数不得静默忽略。`restart --foreground` 拒绝；`start/restart` 共用冻结 `START_*` 参数错误码。TUI 不在帮助或 dispatch 中；`--daemon-run` 和 override worker 是内部模式，不是用户入口。
+未知 flag、多余位置参数、缺值/非法参数不得静默忽略。`restart --foreground` 拒绝；`start/restart` 共用冻结 `START_*` 参数错误码。TUI 不在帮助或 dispatch 中；`--daemon-run`、服务/安装内部模式和 override worker 是内部模式，不是用户入口。
 
 `config download/update` 的订阅 HTTP(S) 请求发送 `User-Agent: zc/<版本>`，避免服务端拒绝缺失客户端标识的请求；不冒充 Clash 或浏览器，不增加 curl 回退。仍保持 TLS 校验、直连（不读取环境代理）、30 秒超时、最多 5 次重定向和 16 MiB 响应上限。服务端返回非成功状态时保留 `CONFIG_DOWNLOAD_FAILED` / `CONFIG_UPDATE_FAILED` 错误码，消息明确给出 HTTP 状态码并提示检查订阅是否开启、有效、可访问；不回显订阅 URL 或响应正文，也不发布失败响应。
 
@@ -65,6 +71,53 @@
 - `--foreground` 实例由 systemd/容器等 supervisor 管理，CLI reload/restart 拒绝并提示 supervisor。
 - `config load/use` 仅持久化，不自动 apply。要显式切换运行来源可用 `restart -c <name>`；默认 restart 不等价于“读取最新 active”。
 - `config update/override` 提交成功后才尝试 live apply。当前 `auto/hot` 均走 prepared restart fallback，`restart` 显式走 restart；不承诺热切换或存量流量 drain。apply 失败不撤销已经提交的新 revision，错误会说明 persisted-but-not-applied。
+
+## 当前用户服务
+
+支持 macOS 登录 LaunchAgent 和 Linux `systemd --user`；用户登录后运行，不提供登录前启动、root/system-wide 服务或自动 linger。macOS 需要当前用户的 GUI 登录域，Linux 需要可访问的 user manager。服务进程保持前台，当前无崩溃自动重启承诺。
+
+```bash
+zc service start -c <profile-or-file> --port 17890
+zc service enable                  # Keep the current running/stopped state.
+zc service status --json
+zc service stop                    # Keep login autostart enabled.
+zc service disable                 # Leave a running service running.
+```
+
+一份注册绑定一个 HOME、绝对二进制路径和 runtime namespace。原生管理器操作要求 HOME 与操作系统登录账户一致；HOME 覆盖不提供其他用户服务的操作权限。重复命令须使用注册的安装路径与 runtime 环境；不匹配时拒绝，不收养其他实例。Linux 管理器连接使用当前 UID 的 `/run/user/<uid>/bus`，与 zc 选择的 runtime 路径分开。
+
+Linux 服务的**可执行文件路径**接受空格、`$`、`%`，按 systemd 原生规则编码；单引号、双引号和反斜杠即使转义也会被 systemd 拒绝。zc 在配置准备、锁文件或服务状态创建之前检查解析后的绝对路径，返回 `SERVICE_EXECUTABLE_PATH_UNSUPPORTED`；请先把二进制安装到不含这些字符的目录。macOS 使用 plist 参数数组，支持上述字符。两平台路径均要求有效 UTF-8，拒绝控制字符。
+
+首次 start/enable 冻结配置、providers、认证信息和选择；只有这次缺省来源才取 active profile，端口仍为显式 `--port` 或 7899。以后普通 start/restart 复用快照，原来源删除或 active 切换不影响它。显式 `-c` 重新准备来源；只传 `--port` 修改冻结端口。运行中改变配置使用 `service restart`；start/enable 的显式配置变更要求先停止。停止态 enable 可配置下次启动，保持停止。
+
+注册快照保留注册或上次捕获的选择；启动不会偷偷切到新的 active/head。离线 profile 选择或来源变更要明确应用时，使用 `zc service restart -c <profile>`。运行态 stop/restart/安装升级在停止前捕获已应用的选择；托管 profile 的自动 controller secret 沿用既有生成与冻结规则，enable 的首次配置准备也可能生成该私有值。定义文件、argv、环境和管理器错误输出均不包含它。
+
+注册位于 `$HOME/.local/state/zc/service/registration.json`，认证快照和私有定义在同一私有目录。macOS 登录副本为 `~/Library/LaunchAgents/org.zc.user.plist`；Linux 定义为 `~/.config/systemd/user/zc-user.service`。只接受与注册逐字节一致的定义，拒绝外来内容、drop-ins、错误的已加载调用、缺失或损坏状态，保留现场。不要手工编辑定义或删除注册来绕过检查。服务和安装检查只验证既有 schema-2 catalog，缺失时不从兼容镜像重建；有效旧格式应先通过原配置命令明确完成既有迁移流程。
+
+stop/restart 的停止步骤失败时，恢复逐字节原注册、原启动许可和原冻结输入；显式新端口尚未提交。命令仍报错，并根据证据说明原实例仍在、服务已停止或结果不明。管理器可能已执行停止后才报错；此时保留停止状态，确认 `service status` 后显式 `service start` 恢复原冻结调用。身份变化或无法核实时只报结果不明，保留现场，不补发停止请求或认领新实例。
+
+成功的配置变更、已应用选择捕获与安装事务，只清理本事务确实替换、且再次通过认证的旧服务快照；正常重复成功操作保留一份当前冻结快照。失败恢复仍需的输入、无法认证的文件和非本事务旧文件保留。运行时快照的清理覆盖二进制锁竞争、早期观测初始化失败及异步取消；服务冻结快照与其他 nonce 的状态分别保留。
+
+macOS 用登录副本表达自启动：stop 通过 bootout 卸载当前任务，保留副本；disable 仅移除验证属于注册的副本，保留运行实例。start/enable 会清除该受控 label 的外部 disabled 状态，因为 launchd 拒绝加载 disabled job；未启用自启动时仍从私有定义显式加载。若外部 disabled 状态与登录副本共存，start 先移除受控登录副本，再恢复可加载性，保持实际自启动关闭。Linux 使用 enable/disable，均不带 `--now`；stop 不改变 enablement。
+
+JSON 的四个布尔字段含义：
+
+| 字段 | 证据 |
+| --- | --- |
+| `registered` | 私有注册、认证快照和定义通过校验 |
+| `loaded` | 当前用户管理器中存在已核对的定义；systemd 的停止态 unit 也可 loaded |
+| `running` | 管理器 PID 与 daemon 的服务身份、PID/nonce、实例锁及 ready descriptor 一致 |
+| `enabled` | 实际登录自启动状态；不是“现在正在运行” |
+
+注册时另有 `binary/runtime/configured_port`；运行时提供 `pid/mixed_port`。管理器启动命令成功后最多等待 10 秒验证 readiness；单次管理器命令最多 15 秒，stdout/stderr 各最多 64 KiB。不存在 unit 与管理器不可用/拒绝访问分开处理；错误、身份不匹配或启动中状态不会伪报 ready。
+
+### 所有权与手动迁移
+
+服务管理操作和本地安装串行，停止前复查捕获的实例；发布使用独占二进制锁，运行实例持有共享锁。安装目录中的 `.zc.install.guard/.zc.binary.lock` 为稳定锁文件，保留其 inode。运行 root-owned 分发版本的普通 daemon 不需要写入其安装目录；当前用户安装目录须可写以建立锁。
+
+普通 `zc start/stop/restart/reload` 保留手动实例语义；注册 runtime 的生命周期由 `zc service` 管理，普通入口返回 `SERVICE_OWNED`，避免绕过管理器或误恢复默认配置。服务命令也拒绝接管手动实例。迁移顺序：确认原 HOME/runtime、配置和端口 → 用原来的 `zc stop` 或 supervisor 停止 → 显式 `zc service start -c <config> --port <port>`。迁移需要重新准备输入，来源不可用时保留手动安装并先恢复来源，不自动停止它。
+
+服务重启和安装升级均为冷切换，存量连接可能关闭；不承诺热升级或连接 drain。安装与失败恢复见[本地安装](../install/README.md#可选的本地安装)。
 
 ## 状态、快照与持久选择
 

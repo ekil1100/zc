@@ -8,9 +8,12 @@ command -v cc >/dev/null 2>&1 || {
   echo "LOCAL_DEV_INSTALL_REASON=missing_cc"
   exit 1
 }
-TMP_DIR="/tmp/zc-local-dev-install"
-
-rm -rf "$TMP_DIR"
+REAL_ZC_BIN="${ZC_BIN:-$ROOT_DIR/target/debug/zc}"
+[[ -x "$REAL_ZC_BIN" ]] || { echo "Build the Rust candidate before this regression" >&2; exit 1; }
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zc-local-dev-install.XXXXXX")"
+TMP_DIR="$(cd "$TMP_DIR" && pwd -P)"
+mkdir -m 700 "$TMP_DIR/home" "$TMP_DIR/runtime"
+export HOME="$TMP_DIR/home" XDG_RUNTIME_DIR="$TMP_DIR/runtime"
 mkdir -p "$TMP_DIR/src" "$TMP_DIR/bin"
 
 TARGET="$TMP_DIR/bin/zc"
@@ -32,11 +35,9 @@ printf 'old\n'
 EOF
 chmod +x "$TARGET"
 
-cat >"$SOURCE" <<'EOF'
-#!/usr/bin/env bash
-printf 'new\n'
-EOF
+cp "$REAL_ZC_BIN" "$SOURCE"
 chmod +x "$SOURCE"
+export EXPECTED_ZC_VERSION="$("$SOURCE" --version)"
 
 cat >"$HOOK" <<'EOF'
 #!/usr/bin/env bash
@@ -48,13 +49,13 @@ staged="$2"
 [[ -x "$target" ]]
 [[ "$("$target")" == "old" ]]
 [[ -f "$staged" ]]
-[[ "$("$staged")" == "new" ]]
+[[ "$("$staged" --version)" == "$EXPECTED_ZC_VERSION" ]]
 EOF
 chmod +x "$HOOK"
 
 ZC_INSTALL_BEFORE_PROMOTE_HOOK="$HOOK" bash "$INSTALLER" --source "$SOURCE" --target-dir "$TMP_DIR/bin"
 
-if [[ "$("$TARGET")" != "new" ]]; then
+if [[ "$("$TARGET" --version)" != "$EXPECTED_ZC_VERSION" ]]; then
   echo "LOCAL_DEV_INSTALL_REGRESSION=FAIL"
   echo "LOCAL_DEV_INSTALL_REASON=target_not_replaced"
   exit 1
@@ -117,13 +118,24 @@ running_target_pid=""
 echo "LOCAL_DEV_INSTALL_RUNNING_TARGET=PASS"
 
 race_ready="$TMP_DIR/race-target.ready"
-race_pid_file="$TMP_DIR/race-target.pid"
+race_trigger="$TMP_DIR/race-target.trigger"
+# Race from an independent actor, not a publisher child. Command-group cleanup
+# must terminate publisher helpers while leaving this unrelated target alive.
+(
+  attempt=0
+  while [[ "$attempt" -lt 1000 ]]; do
+    if [[ -f "$race_trigger" ]]; then exec "$TARGET" "$race_ready"; fi
+    attempt=$((attempt + 1))
+    sleep 0.01
+  done
+  exit 1
+) &
+running_target_pid=$!
 race_hook="$TMP_DIR/start-target-before-promote.sh"
 cat >"$race_hook" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-"\$1" "$race_ready" &
-echo \$! >"$race_pid_file"
+touch "$race_trigger"
 attempt=0
 while [[ \$attempt -lt 100 ]]; do
   [[ ! -f "$race_ready" ]] || exit 0
@@ -140,7 +152,6 @@ if ZC_INSTALL_BEFORE_PROMOTE_HOOK="$race_hook" \
   echo "LOCAL_DEV_INSTALL_REASON=running_race_should_fail"
   exit 1
 fi
-running_target_pid="$(cat "$race_pid_file")"
 if ! kill -0 "$running_target_pid" >/dev/null 2>&1; then
   echo "LOCAL_DEV_INSTALL_REGRESSION=FAIL"
   echo "LOCAL_DEV_INSTALL_REASON=running_race_target_was_terminated"

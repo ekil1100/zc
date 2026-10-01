@@ -19,6 +19,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 | `src/main.rs`、`src/cli.rs` | 命令表、别名、冻结错误码、JSON/text 输出、用户操作编排 |
 | `src/store.rs`、`src/fsutil.rs` | schema-2 catalog、不可变 revision、旧数据接管、CAS、owner-only 路径与原子持久化 |
 | `src/service.rs` | 解析配置身份，准备 provider/override/selection，冻结启动输入 |
+| `src/user_service.rs` | 用户服务注册与管理器适配、冻结调用、本地冷发布和失败恢复 |
 | `src/daemon.rs` | PID/lock/nonce 身份、认证快照、readiness、stop/restart/回滚、live selection |
 | `src/api.rs` | 有界 loopback minimal HTTP API、Bearer 与 managed generation 校验 |
 | `src/config.rs`、`src/config_provider.rs` | 有界 YAML、规则展开、select 索引与路由 |
@@ -240,3 +241,12 @@ cargo clippy --offline --locked --lib --test provider_cache --test service --tes
 运行快照独立冻结实际采用的自动 secret overlay，**有 overlay 必须 schema 2**，防止旧 Rust 的宽松 Prepared reader 忽略字段而无 secret 启动。新 reader 严格区分 schema 1（无 overlay）和 schema 2（完整合法 overlay，仅 managed、有 controller、原 source 无非空显式 secret）；坏字段、null、缺失及 HMAC 篡改均拒绝，解码错误不输出字段值。没有 overlay 继续 schema 1；旧 Rust 和认证 legacy Zig YAML 保持原 source secret，不查询新 profile 状态。需要启用自动值须显式 `restart -c <profile>`；默认 restart、readiness/selection 重写及失败回滚保留冻结认证。当前 head 已变更时既有 readiness 拒绝及精确回滚策略不变。
 
 实现与验收记录：`target/profile-secret/implementation-validation.md`；新增公共边界测试为 `tests/profile_secret.rs`、`tests/store.rs` 与 `tests/connections_cli.rs`。旧 Rust/Zig binary 对照为显式可选用例，普通测试不自动构建或运行历史 binary。仅临时 HOME/loopback，未安装或操作在用实例；本轮不声称性能、四平台、安装回滚或 24/72 小时长稳通过。
+
+
+## 用户服务与本地冷升级
+
+本次用户授权范围、验收契约与验证结果见 [契约](../service-upgrade-contract.md)、[验证](../service-upgrade-validation.md)。新增 `zc service` 与本地安装器状态保持冷升级；不追随旧 Zig 热升级提案，不提供无中断切换。
+
+仅服务实例在 descriptor 末尾写可选 `service_id`，与注册、管理器 PID、nonce、认证快照及实例锁共同校验。普通手动实例省略该字段，原 descriptor canonical bytes 保持；旧严格 reader 可能拒绝新服务 descriptor。自动恢复适用于已经接受原注册/快照格式的旧服务二进制，不把它扩写为任意历史版本的数据格式回退。恢复兼容边界与完整状态备份要求保持。
+
+本机新服务测试使用独立管理器替身和真实隔离 daemon/二进制发布；没有真实用户服务变更或生产安装。首轮累计去重 227 项定向回归通过、3 项历史二进制忽略，以及未解决的 override_spawn 失败分别记录。后续服务恢复修复的当前定向验证为 185 passed / 3 ignored，含 27 项用户服务测试、36 个中断/超时子场景；本轮未运行 override_spawn。详细红绿、人工恢复边界及原生 Linux 待验证项见上述验证文档；构建/Clippy 通过不代替原生平台、性能、四平台或长稳证据。

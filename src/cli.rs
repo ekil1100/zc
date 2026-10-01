@@ -52,6 +52,12 @@ fn usage(code: &str, command: &str) -> anyhow::Error {
 
 const COMMANDS: &[(&str, &str)] = &[
     ("start", "[-c <config>] [--port <port>] [--foreground]"),
+    ("service start", "[-c <config>] [--port <port>]"),
+    ("service stop", ""),
+    ("service restart", "[-c <config>] [--port <port>]"),
+    ("service enable", "[-c <config>] [--port <port>]"),
+    ("service disable", ""),
+    ("service status", ""),
     ("stop", ""),
     ("restart", "[-c <config>] [--port <port>]"),
     ("reload", ""),
@@ -79,7 +85,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("diag doctor", "[-c <config>]"),
 ];
 fn group(s: &str) -> bool {
-    matches!(s, "config" | "proxy" | "profile" | "diag" | "connection")
+    matches!(
+        s,
+        "config" | "proxy" | "profile" | "diag" | "connection" | "service"
+    )
 }
 fn canonical(s: &str) -> &str {
     match s {
@@ -105,7 +114,7 @@ fn help(topic: &str) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n");
         return Ok(format!(
-            "zc {} — proxy runtime\n\nUsage: zc <command> [options]\n\nCommands:\n{commands}\n  config\n  proxy\n  profile\n  diag\n  connection\n  help\n\nAliases: up = start, down = stop, ls = list\n\nOptions:\n  --json        Machine-readable output\n  --no-color    Disable ANSI colors\n\nExamples:\n  zc help start\n",
+            "zc {} — proxy runtime\n\nUsage: zc <command> [options]\n\nCommands:\n{commands}\n  config\n  proxy\n  profile\n  diag\n  connection\n  service\n  help\n\nAliases: up = start, down = stop, ls = list\n\nOptions:\n  --json        Machine-readable output\n  --no-color    Disable ANSI colors\n\nExamples:\n  zc help start\n",
             env!("CARGO_PKG_VERSION")
         ));
     }
@@ -204,7 +213,7 @@ fn parse(path: &str, tokens: &[String]) -> Result<Args> {
             normalized,
             "--override-script" | "--override-arg" | "--override-timeout-ms"
         );
-        if override_flag && path.starts_with("connection ") {
+        if override_flag && (path.starts_with("connection ") || path.starts_with("service ")) {
             return Err(usage(&argument_code(path), path));
         }
         let takes_value = override_flag
@@ -212,6 +221,9 @@ fn parse(path: &str, tokens: &[String]) -> Result<Args> {
                 "-c" => matches!(
                     path,
                     "start"
+                        | "service start"
+                        | "service restart"
+                        | "service enable"
                         | "restart"
                         | "test"
                         | "doctor"
@@ -226,7 +238,14 @@ fn parse(path: &str, tokens: &[String]) -> Result<Args> {
                 ),
                 "--port" => matches!(
                     path,
-                    "start" | "restart" | "test" | "proxy test" | "profile test"
+                    "start"
+                        | "restart"
+                        | "test"
+                        | "proxy test"
+                        | "profile test"
+                        | "service start"
+                        | "service restart"
+                        | "service enable"
                 ),
                 "-n" => matches!(path, "log" | "config download"),
                 "--apply" => path == "config update",
@@ -373,6 +392,20 @@ fn safe_text(text: &str) -> String {
 
 /// Run ordinary CLI dispatch, returning the stable process exit code.
 pub async fn run(tokens: Vec<String>) -> u8 {
+    run_with_services(
+        tokens,
+        &crate::user_service::Native,
+        &std::env::current_exe().unwrap_or_default(),
+    )
+    .await
+}
+
+/// Public CLI with an explicit service-manager execution seam.
+pub async fn run_with_services(
+    tokens: Vec<String>,
+    runner: &dyn crate::user_service::CommandRunner,
+    binary: &Path,
+) -> u8 {
     let json_mode = tokens.iter().any(|t| t == "--json");
     let mut command = String::new();
     let result: Result<Output> = async {
@@ -399,7 +432,7 @@ pub async fn run(tokens: Vec<String>) -> u8 {
         }
         command = canonical(&tokens[0]).into();
         let mut start = 1;
-        if command == "connection"
+        if matches!(command.as_str(), "connection" | "service")
             && tokens
                 .get(1)
                 .is_some_and(|v| matches!(v.as_str(), "--json" | "--no-color"))
@@ -410,7 +443,10 @@ pub async fn run(tokens: Vec<String>) -> u8 {
                 .iter()
                 .any(|v| matches!(v.as_str(), "-h" | "--help"))
         {
-            return Err(usage("CONNECTION_ARGUMENT_INVALID", "connection"));
+            return Err(usage(
+                &format!("{}_ARGUMENT_INVALID", command.to_uppercase()),
+                &command,
+            ));
         }
         if group(&command) {
             if tokens.len() == 1
@@ -453,7 +489,13 @@ pub async fn run(tokens: Vec<String>) -> u8 {
             return Ok(Output::Raw(help(&command)?));
         }
         let args = parse(&command, &tokens[start..])?;
-        dispatch(&args).await
+        if let Some(action) = args.path.strip_prefix("service ") {
+            Ok(Output::Data(
+                crate::user_service::execute(action, args.prepare(), binary, runner).await?,
+            ))
+        } else {
+            dispatch(&args).await
+        }
     }
     .await;
     match result {
@@ -589,6 +631,7 @@ fn map_error(command: &str, error: anyhow::Error) -> Failure {
         "config update" => "CONFIG_UPDATE_FAILED",
         "config download" => "CONFIG_DOWNLOAD_FAILED",
         "config delete" => "CONFIG_DELETE_FAILED",
+        path if path.starts_with("service ") => "SERVICE_FAILED",
         _ => "COMMAND_UNKNOWN",
     };
     let mut code = default_code.to_owned();
@@ -668,6 +711,11 @@ fn map_error(command: &str, error: anyhow::Error) -> Failure {
         "CONFIG_CAPABILITY_UNSUPPORTED" if command=="config update"=>"repair the subscription source and retry `zc config update`",
         "CONFIG_CAPABILITY_UNSUPPORTED"=>"retry download without -d; inspect `zc config dump -c <name> --no-override`, then repair the subscription source",
         "START_CONFIG_NOT_SELECTED"|"RESTART_CONFIG_NOT_SELECTED"=>"run `zc config list`, then `zc config use <name>`",
+        "SERVICE_OWNED"=>"use `zc service start/stop/restart`; explicit `-c` reprepares a service configuration",
+        "SERVICE_MANUAL_INSTANCE"=>"confirm the exact manual runtime, stop it with its original command, then run `zc service start -c <config> --port <port>`",
+        "SERVICE_FOREIGN"|"SERVICE_STATE_INVALID"=>"retain the registration, unit and snapshot; inspect ownership and restore a verified backup instead of deleting state",
+        "SERVICE_TARGET_MISMATCH"=>"use the registered executable, HOME and XDG_RUNTIME_DIR; do not switch namespace to bypass the check",
+        "SERVICE_MANAGER_FAILED"|"SERVICE_MANAGER_UNAVAILABLE"=>"check the current user's login session and service-manager access; no sudo or linger is needed",
         "CONFIG_NAME_INVALID"=>"use 1-250 UTF-8 bytes, excluding slashes, controls, . and ..",
         "CONFIG_ALREADY_EXISTS"=>"choose another name or run `zc config update`",
         "CONFIG_NOT_FOUND"=>"run `zc config list` and pick an existing config name",
@@ -695,6 +743,23 @@ fn map_error(command: &str, error: anyhow::Error) -> Failure {
 }
 
 fn render_text(command: &str, data: &Value) {
+    if command.starts_with("service ") {
+        for (label, key) in [
+            ("Registered", "registered"),
+            ("Loaded", "loaded"),
+            ("Running", "running"),
+            ("Login autostart", "enabled"),
+        ] {
+            println!("{label}: {}", if data[key] == true { "yes" } else { "no" });
+        }
+        if let Some(pid) = data["pid"].as_u64() {
+            println!("PID: {pid}");
+        }
+        if let Some(port) = data["mixed_port"].as_u64() {
+            println!("Port: {port}");
+        }
+        return;
+    }
     match command {
         "version" => println!("zc {}", env!("CARGO_PKG_VERSION")),
         "connection list" => {
@@ -845,6 +910,7 @@ async fn dispatch(args: &Args) -> Result<Output> {
             daemon::connections(Some(&args.positionals[0])).await?,
         )),
         "restart" | "reload" => {
+            crate::user_service::check_manual_ownership()?;
             let captured = daemon::capture_restart().await?;
             let current = captured.prepared.clone();
             if args.path == "reload" && current.is_none() {

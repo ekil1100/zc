@@ -6,7 +6,8 @@ command -v cc >/dev/null 2>&1 || {
     echo "TEST_RESULT=FAIL missing cc" >&2
     exit 1
 }
-real_zc_bin="${1:-}"
+real_zc_bin="${1:-$repo_root/target/debug/zc}"
+[[ -x "$real_zc_bin" ]] || { echo "Build the Rust candidate before this regression" >&2; exit 1; }
 port_helper_bin="${2:-}"
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/zc-installer-e2e.XXXXXX")"
 real_home=""
@@ -53,7 +54,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-version="v9.8.7"
+work_root="$(cd "$work_root" && pwd -P)"
+mkdir -m 700 "$work_root/home"
+export HOME="$work_root/home"
+unset XDG_RUNTIME_DIR
+cd "$work_root"
+version="v$("$real_zc_bin" --version | sed 's/^zc //')"
 release_root="$work_root/releases"
 release_dir="$release_root/$version"
 install_dir="$work_root/install"
@@ -99,6 +105,11 @@ EOF
     chmod 755 "$work_root/package/$package_name/zc"
 }
 
+write_supported_binary() {
+    cp "$real_zc_bin" "$work_root/package/$package_name/zc"
+    chmod 755 "$work_root/package/$package_name/zc"
+}
+
 write_checksum() {
     local archive_path="$release_dir/$archive_name"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -119,7 +130,7 @@ run_installer() {
     ZC_VERSION="$version" \
         ZC_INSTALL_DIR="$install_dir" \
         ZC_RELEASE_BASE_URL="file://$release_root" \
-        /bin/sh "$repo_root/install.sh"
+        /bin/sh <"$repo_root/install.sh"
 }
 
 run_latest_installer_from_stdin() {
@@ -130,7 +141,23 @@ run_latest_installer_from_stdin() {
         /bin/sh <"$repo_root/install.sh"
 }
 
+# Legacy candidates must be rejected before any publication, even when their
+# version is correct. No old shell installation state machine is permitted.
 write_fixture_binary "${version#v}"
+package_fixture
+cp "$work_root/package/$package_name/zc" "$install_dir/zc"
+printf '# legacy sentinel\n' >>"$install_dir/zc"
+chmod 755 "$install_dir/zc"
+if run_installer >"$work_root/legacy.out" 2>&1; then
+    echo "legacy candidate without the install contract unexpectedly installed" >&2
+    exit 1
+fi
+grep -q 'legacy sentinel' "$install_dir/zc"
+grep -q 'ZC_VERSION' "$work_root/legacy.out"
+rm "$install_dir/zc"
+echo "INSTALLER_LEGACY_CONTRACT_REFUSAL=PASS"
+
+write_supported_binary
 package_fixture
 
 default_home="$work_root/default-home"
@@ -261,7 +288,7 @@ fi
 test "$("$install_dir/zc")" = "zc preserved"
 echo "INSTALLER_SELF_CHECK_FAIL_CLOSED=PASS"
 
-write_fixture_binary "${version#v}"
+write_supported_binary
 package_fixture
 mkdir "$install_dir/.zc.install.lock"
 if run_installer >/dev/null 2>&1; then
@@ -298,6 +325,15 @@ test "$("$install_dir/zc")" = "zc symlink sentinel"
 rm "$install_dir/zc"
 echo "INSTALLER_SYMLINK_TARGET_FAIL_CLOSED=PASS"
 
+mkfifo "$install_dir/zc"
+if run_installer >"$work_root/fifo.out" 2>&1; then
+    echo "FIFO target was unexpectedly replaced" >&2
+    exit 1
+fi
+test -p "$install_dir/zc"
+rm "$install_dir/zc"
+echo "INSTALLER_NONREGULAR_TARGET_FAIL_CLOSED=PASS"
+
 write_fixture_binary "${version#v}" running
 package_fixture
 cat >"$install_dir/zc" <<'EOF'
@@ -313,74 +349,20 @@ fi
 EOF
 chmod 755 "$install_dir/zc"
 if run_installer >/dev/null 2>&1; then
-    echo "daemon start race was unexpectedly accepted" >&2
+    echo "legacy status-only candidate was unexpectedly accepted" >&2
     exit 1
 fi
 test "$("$install_dir/zc" --version)" = "zc previous-race"
-echo "INSTALLER_START_RACE_ROLLBACK=PASS"
+echo "INSTALLER_LEGACY_STATUS_CANDIDATE_REFUSED=PASS"
 
-status_marker="$work_root/status-marker"
-cat >"$work_root/package/$package_name/zc" <<EOF
-#!/bin/sh
-if [ "\${1:-}" = "--version" ]; then
-    echo "zc ${version#v}"
-    exit 0
-fi
-if [ "\${1:-}" = "status" ]; then
-    : >"\$ZC_TEST_STATUS_MARKER"
-    sleep 2
-    echo '{"ok":true,"data":{"state":"stopped"}}'
-    exit 0
-fi
-EOF
-chmod 755 "$work_root/package/$package_name/zc"
+write_supported_binary
 package_fixture
-cat >"$install_dir/zc" <<'EOF'
-#!/bin/sh
-if [ "${1:-}" = "--version" ]; then
-    echo "zc previous-signal"
-    exit 0
-fi
-if [ "${1:-}" = "status" ]; then
-    echo '{"ok":true,"data":{"state":"stopped"}}'
-    exit 0
-fi
-EOF
-chmod 755 "$install_dir/zc"
-ZC_TEST_STATUS_MARKER="$status_marker" \
-    ZC_VERSION="$version" \
-    ZC_INSTALL_DIR="$install_dir" \
-    ZC_RELEASE_BASE_URL="file://$release_root" \
-    /bin/sh "$repo_root/install.sh" >/dev/null 2>&1 &
-signal_installer_pid=$!
-status_attempt=0
-while [ "$status_attempt" -lt 100 ]; do
-    if [ -f "$status_marker" ]; then
-        break
-    fi
-    status_attempt=$((status_attempt + 1))
-    sleep 0.05
-done
-test -f "$status_marker"
-kill -TERM "$signal_installer_pid"
-if wait "$signal_installer_pid"; then
-    echo "interrupted installer unexpectedly succeeded" >&2
-    exit 1
-fi
-signal_installer_pid=""
-test "$("$install_dir/zc" --version)" = "zc previous-signal"
-for transaction_path in \
-    "$install_dir"/.zc.tmp.* \
-    "$install_dir"/.zc.backup.* \
-    "$install_dir"/.zc.install.lock; do
-    if [ -e "$transaction_path" ]; then
-        echo "interrupted installer leaked transaction artifact: $transaction_path" >&2
-        exit 1
-    fi
-done
+python3 "$repo_root/scripts/install/test-install-checks.py"
+python3 "$repo_root/scripts/install/test-install-signals.py" "$repo_root/install.sh" \
+    "$release_root" "$version" "$real_zc_bin" "$work_root"
 echo "INSTALLER_SIGNAL_ROLLBACK=PASS"
 
-write_fixture_binary "${version#v}"
+write_fixture_binary "${version#v}" running
 package_fixture
 cat >"$install_dir/zc" <<'EOF'
 #!/bin/sh
@@ -396,7 +378,10 @@ if run_installer >/dev/null 2>&1; then
     exit 1
 fi
 test "$("$install_dir/zc")" = "zc running sentinel"
-echo "INSTALLER_RUNNING_TARGET_FAIL_CLOSED=PASS"
+echo "INSTALLER_LEGACY_RUNNING_STATUS_REFUSED=PASS"
+
+write_supported_binary
+package_fixture
 
 cat >"$work_root/orphan-target.c" <<'EOF'
 #include <stdio.h>
@@ -447,6 +432,8 @@ kill "$orphan_target_pid" >/dev/null 2>&1 || true
 wait "$orphan_target_pid" >/dev/null 2>&1 || true
 orphan_target_pid=""
 echo "INSTALLER_ORPHAN_TARGET_FAIL_CLOSED=PASS"
+python3 "$repo_root/scripts/install/test-release-safety.py" "$repo_root/install.sh" \
+    "$work_root" "$real_zc_bin" "$version" "$package_name"
 
 if [ -n "$real_zc_bin" ] && [ -n "$port_helper_bin" ]; then
     real_home="$work_root/real-home"
@@ -491,4 +478,7 @@ EOF
     echo "INSTALLER_REAL_DAEMON_FAIL_CLOSED=PASS"
 fi
 
+service_fixture="${ZC_INSTALL_SERVICE_FIXTURE:-$(dirname "$real_zc_bin")/examples/e2e_service_install}"
+[[ -x "$service_fixture" ]] || { echo "Build e2e_service_install before this regression" >&2; exit 1; }
+python3 "$repo_root/scripts/install/test-release-service.py" "$repo_root" "$service_fixture" "$work_root"
 echo "INSTALLER_E2E_RESULT=PASS"

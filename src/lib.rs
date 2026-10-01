@@ -17,3 +17,5 @@ pub mod simple_obfs;
 pub mod store;
 pub mod target;
 pub mod udp;
+
+pub mod user_service;

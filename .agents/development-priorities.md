@@ -41,6 +41,15 @@
 - **分层日志已实现并完成主工作区合并前验证，未安装**：保留六阶段，新增有限来源分类，区分目标/节点解析、连接、TLS 与代理协议准备；161 项相关回归通过，1 项五分钟 UDP idle 忽略，格式及严格 all-targets Clippy 通过。证据见 [分层故障观测验收](reliability/dns-failure-observation.md)。不承诺检测 DNS 错答或隧道内客户端 TLS 错误。
 - **`zc test` 可用性与实际路径已实现并完成合并验证，未安装**：全部目标成功才 exit 0；鉴权、实例绑定的单次票据记录 HTTP forward 实际 leaf，分别统计直连/代理/拒绝/未知路径。缺 controller 或证据时明确未知及原因，不用配置猜测。合并分层日志后 187 项相关回归通过，4 项忽略（3 项历史二进制、1 项已在分支独立通过的真实 120 秒到期测试）；格式及严格 all-targets Clippy 通过。证据见 [可用性与实际路径验收](reliability/test-availability.md)。
 
+### 当前用户服务与本地冷升级
+
+- 用户确认新增 `zc service start/stop/restart/enable/disable/status`：macOS 登录 LaunchAgent、Linux systemd user；无 sudo、登录前运行、系统级服务或自动 linger。
+- **实现及隔离定向验证已完成，未安装到真实用户环境**：自启动与启停分离，注册/加载/真实 readiness/自启动状态独立；注册绑定安装路径与 runtime，冻结配置、认证和节点选择。手动实例显式迁移，保持安全拒绝。
+- `just install` 构建并检查私有候选后，通过管理器冷停止并发布；仅恢复原本运行的服务。失败尝试旧二进制和精确旧快照，恢复失败保留证据并明确报错。共享二进制锁与现有 launch/instance 锁保护跨 namespace 的运行目标；不按 PID 猜测停止。
+- 定向 Rust 回归累计去重 **227 项通过、3 项忽略**（完整定向 185 项通过，随后严格 catalog 读取补强的受影响范围 74 项通过）；其中用户服务 17 项测试在临时 HOME/runtime 中用独立管理器替身和真实 daemon/发布验证两种适配器。Justfile 15 项、本地发布拒绝/竞态回归、发布工作流契约、格式与严格 all-targets Clippy 通过。
+- 未修改的 `override_spawn` 套件在首轮有 2 项失败，单独复测有 6 项失败（含后继锁中毒）；断言和期限保持原样，根因及与本轮改动的关系尚无独立基线证明。完整测试全绿仍未取得。
+- 未运行真实 launchctl/systemctl 变更、原生登录/注销、四平台、性能或长稳门禁；连接可能关闭。契约、主源依据、完整命令和边界见 [用户服务与冷升级验证](service-upgrade-validation.md)。此项记录用户本次已批准范围，不改变其余优先级。
+
 ## P1：SS / Trojan / AnyTLS
 
 - 用户确认常用协议为 SS、Trojan、AnyTLS，先实现 AnyTLS。只读检查当前运行 profile 对应配置，90 个 SS 节点均为 `aes-128-gcm`，当前选中 SS 也是该算法；已有支持，无需优先补 AEAD-2022。未记录节点地址、密码或订阅信息。

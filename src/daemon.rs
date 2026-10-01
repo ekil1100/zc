@@ -93,6 +93,8 @@ struct Descriptor {
     generation: u64,
     ready: bool,
     invocation: Option<Invocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_id: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +206,10 @@ fn read_descriptor(dir: &SecureDir) -> Result<Option<Descriptor>> {
             "RUNTIME_DESCRIPTOR_INVALID: invalid endpoint"
         );
     }
+    ensure!(
+        d.service_id.as_ref().is_none_or(|id| valid_hex(id, 32)),
+        "RUNTIME_DESCRIPTOR_INVALID: invalid service identity"
+    );
     if let Some(invocation) = &d.invocation {
         ensure!(
             !(invocation.prepared && invocation.foreground)
@@ -299,13 +305,16 @@ fn daemon_process(pid: u32) -> Result<bool> {
     let Some(binary) = args.first().and_then(|a| std::str::from_utf8(a).ok()) else {
         return Ok(false);
     };
-    if !matches!(
-        Path::new(binary).file_name().and_then(|n| n.to_str()),
-        Some("zc" | "zclash")
-    ) {
+    if !args.contains(&b"--service-run".as_slice())
+        && !matches!(
+            Path::new(binary).file_name().and_then(|n| n.to_str()),
+            Some("zc" | "zclash")
+        )
+    {
         return Ok(false);
     }
-    Ok(args.contains(&b"--daemon-run".as_slice())
+    Ok(args.contains(&b"--service-run".as_slice())
+        || args.contains(&b"--daemon-run".as_slice())
         || (args.contains(&b"--foreground".as_slice())
             && args.iter().skip(1).find(|a| !a.starts_with(b"-")) == Some(&&b"start"[..])))
 }
@@ -444,7 +453,7 @@ fn snapshot_key(dir: &SecureDir, create: bool) -> Result<Vec<u8>> {
     );
     Ok(key)
 }
-fn save_snapshot(dir: &SecureDir, prepared: Prepared, nonce: &str) -> Result<String> {
+pub(crate) fn save_snapshot(dir: &SecureDir, prepared: Prepared, nonce: &str) -> Result<String> {
     let bytes = encode(&Snapshot {
         schema_version: if prepared.controller_secret.is_some() {
             2
@@ -471,7 +480,7 @@ fn save_snapshot(dir: &SecureDir, prepared: Prepared, nonce: &str) -> Result<Str
     }
     Ok(name)
 }
-fn load_snapshot(dir: &SecureDir, name: &str, nonce: &str) -> Result<Prepared> {
+pub(crate) fn load_snapshot(dir: &SecureDir, name: &str, nonce: &str) -> Result<Prepared> {
     ensure!(
         valid_hex(nonce, 32) && fsutil::single_component(name),
         "START_SNAPSHOT_INVALID: invalid snapshot name"
@@ -701,7 +710,7 @@ fn remove_descriptor_snapshot(runtime: &Directory, d: &Descriptor) {
         name.ends_with(".yaml") && load_zig_prepared(&runtime.dir, name, d).is_ok();
     if path.parent() != Some(runtime.path.as_path())
         || !name.starts_with("zc.prepared.")
-        || (!name.ends_with(&format!(".{}.snapshot", d.nonce)) && !authenticated_yaml)
+        || (load_snapshot(&runtime.dir, name, &d.nonce).is_err() && !authenticated_yaml)
     {
         return;
     }
@@ -765,6 +774,10 @@ pub async fn capture_restart() -> Result<RestartCapture> {
         });
     };
     let descriptor = observe(&runtime)?;
+    ensure!(
+        descriptor.as_ref().is_none_or(|d| d.service_id.is_none()),
+        "SERVICE_OWNED: use `zc service restart` or explicitly reprepare with `zc service restart -c <config>`"
+    );
     ensure!(
         descriptor.as_ref().is_none_or(|d| d.ready),
         "RESTART_CONTENDED: startup is in progress"
@@ -832,6 +845,7 @@ pub async fn capture_restart() -> Result<RestartCapture> {
     })
 }
 pub async fn start(options: crate::service::PrepareOptions) -> Result<Value> {
+    let _service_guard = crate::user_service::manual_guard()?;
     let runtime = runtime_dir(true)?.context("runtime unavailable")?;
     let _launch = runtime
         .dir
@@ -981,8 +995,11 @@ impl Drop for PendingLaunch<'_> {
     }
 }
 fn cleanup_names(dir: &SecureDir, nonce: &str, snapshot: &str) {
+    // A matching-looking name alone is not authority to delete corrupted state.
+    if load_snapshot(dir, snapshot, nonce).is_ok() {
+        let _ = dir.remove_file(snapshot);
+    }
     for name in [
-        snapshot.to_owned(),
         format!("zc.stop.{nonce}"),
         format!("zc.start.{nonce}"),
         format!("zc.restore.{nonce}"),
@@ -1005,7 +1022,15 @@ pub async fn run_child(snapshot_name: &str, nonce: &str) -> Result<()> {
             .context("START_LOCK_HANDOFF_INVALID: daemon lock handoff failed")?;
         rustix::process::setsid().context("START_FAILED: cannot detach daemon session")?;
         let exact = runtime.dir.exists(&format!("zc.restore.{nonce}"))?;
-        run_instance(&runtime, prepared, snapshot_name, nonce, lock, exact).await
+        run_instance(
+            &runtime,
+            prepared,
+            snapshot_name,
+            nonce,
+            (lock, None),
+            exact,
+        )
+        .await
     }
     .await;
     if let Err(error) = &result {
@@ -1021,6 +1046,7 @@ pub async fn run_child(snapshot_name: &str, nonce: &str) -> Result<()> {
     result
 }
 pub async fn run_foreground(options: crate::service::PrepareOptions) -> Result<()> {
+    let _service_guard = crate::user_service::manual_guard()?;
     let runtime = runtime_dir(true)?.context("runtime unavailable")?;
     let launch = runtime
         .dir
@@ -1037,7 +1063,8 @@ pub async fn run_foreground(options: crate::service::PrepareOptions) -> Result<(
     // Keep instance ownership throughout the foreground lifetime, but allow
     // other lifecycle callers to observe/reject it without waiting for exit.
     drop(launch);
-    run_instance(&runtime, prepared, &name, &nonce, lock, false).await
+    drop(_service_guard);
+    run_instance(&runtime, prepared, &name, &nonce, (lock, None), false).await
 }
 
 struct Control {
@@ -1161,6 +1188,7 @@ fn desired_guard(identity: &ActiveIdentity) -> Result<Option<(store::Desired, Fi
 // Own listener tasks and the stable lifecycle lock outside the caught instance
 // future. Never abort a listener: it must cancel and join its own nested tasks.
 struct InstanceScope {
+    service_id: Option<String>,
     phase: &'static str,
     guardian: Option<(Directory, FileLock)>,
     control: Option<Arc<Control>>,
@@ -1171,6 +1199,7 @@ impl InstanceScope {
     fn new() -> Self {
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Self {
+            service_id: None,
             phase: "startup",
             guardian: None,
             control: None,
@@ -1202,16 +1231,37 @@ async fn wait_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+struct InstanceCleanup<'a> {
+    runtime: &'a Directory,
+    nonce: &'a str,
+    name: &'a str,
+}
+impl Drop for InstanceCleanup<'_> {
+    fn drop(&mut self) {
+        cleanup_instance(self.runtime, self.nonce, self.name);
+    }
+}
+
 async fn run_instance(
     runtime: &Directory,
     prepared: Prepared,
     name: &str,
     nonce: &str,
-    lock: FileLock,
+    owner: (FileLock, Option<String>),
     exact: bool,
 ) -> Result<()> {
+    let lock = Arc::new(owner.0);
+    // All callers have already authenticated or created this snapshot. Keep
+    // cleanup armed across lease/evidence failures and future cancellation,
+    // while instance ownership still excludes another launch.
+    let cleanup = InstanceCleanup {
+        runtime,
+        nonce,
+        name,
+    };
+    let _binary_lease = crate::user_service::binary_lease()?;
     let mut scope = InstanceScope::new();
-    let lock = Arc::new(lock);
+    scope.service_id = owner.1;
     let evidence = Evidence::start(&runtime.path, nonce, lock.clone())?;
     let mut result = observability::catch_instance_panic(run_instance_inner(
         runtime, prepared, name, nonce, exact, &mut scope, &evidence,
@@ -1222,7 +1272,7 @@ async fn run_instance(
         scope.phase = "shutdown";
         result = drained;
     }
-    cleanup_instance(runtime, nonce, name);
+    drop(cleanup);
     // Both ownership locks and the private hook survive all nested task drops.
     evidence.finish(scope.phase, result.as_ref().err()).await;
     result
@@ -1267,6 +1317,7 @@ async fn run_instance_inner(
         generation: prepared.generation,
         ready: false,
         invocation: Some(invocation),
+        service_id: scope.service_id.clone(),
     };
     let control = Arc::new(Control {
         runtime: Directory {
@@ -1385,6 +1436,7 @@ fn cleanup_instance(runtime: &Directory, nonce: &str, name: &str) {
 }
 
 pub async fn stop() -> Result<Value> {
+    let _service_guard = crate::user_service::manual_guard()?;
     let Some(runtime) = runtime_dir(false)? else {
         return Ok(json!({"detail": "already_stopped"}));
     };
@@ -1484,6 +1536,7 @@ async fn stop_instance(runtime: &Directory, expected: &Descriptor) -> Result<()>
     bail!("STOP_FAILED: daemon stop deadline exceeded; request revoked; no PID signal sent")
 }
 pub async fn restart_checked(captured: RestartCapture, prepared: Prepared) -> Result<Value> {
+    let _service_guard = crate::user_service::manual_guard()?;
     parse_config(&prepared)?;
     let runtime = runtime_dir(true)?.context("runtime unavailable")?;
     let _launch = runtime.dir.lock("zc.launch.lock", START_WAIT + STOP_WAIT)?;
@@ -1946,6 +1999,117 @@ pub async fn log(lines: usize, follow: bool, json_output: bool) -> Result<()> {
         }
         tokio::select! { _ = tokio::signal::ctrl_c() => return Ok(()), _ = sleep(Duration::from_millis(200)) => () }
     }
+}
+
+// Resolve and validate the namespace once, before registering a user service.
+pub(crate) fn service_runtime_path() -> Result<PathBuf> {
+    Ok(runtime_dir(true)?.context("runtime unavailable")?.path)
+}
+
+pub(crate) fn service_launch_lock() -> Result<FileLock> {
+    let runtime = runtime_dir(true)?.context("runtime unavailable")?;
+    Ok(runtime.dir.lock("zc.launch.lock", Duration::from_secs(1))?)
+}
+
+pub(crate) struct ServiceCapture {
+    descriptor: Option<Descriptor>,
+    pub prepared: Option<Prepared>,
+}
+impl ServiceCapture {
+    pub fn pid(&self) -> Option<u32> {
+        self.descriptor.as_ref().map(|d| d.pid)
+    }
+    pub fn ready(&self) -> bool {
+        self.descriptor.as_ref().is_some_and(|d| d.ready)
+    }
+    pub fn verify(&self) -> Result<()> {
+        let runtime = runtime_dir(false)?.context("runtime missing")?;
+        ensure!(
+            observe(&runtime)? == self.descriptor,
+            "SERVICE_CONTENDED: captured runtime changed"
+        );
+        Ok(())
+    }
+}
+pub(crate) async fn capture_service(id: &str, selections: bool) -> Result<ServiceCapture> {
+    let runtime = runtime_dir(true)?.context("runtime unavailable")?;
+    let descriptor = observe(&runtime)?;
+    if let Some(d) = &descriptor {
+        ensure!(
+            d.service_id.as_deref() == Some(id),
+            "SERVICE_MANUAL_INSTANCE: runtime belongs to another invocation; confirm and stop it explicitly before service migration"
+        );
+    } else {
+        ensure!(
+            !lock_held(&runtime.dir)?,
+            "SERVICE_CONTENDED: instance startup is in progress"
+        );
+    }
+    let mut prepared = descriptor
+        .as_ref()
+        .map(|d| prepared_for(&runtime, d))
+        .transpose()?;
+    // Managed live selections are already authenticated in the snapshot. Unmanaged
+    // selections can be changed via the API; freeze the exact live selection too.
+    if let (Some(d), Some(p)) = (&descriptor, &mut prepared)
+        && selections
+        && p.identity.is_none()
+        && d.endpoint.is_some()
+    {
+        let data = get_runtime_status(d.endpoint.as_deref().expect("endpoint")).await?;
+        let entries = data["selected_proxies"]
+            .as_array()
+            .context("SERVICE_STATE_INVALID: runtime selections unavailable")?;
+        ensure!(
+            entries.len() <= 1024,
+            "SERVICE_STATE_INVALID: too many selections"
+        );
+        p.selections = entries
+            .iter()
+            .map(|entry| {
+                Ok(Selection {
+                    group: entry["group"].as_str().context("invalid group")?.into(),
+                    proxy: entry["proxy"].as_str().context("invalid proxy")?.into(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        parse_config(p)?;
+    }
+    let captured = ServiceCapture {
+        descriptor,
+        prepared,
+    };
+    captured.verify()?;
+    Ok(captured)
+}
+pub(crate) async fn run_service(id: &str, load: impl FnOnce() -> Result<Prepared>) -> Result<()> {
+    let runtime = runtime_dir(true)?.context("runtime unavailable")?;
+    let launch = runtime.dir.lock("zc.launch.lock", START_WAIT)?;
+    let prepared = load()?;
+    let StartOwnership::Owned(lock) = acquire_start(&runtime).await? else {
+        bail!("SERVICE_CONTENDED: another daemon already owns the namespace");
+    };
+    let mut prepared = prepared;
+    prepared.invocation.foreground = true;
+    prepared.invocation.prepared = false;
+    parse_config(&prepared)?;
+    let nonce = fsutil::nonce()?;
+    let name = save_snapshot(&runtime.dir, prepared.clone(), &nonce)?;
+    drop(launch);
+    run_instance(
+        &runtime,
+        prepared,
+        &name,
+        &nonce,
+        (lock, Some(id.into())),
+        true,
+    )
+    .await
+}
+
+pub(crate) fn validate_service_prepared(prepared: &Prepared) -> Result<()> {
+    parse_config(prepared)?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -314,6 +314,13 @@ impl SecureDir {
         }
     }
     pub fn lock(&self, name: &str, timeout: Duration) -> io::Result<FileLock> {
+        self.lock_mode(name, timeout, false)
+    }
+    /// Shared executable lease; an installer takes the exclusive side before publication.
+    pub fn shared_lock(&self, name: &str, timeout: Duration) -> io::Result<FileLock> {
+        self.lock_mode(name, timeout, true)
+    }
+    fn lock_mode(&self, name: &str, timeout: Duration, shared: bool) -> io::Result<FileLock> {
         let start = Instant::now();
         // Match Zig's stable-inode protocol: create exclusively, close, then open.
         // On APFS, simultaneous O_CREAT opens can otherwise report ENOENT.
@@ -340,7 +347,11 @@ impl SecureDir {
             }
         };
         loop {
-            match file.try_lock() {
+            match if shared {
+                file.try_lock_shared()
+            } else {
+                file.try_lock()
+            } {
                 Ok(()) => break,
                 Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < timeout => {
                     std::thread::sleep(
@@ -615,8 +626,11 @@ impl SecureDir {
         Ok(Self { file })
     }
     pub fn validate_path(&self, path: &Path) -> io::Result<()> {
+        self.validate_owned_path(path, true)
+    }
+    pub fn validate_owned_path(&self, path: &Path, private: bool) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
-        let current = Self::open_owned_absolute(path, true)?;
+        let current = Self::open_owned_absolute(path, private)?;
         let a = self.file.metadata()?;
         let b = current.file.metadata()?;
         if a.dev() != b.dev() || a.ino() != b.ino() {

@@ -887,6 +887,21 @@ impl Store {
         }
         Ok(snapshot)
     }
+    /// Validate an already-established authority without legacy takeover or an
+    /// empty-catalog fallback. Used when a service/installer must retain evidence.
+    pub fn load_existing(&self) -> Result<Snapshot> {
+        let _guard = self.lock()?;
+        let snapshot = self.inspect()?;
+        ensure!(
+            snapshot.token.format == StateFormat::CatalogV2,
+            StoreError::CorruptCatalog
+        );
+        for profile in &snapshot.catalog.profiles {
+            self.read_bundle(&profile.key, &profile.head)?;
+        }
+        Ok(snapshot)
+    }
+
     fn takeover(&self) -> Result<Snapshot> {
         let cutover = self.root.lock("legacy-cutover.lock", self.lock_timeout)?;
         let guard = self.lock()?;

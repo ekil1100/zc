@@ -13,7 +13,7 @@ build *args:
 release:
     cargo build --locked --release
 
-# Build and install Rust locally; pass --target-dir to choose a destination. Never stop/start a daemon.
+# Build/check before publication; cold-upgrade an owned user service, preserving state. Manual daemons refuse replacement.
 install *args: release
     bash scripts/install/local-dev-install.sh "$@"
 
@@ -113,6 +113,6 @@ eval-selfcheck *args:
 migrator-test:
     bash tools/config-migrator/run-all.sh
 
-# Run historical installer regressions; does not install into the real HOME.
+# Run installer regressions in temporary HOME; requires a built Rust candidate for local publication.
 zig-install-test:
     bash scripts/install/run-all-regression.sh

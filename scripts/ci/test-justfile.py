@@ -3,6 +3,7 @@
 
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -100,7 +101,15 @@ class JustfileContract(unittest.TestCase):
         release = self.work / "target" / "release"
         release.mkdir(parents=True)
         binary = release / "zc"
-        binary.write_text("#!/bin/sh\necho rust-release-source\n")
+        binary.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "--local-install" ]; then\n'
+            '  [ "$#" -eq 3 ] || exit 2\n'
+            f"  exec /bin/bash {shlex.quote(str(scripts / 'local-dev-install.sh'))} "
+            '--publish-only --source "$2" --target-dir "$3"\n'
+            "fi\n"
+            "echo rust-release-source\n"
+        )
         binary.chmod(0o755)
         home = self.work / "home"
         home.mkdir(mode=0o700)
@@ -295,6 +304,21 @@ class JustfileContract(unittest.TestCase):
         self.assertNotIn("Setup Zig", ci)
         self.assertNotIn("zig build", ci)
 
+    def test_ci_release_installer_uses_built_host_service_helper(self):
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        production = ci.split("- name: Build production artifact", 1)[1]
+        self.assertIn(
+            'ZC_INSTALL_SERVICE_FIXTURE="$PWD/target/debug/examples/e2e_service_install" '
+            + "\\\n"
+            + '            bash scripts/install/test-oneline-installer.sh "$PWD/$BINARY"',
+            production,
+        )
+        # The preceding gate builds host examples, independently of the
+        # production target/profile used for the release candidate.
+        result = self.just("install-test", dry_run=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cargo build --locked --examples", result.stderr)
+
     def test_delivery_gates_propagate_failures_without_zig(self):
         repo = self.work / "repo"
         scripts = repo / "scripts"
@@ -352,7 +376,15 @@ class JustfileContract(unittest.TestCase):
         release = repo / "target" / "release"
         release.mkdir(parents=True)
         binary = release / "zc"
-        binary.write_text("#!/bin/sh\necho rust-release-source\n")
+        binary.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "--local-install" ]; then\n'
+            '  [ "$#" -eq 3 ] || exit 2\n'
+            f"  exec /bin/bash {shlex.quote(str(scripts / 'local-dev-install.sh'))} "
+            '--publish-only --source "$2" --target-dir "$3"\n'
+            "fi\n"
+            "echo rust-release-source\n"
+        )
         binary.chmod(0o755)
         home = self.work / "home"
         home.mkdir(mode=0o700)

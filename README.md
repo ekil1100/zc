@@ -21,6 +21,8 @@ just run                     # Foreground, example config, port 17890
 
 已发布版本使用 [安装指南](docs/install/README.md) 中的独立安装器或 Homebrew。安装器消费实际 GitHub Release，不代表当前工作区的候选版本已经发布。迁移验收前不要覆盖生产安装或删除已有状态目录。
 
+当前用户服务使用 `zc service start/stop/restart` 管理运行，`zc service enable/disable` 管理登录后自启，`zc service status` 查看状态。无需 sudo，也不提供开机登录前运行。
+
 ## 开发与验证
 
 Rust 最低 `1.91`，CI 固定 `1.98.1`；原生依赖需要 C/C++ 工具链与 CMake，E2E 需要 Python 3、Node.js 和 [`just`](https://github.com/casey/just)。生产目标为 Linux/macOS × x64/arm64，不支持 Windows。Rust 候选的最低 macOS 版本为 **15（Sequoia）**，不再支持 11–14；构建工具链与验收限制见[安装指南](docs/install/README.md#从源码构建)。
@@ -42,7 +44,7 @@ just run path/to/config.yaml 17891
 just -- test --test cli
 ```
 
-`just` 列出全部任务；`just fmt` 会格式化 Rust 源码。默认任务使用 Rust。`just install` 构建 Release 并安装到 `~/.local/bin/zc`，不自动停启 daemon，拒绝覆盖仍在运行的目标。候选试用使用 `just install --target-dir /tmp/zc-candidate/bin`，不要覆盖生产安装。
+`just` 列出全部任务；`just fmt` 会格式化 Rust 源码。默认任务使用 Rust。`just install` 构建 Release 并安装到 `~/.local/bin/zc`。已注册且正在运行的用户服务会在校验候选后自动停止、安装并恢复原配置、端口、选择和自启设置；原本停止的服务保持停止。手动启动的实例仍需先明确停止并迁移为 `zc service`。候选试用使用 `just install --target-dir /tmp/zc-candidate/bin`，不要覆盖生产安装。
 
 生产默认 mixed 端口为 **7899**；配置中的 `mixed-port` 数值不覆盖它。开发必须显式传 `--port` 或使用 `just run`（默认 `17890`，拒绝 `7899`）。端口冲突只报错，不漂移。测试使用临时 HOME/runtime，不读写真实用户状态。
 
@@ -123,7 +125,7 @@ just -- test --test cli
 | Clash-style YAML 核心字段 | ✅ 已实现 | 支持 mixed 入口、静态 proxies、select groups、rules 与 local rule-providers。 |
 | 托管配置 | ✅ 已实现 | 支持 load/download/update/use/delete/dump/override、immutable revision 与本地依赖捕获。 |
 | 持久代理选择 | ✅ 已实现 | 选择与 exact config revision 绑定，daemon 启动前恢复。 |
-| Daemon 生命周期 CLI | ✅ 已实现 | start/stop/restart/reload/status/log/test/doctor，支持结构化 JSON 输出。 |
+| Daemon 生命周期 CLI | ✅ 已实现 | start/stop/restart/reload/status/log/test/doctor，以及用户级 `service start/stop/restart/enable/disable/status`，支持结构化 JSON 输出。 |
 | Minimal REST API | ✅ 已实现 | `/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`。 |
 | 连接列表与按 ID 关闭 | ✅ 最小版 | `zc connection list/close <id>`；必须显式 controller；托管按需持久生成 secret，非托管需手工配置，无流量计数或历史。详见 [API](docs/api/README.md)。 |
 | mihomo 完整 Controller API | ❌ 未实现 | 仅提供需鉴权的连接列表及按 ID 关闭，不提供 `/runtime`、`/profiles`、`/metrics` 等完整资源模型。 |
