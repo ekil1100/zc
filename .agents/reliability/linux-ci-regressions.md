@@ -93,6 +93,14 @@
 
 仅调整测试打包：Linux 下先复制到私有临时文件，再用 `strip --strip-debug` 去除该副本的调试信息；保留原 Cargo 产物（含其硬链接）、macOS 签名路径、安装器 64 MiB 归档/128 MiB 二进制上限。服务测试 helper 路径在重定位前保存。真实 release 产物仍接受完整发布验证。本机 `just install-test` 通过，包括 13 个 release safety 场景、真实 daemon 拒绝、两管理器状态/回滚和 SIGINT/SIGTERM；其中超大二进制拒绝仍通过。日志：`target/linux-ci-fixes/release-fixture-local.log`；Linux 修复后验证待记录。
 
+### 服务替身的 procfs 消失竞态
+
+`c3f9552` 的 [CI 36938363266](https://github.com/ekil1100/zc/actions/runs/36938363266) 中 x64 其余 Rust 套件通过，服务中断测试完成若干边界后，清理 stop 收到 manager exit 1，但产品复核服务已停止。旧夹具未保留原始 Python stderr，因此无法唯一归因该次失败。
+
+检查替身发现独立可确定复现的问题：`alive()` 在 `os.kill(pid, 0)`、`/proc/<pid>/stat.exists()` 后，进程仍可能被回收；随后的 `read_text()` 抛 `FileNotFoundError`，原代码仅捕获 `ProcessLookupError`，将正常消失变成 manager 失败。新增 5 项纯模拟 I/O 测试先红后绿，覆盖该竞态、已消失、zombie、存活/无 procfs 平台及权限错误保持抛出。仅测试替身补捕获 `FileNotFoundError`，产品 stop 逻辑、5 秒等待及边界断言不改；Rust 服务套件加入该回归，并保留意外 Python traceback 到私有夹具目录供失败父测试报告。
+
+本机新回归、真实服务生命周期场景、定向 Clippy、Ruff 与格式通过。证据：`target/linux-ci-fixes/manager-proc-race-{red,green}.log`；原失败：`c3f9552-linux-x64.log`。Linux 复核待记录，不将该竞态的确定性复现等同于已证明原 CI 唯一根因。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。

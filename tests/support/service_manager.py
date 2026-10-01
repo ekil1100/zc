@@ -47,7 +47,8 @@ def alive():
         os.kill(pid, 0)
         proc = pathlib.Path(f"/proc/{pid}/stat")
         return not (proc.exists() and proc.read_text().split(") ", 1)[1][0] == "Z")
-    except ProcessLookupError:
+    except (ProcessLookupError, FileNotFoundError):
+        # Linux may reap the process between the procfs existence check and read.
         return False
 
 

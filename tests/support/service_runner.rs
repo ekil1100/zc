@@ -74,7 +74,15 @@ impl CommandRunner for FakeManager {
                 program.into(),
             ];
             command.extend_from_slice(args);
-            zc::user_service::run_bounded("/usr/bin/python3", &command).await
+            let output = zc::user_service::run_bounded("/usr/bin/python3", &command).await?;
+            if output.code != 0 && output.stderr.contains("Traceback (most recent call last)") {
+                // Preserve unexpected fixture exceptions for the isolated parent;
+                // production errors must continue to hide manager output.
+                let path = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+                    .join("manager-traceback.txt");
+                let _ = std::fs::write(path, &output.stderr);
+            }
+            Ok(output)
         })
     }
 }

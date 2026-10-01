@@ -402,7 +402,12 @@ fn isolated(name: &str) -> bool {
             .env("XDG_RUNTIME_DIR", runtime.canonicalize().unwrap())
             .output()
             .unwrap();
-        assert!(out.status.success(), "{platform}: {out:?}");
+        assert!(
+            out.status.success(),
+            "{platform}: {out:?}; fixture traceback: {}",
+            std::fs::read_to_string(home.path().join("manager-traceback.txt"))
+                .unwrap_or_else(|_| "none captured".into())
+        );
         print!("{}", String::from_utf8_lossy(&out.stdout));
     }
     false
@@ -1851,6 +1856,18 @@ fn uncertain_command_cleanup_retains_backup_without_attempting_publication_or_re
             .await
             .unwrap();
     });
+}
+
+#[test]
+fn manager_fixture_handles_process_disappearance() {
+    let output = Command::new("/usr/bin/python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/test_service_manager.py"
+        ))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
 }
 
 fn install_source_link_count(links: u64) {
