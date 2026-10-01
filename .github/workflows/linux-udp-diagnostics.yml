@@ -1,0 +1,51 @@
+name: Linux UDP diagnostics
+on:
+  push:
+    branches: [ci/linux-udp-diagnostics]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Collect socket and filesystem diagnostics
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.1
+        shell: bash
+        run: |
+          mkdir -p target/diagnostics
+          python3 - <<'PY' | tee target/diagnostics/kernel.txt
+          import socket
+          server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          server.bind(('127.0.0.1', 0))
+          peer = server.getsockname()
+          client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          client.connect(peer)
+          client.settimeout(5)
+          server.close()
+          client.send(b'test')
+          try:
+              print('UDP_RECV', client.recv(1024))
+          except OSError as e:
+              print('UDP_ERROR', repr(e))
+          PY
+          cargo test --locked --test observability_connections --no-run
+          stat -Lc '%n uid=%u mode=%a dev=%d ino=%i nlink=%h' target/debug/zc | tee target/diagnostics/source-stat.txt
+          find target/debug/deps -maxdepth 1 -type f -samefile target/debug/zc -print | tee -a target/diagnostics/source-stat.txt
+          set +e
+          cargo test --locked --test observability_connections actual_udp_socket_refusal_remains_a_transport_failure -- --exact --nocapture 2>&1 | tee target/diagnostics/udp.txt
+          echo "UDP_TEST_EXIT=${PIPESTATUS[0]}" | tee -a target/diagnostics/udp.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostics-${{ matrix.os }}
+          path: target/diagnostics

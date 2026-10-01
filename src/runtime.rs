@@ -851,6 +851,7 @@ async fn udp_relay(
             _ = tokio::time::sleep_until(deadline) => return Ok(()),
             received = socket.recv_from(&mut storage) => {
                 let (len, sender) = received?;
+                eprintln!("UDP_DIAGNOSTIC received len={len} sender={sender} source_ip={source_ip}");
                 if sender.ip() != source_ip || sender.port() == 0 || pinned.is_some_and(|p| p != sender) {
                     continue;
                 }
@@ -884,6 +885,7 @@ async fn udp_relay(
                 let forwarded = timeout(HANDSHAKE_TIMEOUT,
                     session.as_ref().expect("session opened").send_to(payload, &target)
                 ).await;
+                eprintln!("UDP_DIAGNOSTIC forwarded={forwarded:?}");
                 context.outcome(FailureStage::Udp, &forwarded);
                 if matches!(forwarded, Ok(Ok(_))) {
                     deadline = Instant::now() + UDP_IDLE_TIMEOUT;
@@ -895,6 +897,7 @@ async fn udp_relay(
                     None => std::future::pending().await,
                 }
             } => {
+                eprintln!("UDP_DIAGNOSTIC upstream_received={received:?}");
                 let datagram = match received {
                     Ok(datagram) => datagram,
                     Err(error) => {
