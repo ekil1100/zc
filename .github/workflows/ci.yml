@@ -74,7 +74,7 @@ jobs:
       - name: Format and lint
         run: just check
       - name: Test public interfaces
-        run: just test
+        run: just test --no-fail-fast
       - name: Validate delivery contracts
         run: just delivery-test
       - name: Validate beta gate contract
