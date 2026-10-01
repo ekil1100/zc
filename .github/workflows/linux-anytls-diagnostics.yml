@@ -1,0 +1,92 @@
+name: Linux AnyTLS diagnostics (not acceptance)
+
+on:
+  push:
+    branches: [ ci/linux-anytls-diagnostics ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backpressure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install native tools
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          sudo apt-get update && sudo apt-get install -y cmake build-essential pkg-config
+      - name: Compare unchanged deadlines and payloads across socket setup variants
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+          import time
+
+          evidence = Path('target/linux-anytls-diagnostics')
+          evidence.mkdir(parents=True)
+          paths = ['tests/anytls_lifecycle.rs', 'src/anytls.rs', 'src/outbound.rs']
+          original = {p: Path(p).read_bytes() for p in paths}
+          selected = ['heartbeat_does_not_block_real_bidirectional_backpressure',
+                      'local_shutdown_drains_peer_before_backpressured_upload_completes',
+                      'local_shutdown_deadline_includes_backpressured_accepted_writes']
+          fixture = original[paths[0]].decode()
+          old_call = 'let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();'
+          assert fixture.count(old_call) >= 10
+          recv = '    rustix::net::sockopt::set_socket_recv_buffer_size(&s, 16 * 1024).unwrap();'
+          send = '    rustix::net::sockopt::set_socket_send_buffer_size(&s, 16 * 1024).unwrap();'
+          assert fixture.count(recv) == fixture.count(send) == 1
+          early = fixture.replace(old_call, 'let listener = backpressure_listener();')
+          early = early.replace(recv + '\n', '').replace(send + '\n', '')
+          early += '''
+          fn backpressure_listener() -> TcpListener {
+              let socket = tokio::net::TcpSocket::new_v4().unwrap();
+              socket.set_recv_buffer_size(16 * 1024).unwrap();
+              socket.set_send_buffer_size(16 * 1024).unwrap();
+              socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+              socket.listen(1024).unwrap()
+          }
+          '''
+          larger = fixture.replace(recv, recv.replace('16 * 1024', '256 * 1024'))
+          try:
+              for variant in ['baseline', 'old-product', 'pre-handshake-buffer', 'larger-receive-buffer']:
+                  for p, data in original.items():
+                      Path(p).write_bytes(data)
+                  tests = selected
+                  if variant == 'old-product':
+                      for p in paths[1:]:
+                          Path(p).write_bytes(subprocess.check_output(['git', 'show', '30667c6:' + p]))
+                      tests = selected[:1]
+                  elif variant == 'pre-handshake-buffer':
+                      Path(paths[0]).write_text(early)
+                  elif variant == 'larger-receive-buffer':
+                      Path(paths[0]).write_text(larger)
+                  for test in tests:
+                      start = time.monotonic()
+                      run = subprocess.run(['cargo', 'test', '--locked', '--test', 'anytls_lifecycle', test,
+                                            '--', '--exact', '--nocapture'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                      (evidence / (variant + '-' + test + '.log')).write_bytes(run.stdout)
+                      print(f'DIAGNOSTIC variant={variant} test={test} exit={run.returncode} seconds={time.monotonic()-start:.3f}', flush=True)
+                      if run.returncode:
+                          print(run.stdout.decode(errors='replace')[-4000:], flush=True)
+          finally:
+              for p, data in original.items():
+                  Path(p).write_bytes(data)
+          PY
+      - name: Preserve every diagnostic result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-anytls-diagnostics
+          path: target/linux-anytls-diagnostics/
+          if-no-files-found: error
+          retention-days: 7
