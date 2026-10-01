@@ -7,6 +7,7 @@ use std::{
     future::{Future, poll_fn},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, Weak},
     task::Poll,
     time::{Duration, Instant},
 };
@@ -228,15 +229,18 @@ impl Drop for Helper {
     }
 }
 
-fn run(case: &str, failures: i32) {
-    use std::os::unix::{fs::DirBuilderExt, process::CommandExt};
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap();
-    let library = root.join(if cfg!(target_os = "macos") {
-        "fault.dylib"
-    } else {
-        "fault.so"
-    });
+fn fault_library() -> Arc<tempfile::TempDir> {
+    // Share code, not injection state: each helper loads it into its own process.
+    // Concurrent first loads of independently linked dylibs can stall macOS child
+    // startup and consume the script's deadline before its first instruction.
+    // A weak cache keeps the directory alive only while helpers are using it.
+    static LIBRARY: Mutex<Weak<tempfile::TempDir>> = Mutex::new(Weak::new());
+    let mut cached = LIBRARY.lock().unwrap();
+    if let Some(library) = cached.upgrade() {
+        return library;
+    }
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let library = directory.path().join("spawn-fault");
     let mut cc = Command::new("cc");
     cc.args(["-std=c11", "-Wall", "-Wextra", "-Werror"]);
     if cfg!(target_os = "macos") {
@@ -259,6 +263,16 @@ fn run(case: &str, failures: i32) {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
+    *cached = Arc::downgrade(&directory);
+    directory
+}
+
+fn run(case: &str, failures: i32) {
+    use std::os::unix::{fs::DirBuilderExt, process::CommandExt};
+    let library_directory = fault_library();
+    let library = library_directory.path().join("spawn-fault");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
     for dir in ["home", "config", "data", "cache", "state", "runtime", "tmp"] {
         fs::DirBuilder::new()
             .mode(0o700)
