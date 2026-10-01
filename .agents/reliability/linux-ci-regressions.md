@@ -53,6 +53,12 @@
 
 诊断只是定位证据，不是整个 Linux 验收通过。所有变体日志保留于 `target/linux-ci-fixes/socket-diagnostics/`。
 
+### 日志轮转测试的 inode 复用
+
+`2a6658e` 的 [CI 36929886457](https://github.com/ekil1100/zc/actions/runs/36929886457) 在 arm64 上完整通过 AnyTLS 生命周期 19 项；随后 `tests/daemon.rs::unsafe_runtime_paths_are_rejected_and_logs_are_bounded` 因新旧日志 inode 编号相同失败。轮转先原子替换超大日志为告警、再归档并创建新日志，原 inode 已释放，Linux 可以复用其编号；单独记录编号不足以证明文件未替换。
+
+测试改为持有旧日志的打开句柄直到断言完成，阻止编号复用，同时新增旧文件长度保持 `8 MiB + 1` 的断言，验证采用替换而非原地截断。原 inode 差异、日志上限、0600 权限及 3 秒期限断言均保留，生产轮转逻辑不改。原始失败日志：`target/linux-ci-fixes/2a6658e-linux-arm64.log`。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。

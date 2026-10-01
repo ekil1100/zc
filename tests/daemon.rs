@@ -735,7 +735,10 @@ fn unsafe_runtime_paths_are_rejected_and_logs_are_bounded() {
         ]
     );
     use std::os::unix::fs::MetadataExt;
-    let old_inode = fs::metadata(&log).unwrap().ino();
+    // Retain the old file so Linux cannot recycle its inode for the new log.
+    // An inode number by itself does not identify an already unlinked file.
+    let old_log = fs::File::open(&log).unwrap();
+    let old_inode = old_log.metadata().unwrap().ino();
     fs::write(&log, vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while match fs::metadata(&log) {
@@ -747,6 +750,7 @@ fn unsafe_runtime_paths_are_rejected_and_logs_are_bounded() {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert_ne!(fs::metadata(&log).unwrap().ino(), old_inode);
+    assert_eq!(old_log.metadata().unwrap().len(), 8 * 1024 * 1024 + 1);
     assert_eq!(fs::metadata(&log).unwrap().mode() & 0o777, 0o600);
 }
 
