@@ -25,6 +25,7 @@ fn acceptor() -> TlsAcceptor {
     .with_no_client_auth()
     .with_single_cert(vec![cert], key)
     .unwrap();
+    assert!(config.send_tls13_tickets > 0);
     TlsAcceptor::from(Arc::new(config))
 }
 // Independent literal wire fixture, never imports the production codec.
@@ -468,6 +469,81 @@ async fn anytls_mixed_udp_rejects_without_allocating_or_falling_back() {
     }).await.unwrap();
 }
 
+// Resume the same Pending write: local shutdown must be safe without cancellation,
+// an application read, a pre-shutdown flush, or a peer acknowledgement barrier.
+#[tokio::test]
+async fn anytls_immediate_local_shutdown_delivers_accepted_bytes_with_tls13_tickets() {
+    timeout(WAIT, async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = config(listener.local_addr().unwrap().port());
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut s = opened(listener).await;
+            assert_eq!(
+                s.get_ref().1.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+            resumed.await.unwrap();
+            let mut count = 0usize;
+            loop {
+                let (cmd, id, body) = frame(&mut s).await;
+                assert_eq!(id, 1);
+                if cmd == 3 {
+                    assert!(body.is_empty());
+                    break;
+                }
+                assert_eq!(cmd, 2);
+                assert_eq!(body, vec![(count % 251) as u8; 65535]);
+                count += 1;
+            }
+            // No AnyTLS FIN reply or TLS close_notify: ordinary TCP close after
+            // independently validating every accepted byte must also work.
+            count
+        });
+        let connector = Connector::new(&config).unwrap();
+        let mut s = connector
+            .connect(
+                &config.proxies()[2],
+                &Target::new("example.com", 443).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut count = 0;
+        let mut resume = Some(resume);
+        loop {
+            let block = vec![(count % 251) as u8; 65535];
+            let n = tokio::task::unconstrained(std::future::poll_fn(|cx| {
+                let result = std::pin::Pin::new(&mut *s).poll_write(cx, &block);
+                if result.is_pending()
+                    && let Some(resume) = resume.take()
+                {
+                    resume.send(()).unwrap();
+                }
+                result
+            }))
+            .await
+            .unwrap();
+            assert_eq!(n, block.len());
+            count += 1;
+            assert!(count < 1024, "peer must exert real write backpressure");
+            if resume.is_none() {
+                break;
+            }
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                s.write(&vec![(count % 251) as u8; 65535]).await.unwrap(),
+                65535
+            );
+            count += 1;
+        }
+        s.shutdown().await.unwrap();
+        assert_eq!(peer.await.unwrap(), count);
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn anytls_pending_write_cancel_resume_never_replays_or_loses_accepted_bytes() {
     timeout(WAIT, async {
@@ -498,17 +574,22 @@ async fn anytls_pending_write_cancel_resume_never_replays_or_loses_accepted_byte
             .await
             .unwrap();
         let mut count = 0usize;
-        loop {
-            let block = vec![(count % 251) as u8; 65535];
-            match timeout(Duration::from_millis(50), s.write(&block)).await {
-                Ok(result) => {
-                    assert_eq!(result.unwrap(), block.len());
-                    count += 1;
-                    assert!(count < 1024);
+        tokio::task::unconstrained(std::future::poll_fn(|cx| {
+            loop {
+                let block = vec![(count % 251) as u8; 65535];
+                match std::pin::Pin::new(&mut *s).poll_write(cx, &block) {
+                    std::task::Poll::Ready(result) => {
+                        assert_eq!(result.unwrap(), block.len());
+                        count += 1;
+                        assert!(count < 1024);
+                    }
+                    // Only this write is cancelled; elapsed time is not evidence
+                    // of backpressure and cooperative yields are disabled here.
+                    std::task::Poll::Pending => return std::task::Poll::Ready(()),
                 }
-                Err(_) => break,
             }
-        }
+        }))
+        .await;
         resume.send(()).unwrap();
         for _ in 0..8 {
             let block = vec![(count % 251) as u8; 65535];

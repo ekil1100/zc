@@ -62,6 +62,65 @@ impl<S: IoStream> IoStream for tokio_rustls::client::TlsStream<S> {
 }
 pub type BoxStream = Box<dyn IoStream>;
 
+// tokio-rustls 0.26.5 may return plaintext after swallowing a later TCP read
+// error in the same poll. TCP resets are one-shot; the next read can be EOF.
+// Retain terminal read errors only for AnyTLS, whose local close accepts plain
+// TCP EOF after flushing FIN. Otherwise a reset could become a successful close.
+struct AnyTlsTransport {
+    inner: TcpStream,
+    read_error: Option<io::ErrorKind>,
+}
+impl IoStream for AnyTlsTransport {}
+impl AsyncRead for AnyTlsTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(kind) = self.read_error {
+            return Poll::Ready(Err(kind.into()));
+        }
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if let Poll::Ready(Err(error)) = &result
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            )
+        {
+            self.read_error = Some(error.kind());
+        }
+        result
+    }
+}
+impl AsyncWrite for AnyTlsTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, bytes)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, buffers)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 // An incoming protocol unit was interrupted. Retain only its I/O kind, never
 // the transport error's text, since these errors may cross diagnostic boundaries.
 #[derive(Debug)]
@@ -459,7 +518,13 @@ impl Connector {
                     .context("AnyTLS server TCP connection failed")?;
                 stage.stage = FailureStage::Tls;
                 let stream = tls
-                    .connect(name, socket)
+                    .connect(
+                        name,
+                        AnyTlsTransport {
+                            inner: socket,
+                            read_error: None,
+                        },
+                    )
                     .await
                     .context("AnyTLS TLS handshake failed; check certificate, trust roots and sni")
                     .context(FailureStage::Tls)?;

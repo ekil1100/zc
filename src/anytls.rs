@@ -1,10 +1,12 @@
 //! Single-stream AnyTLS sessions. Owns TLS directly: no pool, worker or detached task.
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     io,
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
     task::{Context, Poll, Wake, Waker, ready},
+    time::Duration,
 };
 
 use md5::{Digest as _, Md5};
@@ -22,6 +24,9 @@ const MAX_FRAME: usize = u16::MAX as usize;
 const MAX_STOP: usize = 32;
 const MAX_PADDING: usize = 65536;
 const MAX_HEARTS: usize = 32;
+// One deadline covers accepted writes, FIN, TLS write shutdown and peer drain.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CLOSE_DRAIN: usize = 1024 * 1024;
 
 pub(crate) type SharedPadding = Arc<RwLock<Arc<Padding>>>;
 pub(crate) fn default_padding() -> SharedPadding {
@@ -220,7 +225,11 @@ pub(crate) struct AnyTls {
     data_ready: bool,
     v2: bool,
     acknowledged: bool,
-    closing: bool,
+    fin_queued: bool,
+    write_closed: bool,
+    peer_closed: bool,
+    close_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    close_drained: usize,
     failure: Option<io::ErrorKind>,
     wakes: Arc<Wakes>,
     whole_closed: tokio::sync::watch::Sender<bool>,
@@ -277,7 +286,11 @@ impl AnyTls {
             data_ready: false,
             v2: false,
             acknowledged: false,
-            closing: false,
+            fin_queued: false,
+            write_closed: false,
+            peer_closed: false,
+            close_deadline: None,
+            close_drained: 0,
             failure: None,
             wakes: Arc::default(),
             whole_closed: tokio::sync::watch::channel(false).0,
@@ -296,6 +309,7 @@ impl AnyTls {
     }
     fn finish(&mut self) {
         self.inner.take();
+        self.close_deadline.take();
         self.outgoing.clear();
         self.hearts.clear();
         if self.failure.is_none() {
@@ -351,6 +365,23 @@ impl AnyTls {
                 Err(e) => Poll::Ready(Err(self.fail(e))),
             };
         }
+    }
+    fn shutdown_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.drain(cx))?;
+        if !self.fin_queued {
+            self.fin_queued = true;
+            if let Err(e) = self.queue(3, 1, &[]) {
+                return Poll::Ready(Err(self.fail(e)));
+            }
+        }
+        ready!(self.drain(cx))?;
+        // Empty application queues alone do not prove completion: TLS may still
+        // have a Pending flush, including close_notify, before TCP write shutdown.
+        match ready!(Pin::new(self.inner.as_mut().unwrap()).poll_shutdown(cx)) {
+            Ok(()) => self.write_closed = true,
+            Err(e) => return Poll::Ready(Err(self.fail(e))),
+        }
+        Poll::Ready(Ok(()))
     }
     fn validate_header(&self) -> io::Result<()> {
         let cmd = self.header[0];
@@ -426,6 +457,12 @@ impl AnyTls {
             }
             if self.inner.is_none() {
                 return Poll::Ready(Ok(()));
+            }
+            // Local shutdown owns transport reads until cleanup completes. Expose
+            // only an already assembled PSH tail here. EOF or whole_close earlier
+            // would let runtime::transfer cancel the pending shutdown owner.
+            if self.close_deadline.is_some() {
+                return Poll::Pending;
             }
             // A Pending control write must not gate reads: both TCP directions
             // can be full. Keep replies bounded and reject excess requests instead
@@ -505,7 +542,7 @@ impl AsyncWrite for AnyTls {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.check_error()?;
-        if self.closing || self.inner.is_none() {
+        if self.close_deadline.is_some() || self.inner.is_none() {
             return Poll::Ready(Err(closed()));
         }
         if data.is_empty() {
@@ -525,6 +562,9 @@ impl AsyncWrite for AnyTls {
         if self.inner.is_none() {
             return Poll::Ready(Ok(()));
         }
+        if self.write_closed {
+            return Poll::Ready(Ok(()));
+        }
         let w = self.register(cx, true);
         self.drain(&mut Context::from_waker(&w))
     }
@@ -535,19 +575,49 @@ impl AsyncWrite for AnyTls {
         }
         let w = self.register(cx, true);
         let mut cx = Context::from_waker(&w);
-        ready!(self.drain(&mut cx))?;
-        if !self.closing {
-            self.closing = true;
-            self.queue(3, 1, &[])?;
+        let deadline = self
+            .close_deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(CLOSE_TIMEOUT)));
+        if deadline.as_mut().poll(&mut cx).is_ready() {
+            return Poll::Ready(Err(self.fail(io::Error::from(io::ErrorKind::TimedOut))));
         }
-        ready!(self.drain(&mut cx))?;
-        // Send close_notify and shut down the socket write side after FIN. This
-        // drains the transport without waiting for a FIN reply or TLS peer close.
-        match ready!(Pin::new(self.inner.as_mut().unwrap()).poll_shutdown(&mut cx)) {
-            Ok(()) => (),
-            Err(e) => return Poll::Ready(Err(self.fail(e))),
+        if !self.write_closed
+            && let Poll::Ready(result) = self.shutdown_write(&mut cx)
+        {
+            result?;
         }
-        self.finish();
-        Poll::Ready(Ok(()))
+        // Drive reads even while accepted writes/FIN/TLS shutdown are Pending:
+        // both TCP directions may be full, with the peer sending before reading.
+        // Dropping unread TLS can reset TCP and discard our accepted PSH/FIN.
+        // This is bounded transport cleanup, not a half-close response or FIN ack.
+        let mut discard = [0; 16384];
+        for _ in 0..16 {
+            if self.peer_closed {
+                break;
+            }
+            let remaining = (MAX_CLOSE_DRAIN - self.close_drained + 1).min(discard.len());
+            let mut b = ReadBuf::new(&mut discard[..remaining]);
+            match ready!(Pin::new(self.inner.as_mut().unwrap()).poll_read(&mut cx, &mut b)) {
+                Ok(()) if !b.filled().is_empty() => {
+                    self.close_drained += b.filled().len();
+                    if self.close_drained > MAX_CLOSE_DRAIN {
+                        return Poll::Ready(Err(self.fail(invalid())));
+                    }
+                }
+                // Local close also accepts ordinary TCP EOF, but it never proves
+                // our write side completed. Keep queued PSH/FIN and TLS flushes.
+                Ok(()) => self.peer_closed = true,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => self.peer_closed = true,
+                Err(e) => return Poll::Ready(Err(self.fail(e))),
+            }
+        }
+        if self.peer_closed && self.write_closed {
+            self.finish();
+            return Poll::Ready(Ok(()));
+        }
+        if !self.peer_closed {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
     }
 }
