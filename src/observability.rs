@@ -471,6 +471,11 @@ impl Evidence {
             nonce: nonce.into(),
             writer: Mutex::new(()),
         });
+        // Cold lock creation includes file and directory sync. Give that setup
+        // the startup lock budget; subsequent writes retain their 50ms budget.
+        log.dir.validate_path(&log.path)?;
+        log.lock.validate(&log.dir, "zc.lock")?;
+        drop(log.dir.lock("zc.log.lock", Duration::from_secs(1))?);
         log.lifecycle("daemon_starting", "startup", None)?;
         let marker = log.begin_marker();
         let observer = Arc::new(Observer::new());
@@ -795,6 +800,10 @@ fn parse_cpu_time(value: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/observability_init.rs"]
+mod initialization_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
@@ -944,6 +953,7 @@ pub(crate) mod tests {
             "observability::tests::spawned_task_errors_never_serialize_panic_payload_or_location",
             "task",
         );
+        assert!(output.status.success(), "{output:?}");
         let startup = std::fs::read_to_string(
             home.path()
                 .join("runtime/zc.start.0123456789abcdef0123456789abcdef"),
@@ -963,7 +973,6 @@ pub(crate) mod tests {
                 "panic location escaped"
             );
         }
-        assert!(output.status.success(), "{output:?}");
         assert_eq!(startup, "RUNTIME_FAILED: task panicked");
         let stdout = String::from_utf8(output.stdout).unwrap();
         let events: Vec<Value> = stdout
