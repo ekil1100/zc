@@ -107,6 +107,14 @@
 
 将 `test-release-service.py` 的 Linux helper 也复制到私有临时文件后移除 debug sections，增加原 Cargo 文件 SHA256 不变断言；后续全部字节等同性、旧版恢复、服务状态与信号断言继续针对实际打包候选执行。安装器大小门限及生产代码保持不变。原始日志：`target/linux-ci-fixes/d84d4f5-linux-{x64,arm64}.log`；定向 Linux 安装复核与完整产物步骤待记录。
 
+### 安装复核通过；补齐实例启动前的诊断写入预算
+
+[定向 CI 36941792084](https://github.com/ekil1100/zc/actions/runs/36941792084) 的 x64/arm64 服务发布安装全场景通过，包括状态保留、发布/激活回滚和 SIGINT/SIGTERM 后无迟到发布；helper 候选分别为 39,138,328 / 37,237,008 bytes，原 Cargo 文件哈希保持不变。证据：`target/linux-ci-fixes/install-helper-linux/`。
+
+`c588213` 的 [完整 CI 36941768097](https://github.com/ekil1100/zc/actions/runs/36941768097) 又捕获 arm64 `pre_observer_rotation_reports_writer_pid_without_guessing_instance` 在 `append_log()` 首次创建锁时超时。该入口在 `Evidence::start` **之前**，此前的实例初始化修复未覆盖它。将无实例身份的启动/失败诊断写入也使用 1 秒启动预算；绑定实例的全部热写入仍明确传入 50ms，锁安全检查和超时拒绝保持。
+
+原注入矩阵增加 diagnostic writer 路径：75ms 同步确定性红绿，包含超时、文件/目录 EIO、锁争用、symlink/hardlink/权限拒绝和原热锁约束，共 20 个子场景。本机 observability 11 项、定向 Clippy 与格式通过。证据：`target/linux-ci-fixes/pre-observer-init-{red,green}.log`、`c588213-linux-arm64.log`。完整 Linux 矩阵待最终复核。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。

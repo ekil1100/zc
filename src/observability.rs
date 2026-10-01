@@ -229,12 +229,18 @@ fn valid_marker(bytes: &[u8]) -> Option<ExitMarker> {
 /// Fixed retention: current plus one archive, each at most eight MiB. The lock
 /// also serializes the few pre-observer diagnostic writers in the daemon.
 pub(crate) fn append_log(dir: &SecureDir, bytes: &[u8]) -> Result<()> {
-    // A generic diagnostic writer has no authenticated instance identity.
-    append_log_for_instance(dir, bytes, None)
+    // A generic diagnostic writer has no authenticated instance identity and
+    // may be the first writer before Evidence has initialized the durable lock.
+    append_log_for_instance(dir, bytes, None, Duration::from_secs(1))
 }
-fn append_log_for_instance(dir: &SecureDir, bytes: &[u8], instance: Option<&str>) -> Result<()> {
+fn append_log_for_instance(
+    dir: &SecureDir,
+    bytes: &[u8],
+    instance: Option<&str>,
+    lock_budget: Duration,
+) -> Result<()> {
     ensure!(bytes.len() <= RECORD_LIMIT, "runtime event exceeds limit");
-    let guard = dir.lock("zc.log.lock", Duration::from_millis(50))?;
+    let guard = dir.lock("zc.log.lock", lock_budget)?;
     guard.validate(dir, "zc.log.lock")?;
     rotate_log(dir, bytes.len(), instance)?;
     dir.append_bounded("zc.log", bytes, LOG_LIMIT)?;
@@ -298,7 +304,12 @@ impl EventLog {
             .map_err(|_| anyhow::anyhow!("runtime log writer unavailable"))?;
         self.dir.validate_path(&self.path)?;
         self.lock.validate(&self.dir, "zc.lock")?;
-        append_log_for_instance(&self.dir, &bytes, Some(&self.nonce))?;
+        append_log_for_instance(
+            &self.dir,
+            &bytes,
+            Some(&self.nonce),
+            Duration::from_millis(50),
+        )?;
         Ok(())
     }
     fn maintenance(&self) -> Result<()> {

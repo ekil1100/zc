@@ -14,8 +14,13 @@ async fn cold_log_initialization_preserves_lock_contract() {
         let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
         let held = (case == "startup-contention")
             .then(|| dir.lock("zc.log.lock", Duration::from_secs(1)).unwrap());
+        let diagnostic = std::env::var("ZC_LOG_INIT_WRITER").as_deref() == Ok("diagnostic");
         let started = Instant::now();
-        let result = Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock);
+        let result = if diagnostic {
+            append_log(&dir, b"Diagnostic before observer startup.\n").map(|()| None)
+        } else {
+            Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock).map(Some)
+        };
         match case {
             "expired" | "file-eio" | "directory-eio" | "startup-contention" => {
                 let error = result
@@ -40,41 +45,55 @@ async fn cold_log_initialization_preserves_lock_contract() {
             }
             _ => {
                 let evidence = result.expect("cold log initialization must tolerate a 75ms sync");
-                if case == "hot-contention" {
-                    let guard = dir.lock("zc.log.lock", Duration::from_secs(1)).unwrap();
-                    let started = Instant::now();
-                    let error = evidence.ready().unwrap_err();
-                    assert_eq!(
-                        error.downcast_ref::<io::Error>().unwrap().kind(),
-                        io::ErrorKind::TimedOut
-                    );
-                    assert!(started.elapsed() >= Duration::from_millis(50));
-                    assert!(started.elapsed() < Duration::from_millis(500));
-                    drop(guard);
-                }
-                if case == "hot-invalid" {
-                    let lock_path = path.join("zc.log.lock");
-                    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o666))
+                if let Some(evidence) = evidence {
+                    if case == "hot-contention" {
+                        let guard = dir.lock("zc.log.lock", Duration::from_secs(1)).unwrap();
+                        let started = Instant::now();
+                        let error = evidence.ready().unwrap_err();
+                        assert_eq!(
+                            error.downcast_ref::<io::Error>().unwrap().kind(),
+                            io::ErrorKind::TimedOut
+                        );
+                        assert!(started.elapsed() >= Duration::from_millis(50));
+                        assert!(started.elapsed() < Duration::from_millis(500));
+                        drop(guard);
+                    }
+                    if case == "hot-invalid" {
+                        let lock_path = path.join("zc.log.lock");
+                        std::fs::set_permissions(
+                            &lock_path,
+                            std::fs::Permissions::from_mode(0o666),
+                        )
                         .unwrap();
-                    assert!(evidence.ready().is_err(), "unsafe hot log lock accepted");
-                    assert_eq!(
-                        std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
-                        0o666
-                    );
-                    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+                        assert!(evidence.ready().is_err(), "unsafe hot log lock accepted");
+                        assert_eq!(
+                            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+                            0o666
+                        );
+                        std::fs::set_permissions(
+                            &lock_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
                         .unwrap();
+                    }
+                    evidence.ready().unwrap();
+                    evidence.finish("stop_request", None).await;
+                    let events: Vec<Value> = std::fs::read_to_string(path.join("zc.log"))
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect();
+                    assert_eq!(events.first().unwrap()["event"], "daemon_starting");
+                    assert!(events.iter().any(|event| event["event"] == "daemon_ready"));
+                    assert_eq!(events.last().unwrap()["event"], "daemon_stopped");
+                    assert!(!path.join(EXIT_MARKER).exists());
+                } else {
+                    assert_eq!(
+                        std::fs::read(path.join("zc.log")).unwrap(),
+                        b"Diagnostic before observer startup.\n"
+                    );
+                    assert!(!path.join(EXIT_MARKER).exists());
                 }
-                evidence.ready().unwrap();
-                evidence.finish("stop_request", None).await;
-                let events: Vec<Value> = std::fs::read_to_string(path.join("zc.log"))
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                assert_eq!(events.first().unwrap()["event"], "daemon_starting");
-                assert!(events.iter().any(|event| event["event"] == "daemon_ready"));
-                assert_eq!(events.last().unwrap()["event"], "daemon_stopped");
-                assert!(!path.join(EXIT_MARKER).exists());
             }
         }
         drop(held);
@@ -109,7 +128,7 @@ async fn cold_log_initialization_preserves_lock_contract() {
         .output()
         .expect("cc is required for log initialization injection");
     assert!(output.status.success(), "{output:?}");
-    for case in [
+    for (case, writer) in [
         "precreated",
         "slow",
         "expired",
@@ -121,8 +140,14 @@ async fn cold_log_initialization_preserves_lock_contract() {
         "symlink",
         "hardlink",
         "permissions",
-    ] {
-        let root = home.join(case);
+    ]
+    .into_iter()
+    .flat_map(|case| ["observer", "diagnostic"].map(|writer| (case, writer)))
+    {
+        if writer == "diagnostic" && matches!(case, "hot-contention" | "hot-invalid") {
+            continue;
+        }
+        let root = home.join(format!("{writer}-{case}"));
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&root)
@@ -160,6 +185,7 @@ async fn cold_log_initialization_preserves_lock_contract() {
                 .env("XDG_RUNTIME_DIR", &root)
                 .env("ZC_LOG_INIT_ROOT", &root)
                 .env("ZC_LOG_INIT_CASE", case)
+                .env("ZC_LOG_INIT_WRITER", writer)
                 .env(
                     if cfg!(target_os = "macos") {
                         "DYLD_INSERT_LIBRARIES"
@@ -200,6 +226,6 @@ async fn cold_log_initialization_preserves_lock_contract() {
             markers, expected,
             "injection scope or durability changed: {case}"
         );
-        eprintln!("Log initialization fixture {case}: verified");
+        eprintln!("Log initialization fixture {writer}/{case}: verified");
     }
 }
