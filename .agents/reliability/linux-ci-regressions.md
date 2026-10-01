@@ -59,6 +59,16 @@
 
 测试改为持有旧日志的打开句柄直到断言完成，阻止编号复用，同时新增旧文件长度保持 `8 MiB + 1` 的断言，验证采用替换而非原地截断。原 inode 差异、日志上限、0600 权限及 3 秒期限断言均保留，生产轮转逻辑不改。原始失败日志：`target/linux-ci-fixes/2a6658e-linux-arm64.log`。
 
+### 完整套件收集与安装来源硬链接
+
+`8918753` 开启 `just test --no-fail-fast`，保持测试集合、断言和失败退出码，一次收齐全部 Rust 套件。[CI 36930700322](https://github.com/ekil1100/zc/actions/runs/36930700322) 中 Linux x64/arm64 均通过原日志锁/API、AnyTLS 13 项、AnyTLS 生命周期 19 项及 daemon 19 项；剩余为 UDP 拒绝场景 1 项、服务安装 11 项。相关日志：`target/linux-ci-fixes/8918753-linux-{x64,arm64}.log`。工作流的 Python 契约最初仍要求裸 `just test`，已同步为完整命令，`just delivery-test` 的 70 项 Python 测试及 shell 契约通过。
+
+服务安装通过通用严格读取器捕获 Cargo 来源，它要求 `nlink=1`。独立 [Linux 诊断 36934363820](https://github.com/ekil1100/zc/actions/runs/36934363820) 证实两平台的 `target/debug/zc` 均为当前 UID 所有、0755、`nlink=2`，与 deps 目录产物共享 inode。独立复制的单链接来源安装成功，增加硬链接后确定性失败；这同样影响实际 Cargo 本地安装入口。
+
+修复为安装来源专用有界捕获：允许当前用户所有、稳定且至少一个链接的普通来源文件；保留 no-follow、nonblocking、256 MiB 上限、捕获前校验及前后 ctime/nlink/uid/mode/len/mtime 比较。后续独立私有候选、自检、目标与恢复保护不变，通用严格读取、cache、锁和已安装目标仍要求单链接。父会话复核全部原读取调用点继续使用严格策略。
+
+本机红绿及回归：新增硬链接来源成功且目标独立、既有硬链接目标拒绝；fsutil 18、user_service 36、provider_cache 17、store 23 项通过，定向 Clippy、格式与 diff 检查通过。原始证据：`target/linux-ci-fixes/install-source-{red,green,target-green,fsutil,user-service,strict-read-regression,commands}.log`。Linux 修复后结果待后续记录。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。

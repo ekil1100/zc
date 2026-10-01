@@ -1853,6 +1853,107 @@ fn uncertain_command_cleanup_retains_backup_without_attempting_publication_or_re
     });
 }
 
+fn install_source_link_count(links: u64) {
+    use std::{fs, os::unix::fs::MetadataExt};
+    let home = tempfile::tempdir().unwrap();
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+    // Do not depend on Cargo's platform-specific artifact link count.
+    let source = home.path().join("source-zc");
+    fs::copy(binary, &source).unwrap();
+    let alias = home.path().join("source-alias");
+    if links == 2 {
+        fs::hard_link(&source, &alias).unwrap();
+    }
+    let before = fs::metadata(&source).unwrap();
+    assert_eq!(before.nlink(), links);
+    let bytes = fs::read(&source).unwrap();
+    let target = home.path().join("bin with spaces");
+    let out = Command::new(binary)
+        .arg("--local-install")
+        .arg(&source)
+        .arg(&target)
+        .current_dir(home.path())
+        .env("HOME", home.path().canonicalize().unwrap())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "source nlink={links}: {out:?}");
+    let installed = fs::metadata(target.join("zc")).unwrap();
+    assert_ne!(
+        (installed.dev(), installed.ino()),
+        (before.dev(), before.ino())
+    );
+    assert_eq!(installed.nlink(), 1);
+    assert_eq!(fs::read(target.join("zc")).unwrap(), bytes);
+    for path in std::iter::once(&source).chain((links == 2).then_some(&alias)) {
+        let after = fs::metadata(path).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.nlink(), links);
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert!(!home.path().join(".local/state/zc/service").exists());
+    assert!(
+        !home
+            .path()
+            .join(".local/state/zc/runtime/zc.daemon.json")
+            .exists()
+    );
+}
+
+#[test]
+fn install_source_single_link_control() {
+    install_source_link_count(1);
+}
+
+#[test]
+fn install_source_stable_hardlinks_are_captured_into_independent_target() {
+    install_source_link_count(2);
+}
+
+#[test]
+fn install_source_hardlinks_do_not_allow_hardlinked_installed_target() {
+    use std::{fs, os::unix::fs::MetadataExt};
+    let home = tempfile::tempdir().unwrap();
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+    let source = home.path().join("source-zc");
+    fs::copy(binary, &source).unwrap();
+    fs::hard_link(&source, home.path().join("source-alias")).unwrap();
+    let target_dir = home.path().join("bin");
+    fs::create_dir(&target_dir).unwrap();
+    let target = target_dir.join("zc");
+    fs::copy(binary, &target).unwrap();
+    let alias = home.path().join("target-alias");
+    fs::hard_link(&target, &alias).unwrap();
+    let before = fs::metadata(&target).unwrap();
+    let bytes = fs::read(&target).unwrap();
+    let out = Command::new(binary)
+        .arg("--local-install")
+        .arg(&source)
+        .arg(&target_dir)
+        .current_dir(home.path())
+        .env("HOME", home.path().canonicalize().unwrap())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("SERVICE_TARGET_INVALID"),
+        "{out:?}"
+    );
+    for path in [&target, &alias, &source, &home.path().join("source-alias")] {
+        assert_eq!(fs::metadata(path).unwrap().nlink(), 2);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    let after = fs::metadata(&target).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert!(!fs::read_dir(target_dir).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(".zc.candidate.") || name.starts_with(".zc.recovery.")
+    }));
+}
+
 #[test]
 fn private_install_entry_embeds_publisher_and_requires_only_source_and_target() {
     let home = tempfile::tempdir().unwrap();

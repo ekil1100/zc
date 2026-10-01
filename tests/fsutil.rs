@@ -206,7 +206,7 @@ mod read_capture {
         path::Path,
         process::Command,
     };
-    use zc::fsutil::{SecureDir, read_contained, read_regular};
+    use zc::fsutil::{SecureDir, read_contained, read_installation_source, read_regular};
 
     const BYTES: &[u8] = b"capture payload\n";
     const SEAMS: &[&str] = &[
@@ -225,6 +225,7 @@ mod read_capture {
                 .map(|(bytes, _)| bytes),
             "read_cache" => SecureDir::open(root)?.read_cache(name, BYTES.len()),
             "read_regular" => read_regular(root.join(name), BYTES.len()),
+            "read_installation_source" => read_installation_source(root.join(name), BYTES.len()),
             "read_contained" => read_contained(root, name, BYTES.len()).map(|(_, bytes)| bytes),
             _ => panic!("unknown public read seam: {seam}"),
         }
@@ -254,6 +255,13 @@ mod read_capture {
     }
 
     fn reject_race(action: &str, seams: &[&str]) {
+        // Cache has a separate permission-check snapshot after checked-open.
+        // Widen only after that genuine snapshot, before capture's fresh stat.
+        let snapshot = if action == "cache-chmod" { "2" } else { "1" };
+        reject_race_at(action, seams, snapshot);
+    }
+
+    fn reject_race_at(action: &str, seams: &[&str], snapshot: &str) {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
         let library = home.join(if cfg!(target_os = "macos") {
@@ -299,9 +307,6 @@ mod read_capture {
             let target = root.join("target");
             let original = fs::metadata(&target).unwrap();
             let marker = root.join("injected");
-            // Cache has a separate permission-check snapshot after checked-open.
-            // Widen only after that genuine snapshot, before capture's fresh stat.
-            let snapshot = if action == "cache-chmod" { "2" } else { "1" };
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -363,6 +368,98 @@ mod read_capture {
     #[test]
     fn rejects_cache_group_write_after_permission_check() {
         reject_race("cache-chmod", &["read_cache"]);
+    }
+
+    #[test]
+    fn installation_source_rejects_unlinked_inode_at_capture_before() {
+        reject_race_at("unlink", &["read_installation_source"], "1");
+    }
+
+    #[test]
+    fn installation_source_rejects_mutation_during_capture() {
+        // Snapshot 2 is capture-before: the returned snapshot remains genuine,
+        // while subsequent reads/stat observe the real inode mutation.
+        for action in ["unlink", "hardlink", "cache-chmod"] {
+            reject_race_at(action, &["read_installation_source"], "2");
+        }
+    }
+
+    #[test]
+    fn installation_source_links_do_not_relax_strict_reads_or_byte_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("source");
+        fs::write(&source, BYTES).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_installation_source(&source, BYTES.len()).unwrap(),
+            BYTES
+        );
+        for name in ["alias", "another-alias"] {
+            fs::hard_link(&source, root.join(name)).unwrap();
+            assert_eq!(
+                read_installation_source(&source, BYTES.len()).unwrap(),
+                BYTES
+            );
+            assert!(read_installation_source(&source, BYTES.len() - 1).is_err());
+            for seam in SEAMS {
+                assert!(
+                    capture(root, seam, "source").is_err(),
+                    "{seam} accepted hard links"
+                );
+            }
+            assert_eq!(fs::read(root.join(name)).unwrap(), BYTES);
+        }
+        assert_eq!(fs::metadata(&source).unwrap().nlink(), 3);
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            read_installation_source(&source, BYTES.len()).unwrap(),
+            BYTES
+        );
+    }
+
+    #[test]
+    fn installation_source_rejects_symlinks_special_files_and_foreign_ownership() {
+        use std::{
+            os::unix::fs::symlink,
+            time::{Duration, Instant},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("regular"), BYTES).unwrap();
+        symlink("regular", root.join("symlink")).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(root.join("fifo"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::create_dir(root.join("directory")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
+        for name in ["symlink", "fifo", "directory", "socket"] {
+            let start = Instant::now();
+            assert!(
+                read_installation_source(root.join(name), BYTES.len()).is_err(),
+                "{name}"
+            );
+            assert!(start.elapsed() < Duration::from_secs(1), "{name} blocked");
+        }
+        let foreign = if rustix::process::geteuid().is_root() {
+            let path = root.join("foreign");
+            fs::write(&path, BYTES).unwrap();
+            rustix::fs::chown(&path, Some(rustix::process::Uid::from_raw(1)), None).unwrap();
+            path
+        } else {
+            // A publicly readable, root-owned file on both supported OSes.
+            Path::new("/etc/passwd").canonicalize().unwrap()
+        };
+        assert_ne!(
+            fs::metadata(&foreign).unwrap().uid(),
+            rustix::process::geteuid().as_raw()
+        );
+        let error = read_installation_source(foreign, 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("ownership"), "{error}");
     }
 
     #[test]

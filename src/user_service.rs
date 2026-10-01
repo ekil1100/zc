@@ -1194,7 +1194,7 @@ pub async fn install(
     let candidate_name = format!(".zc.candidate.{}", fsutil::nonce()?);
     target_fd.write_new(
         &candidate_name,
-        &fsutil::read_regular(&source, 256 * 1024 * 1024)?,
+        &fsutil::read_installation_source(&source, 256 * 1024 * 1024)?,
     )?;
     let _candidate = CandidateFile {
         dir: &target_fd,

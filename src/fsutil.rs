@@ -195,7 +195,12 @@ impl SecureDir {
         }
     }
     pub fn read(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
-        read_bounded(self.open_file(name, false, false)?, limit, 0o077)
+        read_bounded(
+            self.open_file(name, false, false)?,
+            limit,
+            0o077,
+            ReadLinks::Single,
+        )
     }
     pub fn exists(&self, name: &str) -> io::Result<bool> {
         component(name)?;
@@ -373,13 +378,43 @@ impl SecureDir {
     }
 }
 
-fn read_bounded(file: File, limit: usize, forbidden_permissions: u32) -> io::Result<Vec<u8>> {
+#[derive(Clone, Copy)]
+enum ReadLinks {
+    Single,
+    InstallationSource,
+}
+
+#[cfg(unix)]
+fn check_read_metadata(metadata: &std::fs::Metadata, links: ReadLinks) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match links {
+        ReadLinks::Single => check_metadata(metadata, false, false),
+        ReadLinks::InstallationSource => {
+            if !metadata.is_file() {
+                return Err(invalid("not a regular file"));
+            }
+            if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.nlink() == 0 {
+                return Err(invalid(
+                    "unsafe installation source ownership or missing links",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_bounded(
+    file: File,
+    limit: usize,
+    forbidden_permissions: u32,
+    links: ReadLinks,
+) -> io::Result<Vec<u8>> {
     let before = file.metadata()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         // Validate the capture snapshot itself, not an earlier checked-open stat.
-        check_metadata(&before, false, false)?;
+        check_read_metadata(&before, links)?;
         if before.mode() & forbidden_permissions != 0 {
             return Err(invalid("unsafe file permissions during capture"));
         }
@@ -414,17 +449,28 @@ fn read_bounded(file: File, limit: usize, forbidden_permissions: u32) -> io::Res
 
 /// Read a caller-supplied path with a no-follow, nonblocking final open.
 pub fn read_regular(path: impl AsRef<Path>, limit: usize) -> io::Result<Vec<u8>> {
+    read_path(path.as_ref(), limit, ReadLinks::Single)
+}
+
+/// Capture an owned installation source, including stable Cargo artifact hard links.
+/// The caller must create an independent private candidate from these bytes; this
+/// policy is not for installed targets, backups, configuration, or private state.
+pub fn read_installation_source(path: impl AsRef<Path>, limit: usize) -> io::Result<Vec<u8>> {
+    read_path(path.as_ref(), limit, ReadLinks::InstallationSource)
+}
+
+fn read_path(path: &Path, limit: usize, links: ReadLinks) -> io::Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use rustix::fs::{Mode, OFlags, open};
         let file: File = open(
-            path.as_ref(),
+            path,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )?
         .into();
-        check(&file, false, false)?;
-        read_bounded(file, limit, 0)
+        check_read_metadata(&file.metadata()?, links)?;
+        read_bounded(file, limit, 0, links)
     }
     #[cfg(not(unix))]
     {
@@ -527,7 +573,10 @@ pub fn read_contained(root: &Path, logical: &str, limit: usize) -> io::Result<(S
             names.push(part);
             if last {
                 check(&file, false, false)?;
-                return Ok((names.join("/"), read_bounded(file, limit, 0)?));
+                return Ok((
+                    names.join("/"),
+                    read_bounded(file, limit, 0, ReadLinks::Single)?,
+                ));
             }
             dirs.push(file);
         }
@@ -646,7 +695,7 @@ impl SecureDir {
     ) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
         let file = self.open_file(name, false, false)?;
         let metadata = file.metadata()?;
-        let bytes = read_bounded(file, limit, 0o077)?;
+        let bytes = read_bounded(file, limit, 0o077, ReadLinks::Single)?;
         Ok((bytes, metadata))
     }
     pub fn file_metadata(&self, name: &str) -> io::Result<std::fs::Metadata> {
@@ -693,7 +742,7 @@ impl SecureDir {
         self.open_cache_file(name)?.metadata()
     }
     pub fn read_cache(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
-        read_bounded(self.open_cache_file(name)?, limit, 0o022)
+        read_bounded(self.open_cache_file(name)?, limit, 0o022, ReadLinks::Single)
     }
     /// Caller holds the directory lock. New bytes are always owner-only.
     pub fn write_cache(&self, name: &str, bytes: &[u8]) -> io::Result<WriteReceipt> {
