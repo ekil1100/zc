@@ -1,4 +1,5 @@
 //! Public command contract. State and runtime authority remain in store/daemon.
+mod probes;
 use crate::{
     config::{self, Config},
     daemon,
@@ -1794,43 +1795,55 @@ pub fn doctor_report(data: &Value) -> String {
 /// Probe an explicit real HTTP target using the command's proxy client. Tests
 /// supply local URLs; no CLI or environment target override is introduced.
 pub async fn diagnostic_target_probe(client: &reqwest::Client, name: &str, url: &str) -> Value {
+    diagnostic_request_probe(client.get(url), name).await
+}
+async fn diagnostic_request_probe(request: reqwest::RequestBuilder, name: &str) -> Value {
     let geo = name == "IP/Location";
-    let failure =
-        |reason: &str| json!({"name":name,"ok":false,"reason":if geo {"no response"}else{reason}});
-    let request_error = |error: reqwest::Error| {
-        failure(if error.is_timeout() {
-            "Timeout"
-        } else if error.is_connect() {
-            "TCP connect failure"
-        } else {
-            "Unknown failure"
-        })
+    let failure = |stage: &str, reason: &str, status: Option<u16>| {
+        let mut target = json!({"name":name,"ok":false,"reason":reason,"failure_stage":stage,"actual_path":"unknown"});
+        if let Some(status) = status {
+            target["http_status"] = json!(status);
+        }
+        target
     };
     let start = std::time::Instant::now();
-    let mut response = match client
-        .get(url)
+    let mut response = match request
         .timeout(Duration::from_secs(if geo { 90 } else { 5 }))
         .send()
         .await
     {
         Ok(response) => response,
-        Err(error) => return request_error(error),
+        Err(error) => {
+            let (stage, reason) = diagnostic_request_error(&error);
+            return failure(stage, reason, None);
+        }
     };
-    if response.status().as_u16() == 502 {
-        return failure("TCP connect failure");
+    let status = response.status().as_u16();
+    if status == 502 {
+        return failure("http", "HTTP 502 response", Some(status));
     }
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) if geo => {
                 if chunk.len() > (1024 * 1024usize).saturating_sub(body.len()) {
-                    return failure("Unknown failure");
+                    return failure("http_body", "Response body exceeds limit", Some(status));
                 }
                 body.extend_from_slice(&chunk);
             }
             Ok(Some(_)) => (),
             Ok(None) => break,
-            Err(error) => return request_error(error),
+            Err(error) => {
+                return failure(
+                    "http_body",
+                    if error.is_timeout() {
+                        "Timeout"
+                    } else {
+                        "Response body read failed"
+                    },
+                    Some(status),
+                );
+            }
         }
     }
     if geo {
@@ -1841,15 +1854,49 @@ pub async fn diagnostic_target_probe(client: &reqwest::Client, name: &str, url: 
             .as_ref()
             .and_then(|value| value["query"].as_str())
             .unwrap_or("unknown");
-        json!({"name":name,"ok":true,"ip":ip})
+        json!({"name":name,"ok":true,"ip":ip,"actual_path":"unknown","http_status":status})
     } else {
-        json!({"name":name,"ok":true,"latency_ms":start.elapsed().as_millis() as u64})
+        json!({"name":name,"ok":true,"latency_ms":start.elapsed().as_millis() as u64,"actual_path":"unknown","http_status":status})
+    }
+}
+
+fn diagnostic_request_error(error: &reqwest::Error) -> (&'static str, &'static str) {
+    // Match typed TLS evidence, never error text or a guessed DNS cause.
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return (
+                "tls",
+                if matches!(tls, rustls::Error::InvalidCertificate(_)) {
+                    "TLS certificate validation failed"
+                } else {
+                    "TLS handshake failed"
+                },
+            );
+        }
+        // io::Error::source can skip the contained error itself. Traverse its
+        // payload explicitly, including nested io wrappers from hyper-rustls.
+        cause = if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            io.get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))
+        } else {
+            current.source()
+        };
+    }
+    if error.is_timeout() {
+        ("request", "Timeout")
+    } else if error.is_connect() {
+        // reqwest also groups proxy tunnel setup under connect errors. This is
+        // not evidence that the runtime failed to dial a particular TCP peer.
+        ("connection_setup", "Connection setup failed")
+    } else {
+        ("request", "Request failed")
     }
 }
 
 pub fn diagnostic_target_report(target: &Value) -> String {
     let name = target["name"].as_str().unwrap_or("target");
-    if let Some(ip) = target["ip"].as_str() {
+    let result = if let Some(ip) = target["ip"].as_str() {
         let (ip, truncated) = bounded_diagnostic(ip);
         format!(
             "{name}: {ip}{}",
@@ -1858,12 +1905,34 @@ pub fn diagnostic_target_report(target: &Value) -> String {
     } else if target["ok"] == true {
         format!("{name}: OK {} ms", target["latency_ms"])
     } else {
-        format!("{name}: {}", target["reason"].as_str().unwrap_or("failed"))
+        format!(
+            "{name}: {} [stage: {}]",
+            target["reason"].as_str().unwrap_or("failed"),
+            target["failure_stage"].as_str().unwrap_or("unknown")
+        )
+    };
+    let path = target["actual_path"].as_str().unwrap_or("unknown");
+    let mut result = format!("{result} [actual path: {path}]");
+    if let Some(proxy) = target["proxy"]["name"].as_str() {
+        result.push_str(&format!(" leaf: {}", safe_text(proxy)));
     }
+    if let Some(reason) = target["path_reason"].as_str() {
+        result.push_str(&format!(
+            " ({reason}; {})",
+            target["path_hint"]
+                .as_str()
+                .unwrap_or("retry against the intended instance")
+        ));
+    }
+    result
 }
 
-fn diagnostic_load_error(error: anyhow::Error, args: &Args, doctor: bool) -> anyhow::Error {
-    if args.overrides.script_path.is_some()
+fn diagnostic_load_error(
+    error: anyhow::Error,
+    override_requested: bool,
+    doctor: bool,
+) -> anyhow::Error {
+    if override_requested
         && error
             .chain()
             .any(|cause| cause.to_string().starts_with("OVERRIDE_"))
@@ -1890,15 +1959,42 @@ async fn diagnose(args: &Args, doctor: bool) -> Result<Output> {
         let state = daemon::status().await?;
         let data = doctor_diagnostics(args.prepare(), &state, ([1, 1, 1, 1], 443).into())
             .await
-            .map_err(|error| diagnostic_load_error(error, args, true))?;
+            .map_err(|error| {
+                diagnostic_load_error(error, args.overrides.script_path.is_some(), true)
+            })?;
         if !args.flag("--json") {
             print!("{}", doctor_report(&data));
         }
         return diagnostic_result(data);
     }
-    let prepared = service::prepare(args.prepare())
+    let data = test_diagnostics(
+        args.prepare(),
+        &[
+            ("IP/Location", "http://ip-api.com/json"),
+            ("Google", "http://www.google.com/generate_204"),
+            ("YouTube", "http://www.youtube.com/generate_204"),
+            ("Netflix", "http://www.netflix.com"),
+            ("OpenAI", "http://chat.openai.com"),
+            ("GitHub", "http://github.com"),
+            ("Cloudflare", "http://1.1.1.1"),
+        ],
+        !args.flag("--json"),
+    )
+    .await?;
+    diagnostic_result(data)
+}
+
+/// The same command diagnostics with explicit targets for isolated real-runtime
+/// tests. Production targets are fixed; there is no environment/CLI override.
+pub async fn test_diagnostics(
+    options: PrepareOptions,
+    probe_targets: &[(&str, &str)],
+    print: bool,
+) -> Result<Value> {
+    let override_requested = options.override_options.script_path.is_some();
+    let prepared = service::prepare(options)
         .await
-        .map_err(|error| diagnostic_load_error(error, args, false))?;
+        .map_err(|error| diagnostic_load_error(error, override_requested, false))?;
     let state = daemon::status().await?;
     let port = prepared.port;
     let listening = tcp_probe(([127, 0, 0, 1], port).into(), Duration::from_millis(250)).await;
@@ -1908,6 +2004,7 @@ async fn diagnose(args: &Args, doctor: bool) -> Result<Output> {
     ];
     let mut targets = Vec::new();
     if listening {
+        let tracking = probes::Tracking::capture(port).await;
         let client = reqwest::Client::builder()
             .no_proxy()
             .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{port}"))?)
@@ -1916,37 +2013,62 @@ async fn diagnose(args: &Args, doctor: bool) -> Result<Output> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let mut tasks = tokio::task::JoinSet::new();
-        for (name, url) in [
-            ("IP/Location", "http://ip-api.com/json"),
-            ("Google", "http://www.google.com/generate_204"),
-            ("YouTube", "http://www.youtube.com/generate_204"),
-            ("Netflix", "http://www.netflix.com"),
-            ("OpenAI", "http://chat.openai.com"),
-            ("GitHub", "http://github.com"),
-            ("Cloudflare", "http://1.1.1.1"),
-        ] {
+        for &(name, url) in probe_targets {
             let client = client.clone();
-            tasks.spawn(async move { diagnostic_target_probe(&client, name, url).await });
+            let (name, url) = (name.to_owned(), url.to_owned());
+            let tracking = tracking.clone();
+            tasks.spawn(async move { tracking.probe(&client, &name, &url).await });
         }
         while let Some(result) = tasks.join_next().await {
             let target = result?;
-            if !args.flag("--json") {
+            if print {
                 println!("{}", diagnostic_target_report(&target));
             }
             targets.push(target);
         }
         let success = targets.iter().filter(|t| t["ok"] == true).count();
-        checks.push(json!({"name":"connectivity","ok":success>0,"detail":format!("{success}/{} targets reachable",targets.len())}));
-    } else if !args.flag("--json") {
+        checks.push(json!({"name":"connectivity","ok":success == targets.len(),"detail":format!("{success}/{} targets reachable",targets.len())}));
+    } else if print {
         println!("Port: 127.0.0.1:{port} not listening");
+    }
+    let succeeded = targets.iter().filter(|target| target["ok"] == true).count();
+    let total = targets.len();
+    let (status, label) = if total == 0 {
+        ("not_run", "not run")
+    } else if succeeded == total {
+        ("all_succeeded", "all targets reachable")
+    } else if succeeded == 0 {
+        ("all_failed", "all targets failed")
+    } else {
+        ("partial", "partially reachable")
+    };
+    let summary =
+        json!({"status":status,"total":total,"succeeded":succeeded,"failed":total-succeeded});
+    let path_summary = probes::path_summary(&targets);
+    if print {
+        println!("Summary: {label} ({succeeded}/{total} targets reachable)");
+        for path in ["direct", "proxy", "reject", "unknown"] {
+            let counts = &path_summary[path];
+            println!(
+                "Path {path}: {}/{} succeeded, {} failed{}",
+                counts["succeeded"],
+                counts["total"],
+                counts["failed"],
+                if counts["total"] == 0 {
+                    " (not tested)"
+                } else {
+                    ""
+                }
+            );
+        }
     }
     let selected = config
         .selected()
         .into_iter()
         .map(|(group, proxy)| json!({"group":group,"proxy":proxy}))
         .collect::<Vec<_>>();
-    diagnostic_result(
-        json!({"action":"proxy_test","daemon_state":state["state"],"selected_proxies":selected,"ports":[{"label":"mixed","port":port,"listening":listening}],"checks":checks,"targets":targets}),
+    Ok(
+        json!({"action":"proxy_test","daemon_state":state["state"],"selected_proxies":selected,"selected_proxies_source":"prepared_config","ports":[{"label":"mixed","port":port,"listening":listening}],"checks":checks,"targets":targets,"summary":summary,"path_summary":path_summary}),
     )
 }
 fn diagnostic_result(data: Value) -> Result<Output> {

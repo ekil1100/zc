@@ -108,6 +108,21 @@ struct Request {
 #[derive(Clone, Copy)]
 struct HttpError(u16, &'static str);
 const BAD: HttpError = HttpError(400, "Bad Request");
+impl From<crate::connection::ProbeError> for HttpError {
+    fn from(error: crate::connection::ProbeError) -> Self {
+        use crate::connection::ProbeError;
+        match error {
+            ProbeError::Invalid => BAD,
+            ProbeError::Instance => Self(409, "Connection instance changed"),
+            ProbeError::Missing => Self(404, "Probe not found"),
+            ProbeError::Consumed => Self(409, "Probe already claimed"),
+            ProbeError::Target => Self(409, "Probe target mismatch"),
+            ProbeError::Quota => Self(429, "Probe quota exceeded"),
+            ProbeError::Unavailable => Self(500, "Probe unavailable"),
+            ProbeError::ResponseTooLarge => Self(500, "Response Too Large"),
+        }
+    }
+}
 async fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, HttpError> {
     let mut bytes = Vec::with_capacity(4096);
     let header_end = loop {
@@ -150,7 +165,10 @@ async fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Ht
     let mut authorization = None;
     let mut instance = None;
     for header in parsed.headers.iter() {
-        if header.name.eq_ignore_ascii_case("x-zc-instance-nonce") {
+        if header
+            .name
+            .eq_ignore_ascii_case(crate::connection::INSTANCE_HEADER)
+        {
             if instance.is_some() {
                 return Err(BAD);
             }
@@ -268,7 +286,38 @@ impl State {
         {
             return Err(HttpError(409, "Connection instance changed"));
         }
+        let probe_request = request.path == "/connections/probes"
+            || request.path.starts_with("/connections/probes/");
+        if probe_request && request.instance.is_none() {
+            return Err(BAD);
+        }
         match (request.method.as_str(), request.path.as_str()) {
+            ("PUT", "/connections/probes") => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Reservation {
+                    host: String,
+                    port: u16,
+                }
+                let body: Reservation = serde_json::from_slice(&request.body).map_err(|_| BAD)?;
+                let target = crate::target::Target::new(body.host, body.port).map_err(|_| BAD)?;
+                let token = self.connections.reserve_probe(&target)?;
+                Ok(json!({"token": token}))
+            }
+            ("GET", path) if path.starts_with("/connections/probes/") => {
+                let token = &path["/connections/probes/".len()..];
+                let mut bounded = BoundedResponse(Vec::new());
+                self.connections
+                    .write_probe(token, &self.config, &mut bounded)?;
+                serde_json::from_slice(&bounded.0)
+                    .map_err(|_| HttpError(500, "Internal Server Error"))
+            }
+            ("DELETE", path) if path.starts_with("/connections/probes/") => {
+                let token = &path["/connections/probes/".len()..];
+                self.connections.release_probe(token)?;
+                Ok(json!({"released": true}))
+            }
+            _ if probe_request => Err(HttpError(405, "Method Not Allowed")),
             ("GET", "/connections") => {
                 let mut bounded = BoundedResponse(Vec::new());
                 self.connections

@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{Value, json};
 use zc::{
     cli::{doctor_diagnostics, doctor_report},
     service::PrepareOptions,
@@ -169,7 +169,102 @@ fn diagnostic_load_errors_do_not_leak_start_codes_or_hide_capability_codes() {
 }
 
 #[tokio::test]
-async fn proxy_target_shapes_match_zig_geo_and_latency_results_on_real_local_http() {
+async fn target_body_and_request_failures_keep_only_observed_stage_and_status() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (wire, stage, reason, status) in [
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\nConnection: close\r\n\r\nshort".as_slice(),
+            "http_body",
+            "Response body read failed",
+            Some(200),
+        ),
+        (
+            b"TLS certificate error DNS pollution PRIVATE_MARKER\r\n\r\n".as_slice(),
+            "request",
+            "Request failed",
+            None,
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+                assert!(request.len() < 16384);
+            }
+            stream.write_all(wire).await.unwrap();
+        });
+        let target = zc::cli::diagnostic_target_probe(
+            &client,
+            "IP/Location",
+            &format!("http://{address}/PRIVATE_MARKER"),
+        )
+        .await;
+        peer.await.unwrap();
+        assert_eq!(target["ok"], false);
+        assert_eq!(target["failure_stage"], stage, "{target}");
+        assert_eq!(target["reason"], reason);
+        assert_eq!(target.get("http_status").and_then(Value::as_u64), status);
+        assert!(!target.to_string().contains("PRIVATE_MARKER"));
+    }
+}
+
+#[tokio::test]
+async fn target_certificate_failure_reports_tls_without_guessing_dns_or_tcp() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::sync::Arc;
+    let pem = include_bytes!("../testdata/e2e/dns-route-cert.pem");
+    let cert = CertificateDer::from_pem_slice(pem).unwrap();
+    let key =
+        PrivateKeyDer::from_pem_slice(include_bytes!("../testdata/e2e/trojan-key.pem")).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key)
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(pem).unwrap())
+        .build()
+        .unwrap();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(acceptor.accept(stream).await.is_err());
+    });
+    // The trusted certificate is for front.example, not the loopback IP.
+    let target = zc::cli::diagnostic_target_probe(
+        &client,
+        "TLS target",
+        &format!("https://{address}/PRIVATE_MARKER?token=PRIVATE_MARKER"),
+    )
+    .await;
+    peer.await.unwrap();
+    assert_eq!(target["ok"], false);
+    assert_eq!(target["failure_stage"], "tls", "{target}");
+    assert_eq!(target["reason"], "TLS certificate validation failed");
+    assert_eq!(target["actual_path"], "unknown");
+    assert!(target.get("http_status").is_none());
+    let text = zc::cli::diagnostic_target_report(&target);
+    assert!(text.contains("stage: tls"));
+    assert!(!text.contains("TCP"));
+    for output in [target.to_string(), text] {
+        assert!(!output.contains("PRIVATE_MARKER"));
+        assert!(!output.to_lowercase().contains("dns"));
+    }
+}
+
+#[tokio::test]
+async fn proxy_target_shapes_preserve_geo_and_latency_and_report_http_evidence() {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -202,6 +297,8 @@ async fn proxy_target_shapes_match_zig_geo_and_latency_results_on_real_local_htt
         let target = zc::cli::diagnostic_target_probe(&client, name, &url).await;
         peer.await.unwrap();
         assert_eq!(target["ok"], expected_ok);
+        assert_eq!(target["http_status"], status);
+        assert_eq!(target["actual_path"], "unknown");
         assert_eq!(
             target.get("ip").and_then(|value| value.as_str()),
             expected_ip
@@ -211,14 +308,8 @@ async fn proxy_target_shapes_match_zig_geo_and_latency_results_on_real_local_htt
             expected_ok && name != "IP/Location"
         );
         if !expected_ok {
-            assert_eq!(
-                target["reason"],
-                if name == "IP/Location" {
-                    "no response"
-                } else {
-                    "TCP connect failure"
-                }
-            );
+            assert_eq!(target["reason"], "HTTP 502 response");
+            assert_eq!(target["failure_stage"], "http");
         }
         let text = zc::cli::diagnostic_target_report(&target);
         assert!(text.contains(name));

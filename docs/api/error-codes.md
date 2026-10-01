@@ -244,7 +244,7 @@ source 并修复 subscription source；active update 只提示修复 subscriptio
 
 `CHECKS_FAILED` 是诊断类命令（`test` / `proxy test` / `profile test` /
 `doctor` / `diag doctor`）的统一失败码：envelope 附带 `data`（逐项
-`checks`），exit 1（决策 D3）。
+`checks`），exit 1（决策 D3）。`test` 及其别名现在要求全部目标成功；部分成功同样返回此码，`data.summary` 提供成功/失败计数与状态，`data.targets` 保留逐项目标结果。端口不可达时摘要为 `not_run`。字段及旧版兼容变化见 [CLI 契约](../cli/spec.md#test-的可用性摘要与实际路径)。
 
 ### F. override / rule-provider
 

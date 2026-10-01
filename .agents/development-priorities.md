@@ -39,7 +39,7 @@
 
 - 用户确认并行推进 `zc test` 可用性反馈与 DNS/出站分层故障日志，优先处理真实故障暴露的诊断缺口。
 - **分层日志已实现并完成主工作区合并前验证，未安装**：保留六阶段，新增有限来源分类，区分目标/节点解析、连接、TLS 与代理协议准备；161 项相关回归通过，1 项五分钟 UDP idle 忽略，格式及严格 all-targets Clippy 通过。证据见 [分层故障观测验收](reliability/dns-failure-observation.md)。不承诺检测 DNS 错答或隧道内客户端 TLS 错误。
-- `zc test` 结果与退出码修复已完成分支验证，真实出站路径识别仍在独立 worktree 实施，尚未合入。
+- **`zc test` 可用性与实际路径已实现并完成合并验证，未安装**：全部目标成功才 exit 0；鉴权、实例绑定的单次票据记录 HTTP forward 实际 leaf，分别统计直连/代理/拒绝/未知路径。缺 controller 或证据时明确未知及原因，不用配置猜测。合并分层日志后 187 项相关回归通过，4 项忽略（3 项历史二进制、1 项已在分支独立通过的真实 120 秒到期测试）；格式及严格 all-targets Clippy 通过。证据见 [可用性与实际路径验收](reliability/test-availability.md)。
 
 ## P1：SS / Trojan / AnyTLS
 

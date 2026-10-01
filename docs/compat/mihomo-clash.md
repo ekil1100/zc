@@ -183,6 +183,10 @@ CLI/daemon/state 契约见 [CLI](../cli/spec.md)；minimal API 见 [API](../api/
 
 `doctor` 保留配置与连接两个 gating checks：daemon stopped 合法；运行中端口不可达才使连接 check 失败。`network_ok` 仍真实探测 `1.1.1.1:443`，200 ms，但不 gating。显式/默认 `config_source` 为原来的 `custom/default`。语法/I/O 失败返回 `DIAG_DOCTOR_FAILED`，显式 override 保留对应错误码，上表兼容字段不构成配置错误；已识别的能力准入失败返回 `CONFIG_CAPABILITY_UNSUPPORTED`，不捏造字段诊断；可解析但语义无效时返回 `CHECKS_FAILED`，`config_errors` 给出具体错误，文本和 JSON 使用同一条消息，512 UTF-8 bytes 上限并明确标记截断。
 
-`test/proxy test/profile test` 加载失败使用 `PROXY_CONFIG_LOAD_FAILED`；端口不可达时不跑外网 targets。七个默认目标、至少一个目标成功才通过 connectivity 的判定保持不变。IP/Location JSON：成功含 `ip`（无 query 时 `unknown`），不含 `latency_ms`；其他成功 target 含 latency。502 失败，403 等非 502 响应仍算连通；文本显示同一 IP/latency/reason，连接期限 5 秒、geo 总期限 90 秒、其余目标 5 秒。
+`test/proxy test/profile test` 加载失败使用 `PROXY_CONFIG_LOAD_FAILED`；端口不可达时不跑外网 targets。七个默认 HTTP 目标保持不变；**connectivity 改为全部目标成功才通过**，部分成功与全部失败均为 `ok:false`、`CHECKS_FAILED`、exit 1。新增成功/失败计数及 `all_succeeded/partial/all_failed/not_run` 摘要，保留逐项结果。这是相对旧版“至少一个成功”的明确 CLI 兼容变化，详见 [CLI 摘要与字段](../cli/spec.md#test-的可用性摘要与实际路径)。
+
+新版 zc 实例的 HTTP 探测通过强制鉴权、实例绑定、单次消费的请求票据记录真实 leaf；每项 `actual_path` 为 `direct/proxy/reject/unknown`，已验证项带 leaf 及连接/请求标识，`path_summary` 分别计数各路径的成功和失败。短连接结束后证据仍保留至释放或 120 秒到期；同目标并发与 keep-alive 各请求独立，切组不重写旧记录，重启后的旧身份拒绝。无 controller/secret、外部端口、旧版或不可验证实例等情况仍为 unknown 并给出原因与操作提示，不自动新开端口。`selected_proxies_source:"prepared_config"` 区分准备配置与运行中实际路径，不根据目标名、IP 或选择推断 DIRECT/代理。IP/Location JSON 成功含 `ip`（无 query 时 `unknown`），不含 `latency_ms`；其他成功 target 含 latency。502 失败，403 等非 502 完整响应仍算连通；默认禁重定向，因此全部成功也只是这组 HTTP 目标的连通结果；特定代理是否被测须看已验证路径和 leaf，不证明 HTTPS 或业务全面可用。连接期限 5 秒、geo 总期限 90 秒、其余目标 5 秒保持不变。
+
+收到响应头时提供 `http_status`；失败提供 CLI 侧 `failure_stage` 和脱敏原因，文本/JSON 同源。502 只证明收到该 HTTP 状态；直接可见的 TLS 错误才标为 TLS，证书错误不推断 DNS 污染。IP/Location 失败也保留阶段原因，替代旧版统一 `no response`；不将客户端的连接准备错误一概写成代理节点 TCP 失败。
 
 诊断提供多错误汇总、支持范围内的 warnings 和原始配置迁移提示；errors/warnings 合计最多 256 条、每条 512 bytes，错误优先，省略必须显式标记。geo 文本的城市/地区附加信息及 curl 特有的底层错误细分未逐项复刻，不宣称所有诊断文字完全等价。

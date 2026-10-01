@@ -302,6 +302,7 @@ fn authority(value: &str, default_port: Option<u16>) -> Result<Target> {
 struct HttpRequest {
     target: Target,
     forward: Option<Forward>,
+    probe_token: Option<String>,
 }
 
 struct Forward {
@@ -372,10 +373,21 @@ fn http_request(request: &httparse::Request<'_, '_>) -> Result<HttpRequest> {
     let mut expect_seen = false;
     let mut trailers = false;
     let mut host_seen = false;
+    let mut probe_token = None;
     let mut connection = Vec::new();
     for header in request.headers.iter() {
         let name = header.name.to_ascii_lowercase();
         match name.as_str() {
+            crate::connection::PROBE_HEADER => {
+                if probe_token.is_some() || connect {
+                    bail!("invalid probe header");
+                }
+                let token = std::str::from_utf8(header.value)?;
+                if token.len() != 65 {
+                    bail!("invalid probe header");
+                }
+                probe_token = Some(token.to_owned());
+            }
             "transfer-encoding" => {
                 if chunked
                     || connect
@@ -474,6 +486,7 @@ fn http_request(request: &httparse::Request<'_, '_>) -> Result<HttpRequest> {
         return Ok(HttpRequest {
             target,
             forward: None,
+            probe_token: None,
         });
     }
     let host = if target.host().contains(':') {
@@ -494,6 +507,7 @@ fn http_request(request: &httparse::Request<'_, '_>) -> Result<HttpRequest> {
             "connection",
             "proxy-authorization",
             "proxy-connection",
+            crate::connection::PROBE_HEADER,
             "keep-alive",
             "te",
         ]
@@ -513,6 +527,7 @@ fn http_request(request: &httparse::Request<'_, '_>) -> Result<HttpRequest> {
     header.extend_from_slice(b"Connection: close\r\n\r\n");
     Ok(HttpRequest {
         target,
+        probe_token,
         forward: Some(Forward {
             header,
             length: length.unwrap_or(0),
@@ -587,6 +602,7 @@ async fn dial(
     source: SocketAddr,
     stage: &mut FailureContext,
     record: &Guard,
+    probe: Option<&crate::connection::Probe>,
 ) -> Result<Option<BoxStream>> {
     *stage = FailureContext {
         stage: FailureStage::Dns,
@@ -597,6 +613,9 @@ async fn dial(
         .route_with_context(target, &match_context(source))
         .await?;
     record.routed(&route);
+    if let Some(probe) = probe {
+        probe.routed(&route);
+    }
     if matches!(route.proxy.kind, ProxyKind::Reject) {
         record.phase(Phase::Rejected);
         context.rejected();
@@ -931,7 +950,7 @@ async fn serve(
         let mut stage = FailureStage::Connect.into();
         let upstream = match timeout(
             HANDSHAKE_TIMEOUT,
-            dial(&context, &target, source, &mut stage, record),
+            dial(&context, &target, source, &mut stage, record, None),
         )
         .await
         {
@@ -991,10 +1010,33 @@ async fn serve(
                 Inbound::HttpConnect
             },
         );
+        let probe = match request.probe_token.as_deref() {
+            Some(token) => match record.claim_probe(token, &request.target, number) {
+                Ok(probe) => Some(probe),
+                Err(_) => {
+                    // Admission failed before any target dial. Use the existing
+                    // diagnostic failure status, not a reachable-origin 4xx.
+                    timeout(
+                        HANDSHAKE_TIMEOUT,
+                        http_reply(&mut write_client, "502 Bad Gateway"),
+                    )
+                    .await??;
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
         let mut stage = FailureStage::Connect.into();
         let mut upstream = match timeout(
             HANDSHAKE_TIMEOUT,
-            dial(&context, &request.target, source, &mut stage, record),
+            dial(
+                &context,
+                &request.target,
+                source,
+                &mut stage,
+                record,
+                probe.as_ref(),
+            ),
         )
         .await
         {
@@ -1153,6 +1195,7 @@ fn validate_trailer(name: &str) -> Result<()> {
         "trailer",
         "authorization",
         "proxy-authorization",
+        crate::connection::PROBE_HEADER,
         "upgrade",
         "expect",
         "te",

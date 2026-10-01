@@ -18,7 +18,7 @@
 | `zc connection list` | 列出运行实例的活动连接、来源、协议/阶段、目标、命中运行时规则和实际 leaf；需显式 controller；托管自动 secret 或非空显式 secret |
 | `zc connection close <id>` | 按完整实例绑定 ID 请求关闭；成功仅表示已请求，非已回收 |
 | `zc log [-n <lines>] [-f\|--no-follow]` | 文本默认 follow；JSON 默认不 follow，`-f` 可显式启用；默认尾部 50 行 |
-| `zc test [-c <config>] [--port <port>]` | 通过代理端口做真实连通性检查；显式端口或默认 7899；文本/JSON 使用相同检查 |
+| `zc test [-c <config>] [--port <port>]` | 通过代理端口做真实目标连通性检查，全部目标成功才 exit 0；显式端口或默认 7899；文本/JSON 使用相同检查 |
 | `zc doctor [-c <config>]` | 配置、daemon、端口、连接诊断；运行中使用 descriptor 的实际 mixed 端口 |
 | `zc config load <path>` | 校验并捕获本地 YAML 与 root-contained provider 为 immutable revision，设为 active；不自动 apply，`applied:false` |
 | `zc config list` | 别名 `ls`；列出显示名称及可用于 `config use` 的 ID，以 `*` 标记 active；JSON 保持 `name`（ID）/`display`/`active` |
@@ -120,9 +120,78 @@ HTTP keep-alive 同 ID，下一请求更新路由，idle 清除目标/规则/lea
 
 doctor 最多保留 256 条 errors/warnings 合计、每条 512 rendered bytes，错误优先并可替换末尾 warning；有效性独立于保留条数。超长消息使用原模板省略参数并追加 ` ... [truncated]`，数量或字节省略均以 `config_diagnostics_truncated` 明示。文本/JSON 同源输出多错误、warnings 与 migration hints；凭据不回显，终端控制字符清理。hints 保留原显式文件的 1 MiB 文本扫描规则（包括注释），不表示启用所提及的能力，unsupported 声明仍拒绝。加载失败不伪造语义诊断，语义错误保持 `CHECKS_FAILED`。上述详细诊断仅描述 doctor；其他配置加载命令可能只返回概括性错误。
 
-`test/proxy test/profile test` 含 `daemon_state/selected_proxies/ports/checks/targets`，文本并发探测按完成顺序输出；任何失败的 check 返回 `CHECKS_FAILED` + data，exit 1。单项 target 与聚合 check 不应混为一谈。`doctor` 含 `proxy_reachable/network_ok/config_ok/config_diagnostics_truncated`，文本冻结标签 `Config:/Daemon:/PID:/Port:/Connection:`。这些诊断会发起真实网络探测，不属于纯离线验证。
+`doctor` 含 `proxy_reachable/network_ok/config_ok/config_diagnostics_truncated`，文本冻结标签 `Config:/Daemon:/PID:/Port:/Connection:`。诊断会发起真实网络探测，不属于纯离线验证。`test/proxy test/profile test` 的目标、摘要和退出码见下节。
 
 `zc.pid/zc.lock/zc.log/zc.daemon.json/zc.daemon.lock` 位于安全 runtime directory。`XDG_RUNTIME_DIR` 须为既有、绝对规范路径、当前 euid 所有、0700；未设置使用规范化 `$HOME/.local/state/zc/runtime`。不安全父路径、symlink、特殊文件 fail closed；文件 0600。运行日志当前文件 `zc.log` 与归档 `zc.log.1` 各最多 8 MiB，轮转受 `zc.log.lock` 保护，follow 会在安全重建后重开；非 follow 合并归档和当前文件的一致快照后取尾部。`zc.exit.json` 仅为异常退出诊断标记，不参与实例权威判断。文件保持 owner-only，测试必须使用临时 HOME/runtime。
+
+### test 的可用性摘要与实际路径
+
+`test`、`proxy test`、`profile test` 共用以下文本/JSON 语义。保留 `daemon_state/selected_proxies/ports/checks/targets`；文本逐项按并发探测完成顺序输出，最后输出摘要。任一目标失败都使 `connectivity` check 失败，返回 `ok:false`、`CHECKS_FAILED`、exit 1，并保留完整诊断 `data`。
+
+`data.summary` 字段：
+
+| `status` | 含义 | 整体结果 |
+| --- | --- | --- |
+| `all_succeeded` | 已执行目标全部成功 | `ok:true`，exit 0 |
+| `partial` | 部分目标成功 | `ok:false`，exit 1 |
+| `all_failed` | 已执行目标全部失败 | `ok:false`，exit 1 |
+| `not_run` | 代理端口不可达，目标探测未执行 | `ok:false`，exit 1；端口 check 失败 |
+
+`total/succeeded/failed` 分别为已执行、成功、失败目标数，`total = succeeded + failed`。端口不可达时三者均为 0，`targets:[]`；用 `not_run` 区分“未测”与“测过且全失败”。配置加载失败沿用原错误码，不伪造摘要。
+
+例如只有一个目标成功时，摘要为 `{"status":"partial","total":7,"succeeded":1,"failed":6}`；文本为 `Summary: partially reachable (1/7 targets reachable)`。脚本须检查整体 `ok` / 退出码及摘要，按 `name` 识别逐项结果，不依赖完成顺序。
+
+**实际路径**：每个 target 的 `actual_path` 为 `direct/proxy/reject/unknown`。已验证项额外提供 `proxy:{name,type}` 和 `route_evidence:{connection_id,request_index}`；`request_index` 从 0 开始，区分同一 HTTP keep-alive 连接中的不同请求。命名 direct 节点仍按 `type:Direct` 计入直连，REJECT 单独计数。这里证明的是运行时为该请求实际选定并尝试的 leaf；连接或 HTTP 结果仍由该项 `ok` 表达，选中代理不等于连接成功。
+
+证据来自本次真实请求：CLI 从认证冻结快照取得现有 controller 的 secret 和实例身份，预约单次随机票据，在本地 HTTP 请求中携带逐跳追踪头；runtime 消费票据并保存随后实际路由使用的 leaf，CLI 再经鉴权接口读取。记录独立于活动连接，短请求结束后仍可查询；同目标并发、keep-alive 各请求使用不同票据。读端不重算路由、不查询瞬时连接列表后按域名匹配，也不以查询时的当前选择覆盖已记录 leaf。控制请求前后验证同一实例，重启后的旧身份拒绝；同实例切组不抹掉请求当时的证据。详见 [API 票据边界](../api/README.md#诊断请求票据)。
+
+`selected_proxies_source:"prepared_config"` 继续说明 `selected_proxies` 来自本次准备配置，可能与该端口的运行实例不同；它与目标名、目标 IP、HTTP 状态均不参与实际路径归类。
+
+**按路径计数**：`data.path_summary` 的 `direct/proxy/reject/unknown` 各含 `total/succeeded/failed`；四类之和等于整体摘要。文本逐项显示路径和 leaf，最后显示四类计数，`total:0` 显示 `not tested`。例如只有 DIRECT 成功、六个代理请求失败时：
+
+```json
+{
+  "direct": {"total": 1, "succeeded": 1, "failed": 0},
+  "proxy": {"total": 6, "succeeded": 0, "failed": 6},
+  "reject": {"total": 0, "succeeded": 0, "failed": 0},
+  "unknown": {"total": 0, "succeeded": 0, "failed": 0}
+}
+```
+
+`proxy.total:0` 表示没有已证实走代理的样本，不能用 DIRECT 或 unknown 的成功数证明代理可用。路径未知不伪造为失败或 DIRECT，目标 HTTP 结果继续单独保留。
+
+**取得证据的条件与提示**：支持运行新版 zc、认证运行快照可读、指定 mixed 端口匹配该实例、已配置 controller 和非空运行时 secret 的 HTTP forward 请求。托管 profile 已有 controller 时自动 secret 沿用既有生命周期；默认不需要用户复制 secret。端口选择仍为显式 `--port` 或 7899，若实例用了其他端口，应传入该实际端口。没有 controller 时不自动开监听器。
+
+未知项包含 `path_reason/path_hint`，文本也显示同一提示：
+
+| `path_reason` | 条件与操作 |
+| --- | --- |
+| `not_running` | 当前隔离状态中没有可验证运行实例；启动目标实例后重试 |
+| `controller_required` | 冻结配置未启用 controller；配置显式 `external-controller` 后用 `zc restart -c <profile>` 重新准备，默认 restart 沿用旧快照 |
+| `secret_required` / `unauthorized` | 缺少有效鉴权；托管 profile 显式重新准备，非托管配置设置非空 secret，并核对运行实例认证 |
+| `port_mismatch` | `--port` 指向其他端口或外部代理；改用当前 zc 实例 mixed 端口，外部代理仅报告 HTTP 结果 |
+| `instance_changed` | 采集期间实例身份变化；在稳定实例上重试 |
+| `evidence_unavailable` | controller 不可达、旧版本不支持、票据过期/额度耗尽或响应校验失败；检查 controller 版本和连通性后重试 |
+| `route_not_observed` | 请求结束时尚无实际路由记录，例如路由 DNS 未完成；结合运行日志排查 |
+| `unsupported_scheme` | 当前票据只用于 HTTP forward；默认七项均属此范围，HTTPS 隧道不携带追踪票据 |
+
+追踪票据不是 controller secret，单张只能消费一次，实例内最多 256 张，从预约起有效 120 秒；CLI 查询后尽力释放。长期 Bearer 只发往已有 loopback controller；mixed 入口剥离追踪头、拒绝重复头/CONNECT/追踪 trailer，CLI 同时使用 `Connection` 声明其逐跳性质，避免旧版 zc 或合规代理接管端口后将它转发到目标。旧/过期票据在目标拨号前拒绝并返回 502，计为失败。沿用既有可信本机 HTTP controller 边界，不增加对恶意本地监听器的加密身份认证。
+
+**探测范围**：七个固定目标仍为 IP/Location、Google、YouTube、Netflix、OpenAI、GitHub、Cloudflare，使用既有 HTTP URL；Cloudflare 是 `http://1.1.1.1`。请求禁重定向，成功只表示按既有判定取得了完整的非 502 HTTP 响应，403、其他非 502 状态仍可计为连通。HTTP 重定向响应不证明最终 HTTPS 站点可用。全部目标成功也只证明本次目标连通，指定代理是否被测以实际路径计数为准，HTTPS/TLS、登录/下载、其他站点和持续可用性仍需相应证据；仅 DIRECT 成功尤其不足以证明代理可用。
+
+**逐项证据**：成功保留 `ip`（IP/Location 缺 query 时 `unknown`，无 latency）或 `latency_ms`（其他目标）；失败保留 `reason` 并新增 `failure_stage`；取得 HTTP 响应头时额外提供数值 `http_status`（包括失败项）。阶段描述 CLI 自身观察，不等同于 daemon 内部故障阶段：
+
+| `failure_stage` | 直接证据与边界 |
+| --- | --- |
+| `tls` | 客户端错误链含类型化 TLS 错误；证书校验失败明确报告，原因不推断为 DNS 污染 |
+| `http` | 收到 HTTP 502；只报告响应码，不猜测 DNS、节点 TCP 或其他内部原因 |
+| `http_body` | 已收到响应头，读取正文失败、超时或 IP/Location 正文超限 |
+| `connection_setup` | 客户端报告连接准备失败，可能包含代理隧道准备；不等价于已定位某个 TCP 对端失败 |
+| `request` | 请求超时或其他缺少更具体阶段证据的错误 |
+
+文本失败行显示相同 `reason` 与阶段。错误不回显 URL、响应正文或底层原始错误。默认目标为 HTTP，通常不会在 CLI 侧进行目标 TLS；运行时代理自身的 TLS 故障也不能仅凭 HTTP 502 细分。
+
+**兼容变化**：旧版“至少一个目标成功就 exit 0”改为全部成功才 exit 0；部分成功现在明确失败。JSON 新增 `summary`、`path_summary`、`selected_proxies_source` 及逐项路径/失败阶段证据字段，旧字段保留。原 502 的 `TCP connect failure` 和 IP/Location 统一的 `no response` 改为有证据的阶段原因。消费方应读取字段而非匹配旧错误文案；不改变默认目标、期限、403 等非 502 响应判定、provider 准备策略或 doctor gating。
 
 ### 稳定性日志
 

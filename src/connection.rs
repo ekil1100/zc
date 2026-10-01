@@ -11,6 +11,10 @@ use std::{
 };
 use tokio::sync::watch;
 
+mod probes;
+pub(crate) use probes::{Probe, ProbeError};
+
+pub const PROBE_HEADER: &str = "x-zc-probe-token";
 pub const INSTANCE_HEADER: &str = "x-zc-instance-nonce";
 pub const LIMIT: usize = 1024;
 
@@ -71,6 +75,7 @@ struct State {
 pub struct ConnectionRegistry {
     nonce: String,
     state: Mutex<State>,
+    probes: Mutex<probes::Tickets>,
 }
 pub(crate) enum CloseError {
     Invalid,
@@ -85,6 +90,7 @@ impl ConnectionRegistry {
         Arc::new(Self {
             nonce,
             state: Mutex::new(State::default()),
+            probes: Mutex::new(probes::Tickets::default()),
         })
     }
     pub(crate) fn nonce(&self) -> &str {
