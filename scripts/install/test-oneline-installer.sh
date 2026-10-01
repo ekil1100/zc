@@ -8,6 +8,7 @@ command -v cc >/dev/null 2>&1 || {
 }
 real_zc_bin="${1:-$repo_root/target/debug/zc}"
 [[ -x "$real_zc_bin" ]] || { echo "Build the Rust candidate before this regression" >&2; exit 1; }
+service_fixture="${ZC_INSTALL_SERVICE_FIXTURE:-$(dirname "$real_zc_bin")/examples/e2e_service_install}"
 port_helper_bin="${2:-}"
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/zc-installer-e2e.XXXXXX")"
 real_home=""
@@ -66,7 +67,14 @@ install_dir="$work_root/install"
 package_name=""
 
 case "$(uname -s)" in
-    Linux) package_os="linux" ;;
+    Linux)
+        package_os="linux"
+        # Package release-shaped bytes without changing the shared Cargo artifact.
+        # ELF debug sections can exceed the installer's fixed 128 MiB limit.
+        cp "$real_zc_bin" "$work_root/release-fixture-zc"
+        strip --strip-debug "$work_root/release-fixture-zc"
+        real_zc_bin="$work_root/release-fixture-zc"
+        ;;
     Darwin) package_os="macos" ;;
     *)
         echo "TEST_RESULT=FAIL unsupported host OS" >&2
@@ -478,7 +486,6 @@ EOF
     echo "INSTALLER_REAL_DAEMON_FAIL_CLOSED=PASS"
 fi
 
-service_fixture="${ZC_INSTALL_SERVICE_FIXTURE:-$(dirname "$real_zc_bin")/examples/e2e_service_install}"
 [[ -x "$service_fixture" ]] || { echo "Build e2e_service_install before this regression" >&2; exit 1; }
 python3 "$repo_root/scripts/install/test-release-service.py" "$repo_root" "$service_fixture" "$work_root"
 echo "INSTALLER_E2E_RESULT=PASS"

@@ -87,6 +87,12 @@
 
 [完整 CI 36935978547](https://github.com/ekil1100/zc/actions/runs/36935978547) 中 arm64 已通过全部 Rust 测试，并进入互操作阶段；x64 的本轮产品修复与服务 36 项也通过，唯一失败为 `probe_cli` 的 daemon 启动遇到 `START_CONTROLLER_PORT_IN_USE`，控制端口 43239 与请求 mixed 端口 46299 不同。该套件五个独立子进程并行使用先选端口、释放后启动的夹具，存在相互抢占窗口；本次日志未捕获具体占用者 PID。改为在父进程异步串行独立夹具，保持单场景内部并发、子进程取消、原断言与期限；本机 5 项、定向 Clippy 与格式通过。修正后 Linux 复核待记录。
 
+### 发布安装测试包的调试信息
+
+`4cab230` 的 arm64 随后通过交付契约、beta 契约、独立 core/TCP 互操作；在安装回归首次真实候选安装时，被 `release binary exceeds 128 MiB` 正确拒绝。回归脚本此前直接把完整 ELF debug 产物包装成发布归档，调试信息超过发布二进制上限。
+
+仅调整测试打包：Linux 下先复制到私有临时文件，再用 `strip --strip-debug` 去除该副本的调试信息；保留原 Cargo 产物（含其硬链接）、macOS 签名路径、安装器 64 MiB 归档/128 MiB 二进制上限。服务测试 helper 路径在重定位前保存。真实 release 产物仍接受完整发布验证。本机 `just install-test` 通过，包括 13 个 release safety 场景、真实 daemon 拒绝、两管理器状态/回滚和 SIGINT/SIGTERM；其中超大二进制拒绝仍通过。日志：`target/linux-ci-fixes/release-fixture-local.log`；Linux 修复后验证待记录。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。
