@@ -290,7 +290,13 @@ class JustfileContract(unittest.TestCase):
         rust = (ROOT / ".github/workflows/rust.yml").read_text()
         self.assertIn("uses: ./.github/workflows/ci.yml", rust)
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
-        for recipe in ["check", "test", "delivery-test", "e2e", "install-test"]:
+        for recipe in [
+            "check",
+            "test --no-fail-fast",
+            "delivery-test",
+            "e2e",
+            "install-test",
+        ]:
             self.assertIn(f"run: just {recipe}\n", ci)
         for platform in [
             "ubuntu-latest",
