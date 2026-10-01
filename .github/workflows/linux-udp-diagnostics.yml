@@ -17,6 +17,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y strace tcpdump
       - name: Collect socket and filesystem diagnostics
         env:
           RUSTUP_TOOLCHAIN: 1.98.1
@@ -42,8 +43,11 @@ jobs:
           stat -Lc '%n uid=%u mode=%a dev=%d ino=%i nlink=%h' target/debug/zc | tee target/diagnostics/source-stat.txt
           find target/debug/deps -maxdepth 1 -type f -samefile target/debug/zc -print | tee -a target/diagnostics/source-stat.txt
           set +e
-          cargo test --locked --test observability_connections actual_udp_socket_refusal_remains_a_transport_failure -- --exact --nocapture 2>&1 | tee target/diagnostics/udp.txt
+          sudo timeout 15 tcpdump -l -i lo -nn 'udp or icmp' > target/diagnostics/packets.txt 2>&1 &
+          capture=$!
+          strace -f -e trace=network,close -o target/diagnostics/syscalls.txt cargo test --locked --test observability_connections actual_udp_socket_refusal_remains_a_transport_failure -- --exact --nocapture 2>&1 | tee target/diagnostics/udp.txt
           echo "UDP_TEST_EXIT=${PIPESTATUS[0]}" | tee -a target/diagnostics/udp.txt
+          wait "$capture" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
