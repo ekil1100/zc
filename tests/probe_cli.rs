@@ -38,6 +38,10 @@ async fn isolated(name: &str) -> bool {
     if std::env::var("ZC_PROBE_CLI_CASE").ok().as_deref() == Some(name) {
         return false;
     }
+    // Free-port choices are snapshots. Keep independent subprocess fixtures
+    // from claiming each other's ports between selection and daemon startup.
+    static CASES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _case = CASES.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])

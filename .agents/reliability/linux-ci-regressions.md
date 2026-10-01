@@ -81,6 +81,12 @@
 
 同一完整 CI 的 macOS Intel 另暴露锁身份测试的首次 fsync 消耗 30ms 预算。仅在该夹具获取锁前持久创建空锁文件，保留原 30ms 加锁期限、替换后身份拒绝及 dirfd 路径替换断言；本机原用例通过。
 
+### `4cab230` 原生复核与探测夹具
+
+[定向 Linux 复核 36936049474](https://github.com/ekil1100/zc/actions/runs/36936049474) 中，两架构原 UDP 观测用例均通过，trace 明确收到原始 `ConnectionRefused`，控制连接 EOF、计数与隐私断言保持。
+
+[完整 CI 36935978547](https://github.com/ekil1100/zc/actions/runs/36935978547) 中 arm64 已通过全部 Rust 测试，并进入互操作阶段；x64 的本轮产品修复与服务 36 项也通过，唯一失败为 `probe_cli` 的 daemon 启动遇到 `START_CONTROLLER_PORT_IN_USE`，控制端口 43239 与请求 mixed 端口 46299 不同。该套件五个独立子进程并行使用先选端口、释放后启动的夹具，存在相互抢占窗口；本次日志未捕获具体占用者 PID。改为在父进程异步串行独立夹具，保持单场景内部并发、子进程取消、原断言与期限；本机 5 项、定向 Clippy 与格式通过。修正后 Linux 复核待记录。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。
