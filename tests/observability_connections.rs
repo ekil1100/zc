@@ -1377,7 +1377,7 @@ fn actual_udp_socket_refusal_remains_a_transport_failure() {
         .unwrap();
     let received = control.read(&mut [0]);
     eprintln!("UDP_DIAGNOSTIC upstream={closed} relay={relay} read={received:?} events={:?}", log_events(&f));
-    eprintln!("UDP_DIAGNOSTIC rawlog={:?}", fs::read_to_string(f.runtime.join("zc.log")));
+    eprintln!("UDP_DIAGNOSTIC trace={:?}", fs::read_to_string("/tmp/zc-udp-diagnostics.log"));
     assert_eq!(received.unwrap(), 0);
     f.json(&["stop", "--json"]);
     let events = log_events(&f);
