@@ -8,6 +8,17 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use zc::{config::Config, outbound::Connector, target::Target};
 
 const WAIT: Duration = Duration::from_secs(8);
+
+fn backpressure_listener() -> TcpListener {
+    // Negotiate the small receive window during the TCP handshake. Shrinking it
+    // after accept can stall Linux window updates instead of testing our adapter.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(16 * 1024).unwrap();
+    socket.set_send_buffer_size(16 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    socket.listen(1024).unwrap()
+}
+
 fn config(port: u16) -> Config {
     Config::parse(&format!("proxies: [{{name: edge, type: anytls, server: 127.0.0.1, port: {port}, password: password, sni: front.example, skip-cert-verify: true}}]\nrules: ['MATCH,edge']")).unwrap()
 }
@@ -46,8 +57,6 @@ async fn opened_to(listener: TcpListener, address: &[u8]) -> TlsStream<TcpStream
     let padding = 30;
     let md5 = "75cff2ad89aadf5e257059ee571ebe11";
     let (s, _) = listener.accept().await.unwrap();
-    rustix::net::sockopt::set_socket_recv_buffer_size(&s, 16 * 1024).unwrap();
-    rustix::net::sockopt::set_socket_send_buffer_size(&s, 16 * 1024).unwrap();
     let mut s = TlsAcceptor::from(tls_config()).accept(s).await.unwrap();
     assert!(matches!(
         s.get_ref().1.server_name(),
@@ -79,7 +88,7 @@ async fn opened_to(listener: TcpListener, address: &[u8]) -> TlsStream<TcpStream
 #[tokio::test]
 async fn remote_fin_drains_received_data_before_rejecting_late_upload() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let peer = tokio::spawn(async move {
             let mut s = opened(listener).await;
@@ -128,7 +137,7 @@ async fn remote_fin_drains_received_data_before_rejecting_late_upload() {
 #[tokio::test]
 async fn remote_fin_returns_without_waiting_for_ingress_write_eof() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let peer = tokio::spawn(async move {
             let mut s = opened(listener).await;
@@ -168,7 +177,7 @@ async fn remote_fin_returns_without_waiting_for_ingress_write_eof() {
 async fn heartbeat_does_not_block_real_bidirectional_backpressure() {
     for heartbeat_count in [0, 1, 32] {
         timeout(Duration::from_secs(12), async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = backpressure_listener();
             let config = config(listener.local_addr().unwrap().port());
             let (resume, resumed) = tokio::sync::oneshot::channel();
             let peer = tokio::spawn(async move {
@@ -224,7 +233,7 @@ async fn heartbeat_does_not_block_real_bidirectional_backpressure() {
 #[tokio::test]
 async fn local_shutdown_preserves_already_assembled_psh_body() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let peer = tokio::spawn(async move {
             let mut s = opened(listener).await;
@@ -275,7 +284,7 @@ async fn saturate_upload(upstream: &mut zc::outbound::BoxStream) -> usize {
 #[tokio::test]
 async fn control_flood_under_write_backpressure_fails_instead_of_blocking_or_growing() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (resume, resumed) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -330,7 +339,7 @@ async fn http_head(s: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
 async fn mixed_connect_and_socks_deliver_fin_without_client_half_close() {
     timeout(WAIT, async {
         for socks in [false, true] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = backpressure_listener();
             let runtime =
                 zc::runtime::Runtime::bind(config(listener.local_addr().unwrap().port()), 0)
                     .await
@@ -441,7 +450,7 @@ async fn mixed_http_and_https_forward_drain_early_response_with_upload_still_ope
     }
     timeout(Duration::from_secs(15), async {
         for secure in [false, true] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = backpressure_listener();
             let runtime = zc::runtime::Runtime::bind(config(listener.local_addr().unwrap().port()),0).await.unwrap();
             let address = runtime.local_addr().unwrap();
             let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -544,7 +553,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountReads<S> {
 async fn cancelling_transfer_drops_owned_tls_without_a_worker() {
     use std::{future::Future, task::Poll};
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let peer = tokio::spawn(async move {
             let mut s = opened(listener).await;
@@ -611,7 +620,7 @@ async fn shutdown_pending_until(
 #[tokio::test]
 async fn local_shutdown_drains_late_input_without_early_eof_or_whole_close() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (fin, saw_fin) = tokio::sync::oneshot::channel();
         let (late, send_late) = tokio::sync::oneshot::channel();
@@ -678,7 +687,7 @@ async fn local_shutdown_drains_late_input_without_early_eof_or_whole_close() {
 #[tokio::test]
 async fn transfer_keeps_pending_local_shutdown_owned_until_transport_cleanup() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (fin, mut saw_fin) = tokio::sync::oneshot::channel();
         let (close, close_peer) = tokio::sync::oneshot::channel();
@@ -739,7 +748,7 @@ async fn transfer_keeps_pending_local_shutdown_owned_until_transport_cleanup() {
 #[tokio::test]
 async fn local_shutdown_peer_stall_is_a_bounded_failure_not_success() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (fin, saw_fin) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -780,7 +789,7 @@ async fn local_shutdown_peer_stall_is_a_bounded_failure_not_success() {
 async fn local_shutdown_bounds_peer_flood_and_accepts_exact_drain_limit() {
     for excess in [false, true] {
         timeout(WAIT, async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = backpressure_listener();
             let config = config(listener.local_addr().unwrap().port());
             let (fin, saw_fin) = tokio::sync::oneshot::channel();
             let (flood, start_flood) = tokio::sync::oneshot::channel();
@@ -840,7 +849,7 @@ async fn local_shutdown_bounds_peer_flood_and_accepts_exact_drain_limit() {
 #[tokio::test]
 async fn local_shutdown_deadline_includes_backpressured_accepted_writes() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (release, released) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
@@ -881,7 +890,7 @@ async fn local_shutdown_deadline_includes_backpressured_accepted_writes() {
 #[tokio::test]
 async fn cancelling_pending_local_shutdown_releases_transport_without_a_worker() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (fin, saw_fin) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -919,7 +928,7 @@ async fn cancelling_pending_local_shutdown_releases_transport_without_a_worker()
 #[tokio::test]
 async fn local_shutdown_reports_peer_reset_after_fin_instead_of_success() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (fin, saw_fin) = tokio::sync::oneshot::channel();
         let (reset, send_reset) = tokio::sync::oneshot::channel();
@@ -955,7 +964,7 @@ async fn local_shutdown_reports_peer_reset_after_fin_instead_of_success() {
 #[tokio::test]
 async fn local_shutdown_owns_backpressured_upload_even_if_peer_fin_arrives() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (resume, resumed) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
@@ -1016,7 +1025,7 @@ async fn local_shutdown_owns_backpressured_upload_even_if_peer_fin_arrives() {
 #[tokio::test]
 async fn local_shutdown_reports_reset_queued_after_short_tls_plaintext() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (fin, saw_fin) = tokio::sync::oneshot::channel();
         let (reset, send_reset) = tokio::sync::oneshot::channel();
@@ -1095,7 +1104,7 @@ async fn saturate_settled_upload(s: &mut zc::outbound::BoxStream) -> usize {
 #[tokio::test]
 async fn local_shutdown_drains_peer_before_backpressured_upload_completes() {
     timeout(WAIT, async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = backpressure_listener();
         let config = config(listener.local_addr().unwrap().port());
         let (resume, resumed) = tokio::sync::oneshot::channel();
         let (blocked, saw_blocked) = tokio::sync::oneshot::channel();
@@ -1188,7 +1197,7 @@ async fn local_shutdown_drains_peer_before_backpressured_upload_completes() {
 async fn local_shutdown_peer_eof_does_not_discard_backpressured_writes() {
     for tls_close in [false, true] {
         timeout(WAIT, async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = backpressure_listener();
             let config = config(listener.local_addr().unwrap().port());
             let (close, close_peer) = tokio::sync::oneshot::channel();
             let (closed, saw_close) = tokio::sync::oneshot::channel();
