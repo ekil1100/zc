@@ -98,6 +98,39 @@ async fn classic_shadowsocks_udp_drops_bad_auth_and_truncation_then_recovers() {
     }
 }
 
+#[tokio::test]
+async fn shadowsocks_udp_refusal_is_a_transport_error() {
+    timeout(Duration::from_secs(5), async {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = peer.local_addr().unwrap();
+        let config = Config::parse(&format!(
+            "proxies: [{{name: edge, type: ss, server: 127.0.0.1, port: {}, password: password, cipher: aes-128-gcm, udp: true}}]\nrules: ['MATCH,edge']",
+            address.port()
+        ))
+        .unwrap();
+        let target = Target::new("127.0.0.1", 53).unwrap();
+        let route = config.route(&target).await.unwrap();
+        let connector = Connector::new(&config).unwrap();
+        let session = connector.open_udp(route.proxy, &route.target).await.unwrap();
+        // Cancelling a receive must also release its error-readiness waiter.
+        assert!(
+            timeout(Duration::from_millis(20), session.recv_from())
+                .await
+                .is_err()
+        );
+        // Keep the peer bound until the connected outbound socket exists.
+        drop(peer);
+        session.send_to(b"query", &target).await.unwrap();
+        let error = session.recv_from().await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+    })
+    .await
+    .unwrap();
+}
+
 fn tls_peer() -> (tokio_rustls::TlsAcceptor, rustls::RootCertStore) {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
     use std::sync::Arc;

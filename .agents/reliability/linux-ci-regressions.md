@@ -69,6 +69,18 @@
 
 本机红绿及回归：新增硬链接来源成功且目标独立、既有硬链接目标拒绝；fsutil 18、user_service 36、provider_cache 17、store 23 项通过，定向 Clippy、格式与 diff 检查通过。原始证据：`target/linux-ci-fixes/install-source-{red,green,target-green,fsutil,user-service,strict-read-regression,commands}.log`。Linux 修复后结果待后续记录。
 
+### Linux UDP 错误就绪
+
+[诊断 36934988048](https://github.com/ekil1100/zc/actions/runs/36934988048) 在两种 Linux 架构上同时取得 syscall 与 loopback 抓包：入站 11 bytes 被接收，SS 40 bytes 成功发往已关闭端口，内核立即返回 ICMP port unreachable，进程却始终未对上游 fd 调用 recv。独立 Python connected UDP 对照正常返回 `ConnectionRefused`。问题不在上游未关闭或内核不报告错误。
+
+锁定依赖中，Shadowsocks 1.25 的通用 datagram 接口调用 Tokio `poll_recv`，Tokio 1.53.1 的轮询读路径只等待 `READABLE | READ_CLOSED`；Linux 的独立 `ERROR` 事件被遗漏。其异步 `UdpSocket::recv` 已显式包含 `Interest::ERROR`，两条路径行为不同。
+
+修复在 SS 接收循环并行等待同一个已注册 socket 的 `Interest::ERROR`，使用 `SO_ERROR` 取得原始 I/O 错误；若错误被其他操作取走，返回 `WouldBlock` 清除旧就绪标记，避免空转。轻量共享适配器继续使用原库 codec；不增加 fd、后台 worker、轮询定时器或超时。原坏包丢弃、报文上界、64 关联上限及取消释放语义保持。
+
+新增 session 级回归覆盖取消接收后真实 UDP 拒绝；原 observability 测试保留控制连接 EOF、一次 `ConnectionRefused`、活动数归零及隐私断言。本机 UDP/SOCKS UDP/连接观测共 54 项通过，另有 1 项原五分钟 idle 用例继续标记 ignored，定向 Clippy 通过；Linux 修复后结果待记录。诊断工件位于 `target/linux-ci-fixes/udp-syscall-diagnostics/`，本机日志为 `udp-error-readiness-local.log`。
+
+同一完整 CI 的 macOS Intel 另暴露锁身份测试的首次 fsync 消耗 30ms 预算。仅在该夹具获取锁前持久创建空锁文件，保留原 30ms 加锁期限、替换后身份拒绝及 dirfd 路径替换断言；本机原用例通过。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。

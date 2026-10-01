@@ -94,7 +94,7 @@ mixed SOCKS5 CMD=0x03 仅用于显式 `udp:true` 的 SS classic AEAD 或原生 T
 
 ### SS classic AEAD UDP
 
-使用 `shadowsocks` crate；每包独立 CSPRNG salt、HKDF-SHA1 `ss-subkey`、全零 nonce、空 AAD 与 `ATYP|ADDR|PORT|DATA` plaintext，不复用 TCP chunk framing。三种 cipher 与 alias 与 TCP 相同。simple-obfs 不包装 UDP，直接使用同一 server host/port 的 UDP endpoint；错误不得改走 plain/DIRECT fallback。
+使用 `shadowsocks` crate；每包独立 CSPRNG salt、HKDF-SHA1 `ss-subkey`、全零 nonce、空 AAD 与 `ATYP|ADDR|PORT|DATA` plaintext，不复用 TCP chunk framing。三种 cipher 与 alias 与 TCP 相同。simple-obfs 不包装 UDP，直接使用同一 server host/port 的 UDP endpoint；错误不得改走 plain/DIRECT fallback。内核已报告的上游接收错误（例如 Linux 的 UDP 端口拒绝）会结束 association，并按原 I/O 类型记录在 `udp` 失败阶段；无需等待收到其他数据或 300 秒 idle。没有内核错误通知时，UDP 仍按既有 idle 期限处理。
 
 ### Trojan UDP
 
