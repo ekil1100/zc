@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interop suite: delegate to local zig build e2e.
+# Interop suite: delegate to local just e2e.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd -P)"
@@ -19,9 +19,9 @@ while [[ $# -gt 0 ]]; do
 Usage: bash scripts/eval/suites/interop.sh --run-dir <dir>
 
 Runs exactly:
-  zig build e2e --summary all
+  just e2e
 
-Exit: 0 pass, 1 fail, 2 error (missing zig)
+Exit: 0 pass, 1 fail, 2 error (missing just)
 HELP
       exit 0
       ;;
@@ -37,8 +37,8 @@ if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR" ]]; then
   exit 2
 fi
 
-if ! command -v zig >/dev/null 2>&1; then
-  printf 'interop: zig not found on PATH\n' >&2
+if ! command -v just >/dev/null 2>&1; then
+  printf 'interop: just not found on PATH\n' >&2
   exit 2
 fi
 
@@ -47,11 +47,11 @@ mkdir -p "$ARTIFACT_DIR" "$RUN_DIR/suites"
 log_rel="artifacts/interop.log"
 log="$RUN_DIR/$log_rel"
 
-printf 'interop: running zig build e2e --summary all\n'
+printf 'interop: running just e2e\n'
 rc=0
 (
   cd "$ROOT_DIR"
-  zig build e2e --summary all
+  just e2e
 ) >"$log" 2>&1 || rc=$?
 printf 'interop: exit=%s log=%s\n' "$rc" "$log"
 
@@ -96,7 +96,7 @@ json="$(jq -n \
     failed: $failed,
     artifacts: [$log_rel],
     notes: [
-      "local command is zig build e2e --summary all",
+      "local command is just e2e",
       "e2e-release remains owned by CI; this adapter does not attest PATH integrity"
     ],
     steps: [

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-ARCHIVE_ROOT="$ROOT_DIR/docs/install/evidence"
+ARCHIVE_ROOT="$ROOT_DIR/.agents/install/evidence"
 HISTORY_DIR="$ARCHIVE_ROOT/history"
 LATEST_LINK="$ARCHIVE_ROOT/latest"
 
@@ -24,7 +24,7 @@ if [[ -L "$LATEST_LINK" ]]; then
   fi
 
   # 3) latest points into history
-  if [[ "$latest_target" != *"/docs/install/evidence/history/"* ]]; then
+  if [[ "$latest_target" != *"/.agents/install/evidence/history/"* ]]; then
     # allow relative symlink if ends with history/<run_id>
     if [[ ! "$latest_target" =~ history/beta-checklist-[0-9]{8}-[0-9]{6}$ ]]; then
       missing+=("latest_target_outside_history")

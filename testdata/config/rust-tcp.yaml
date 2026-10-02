@@ -1,0 +1,7 @@
+# Rust foreground TCP example. The CLI --port is authoritative.
+mixed-port: 17890
+allow-lan: false
+mode: rule
+rules:
+  - DOMAIN,blocked.invalid,REJECT
+  - MATCH,DIRECT

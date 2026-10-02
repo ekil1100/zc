@@ -171,7 +171,7 @@ if [[ ! -s "$measure_path" ]]; then
 fi
 
 # Extract measured facts only; never invent thresholds.
-# Field names match src/perf_runner.zig / control-plane artifact schema.
+# Field names match examples/perf_runner.rs / control-plane artifact schema.
 metrics_json="$(jq -c '
   {
     benchmarks: [

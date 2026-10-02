@@ -1,0 +1,14 @@
+mixed-port: 9000
+proxies:
+  - name: vless-node
+    type: vless
+    server: example.com
+    port: 443
+    uuid: private
+    ws-opts: {path: '/ws', headers: {Host: example.com}}
+    grpc-opts: {grpc-service-name: svc}
+    network: ws
+  - {name: direct-node, type: direct}
+proxy-groups:
+  - {name: Empty, type: relay, proxies: []}
+rules: ['MATCH,DIRECT']

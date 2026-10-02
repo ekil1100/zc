@@ -5,57 +5,52 @@
 <h1 align="center">zc</h1>
 
 <p align="center">
-  一个面向 mihomo/clash 配置生态的 CLI-first Zig 代理运行时。
+  一个面向 mihomo/clash 配置生态的 CLI-first Rust 代理运行时。
 </p>
+
+## Rust 候选版本
+
+当前开发与交付入口使用 Rust `1.0.1`：完整 CLI、托管 revision、daemon、minimal API、mixed TCP 与受限 UDP 已接入。**实现覆盖不等于迁移验收完成**；当前候选尚未完成正式发布验证，不作四平台、性能或长稳保证。使用方式与支持边界请从[文档目录](docs/README.md)查看。默认构建与运行不依赖 Zig。
+
+```bash
+just build                   # target/debug/zc
+just run                     # Foreground, example config, port 17890
+```
 
 ## 安装
 
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/ekil1100/zc/main/install.sh | sh
-export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
-zc --version
-```
+已发布版本使用 [安装指南](docs/install/README.md) 中的独立安装器或 Homebrew。安装器消费实际 GitHub Release，不代表当前工作区的候选版本已经发布。迁移验收前不要覆盖生产安装或删除已有状态目录。
 
+当前用户服务使用 `zc service start/stop/restart` 管理运行，`zc service enable/disable` 管理登录后自启，`zc service status` 查看状态。无需 sudo，也不提供开机登录前运行。
 
 ## 开发与验证
 
-本地开发与 CI 对齐的入口统一用 [`just`](https://github.com/casey/just)（`just --list` 查看全部）：
+Rust 最低 `1.91`，CI 固定 `1.98.1`；原生依赖需要 C/C++ 工具链与 CMake，E2E 需要 Python 3、Node.js 和 [`just`](https://github.com/casey/just)。生产目标为 Linux/macOS × x64/arm64，不支持 Windows。Rust 候选的最低 macOS 版本为 **15（Sequoia）**，不再支持 11–14；构建工具链与验收限制见[安装指南](docs/install/README.md#从源码构建)。
 
 ```bash
-# Build / test
 just build
+just release                 # target/release/zc; no installation
+just check                   # Formatting check + Clippy
 just test
-
-# Eval framework (reports under .zig-cache/eval/)
-just eval-selfcheck          # fast CI-safe contract checks
-just eval-selfcheck-full     # also runs correctness + contract
-just eval correctness        # zig build + zig build test
-just eval contract           # migrator + install regression + S1/S2
-just eval interop            # local zig build e2e
-just eval perf               # control-plane record (clean worktree required)
-just eval all                # correctness -> contract -> perf
-just eval all -- --with-interop
-just eval-s1                 # startup scenario (default zig-out/bin/zc)
-just eval-s2                 # rule-matrix scenario
-just eval-help
-
-# Gates
-just beta-gate
-just validate                # install + migrator + beta-gate
-just install-regression
-just migrator-regression
-
-# Perf / reliability
-just perf-record -- --samples 9
-just e2e
+just delivery-test
+just e2e                     # Unchanged core harness + independent TCP interoperability
+just install-test            # Temporary-directory installer regressions
+just validate                # check, test, delivery, E2E, installer, release build
+just eval-selfcheck
+just eval correctness
+just -- eval all --with-interop
+just migrator-test
+just run path/to/config.yaml 17891
+just -- test --test cli
 ```
 
-带 `-` 的额外参数用 `--` 隔开，例如：`just eval all -- --run-id my-run`。
+`just` 列出全部任务；`just fmt` 会格式化 Rust 源码。默认任务使用 Rust。`just install` 构建 Release 并安装到 `~/.local/bin/zc`。已注册且正在运行的用户服务会在校验候选后自动停止、安装并恢复原配置、端口、选择和自启设置；原本停止的服务保持停止。手动启动的实例仍需先明确停止并迁移为 `zc service`。候选试用使用 `just install --target-dir /tmp/zc-candidate/bin`，不要覆盖生产安装。
+
+生产默认 mixed 端口为 **7899**；配置中的 `mixed-port` 数值不覆盖它。开发必须显式传 `--port` 或使用 `just run`（默认 `17890`，拒绝 `7899`）。端口冲突只报错，不漂移。测试使用临时 HOME/runtime，不读写真实用户状态。
 
 ## 与 mihomo 的功能对比
 
-表格区分完整实现、部分实现和未实现能力。未支持的出站协议与代理组会在启动或连接前明确拒绝；仅为配置兼容而接受的字段会单独注明 ignored 或上下文限制。
+下表描述 Rust 候选实现，不是最终验收声明。未支持的出站协议与代理组会在启动或连接前明确拒绝；仅为配置兼容而接受的字段会单独注明 ignored 或上下文限制。
 
 ### 入站与运行模式
 
@@ -63,8 +58,8 @@ just e2e
 | --- | --- | --- |
 | Mixed HTTP/SOCKS5 入站 | ⚠️ 部分实现 | 只有一个 mixed listener；无 `--port` 时固定绑定 `7899`，配置中的 `mixed-port` 数值仅兼容解析。 |
 | SOCKS5 UDP ASSOCIATE | ✅ 已实现 | 用于 `udp: true` 的 Shadowsocks classic AEAD 或原生 TLS Trojan 节点。 |
-| 独立 HTTP `port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |
-| 独立 `socks-port` | ❌ 未实现 | 与非零 `mixed-port` 共存时仅作为兼容声明忽略；不能单独启动。 |
+| 独立 HTTP `port` | ❌ 未实现 | 与 `mixed-port` 声明共存时仅作为兼容声明忽略；不能单独启动。 |
+| 独立 `socks-port` | ❌ 未实现 | 与 `mixed-port` 声明共存时仅作为兼容声明忽略；不能单独启动。 |
 | TUN | ❌ 未实现 | 不创建 TUN 设备。 |
 | Redir / TProxy | ❌ 未实现 | `redir-port`、`tproxy-port` 不会创建 listener。 |
 
@@ -86,7 +81,7 @@ just e2e
 | SOCKS5 outbound | ❌ 未实现 | 配置准入阶段拒绝。 |
 | VMess | ❌ 未实现 | 未通过标准 wire 与互操作验证。 |
 | VLESS | ❌ 未实现 | 未完成主流 transport 与互操作验证。 |
-| AnyTLS | ❌ 未实现 | 保留代码不构成运行时支持。 |
+| AnyTLS | ⚠️ 部分实现 | 原生 TLS/TCP；每流独占 session，无池/复用/UDP；乐观开流，FIN 非 half-close。详见[兼容边界](docs/compat/mihomo-clash.md#anytls单流原生-tlstcp)。 |
 | mihomo 的其他 outbound 协议 | ❌ 未实现 | 未列出的协议均不作为已支持能力。 |
 
 ### 代理组
@@ -104,12 +99,12 @@ just e2e
 | 功能 | zc | 实现边界 |
 | --- | --- | --- |
 | `DOMAIN` / `DOMAIN-SUFFIX` / `DOMAIN-KEYWORD` | ✅ 已实现 | 按声明顺序 first-match。 |
-| `IP-CIDR` / `IP-CIDR6` | ✅ 已实现 | 域名目标使用系统 resolver。 |
-| `RULE-SET` | ✅ 已实现 | 支持本地、被托管配置捕获的 rule-provider 展开。 |
+| `IP-CIDR` / `IP-CIDR6` | ✅ 已实现 | 域名目标使用读取系统配置的 Hickory 异步 resolver。 |
+| `RULE-SET` | ✅ 已实现 | 本地 provider 可捕获到托管 revision；unmanaged HTTP provider 可真实下载后展开。 |
 | `MATCH` | ✅ 已实现 | 作为终态规则。 |
 | `GEOIP` | ⚠️ 部分实现 | IPv6 GEOIP 不完整。 |
-| `DST-PORT` | ⚠️ 部分实现 | mixed HTTP CONNECT/forward 的完整上下文仍有限制。 |
-| `SRC-IP-CIDR` / `SRC-PORT` / `PROCESS-NAME` | ⚠️ 部分实现 | parser 已接入，但部分入站路径不会提供完整匹配上下文。 |
+| `DST-PORT` | ✅ 已实现 | mixed HTTP/SOCKS5 使用目标端口，支持范围匹配。 |
+| `SRC-IP-CIDR` / `SRC-PORT` / `PROCESS-NAME` | ⚠️ 部分实现 | mixed 提供来源 IP/端口，不提供进程名；不能宣称进程规则运行时可用。 |
 | Remote `RULE-SET` 完整兼容 | ❌ 未实现 | 托管 revision 不允许引用尚未捕获的 remote provider。 |
 | `proxy-providers` | ❌ 未实现 | 不解析为运行时代理节点。 |
 | mihomo 的其他规则类型 | ❌ 未实现 | 未列出的规则不作为已支持能力。 |
@@ -118,7 +113,7 @@ just e2e
 
 | 功能 | zc | 与 mihomo 的差异 |
 | --- | --- | --- |
-| 规则匹配所需的域名解析 | ✅ 已实现 | 使用系统 resolver 和有界进程缓存。 |
+| 规则匹配所需的域名解析 | ✅ 已实现 | Hickory 读取系统 DNS/hosts，具有 deadline、并发与缓存配置上界；不等价于 libc/NSS。 |
 | `dns:` 运行时配置 | ❌ 未实现 | 未接入完整 DNS 配置模型。 |
 | Fake IP | ❌ 未实现 | 不支持 fake-ip。 |
 | `enhanced-mode` / `nameserver-policy` | ❌ 未实现 | 不提供 mihomo DNS 行为兼容。 |
@@ -130,11 +125,14 @@ just e2e
 | Clash-style YAML 核心字段 | ✅ 已实现 | 支持 mixed 入口、静态 proxies、select groups、rules 与 local rule-providers。 |
 | 托管配置 | ✅ 已实现 | 支持 load/download/update/use/delete/dump/override、immutable revision 与本地依赖捕获。 |
 | 持久代理选择 | ✅ 已实现 | 选择与 exact config revision 绑定，daemon 启动前恢复。 |
-| Daemon 生命周期 CLI | ✅ 已实现 | start/stop/restart/reload/status/log/test/doctor，支持结构化 JSON 输出。 |
+| Daemon 生命周期 CLI | ✅ 已实现 | start/stop/restart/reload/status/log/test/doctor，以及用户级 `service start/stop/restart/enable/disable/status`，支持结构化 JSON 输出。 |
 | Minimal REST API | ✅ 已实现 | `/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`。 |
-| mihomo 完整 Controller API | ❌ 未实现 | 没有 `/runtime`、`/profiles`、`/connections`、`/metrics` 等完整资源模型。 |
+| 连接列表与按 ID 关闭 | ✅ 最小版 | `zc connection list/close <id>`；必须显式 controller；托管按需持久生成 secret，非托管需手工配置，无流量计数或历史。详见 [API](docs/api/README.md)。 |
+| mihomo 完整 Controller API | ❌ 未实现 | 仅提供需鉴权的连接列表及按 ID 关闭，不提供 `/runtime`、`/profiles`、`/metrics` 等完整资源模型。 |
 | WebSocket 事件流 | ❌ 未实现 | 不兼容依赖事件流的 dashboard。 |
 | 第三方 dashboard 兼容 | ❌ 未实现 | minimal API 不等同于 mihomo Controller API。 |
 | 内置 TUI | ❌ 未实现 | 产品表面仅提供 CLI 与 minimal API。 |
+
+内置 `DIRECT`/`REJECT` 字面量可用；用户命名节点的支持边界见[兼容说明](docs/compat/mihomo-clash.md#tcp-与出站)。
 
 详细边界见 [`docs/compat/mihomo-clash.md`](docs/compat/mihomo-clash.md)，实际 API 见 [`docs/api/README.md`](docs/api/README.md)。

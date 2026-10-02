@@ -1,0 +1,13 @@
+name: Rust candidate
+
+on:
+  push:
+    branches: [ to-rust ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  delivery:
+    uses: ./.github/workflows/ci.yml

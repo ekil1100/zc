@@ -8,7 +8,7 @@
 - `scripts/eval/scenarios/s1_startup.sh:66-80,120-130`：刚保存的 `CONFIG_HOME/STATE_HOME/CACHE_HOME` 被清空，失败清理遂以空 XDG 路径执行 `zc stop`，可能遗留 daemon；违反 `AGENTS.md:9` 的稳定性要求。
 - `scripts/eval/selfcheck.sh:54-57,296-300,382-390` 未要求 `rg`，但把 `rg` 不存在与“无匹配”都记为 PASS；`src/eval_rule_matrix_runner.zig:208-215` 又把 OOM、类型错误和缺字段统一报成“missing”。二者违反 `AGENTS.md:6,9`“错误可操作、关键路径可观测”。
 - `scripts/eval/suites/perf.sh:63-221` 没有行为测试（`selfcheck.sh:22-25` 明示永不执行 perf）；提交 `49ffbdb` 的 destructive restore 也未增加测试。违反 `AGENTS.md:23`“先测后改”及 `CONTRIBUTING.md:67-71`“新功能包含测试”。
-- 删除 `latest.json`、重写性能 README 后，`docs/perf/reports/baseline-v1.0.0.md:66` 仍链接 `latest.json`，`docs/reliability/chaos-tests.md:209` 仍引用已消失的“README 第4节”；违反 `AGENTS.md:26`“用户可感知行为变化同步更新文档”。
+- 删除 `latest.json`、重写性能 README 后，`.agents/perf/reports/baseline-v1.0.0.md:66` 仍链接 `latest.json`，`.agents/reliability/chaos-tests.md:209` 仍引用已消失的“README 第4节”；违反 `AGENTS.md:26`“用户可感知行为变化同步更新文档”。
 - 提交 `107a52b test(eval): add ... selfcheck` 实际只改任务 Markdown；`d503c59 docs(agents): ...` 同时改 CI 行为。违反 `AGENTS.md:47`“提交信息清晰”及 `CONTRIBUTING.md:48-53` 的 Conventional Commits 类型语义。
 
 ## 判断项（smell baseline）

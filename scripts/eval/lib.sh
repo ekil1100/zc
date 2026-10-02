@@ -28,7 +28,7 @@ eval_repo_root() {
 eval_cache_root() {
   local root
   root="$(eval_repo_root)"
-  printf '%s\n' "$root/.zig-cache/eval"
+  printf '%s\n' "$root/target/eval"
 }
 
 eval_schema_path() {
@@ -58,7 +58,7 @@ eval_default_run_id() {
   printf 'run-%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
 }
 
-# Atomically create .zig-cache/eval/<run_id>/. Existing directory is an error.
+# Atomically create target/eval/<run_id>/. Existing directory is an error.
 eval_new_run_dir() {
   local run_id="${1:-}"
   local cache_root parent run_dir
@@ -104,21 +104,21 @@ eval_worktree_dirty() {
   fi
 }
 
-# Prints a JSON object: {"os":"...","arch":"...","zig_version":"..."}
+# Prints a JSON object: {"os":"...","arch":"...","rust_version":"..."}
 eval_capture_env_json() {
-  local os arch zig_version
+  local os arch rust_version
   os="$(uname -s 2>/dev/null || printf 'unknown')"
   arch="$(uname -m 2>/dev/null || printf 'unknown')"
-  if command -v zig >/dev/null 2>&1; then
-    zig_version="$(zig version 2>/dev/null || printf 'unknown')"
+  if command -v rustc >/dev/null 2>&1; then
+    rust_version="$(rustc --version 2>/dev/null || printf 'unknown')"
   else
-    zig_version="missing"
+    rust_version="missing"
   fi
   jq -nc \
     --arg os "$os" \
     --arg arch "$arch" \
-    --arg zig_version "$zig_version" \
-    '{os:$os, arch:$arch, zig_version:$zig_version}'
+    --arg rust_version "$rust_version" \
+    '{os:$os, arch:$arch, rust_version:$rust_version}'
 }
 
 eval_validate_report() {

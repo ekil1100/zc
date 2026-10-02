@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-SOURCE_PATH="$ROOT_DIR/zig-out/bin/zc"
+SOURCE_PATH=""
 TARGET_DIR="${HOME}/.local/bin"
+PUBLISH_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --publish-only)
+      PUBLISH_ONLY=1
+      shift
+      ;;
     --source)
       SOURCE_PATH="${2:-}"
       shift 2
@@ -22,9 +26,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$SOURCE_PATH" && "$PUBLISH_ONLY" -eq 0 ]]; then
+  ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+  SOURCE_PATH="$ROOT_DIR/target/release/zc"
+fi
+
 if [[ -z "$SOURCE_PATH" || -z "$TARGET_DIR" ]]; then
   echo "source path and target dir are required" >&2
   exit 2
+fi
+
+# The candidate owns the transaction and invokes the existing staging publisher
+# only after verifying service ownership and holding lifecycle/publication locks.
+if [[ "$PUBLISH_ONLY" -eq 0 ]]; then
+  SOURCE_PATH="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd -P)/$(basename "$SOURCE_PATH")"
+  exec "$SOURCE_PATH" --local-install "$SOURCE_PATH" "$TARGET_DIR"
 fi
 
 mkdir -p "$TARGET_DIR"
@@ -88,7 +104,7 @@ require_stopped_target() {
   fi
   if [[ -n "$target_pids" ]]; then
     echo "Installation target is still running (pid: ${target_pids//$'\n'/, }); refusing replacement" >&2
-    echo "Stop the exact process and retry the install" >&2
+    echo "Confirm and stop the manual instance using its original runtime; then migrate explicitly with zc service start -c <config> --port <port>" >&2
     exit 1
   fi
 }
@@ -103,7 +119,10 @@ PUBLISHING=0
 cleanup() {
   if [[ "$PUBLISHING" -eq 1 ]]; then
     if [[ "$HAD_TARGET" -eq 1 && -f "$BACKUP_PATH" ]]; then
-      mv -f "$BACKUP_PATH" "$TARGET_PATH" || true
+      if ! mv -f "$BACKUP_PATH" "$TARGET_PATH"; then
+        echo "Installation recovery failed; retain the backup and inspect the target" >&2
+        return 1
+      fi
       BACKUP_PATH=""
     else
       rm -f "$TARGET_PATH"

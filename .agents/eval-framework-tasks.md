@@ -34,7 +34,7 @@ Legend: `MVP` required for first shippable branch. `NEXT` after MVP.
   - `test -f scripts/perf-regression.sh`
   - `test -f scripts/perf/run-baseline.sh`
   - `zig build --help | rg 'e2e|e2e-release'`
-  - `test -f docs/reliability/e2e.md`
+  - `test -f .agents/reliability/e2e.md`
   - `rg -n '7899' AGENTS.md`
   - `zig version` must equal CI's `0.16.0`.
 - [x] 0.4 Do **not** change product code in this task.
@@ -224,7 +224,7 @@ git commit -m "feat(eval): delegate interop suite to existing e2e entry"
 - Delete: `scripts/perf/run-baseline.sh`
 - Delete: `scripts/perf/check-readme-consistency.sh` (it asserts the obsolete fake-PASS contract)
 - Delete: `docs/perf/reports/latest.json` (tracked placeholder output)
-- Modify: `docs/perf/reports/README.md` (the only project doc intentionally changed by this temporary plan)
+- Modify: `.agents/perf/reports/README.md` (the only project doc intentionally changed by this temporary plan)
 - Modify: `.agents/eval-framework-tasks.md`
 
 **Behavior:**
@@ -235,13 +235,13 @@ git commit -m "feat(eval): delegate interop suite to existing e2e entry"
 **Acceptance:**
 - [x] `test ! -e scripts/perf-regression.sh && test ! -e scripts/perf/run-baseline.sh && test ! -e scripts/perf/check-readme-consistency.sh`.
 - [x] `test ! -e docs/perf/reports/latest.json`.
-- [x] `! rg -n 'PERF_REGRESSION_RESULT=PASS|RULE_EVAL_P95_VALUE|run-baseline.sh' scripts docs/perf/reports/README.md`.
+- [x] `! rg -n 'PERF_REGRESSION_RESULT=PASS|RULE_EVAL_P95_VALUE|run-baseline.sh' scripts .agents/perf/reports/README.md`.
 - [x] README gives the real record command, clean-worktree precondition, output location, and explicitly says compare/threshold gating is deferred.
 - [x] `bash scripts/perf/run-control-plane-baseline.sh --help` remains green.
 
 **Commit:**
 ```bash
-git add -A scripts/perf-regression.sh scripts/perf docs/perf/reports .agents/eval-framework-tasks.md
+git add -A scripts/perf-regression.sh scripts/perf .agents/perf/reports .agents/eval-framework-tasks.md
 git commit -m "fix(perf): remove placeholder regression gate"
 ```
 
@@ -385,7 +385,7 @@ git commit -m "feat(eval): wire scenario packs into all-suite run"
 **Behavior:**
 - Do **not** wrap `scripts/reliability/run-chaos-round.sh`: it currently emits simulated/dry-run PASS and is not evidence.
 - MVP boundary may remain a thin fail-closed adapter. A future real wrap may call only `run-soak-real.sh` with explicit binary, duration, and non-7899 port, gated by `--allow-long`.
-- No fake PASS and no tracked output under `docs/perf/reports/history/`.
+- No fake PASS and no tracked output under `.agents/perf/reports/history/`.
 
 **Acceptance:**
 - [ ] `bash scripts/eval/run.sh --suite reliability` exits 2, writes validated suite/summary `error`, and explains that no authoritative short reliability gate exists.

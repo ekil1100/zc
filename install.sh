@@ -6,42 +6,50 @@ zc_version="${ZC_VERSION:-latest}"
 zc_release_base_url="${ZC_RELEASE_BASE_URL:-https://github.com/$zc_repo/releases/download}"
 zc_release_feed_url="${ZC_RELEASE_FEED_URL:-https://github.com/$zc_repo/releases.atom}"
 zc_tmp_dir=""
-zc_stage_path=""
-zc_backup_path=""
 zc_lock_dir=""
-zc_target=""
-zc_publish_in_progress=0
-zc_restore_in_progress=0
-zc_restore_path=""
+zc_child=""
+zc_signal=0
+zc_checking=0
 
 zc_fail() {
     printf 'zc install: %s\n' "$1" >&2
     exit 1
 }
 
-zc_cleanup() {
-    trap - 1 2 15
-    if [ "$zc_restore_in_progress" -eq 1 ] && [ -n "$zc_target" ]; then
-        if [ -f "$zc_restore_path" ]; then
-            mv -f "$zc_restore_path" "$zc_target" || true
+# Keep extracted code and the shell lock alive until Rust has joined command
+# cleanup/recovery. Repeated signals request cancellation once, never kill recovery.
+zc_interrupt() {
+    if [ "$zc_signal" -eq 0 ]; then
+        zc_signal="$1"
+        zc_forward_signal="$2"
+        # Background shells may inherit ignored INT; the preflight supervisor
+        # uses TERM for cancellation and has no transaction to recover.
+        if [ "$zc_checking" -eq 1 ]; then zc_forward_signal=TERM; fi
+        if [ -n "$zc_child" ]; then
+            kill -"$zc_forward_signal" "$zc_child" 2>/dev/null || true
         fi
-        zc_restore_in_progress=0
-        zc_publish_in_progress=0
-        zc_backup_path=""
     fi
-    if [ "$zc_publish_in_progress" -eq 1 ] && [ -n "$zc_target" ]; then
-        if [ -n "$zc_backup_path" ] && [ -f "$zc_backup_path" ]; then
-            mv -f "$zc_backup_path" "$zc_target" || true
-            zc_backup_path=""
+}
+zc_wait() {
+    zc_child_status=0
+    while :; do
+        if wait "$zc_child"; then
+            zc_child_status=0
+            break
         else
-            rm -f "$zc_target"
+            zc_child_status=$?
         fi
-    fi
-    if [ -n "$zc_stage_path" ]; then
-        rm -f "$zc_stage_path"
-    fi
-    if [ -n "$zc_backup_path" ]; then
-        rm -f "$zc_backup_path"
+        # wait can return early when the shell's trap runs. Keep joining the
+        # same child; a signal handler must not remove files under recovery.
+        kill -0 "$zc_child" 2>/dev/null || break
+    done
+    zc_child=""
+}
+zc_cleanup() {
+    trap '' 1 2 15
+    if [ -n "$zc_child" ]; then
+        kill -TERM "$zc_child" 2>/dev/null || true
+        zc_wait
     fi
     if [ -n "$zc_tmp_dir" ]; then
         rm -rf "$zc_tmp_dir"
@@ -52,9 +60,51 @@ zc_cleanup() {
     fi
 }
 trap zc_cleanup 0
-trap 'exit 129' 1
-trap 'exit 130' 2
-trap 'exit 143' 15
+trap 'zc_interrupt 129 TERM' 1
+trap 'zc_interrupt 130 INT' 2
+trap 'zc_interrupt 143 TERM' 15
+
+# Bash is already required by the embedded publisher. Its job control creates
+# private process groups on both Linux and macOS, without GNU timeout/setsid.
+# Keep this call in the parent shell: command substitution defers its traps.
+zc_check() {
+    [ "$zc_signal" -eq 0 ] || exit "$zc_signal"
+    zc_checking=1
+    /bin/bash -c '
+        set -m
+        cancelled=0
+        worker=""
+        timer=""
+        trap "cancelled=1" TERM HUP
+        cleanup() {
+            trap "" TERM HUP INT
+            if [ -n "$worker" ]; then kill -KILL -- "-$worker" 2>/dev/null || :; fi
+            if [ -n "$timer" ]; then kill -KILL -- "-$timer" 2>/dev/null || :; fi
+            if [ -n "$worker" ]; then wait "$worker" 2>/dev/null || :; fi
+            if [ -n "$timer" ]; then wait "$timer" 2>/dev/null || :; fi
+        }
+        trap cleanup EXIT
+        "$1" "$2" > "$3" 2>/dev/null &
+        worker=$!
+        (
+            sleep 15
+            : > "$4"
+            kill -TERM "$$"
+        ) &
+        timer=$!
+        trap "exit 124" TERM HUP
+        [ "$cancelled" -eq 0 ] || exit 124
+        wait "$worker"
+        exit $?
+    ' zc-check "$zc_binary" "$1" "$zc_tmp_dir/check-output" "$zc_tmp_dir/check-timeout" 2>/dev/null &
+    zc_child=$!
+    if [ "$zc_signal" -ne 0 ]; then kill -TERM "$zc_child" 2>/dev/null || true; fi
+    zc_wait
+    zc_checking=0
+    [ "$zc_signal" -eq 0 ] || exit "$zc_signal"
+    [ ! -f "$zc_tmp_dir/check-timeout" ] || zc_fail "candidate $1 check timed out after 15 seconds; original installation retained"
+    [ "$zc_child_status" -eq 0 ]
+}
 
 zc_download() {
     zc_download_url="$1"
@@ -90,6 +140,7 @@ command -v curl >/dev/null 2>&1 || zc_fail "curl is required"
 command -v tar >/dev/null 2>&1 || zc_fail "tar is required"
 command -v awk >/dev/null 2>&1 || zc_fail "awk is required"
 command -v mktemp >/dev/null 2>&1 || zc_fail "mktemp is required"
+[ -x /bin/bash ] || zc_fail "/bin/bash is required for the embedded publisher"
 
 zc_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/zc-install.XXXXXX")"
 
@@ -116,11 +167,9 @@ zc_validate_tag "$zc_tag"
 case "$(uname -s)" in
     Linux)
         zc_os="linux"
-        command -v readlink >/dev/null 2>&1 || zc_fail "readlink is required on Linux"
         ;;
     Darwin)
         zc_os="macos"
-        command -v lsof >/dev/null 2>&1 || zc_fail "lsof is required on macOS"
         ;;
     *) zc_fail "unsupported operating system: $(uname -s)" ;;
 esac
@@ -180,6 +229,13 @@ zc_expected_sha="$(printf '%s' "$zc_expected_sha" | tr 'A-F' 'a-f')"
 zc_actual_sha="$(printf '%s' "$zc_actual_sha" | tr 'A-F' 'a-f')"
 [ "$zc_actual_sha" = "$zc_expected_sha" ] || zc_fail "checksum verification failed"
 
+# Inspect the selected member before extraction (including hard links and
+# duplicate entries); no helper or other archive member is executed/extracted.
+tar -tvzf "$zc_archive_path" "$zc_package/zc" >"$zc_tmp_dir/member" \
+    || zc_fail "release archive does not contain $zc_package/zc"
+awk 'substr($0, 1, 1) != "-" { bad=1 } END { exit (bad || NR != 1) }' \
+    "$zc_tmp_dir/member" || zc_fail "release binary member must be one regular file"
+
 mkdir -p "$zc_tmp_dir/extract"
 tar -xzf "$zc_archive_path" -C "$zc_tmp_dir/extract" "$zc_package/zc" \
     || zc_fail "release archive does not contain $zc_package/zc"
@@ -191,17 +247,19 @@ if [ "$zc_binary_size" -gt 134217728 ]; then
     zc_fail "release binary exceeds 128 MiB"
 fi
 
+chmod 700 "$zc_binary"
+zc_expected_version="zc ${zc_tag#v}"
+if ! zc_check --version \
+    || [ "$(cat "$zc_tmp_dir/check-output")" != "$zc_expected_version" ]; then
+    zc_fail "binary self-check failed: expected '$zc_expected_version'"
+fi
+if ! zc_check --install-check \
+    || [ "$(cat "$zc_tmp_dir/check-output")" != "zc-release-install-v1" ]; then
+    zc_fail "release lacks the required install contract; original installation retained. Choose ZC_VERSION=<tag> with zc-release-install-v1 support. For an older-version rollback, explicitly stop the owned service/manual instance with its original HOME/runtime, back up complete state, and restore a verified old binary with matching state; see docs/install/README.md (State compatibility and rollback)."
+fi
+[ "$zc_signal" -eq 0 ] || exit "$zc_signal"
 mkdir -p "$zc_install_dir"
 zc_target="$zc_install_dir/zc"
-zc_install_dir_physical="$(CDPATH= cd -P "$zc_install_dir" && pwd -P)" \
-    || zc_fail "cannot resolve installation directory: $zc_install_dir"
-zc_target_physical="$zc_install_dir_physical/zc"
-if [ -L "$zc_target" ]; then
-    zc_fail "installation target must not be a symbolic link: $zc_target"
-fi
-if [ -d "$zc_target" ]; then
-    zc_fail "installation target is a directory: $zc_target"
-fi
 zc_lock_candidate="$zc_install_dir/.zc.install.lock"
 if ! mkdir "$zc_lock_candidate" 2>/dev/null; then
     zc_lock_owner="$(cat "$zc_lock_candidate/owner" 2>/dev/null || true)"
@@ -209,169 +267,16 @@ if ! mkdir "$zc_lock_candidate" 2>/dev/null; then
 fi
 zc_lock_dir="$zc_lock_candidate"
 printf '%s\n' "$$" >"$zc_lock_dir/owner" || zc_fail "failed to record installer lock owner"
-
-zc_running_target_pids() {
-    if [ -r /proc/self/exe ]; then
-        command -v readlink >/dev/null 2>&1 || return 1
-        for zc_exe_link in /proc/[0-9]*/exe; do
-            if ! zc_executable="$(readlink "$zc_exe_link" 2>/dev/null)"; then
-                zc_proc_dir="${zc_exe_link%/exe}"
-                zc_comm="$(cat "$zc_proc_dir/comm" 2>/dev/null)" || continue
-                [ "$zc_comm" != "zc" ] || return 1
-                continue
-            fi
-            zc_executable="${zc_executable% (deleted)}"
-            if [ "$zc_executable" = "$zc_target" ] \
-                || [ "$zc_executable" = "$zc_target_physical" ]; then
-                zc_pid="${zc_exe_link#/proc/}"
-                printf '%s\n' "${zc_pid%%/*}"
-            fi
-        done
-        return 0
-    fi
-
-    command -v lsof >/dev/null 2>&1 || return 1
-    if ! zc_lsof_output="$(lsof -n -d txt -Fpn 2>/dev/null)"; then
-        return 1
-    fi
-    if ! zc_ps_output="$(ps -ww -axo pid=,comm= 2>/dev/null)"; then
-        return 1
-    fi
-    {
-        printf '%s\n' "$zc_ps_output" | awk \
-            -v logical="$zc_target" \
-            -v physical="$zc_target_physical" '
-                {
-                    pid = $1
-                    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "")
-                    if ($0 == logical || $0 == physical) print pid
-                }
-            '
-        printf '%s\n' "$zc_lsof_output" | awk \
-            -v logical="$zc_target" \
-            -v physical="$zc_target_physical" '
-                /^p/ { pid = substr($0, 2) }
-                /^n/ {
-                    path = substr($0, 2)
-                    sub(/ \(deleted\)$/, "", path)
-                    if (path == logical || path == physical) print pid
-                }
-            '
-    } | awk '!seen[$0]++'
-}
-
-zc_require_stopped_target() {
-    if [ -L "$zc_target" ]; then
-        zc_fail "installation target must not be a symbolic link: $zc_target"
-    fi
-    if [ ! -e "$zc_target" ]; then
-        return 0
-    fi
-    if [ ! -x "$zc_target" ]; then
-        zc_fail "existing target is not executable: $zc_target"
-    fi
-    if ! zc_status="$("$zc_target" status --json 2>/dev/null)"; then
-        zc_fail "cannot verify daemon state with existing $zc_target"
-    fi
-    zc_status_compact="$(printf '%s' "$zc_status" | tr -d '[:space:]')"
-    case "$zc_status_compact" in
-        *'"state":"stopped"'*) ;;
-        *'"state":"running"'*)
-            zc_fail "zc is running; stop it before replacing $zc_target"
-            ;;
-        *) zc_fail "existing zc returned an unknown status contract" ;;
-    esac
-    if ! zc_target_pids="$(zc_running_target_pids)"; then
-        zc_fail "cannot inspect running processes before replacing $zc_target"
-    fi
-    if [ -n "$zc_target_pids" ]; then
-        zc_target_pids_one_line="$(printf '%s' "$zc_target_pids" | tr '\n' ' ')"
-        zc_fail "installation target is still running (pid: $zc_target_pids_one_line)"
-    fi
-}
-
-zc_restore_previous() {
-    zc_restore_reason="$1"
-    zc_restore_path="$zc_backup_path"
-    zc_restore_in_progress=1
-    if ! mv -f "$zc_restore_path" "$zc_target"; then
-        zc_publish_in_progress=0
-        zc_backup_path=""
-        zc_restore_in_progress=0
-        zc_fail "rollback failed; previous zc remains at $zc_restore_path"
-    fi
-    zc_publish_in_progress=0
-    zc_backup_path=""
-    zc_restore_in_progress=0
-    zc_fail "$zc_restore_reason"
-}
-
-zc_verify_post_publish_processes() {
-    if ! zc_target_pids="$(zc_running_target_pids)"; then
-        if [ "$zc_had_target" -eq 1 ]; then
-            zc_restore_previous \
-                "could not inspect processes after publication; restored previous zc"
-        fi
-        zc_fail "could not inspect processes after publication"
-    fi
-    if [ -n "$zc_target_pids" ]; then
-        zc_target_pids_one_line="$(printf '%s' "$zc_target_pids" | tr '\n' ' ')"
-        if [ "$zc_had_target" -eq 1 ]; then
-            zc_restore_previous \
-                "zc started during installation (pid: $zc_target_pids_one_line); restored previous zc"
-        fi
-        zc_fail "zc started during installation (pid: $zc_target_pids_one_line)"
-    fi
-}
-
-zc_require_stopped_target
-zc_had_target=0
-if [ -e "$zc_target" ]; then
-    zc_had_target=1
-    zc_backup_path="$(mktemp "$zc_install_dir/.zc.backup.XXXXXX")"
-    cp -p "$zc_target" "$zc_backup_path"
-fi
-zc_stage_path="$(mktemp "$zc_install_dir/.zc.tmp.XXXXXX")"
-cp "$zc_binary" "$zc_stage_path"
-chmod 755 "$zc_stage_path"
-zc_expected_version="zc ${zc_tag#v}"
-zc_actual_version="$("$zc_stage_path" --version 2>/dev/null || true)"
-[ "$zc_actual_version" = "$zc_expected_version" ] \
-    || zc_fail "binary self-check failed: expected '$zc_expected_version'"
-zc_require_stopped_target
-if [ -L "$zc_target" ]; then
-    zc_fail "installation target became a symbolic link: $zc_target"
-fi
-if [ -d "$zc_target" ]; then
-    zc_fail "installation target became a directory: $zc_target"
-fi
-zc_publish_in_progress=1
-mv -f "$zc_stage_path" "$zc_target"
-zc_stage_path=""
-
-zc_verify_post_publish_processes
-
-if [ "$zc_had_target" -eq 1 ]; then
-    if ! zc_status="$("$zc_target" status --json 2>/dev/null)"; then
-        zc_restore_previous \
-            "new binary could not verify daemon state; restored previous zc"
-    fi
-    zc_status_compact="$(printf '%s' "$zc_status" | tr -d '[:space:]')"
-    case "$zc_status_compact" in
-        *'"state":"stopped"'*) ;;
-        *)
-            zc_restore_previous \
-                "daemon started during installation; restored previous zc"
-            ;;
-    esac
-    zc_verify_post_publish_processes
-    zc_publish_in_progress=0
-    rm -f "$zc_backup_path"
-    zc_backup_path=""
-else
-    zc_verify_post_publish_processes
-    zc_publish_in_progress=0
-fi
+[ "$zc_signal" -eq 0 ] || exit "$zc_signal"
+# Start asynchronously so a signal interrupts wait, rather than deferring the
+# shell trap until the transaction finishes. Rust owns all service/publication state.
+"$zc_binary" --local-install "$zc_binary" "$zc_install_dir" &
+zc_child=$!
+# Close the trap/child-assignment race before waiting.
+if [ "$zc_signal" -ne 0 ]; then kill -"$zc_forward_signal" "$zc_child" 2>/dev/null || true; fi
+zc_wait
+[ "$zc_signal" -eq 0 ] || exit "$zc_signal"
+[ "$zc_child_status" -eq 0 ] || zc_fail "candidate installation failed; inspect the recovery result above before retrying"
 
 printf 'Installed %s to %s\n' "$zc_expected_version" "$zc_target"
 case ":${PATH:-}:" in

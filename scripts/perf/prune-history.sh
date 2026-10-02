@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prune docs/perf/reports/history/*.json while keeping latest N files.
+# Prune .agents/perf/reports/history/*.json while keeping latest N files.
 # NOTE: latest.json is never touched.
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-HISTORY_DIR="$ROOT_DIR/docs/perf/reports/history"
+HISTORY_DIR="$ROOT_DIR/.agents/perf/reports/history"
 KEEP="${1:-30}"
 
 if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [[ "$KEEP" -lt 1 ]]; then

@@ -1,4 +1,6 @@
-# CLI/API Error Codes
+# CLI/API 错误码
+
+本字典说明公开错误码及处理方式；历史内部错误名不保证逐项出现在当前输出中。message/hint 列是英文输出示例，不要求逐字相同。
 
 ## 1) 目标
 
@@ -34,7 +36,7 @@
 
 ---
 
-## 3) 已实现 CLI 错误码（与 `src/` 实际发射点一致）
+## 3) CLI 错误码
 
 ### A. 全局（dispatch / help / version）
 
@@ -93,6 +95,55 @@
 `START_PORT_INVALID`），message/hint 按 `restart` 渲染。以上 `*_REQUIRED` /
 `*_INVALID` 参数错误均为用法错误，exit 2。
 
+### B2. connection 家族
+
+| code | 触发条件 | 恢复方式 |
+|---|---|---|
+| `CONNECTION_ARGUMENT_INVALID` | 裸组全局选项后仍有非法/多余参数 | 使用 `zc help connection`，exit 2 |
+| `CONNECTION_SUBCOMMAND_UNKNOWN` | 未知子命令 | 仅使用 list 或 close，exit 2 |
+| `CONNECTION_LIST_ARGUMENT_INVALID` | list 的非法参数 | 使用 `zc connection list [--json]`，exit 2 |
+| `CONNECTION_CLOSE_ID_REQUIRED` | 缺少 ID | 从 list 取得 ID，exit 2 |
+| `CONNECTION_CLOSE_ARGUMENT_INVALID` | 非法 ID、额外参数或 `--all` | 使用完整 `<nonce>-<序号>`，exit 2 |
+| `CONNECTION_NOT_RUNNING` | 没有已验证的 ready 实例 | 显式准备配置并启动，exit 1 |
+| `CONNECTION_CONTROLLER_REQUIRED` | 冻结配置没有 controller | 配置 controller 后显式 `restart -c <config>`；托管自动提供 secret，非托管还需手工配置；默认 restart 冻结 |
+| `CONNECTION_SECRET_REQUIRED` | 冻结配置无非空 secret，或 API 返回 403 | 托管显式 `restart -c <profile>` 启用自动值；非托管先配置非空 secret；不是默认 restart |
+| `CONNECTION_UNAUTHORIZED` | API 返回 401 | 核对运行实例及冻结 secret，不输出或分享凭据 |
+| `CONNECTION_INSTANCE_CHANGED` | PID/nonce/endpoint/exact identity 或快照不可验证、响应实例头缺失/不匹配、旧 ID、API 409 | 重新 list，仅操作当前实例 ID |
+| `CONNECTION_NOT_FOUND` | API 404，连接已回收 | 重新 list；不存在历史记录 |
+| `CONNECTION_RESPONSE_INVALID` | schema/JSON/响应完整性错误、超过 4 MiB 或 API 无法生成完整响应 | 核对 controller 版本，减少过大的节点/规则展示数据 |
+| `CONNECTION_FAILED` | 其他控制请求、超时、文件读取等失败 | 检查 status/controller；不会创建新监听器 |
+
+除明确列出的用法错误外均 exit 1，文本/JSON 同码。错误不回显 secret、目标或控制器响应正文。CLI 的 DELETE 成功仅为 `close_requested:true`，不能自动重试为“已回收”；仍在 closing 的条目可重复请求，消失后 404。
+
+API 保持 `{"error":"…"}`，不发 CLI 信封或上述 code：非空 secret 缺失 403，缺失/错误 Bearer 401，格式错误 400，实例不符 409，条目不存在 404，完整编码超限 500。旧 GET/PUT 鉴权规则不变。协议与元数据详见 [API](README.md)。
+
+### B3. service 与本地冷升级
+
+| code | 触发条件 | 恢复方式 |
+|---|---|---|
+| `SERVICE_SUBCOMMAND_UNKNOWN` / `SERVICE_ARGUMENT_INVALID` / `SERVICE_<ACTION>_ARGUMENT_INVALID` | 未知动作、缺值、非法端口或多余参数 | 使用 `zc help service`；用法错误 exit 2 |
+| `SERVICE_USER_REQUIRED` / `SERVICE_HOME_MISMATCH` | root 或 HOME 与操作系统登录用户不一致 | 用原登录用户及其 HOME；环境覆盖不授予服务管理权限 |
+| `SERVICE_NOT_REGISTERED` | 未注册却请求 restart | 显式 `zc service start -c <config> --port <port>` |
+| `SERVICE_OWNED` | 普通生命周期命令触及注册 runtime | 使用对应 service 命令；重新准备来源须显式 `-c` |
+| `SERVICE_MANUAL_INSTANCE` | 服务/安装操作遇到手动或其他调用 | 确认原 namespace，按原方式停止，再显式迁移；原实例保留 |
+| `SERVICE_EXECUTABLE_PATH_UNSUPPORTED` | Linux 二进制绝对路径含引号或反斜杠 | 在不含这些字符的路径安装后注册；空格、`$`、`%` 可用；拒绝先于配置准备与服务状态创建 |
+| `SERVICE_TARGET_MISMATCH` | 二进制路径、HOME、runtime 或平台与注册不一致 | 使用已注册安装及其环境，勿换 namespace 绕过 |
+| `SERVICE_STATE_INVALID` / `SERVICE_FOREIGN` | 注册、快照、定义缺失/损坏/内容或调用不符 | 保留现场，核查所有权及备份，不删除重建 |
+| `SERVICE_RUNNING` | start/enable 试图修改运行中配置 | 使用显式 service restart，或先停止再配置 |
+| `SERVICE_INSTANCE_MISMATCH` / `SERVICE_CONTENDED` | 管理器/daemon 身份不符、并发启动/发布 | 检查两个状态及实际进程；未证明的实例不会被停止 |
+| `SERVICE_MANAGER_UNAVAILABLE` / `SERVICE_MANAGER_FAILED` | 管理器不可执行、登录域不可用、拒绝访问或返回异常 | 检查当前用户登录会话及管理器；与 unit 不存在分开处理 |
+| `SERVICE_MANAGER_TIMEOUT` / `SERVICE_MANAGER_OUTPUT_LIMIT` | 单次命令超过 15 秒或单流输出超过 64 KiB | 检查管理器健康；输出正文不会回显 |
+| `SERVICE_START_FAILED` / `SERVICE_STOP_FAILED` | 未取得真实 readiness 或停止证明 | 停止失败恢复原注册/启动许可；若已停止，确认状态后显式 start；结果不明先核对管理器与实例 |
+| `SERVICE_START_FAILED_ROLLED_BACK` | service restart 新调用失败，旧调用已恢复 | 修复目标输入后重试；命令仍 exit 1 |
+| `SERVICE_CANDIDATE_INVALID` / `SERVICE_TARGET_INVALID` / `SERVICE_PUBLISH_FAILED` | 候选检查、安装目标或安全 staging 失败 | 保留旧安装，核查候选、目标权限与遗留进程 |
+| `SERVICE_INSTALL_INTERRUPTED` | 本地安装收到 SIGINT/SIGTERM | 等待命令回收与恢复结果；作为回滚/恢复失败的原因保留，不强杀恢复过程 |
+| `SERVICE_COMMAND_CLEANUP_FAILED` | 命令组终止或直接子进程回收失败 | 保留工件并核对遗留发布进程；锁释放本身不证明发布已结束 |
+| `SERVICE_INSTALL_ROLLED_BACK` | 冷升级失败，旧二进制与原启停状态已恢复 | 修复原因后重试；不会按默认 profile 启动 |
+| `SERVICE_RECOVERY_FAILED` | 旧二进制/精确调用恢复失败 | 保留 `.zc.recovery.*`、注册和认证快照，先核查状态再恢复 |
+| `SERVICE_FAILED` | 其他服务文件系统或状态检查失败 | 检查路径、权限、注册及日志，保留现场 |
+
+除用法错误外均 exit 1；服务命令沿用公开 CLI JSON 信封，不新增 HTTP API。冻结配置准备可能沿用既有 `CONFIG_*` / `START_*` 错误；锁或文件系统错误可通过 `SERVICE_FAILED` 报告。安装内部入口输出脱敏英文错误并返回非零，`just` 传播失败。
+
 ### C. 配置类（CONFIG_*）
 
 | code | message 示例 | hint 示例 |
@@ -137,6 +188,9 @@
 | `CONFIG_OVERRIDE_SCRIPT_NOT_FOUND` | override script file not found | check script path and retry |
 | `CONFIG_OVERRIDE_FAILED` | failed to update persisted config override | check config state and retry |
 | `CONFIG_OVERRIDE_APPLY_FAILED` | override persisted but failed to apply running daemon | check logs and run `zc restart` |
+| `CONFIG_DELETE_NAME_REQUIRED` | missing config name | use `zc config delete <name>` |
+| `CONFIG_DELETE_ARGUMENT_INVALID` | invalid delete arguments | use `zc config delete <name>` |
+| `CONFIG_DELETE_FAILED` | failed to delete config reference | inspect catalog state without deleting immutable data |
 | `CONFIG_SUBCOMMAND_UNKNOWN` | unknown config subcommand | use `zc config --help` to list config subcommands |
 
 `CONFIG_LOAD_INVALID` 是 validator 完成后的语义失败：文本 stderr 在错误块后列出具体 errors/warnings；JSON failure envelope 附带 `data.config_errors`、`data.config_warnings`、`data.config_diagnostics_truncated`。errors 优先于 warnings，占满 256 条共享上界时仍至少保留一条可操作 error。parser/I/O/resource-limit/name 错误不伪造这些字段。
@@ -217,13 +271,13 @@ source 并修复 subscription source；active update 只提示修复 subscriptio
 
 `CHECKS_FAILED` 是诊断类命令（`test` / `proxy test` / `profile test` /
 `doctor` / `diag doctor`）的统一失败码：envelope 附带 `data`（逐项
-`checks`），exit 1（决策 D3）。
+`checks`），exit 1（决策 D3）。`test` 及其别名现在要求全部目标成功；部分成功同样返回此码，`data.summary` 提供成功/失败计数与状态，`data.targets` 保留逐项目标结果。端口不可达时摘要为 `not_run`。字段及旧版兼容变化见 [CLI 契约](../cli/spec.md#test-的可用性摘要与实际路径)。
 
 ### F. override / rule-provider
 
 | code | message 示例 | hint 示例 |
 |---|---|---|
-| `OVERRIDE_SCRIPT_NOT_FOUND` | override script or runtime not found | check `--override-script` path and lua availability |
+| `OVERRIDE_SCRIPT_NOT_FOUND` | override script or executable interpreter not found | check the selected script path or executable interpreter |
 | `OVERRIDE_SCRIPT_EXEC_FAILED` | override script execution failed | ensure script exits 0 and outputs valid override |
 | `OVERRIDE_SCRIPT_TIMEOUT` | override script timed out | increase `--override-timeout-ms` or simplify script |
 | `OVERRIDE_OUTPUT_INVALID` | override output is invalid | output yaml object with known config keys |
@@ -258,20 +312,16 @@ override flag 本身的解析错误（`--override-script`/`--override-arg` 缺�
 
 ## 5) 设计原则
 
-1. `code` 稳定：供前端/脚本分支判断（冻结词汇，见 `docs/cli/ux-workflow.md` 第 3 节）。
+1. `code` 稳定：供前端/脚本分支判断。
 2. `message` 可读：一句话说清发生了什么。
 3. `hint` 可执行：给用户下一步动作。
 4. 尽量避免返回裸异常名（例如 `FileNotFound`）给最终用户；CLI 在 envelope 之外可经 stderr 附加真实错误名作诊断。
 
 ---
 
-## 6) API 文档对齐
+## 6) API 与诊断边界
 
-- 当前 v1.0 active API 文档入口是 `docs/api/README.md`。
-- 旧 OpenAPI 草案已归档到 `docs/archive/api/openapi.yaml`，不再作为当前契约。
-- 新增错误码时，必须同步更新本字典，并在对应 CLI/API 文档中说明可触发场景。
-
-## 7) 后续落地
-
-1. API 路径（`src/api/server.zig`）错误响应仍为 `{"error":"…"}` 简单格式，尚未对齐本字典的 envelope。
-2. 为高频 code 增加集成测试断言（已覆盖 PROXY / PROFILE / DIAG / CHECKS_FAILED 路径，见 `src/integration_error_test.zig`）。
+- HTTP API 使用 `{"error":"…"}` 简单响应，不承诺 CLI envelope；端点及状态码见 [Minimal API](README.md)。
+- 配置资源超限使用公开 `CONFIG_*_LIMIT_EXCEEDED` 等错误码，脚本不应依赖内部 Rust 错误类型名称。
+- 部分配置加载路径只返回概括性错误；doctor 的详细诊断范围见 [CLI](../cli/spec.md)。
+- `durability_uncertain:true` 是可见提交成功但持久性未确认，不应当作失败后自动重试发布；`mirror_out_of_sync:true` 也不代表 catalog commit 失败。

@@ -9,7 +9,7 @@ usage() {
   cat <<'HELP'
 Usage: bash scripts/eval/scenarios/s2_rule_matrix.sh [--matrix <path>]
 
-Runs: zig build eval-rule-matrix -Dcpu=baseline -- <matrix>
+Runs: cargo run --locked --example eval_rule_matrix -- <matrix>
 HELP
 }
 
@@ -36,14 +36,14 @@ if [[ ! -f "$MATRIX" ]]; then
   printf 's2: matrix not found: %s\n' "$MATRIX" >&2
   exit 2
 fi
-if ! command -v zig >/dev/null 2>&1; then
-  printf 's2: zig not found on PATH\n' >&2
+if ! command -v cargo >/dev/null 2>&1; then
+  printf 's2: cargo not found on PATH\n' >&2
   exit 2
 fi
 
 cd "$ROOT_DIR"
 set +e
-zig build eval-rule-matrix -Dcpu=baseline -- "$MATRIX"
+cargo run --locked --example eval_rule_matrix -- "$MATRIX"
 rc=$?
 set -e
 exit "$rc"

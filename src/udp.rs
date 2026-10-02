@@ -1,0 +1,433 @@
+use crate::{
+    dns::Dns,
+    observability::FailureStage,
+    outbound::{BoxStream, destination},
+    target::Target,
+};
+use anyhow::{Context, Result, bail};
+use shadowsocks::{
+    config::ServerConfig,
+    context::SharedContext,
+    relay::udprelay::{
+        DatagramReceive, DatagramSend,
+        proxy_socket::{ProxySocket, ProxySocketError, UdpSocketType},
+    },
+};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, Interest, ReadBuf},
+    net::UdpSocket,
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+    time::timeout,
+};
+
+#[derive(Debug)]
+pub(crate) struct IdleExpired;
+impl std::fmt::Display for IdleExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UDP receive idle expired")
+    }
+}
+impl std::error::Error for IdleExpired {}
+
+struct Trojan {
+    send: mpsc::Sender<Vec<u8>>,
+    receive: Mutex<mpsc::Receiver<Result<Datagram>>>,
+    worker: JoinHandle<()>,
+    resolved: Mutex<Option<(Target, Target)>>,
+}
+
+impl Drop for Trojan {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
+// Share one registered socket with the codec and the error-readiness waiter.
+// The codec's poll-based receive path does not observe Linux error-only events.
+struct SharedUdpSocket(Arc<UdpSocket>);
+
+impl DatagramReceive for SharedUdpSocket {
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.0.poll_recv(cx, buf)
+    }
+
+    fn poll_recv_from(
+        &self,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<SocketAddr>> {
+        self.0.poll_recv_from(cx, buf)
+    }
+
+    fn poll_recv_ready(&self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        self.0.poll_recv_ready(cx)
+    }
+}
+
+impl DatagramSend for SharedUdpSocket {
+    fn poll_send(&self, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.0.poll_send(cx, buf)
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        self.0.poll_send_to(cx, buf, target)
+    }
+
+    fn poll_send_ready(&self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        self.0.poll_send_ready(cx)
+    }
+}
+
+enum Transport {
+    Trojan(Trojan),
+    Direct {
+        ipv4: UdpSocket,
+        ipv6: Option<UdpSocket>,
+    },
+    Shadowsocks {
+        socket: ProxySocket<SharedUdpSocket>,
+        io: Arc<UdpSocket>,
+        overhead: usize,
+    },
+}
+
+pub const MAX_WIRE_BYTES: usize = 65507;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+pub struct Datagram {
+    pub source: Target,
+    pub payload: Vec<u8>,
+}
+
+/// A bounded datagram session. Receives may be cancelled by select! safely.
+/// Pass Route.target to send_to to retain the routing decision's DNS pin.
+pub struct UdpSession {
+    dns: Arc<Dns>,
+    transport: Transport,
+    receive: Mutex<Vec<u8>>,
+    send: Mutex<()>,
+}
+
+impl UdpSession {
+    pub(crate) async fn direct(dns: Arc<Dns>) -> Result<Self> {
+        let ipv4 = bind_socket("0.0.0.0:0").await?;
+        let ipv6 = match bind_socket("[::]:0").await {
+            Ok(socket) => Some(socket),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self {
+            dns,
+            transport: Transport::Direct { ipv4, ipv6 },
+            receive: Mutex::new(vec![0; 65536]),
+            send: Mutex::new(()),
+        })
+    }
+
+    pub(crate) async fn shadowsocks(
+        dns: Arc<Dns>,
+        context: SharedContext,
+        config: &ServerConfig,
+        server: &Target,
+        stage: &mut FailureStage,
+    ) -> Result<Self> {
+        let mut last = None;
+        *stage = FailureStage::Dns;
+        let addresses = dns.resolve(server).await?;
+        *stage = FailureStage::Connect;
+        for ip in addresses {
+            let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let socket = match bind_socket(bind).await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    last = Some(error);
+                    continue;
+                }
+            };
+            match socket.connect(SocketAddr::new(ip, server.port())).await {
+                Ok(()) => {
+                    let io = Arc::new(socket);
+                    return Ok(Self {
+                        dns,
+                        transport: Transport::Shadowsocks {
+                            socket: ProxySocket::from_socket(
+                                UdpSocketType::Client,
+                                context,
+                                config,
+                                SharedUdpSocket(io.clone()),
+                            ),
+                            io,
+                            overhead: config.method().salt_len() + 16,
+                        },
+                        receive: Mutex::new(vec![0; 65536]),
+                        send: Mutex::new(()),
+                    });
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.context("no UDP server addresses")?.into())
+    }
+
+    pub(crate) fn trojan(dns: Arc<Dns>, stream: BoxStream) -> Self {
+        let (send, outgoing) = mpsc::channel(2);
+        let (incoming, receive) = mpsc::channel(2);
+        let worker = tokio::spawn(trojan_worker(stream, outgoing, incoming));
+        Self {
+            dns,
+            transport: Transport::Trojan(Trojan {
+                send,
+                receive: Mutex::new(receive),
+                worker,
+                resolved: Mutex::new(None),
+            }),
+            receive: Mutex::new(Vec::new()),
+            send: Mutex::new(()),
+        }
+    }
+
+    /// Cancel and join the nested worker before releasing its connection owner.
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        if let Transport::Trojan(trojan) = &mut self.transport {
+            trojan.worker.abort();
+            if let Err(error) = (&mut trojan.worker).await
+                && !error.is_cancelled()
+            {
+                return Err(crate::observability::task_error(error));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the accepted payload length. Trojan accepts into a two-frame queue;
+    /// a full queue returns an error (packet drop), never an unbounded waiter queue.
+    pub async fn send_to(&self, payload: &[u8], target: &Target) -> Result<usize> {
+        let _sending = self
+            .send
+            .try_lock()
+            .context("UDP send already in progress; packet dropped")?;
+        let limit = if matches!(self.transport, Transport::Trojan(_)) {
+            u16::MAX as usize
+        } else {
+            MAX_WIRE_BYTES
+        };
+        if payload.len() > limit {
+            bail!("UDP datagram exceeds protocol payload limit");
+        }
+        timeout(SEND_TIMEOUT, async {
+            match &self.transport {
+                Transport::Trojan(trojan) => {
+                    let mut cache = trojan.resolved.lock().await;
+                    let target = if target.host().parse::<IpAddr>().is_ok() {
+                        target.clone()
+                    } else if let Some((original, resolved)) = &*cache
+                        && original == target
+                    {
+                        resolved.clone()
+                    } else {
+                        let ip = self.dns.resolve(target).await?[0];
+                        let resolved = Target::new(ip.to_string(), target.port())?;
+                        *cache = Some((target.clone(), resolved.clone()));
+                        resolved
+                    };
+                    let mut frame = Vec::with_capacity(23 + payload.len());
+                    destination(&target).write_to_buf(&mut frame);
+                    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                    frame.extend_from_slice(b"\r\n");
+                    frame.extend_from_slice(payload);
+                    trojan.send.try_send(frame).map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => {
+                            anyhow::anyhow!("Trojan UDP send queue full; packet dropped")
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {
+                            anyhow::anyhow!("Trojan UDP session closed")
+                        }
+                    })?;
+                    Ok(payload.len())
+                }
+                Transport::Direct { ipv4, ipv6 } => {
+                    let ip = self.dns.resolve(target).await?[0];
+                    let socket = match ip {
+                        IpAddr::V4(_) => ipv4,
+                        IpAddr::V6(_) => ipv6.as_ref().context("IPv6 UDP is unavailable")?,
+                    };
+                    Ok(socket
+                        .send_to(payload, SocketAddr::new(ip, target.port()))
+                        .await?)
+                }
+                Transport::Shadowsocks {
+                    socket, overhead, ..
+                } => {
+                    let address = destination(target);
+                    if payload.len() + address.serialized_len() + overhead > MAX_WIRE_BYTES {
+                        bail!("Shadowsocks UDP wire datagram exceeds 65507 bytes");
+                    }
+                    socket
+                        .send(&address, payload)
+                        .await
+                        .map_err(std::io::Error::from)
+                        .context("Shadowsocks UDP send failed")?;
+                    Ok(payload.len())
+                }
+            }
+        })
+        .await
+        .context("UDP send timed out after 10 seconds")?
+    }
+
+    pub async fn recv_from(&self) -> Result<Datagram> {
+        if let Transport::Trojan(trojan) = &self.transport {
+            let mut receive = trojan
+                .receive
+                .try_lock()
+                .context("only one UDP receiver may wait per session")?;
+            return receive.recv().await.context("Trojan UDP session closed")?;
+        }
+        let mut storage = self
+            .receive
+            .try_lock()
+            .context("only one UDP receiver may wait per session")?;
+        timeout(IDLE_TIMEOUT, async {
+            if let Transport::Shadowsocks { socket, io, .. } = &self.transport {
+                loop {
+                    let received = tokio::select! {
+                        received = socket.recv(&mut storage) => received,
+                        error = io.async_io(Interest::ERROR, || {
+                            io.take_error()?.ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
+                        }) => {
+                            // Another I/O operation may consume SO_ERROR first;
+                            // WouldBlock clears stale readiness instead of spinning.
+                            let error = match error { Ok(error) | Err(error) => error };
+                            return Err(error).context("Shadowsocks UDP receive failed");
+                        }
+                    };
+                    match received {
+                        Ok((n, source, wire)) if wire <= MAX_WIRE_BYTES => {
+                            if let Ok(source) = address_target(source) {
+                                return Ok(Datagram { source, payload: storage[..n].to_vec() });
+                            }
+                        }
+                        Ok(_) | Err(ProxySocketError::ProtocolError(_)) => {},
+                        // The library's transparent wrapper skips the inner I/O
+                        // error in source(); retain its kind for classification.
+                        Err(error) => return Err(std::io::Error::from(error)).context("Shadowsocks UDP receive failed"),
+                    }
+                    // Authentication failures are packet-local, not DIRECT fallback or stream EOF.
+                    tokio::task::yield_now().await;
+                }
+            }
+            let Transport::Direct { ipv4, ipv6 } = &self.transport else { unreachable!() };
+            // Separate buffers prevent a cancelled branch from corrupting the selected packet.
+            let mut ipv6_buffer = [0; 65536];
+            loop {
+                let (n, address, v6) = tokio::select! {
+                    result = ipv4.recv_from(&mut storage) => { let (n, a) = result?; (n, a, false) },
+                    result = async {
+                        match ipv6 {
+                            Some(socket) => socket.recv_from(&mut ipv6_buffer).await,
+                            None => std::future::pending().await,
+                        }
+                    } => { let (n, a) = result?; (n, a, true) },
+                };
+                if n > MAX_WIRE_BYTES { continue; }
+                return Ok(Datagram { source: Target::new(address.ip().to_string(), address.port())?,
+                    payload: if v6 { ipv6_buffer[..n].to_vec() } else { storage[..n].to_vec() } });
+            }
+        }).await.context(IdleExpired)?
+    }
+}
+
+fn address_target(address: shadowsocks::relay::socks5::Address) -> Result<Target> {
+    use shadowsocks::relay::socks5::Address;
+    match address {
+        Address::SocketAddress(address) => Target::new(address.ip().to_string(), address.port()),
+        Address::DomainNameAddress(host, port) => Target::from_socks(host, port),
+    }
+}
+
+async fn bind_socket(address: &str) -> Result<UdpSocket, std::io::Error> {
+    let socket = UdpSocket::bind(address).await?;
+    // macOS defaults to a 9216-byte send buffer, below the supported UDP wire limit.
+    #[cfg(unix)]
+    {
+        rustix::net::sockopt::set_socket_send_buffer_size(&socket, 256 * 1024)?;
+        rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 256 * 1024)?;
+    }
+    Ok(socket)
+}
+
+async fn trojan_worker(
+    stream: BoxStream,
+    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    incoming: mpsc::Sender<Result<Datagram>>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    // Each loop future is polled for its entire lifetime. select! never recreates
+    // a read_exact future when a concurrent send wins, so partial frames survive.
+    let result: Result<()> = tokio::select! {
+        result = async {
+            loop {
+                let packet = timeout(IDLE_TIMEOUT, async {
+                    let source = shadowsocks::relay::socks5::Address::read_from(&mut reader).await
+                        .context("invalid or truncated Trojan UDP address")?;
+                    let source = address_target(source).context("invalid Trojan UDP source")?;
+                    let len = reader.read_u16().await.context("truncated Trojan UDP length")? as usize;
+                    let mut delimiter = [0; 2];
+                    reader.read_exact(&mut delimiter).await.context("truncated Trojan UDP delimiter")?;
+                    if delimiter != *b"\r\n" { bail!("invalid Trojan UDP CRLF"); }
+                    let mut payload = vec![0; len];
+                    reader.read_exact(&mut payload).await.context("truncated Trojan UDP payload")?;
+                    Ok(Datagram { source, payload })
+                }).await.context(IdleExpired)??;
+                match incoming.try_send(Ok(packet)) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {},
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                }
+                tokio::task::yield_now().await;
+            }
+        } => result,
+        result = async {
+            while let Some(frame) = outgoing.recv().await {
+                timeout(SEND_TIMEOUT, async {
+                    writer.write_all(&frame).await?;
+                    writer.flush().await
+                }).await.context("Trojan UDP write timeout after 10 seconds")?
+                    .context("Trojan UDP write failed")?;
+            }
+            Ok(())
+        } => result,
+    };
+    // Close TLS immediately even when the receive queue is full. Terminal errors
+    // follow already accepted frames, and no byte resynchronization is attempted.
+    drop(reader);
+    drop(writer);
+    drop(outgoing);
+    if let Err(error) = result {
+        let _ = incoming.send(Err(error)).await;
+    }
+}

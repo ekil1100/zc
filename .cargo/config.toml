@@ -1,0 +1,4 @@
+[env]
+# All macOS artifacts use the same explicit deployment contract.
+# Other target platforms do not use this Apple toolchain variable.
+MACOSX_DEPLOYMENT_TARGET = "15.0"

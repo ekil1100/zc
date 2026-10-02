@@ -19,7 +19,7 @@ Frozen at branch bootstrap on `wt/eval-framework` (base `24645af` / `origin/main
 | Contract install | `scripts/install/run-all-regression.sh` | Task 4 step |
 | Interop local | `zig build e2e` (`zig build --help` lists `e2e` and `e2e-release`) | Task 5 delegates local `e2e` |
 | Interop CI | `zig build e2e-release` in `.github/workflows/ci.yml` | remains authoritative; eval does not own it |
-| Interop docs | `docs/reliability/e2e.md` | present |
+| Interop docs | `.agents/reliability/e2e.md` | present |
 | Perf record | `scripts/perf/run-control-plane-baseline.sh` | Task 7 real record path |
 | Beta aggregate | `scripts/run-beta-gate.sh` | keep as-is; eval does not re-wrap |
 | Port policy | `AGENTS.md` forbids local daemon on `7899` | S1 must pick non-7899 port |
@@ -33,7 +33,7 @@ Frozen at branch bootstrap on `wt/eval-framework` (base `24645af` / `origin/main
 | `scripts/perf/check-readme-consistency.sh` | asserts obsolete fake-PASS contract |
 | `docs/perf/reports/latest.json` | tracked placeholder output |
 
-Do **not** delete `scripts/perf/run-control-plane-baseline.sh` or history blobs under `docs/perf/reports/history/` (historical only, non-authoritative).
+Do **not** delete `scripts/perf/run-control-plane-baseline.sh` or history blobs under `.agents/perf/reports/history/` (historical only, non-authoritative).
 
 ## Reliability (later / Task 11 optional)
 

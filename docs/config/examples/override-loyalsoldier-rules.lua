@@ -2,8 +2,10 @@
 -- Usage:
 --   zc test -c <config.yaml> --override-script docs/config/examples/override-loyalsoldier-rules.lua
 -- Note:
---   `rule-providers.*.path` is used as local cache path.
---   If `url` is set, zc will auto-download missing files and best-effort refresh stale cache by interval.
+--   Use an explicit unmanaged config with the selected proxy group.
+--   HTTP providers are fetched during preparation; path is a logical asset key.
+--   Rust currently has no disk cache or interval refresh fallback.
+--   Managed offline revisions reject referenced HTTP providers.
 --
 -- Optional args via --override-arg:
 --   proxy_group=<name>   default: Proxies

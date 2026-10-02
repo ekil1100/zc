@@ -159,20 +159,15 @@ if [[ ! -f "$S1" ]]; then
     >"$ARTIFACT_DIR/contract-s1.log"
   record_step s1_startup 2 "artifacts/contract-s1.log" missing
 else
-  zc_bin="$ROOT_DIR/zig-out/bin/zc"
-  if [[ ! -x "$zc_bin" ]]; then
-    build_rc=0
-    (
-      cd "$ROOT_DIR"
-      zig build -Dcpu=baseline
-    ) >"$ARTIFACT_DIR/contract-s1-build.log" 2>&1 || build_rc=$?
-    if [[ $build_rc -ne 0 ]]; then
-      record_step s1_startup "$build_rc" "artifacts/contract-s1-build.log" ran
-      append_note "s1_startup: zig build failed"
-    else
-      run_logged s1_startup artifacts/contract-s1.log \
-        bash "$S1" --zc "$zc_bin"
-    fi
+  zc_bin="$ROOT_DIR/target/debug/zc"
+  build_rc=0
+  (
+    cd "$ROOT_DIR"
+    cargo build --locked --target-dir target
+  ) >"$ARTIFACT_DIR/contract-s1-build.log" 2>&1 || build_rc=$?
+  if [[ $build_rc -ne 0 ]]; then
+    record_step s1_startup "$build_rc" "artifacts/contract-s1-build.log" ran
+    append_note "s1_startup: cargo build failed"
   else
     run_logged s1_startup artifacts/contract-s1.log \
       bash "$S1" --zc "$zc_bin"

@@ -1,0 +1,73 @@
+port: 8080
+socks-port: 1080
+mixed-port: 9001
+redir-port: 0
+tproxy-port: 0
+allow-lan: false
+ipv6: false
+bind-address: "*"
+mode: "rule"
+log-level: "debug"
+external-controller: "127.0.0.1:19091"
+external-ui: "a\u202e\u009b\x01\n\"\\中"
+secret: "private\x7f\tkey"
+idle-session-check-interval: -2
+idle-session-timeout: 12
+min-idle-session: 3
+proxies:
+  - name: "direct-node"
+    type: "direct"
+    server: ""
+    port: 0
+  - name: "reject-node"
+    type: "reject"
+    server: ""
+    port: 0
+    udp: true
+  - name: "ss-node"
+    type: "ss"
+    server: "example.com"
+    port: 8388
+    password: "a\n\"\\b"
+    cipher: "aes-128-gcm"
+    uuid: "extra-uuid"
+    alterId: 9
+    skip-cert-verify: true
+    sni: "private.example"
+    network: "tcp"
+    udp: true
+    plugin: "obfs"
+    plugin-opts:
+      mode: "http"
+      host: "obfs.example.com"
+  - name: "trojan-node"
+    type: "trojan"
+    server: "example.com"
+    port: 443
+    password: "key"
+    tls: true
+    sni: "tls.example.com"
+proxy-groups:
+  - name: "Mixed"
+    type: "select"
+    proxies:
+      - "DIRECT"
+      - "ss-node"
+    url: "https://example.com/check"
+    interval: 12
+    tolerance: 7
+    lazy: false
+  - name: "Proxy"
+    type: "select"
+    proxies:
+      - "Mixed"
+      - "trojan-node"
+      - "REJECT"
+    interval: 300
+    tolerance: 100
+    lazy: true
+rules:
+  - "DOMAIN,example.com,Proxy"
+  - "IP-CIDR,10.0.0.0/8,REJECT,no-resolve"
+  - "DOMAIN-SUFFIX,local.example,DIRECT"
+  - "MATCH,REJECT"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-HISTORY="$ROOT/docs/install/evidence/history"
+HISTORY="$ROOT/.agents/install/evidence/history"
 INDEX_JSONL="$HISTORY/index.jsonl"
 TIMELINE_MD="$HISTORY/timeline.md"
 : > "$INDEX_JSONL"

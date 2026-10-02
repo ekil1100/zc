@@ -1,0 +1,46 @@
+{
+  "darwin-arm64": {
+    "v0.0.13": {
+      "commit": "9666872946857b50a74fdb692896d77b53773cb2",
+      "sha256": "e83fcfb582af111bd1869ccd39045360a51395cdaac7ae37410bf92f55131f1e",
+      "source_url": "https://codeload.github.com/anytls/anytls-go/tar.gz/9666872946857b50a74fdb692896d77b53773cb2",
+      "source_archive_sha256": "53806a6373492066390e9ba4cdfef065d5b426904b91506b349a9e172d27d9b1",
+      "go_version": "go1.27.1",
+      "go_toolchain_sha256": "ee215d57e0ec269c60cc9ceca68e6bda321ba9ee5afe24f4b0988703c2d87d12",
+      "build_flags": [
+        "-mod=readonly",
+        "-trimpath",
+        "-buildvcs=false"
+      ],
+      "build_env": {
+        "CGO_ENABLED": "0",
+        "GOOS": "darwin",
+        "GOARCH": "arm64",
+        "GOARM64": "v8.0",
+        "GOENV": "off",
+        "GOTOOLCHAIN": "local"
+      }
+    },
+    "v0.0.5": {
+      "commit": "bcb7b3dc0f74a2ca87c9959b1c3860c555288f1a",
+      "sha256": "cf8eaed251135de05d5b64c84d479fa060163e34ce8dd52e407e5a6a809344bf",
+      "source_url": "https://codeload.github.com/anytls/anytls-go/tar.gz/bcb7b3dc0f74a2ca87c9959b1c3860c555288f1a",
+      "source_archive_sha256": "63d77535f2faa3ef1417ad3c44fbc3c321c9a2c281d7d37b9a17007b1b8c9b82",
+      "go_version": "go1.27.1",
+      "go_toolchain_sha256": "ee215d57e0ec269c60cc9ceca68e6bda321ba9ee5afe24f4b0988703c2d87d12",
+      "build_flags": [
+        "-mod=readonly",
+        "-trimpath",
+        "-buildvcs=false"
+      ],
+      "build_env": {
+        "CGO_ENABLED": "0",
+        "GOOS": "darwin",
+        "GOARCH": "arm64",
+        "GOARM64": "v8.0",
+        "GOENV": "off",
+        "GOTOOLCHAIN": "local"
+      }
+    }
+  }
+}

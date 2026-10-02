@@ -103,7 +103,7 @@ Deleted:
 - `scripts/perf/check-readme-consistency.sh`
 - `docs/perf/reports/latest.json`
 
-`docs/perf/reports/README.md` now documents only the real control-plane recorder and deferred compare.
+`.agents/perf/reports/README.md` now documents only the real control-plane recorder and deferred compare.
 
 ## CI
 

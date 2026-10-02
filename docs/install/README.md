@@ -1,27 +1,59 @@
-# zc install and validation
+# 构建与安装
 
-This page documents the current v1.0 install scripts that exist in this repository.
+## Rust 候选版本状态
 
-> v1.0 实现路线图已经完成。Standalone installer 与 Homebrew Tap 的实际可安装版本以 GitHub Release 为准。
+当前 Cargo 包版本为 `1.0.1`。**当前 Rust 候选尚未完成正式发布验证，请勿覆盖生产安装。** 版本号、构建成功或单项测试通过不代表可以发布；四平台、性能、长期稳定性和完整兼容性尚不能据此保证。
 
-## Standalone one-line installer
+默认构建使用 Rust，不调用 Zig 编译器或 Zig 运行时回退。
 
-推荐入口不依赖 Homebrew，也不会调用 `sudo`：
+## 从源码构建
+
+**Rust 候选的最低 macOS 版本为 15（Sequoia），不再支持 macOS 11–14。** 此要求针对 Rust 候选，不追溯改变旧版已发布程序的支持范围。
+
+仓库 `.cargo/config.toml` 将 `MACOSX_DEPLOYMENT_TARGET` 默认设为 `15.0`；macOS 构建拒绝其他显式值。`build.rs` 仅为 macOS target 启用 Apple linker 的 `-delay_framework`（Security、SystemConfiguration、CoreFoundation）、`-fatal_warnings` 和 ad-hoc 签名，作用于 binary/tests/examples。仍使用同一组强系统依赖及原 TLS/DNS API，不做 weak-link、旧 OS 回退或运行时替换。
+
+需要支持上述功能的 Apple linker。不要使用 LLD 替换、忽略链接警告或修改 Mach-O header 冒充兼容。ad-hoc 签名不是 Apple 公证。
+
+如果原生依赖缓存使用了更高的部署版本，构建可能拒绝链接；请使用新的 `CARGO_TARGET_DIR` 重新构建，不要删除用户状态或降低链接检查。
+
+```bash
+just build                         # target/debug/zc
+just release                       # cargo build --locked --release
+./target/release/zc --version
+just run testdata/config/rust-tcp.yaml 17890
+```
+
+构建不安装、不替换已有二进制、不接管 daemon。开发运行必须显式使用非生产端口，不使用 `7899`。安装的程序为 `zc`，不包含测试辅助程序。
+
+Rust 最低版本为 `1.91`，推荐使用项目 CI 固定的 `1.98.1`；需要 C/C++ 编译工具、CMake 和 just。Linux musl 构建还需要 `musl-tools` 与 `musl-gcc`，在对应 CPU 架构上原生构建。
+
+生产目标为 Linux/macOS × x64/arm64，不支持 Windows：
+
+| 平台 | Rust target | 归档平台标识 |
+| --- | --- | --- |
+| Linux x64 | `x86_64-unknown-linux-musl` | `linux-amd64` |
+| Linux arm64 | `aarch64-unknown-linux-musl` | `linux-arm64` |
+| macOS x64 | `x86_64-apple-darwin` | `macos-amd64` |
+| macOS arm64 | `aarch64-apple-darwin` | `macos-arm64` |
+
+可用 `cargo build --locked --release --target <target> --bin zc` 构建对应目标；目标列表不代表候选版本已经完成四平台发布验证。
+
+## 已发布版本的独立安装器
+
+以下入口安装 **GitHub Release 实际提供的版本**，不构建或验证当前 Rust 候选：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/ekil1100/zc/main/install.sh | sh
 ```
 
-默认安装到 `${XDG_BIN_HOME:-$HOME/.local/bin}/zc`。默认安装目录尚未位于 `PATH` 时，安装成功后的最后一行会给出可直接复制的命令：
+无需 Homebrew 或 `sudo`，默认目标为 `${XDG_BIN_HOME:-$HOME/.local/bin}/zc`。目录尚未在 `PATH` 中时，安装器会提示：
 
 ```bash
 export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
 ```
 
-Linux 使用静态 musl ELF；macOS 提供 standalone Mach-O，只依赖系统库。发布矩阵覆盖 Linux/macOS 的 amd64 与 arm64。
-
-可固定版本或目录：
+可显式指定已发布版本和目录：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
@@ -29,120 +61,91 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   | ZC_VERSION=v1.0.1 ZC_INSTALL_DIR="$HOME/bin" sh
 ```
 
-installer 先把 `latest` 解析为 immutable tag，再下载版本化归档及对应 `.sha256`；缺少
-checksum、摘要不匹配、归档异常或 `zc --version` 自检失败都会保留旧二进制并非零退出。
-最终替换使用目标目录内的临时文件、单安装器锁、旧二进制备份和原子 rename。installer
-在发布前后都会检查目标状态；若 daemon 在检查与 rename 之间启动，新二进制会检测到
-running 并原子恢复旧二进制。即使 `zc status` 报告 stopped，只要可见进程的 executable
-identity 仍指向安装目标（例如 runtime 路径迁移后遗留的旧 daemon），installer 也会拒绝
-替换；最终目标是 symlink 时同样拒绝。现有 `zc` 无法明确报告 stopped 或平台进程身份检查
-不可用时也拒绝覆盖。先执行 `zc stop` 并确认状态；若是
-无法追踪的旧实例，先核对 PID、命令路径和监听端口，再显式终止该实例。异常断电可能遗留
-`.zc.install.lock`；只有确认其 `owner` PID 已不存在且没有安装进程后才能手动删除。
+新的 macOS Rust 归档要求系统 15+；生成的 Homebrew formula 声明 `macos: :sequoia`。独立安装器仍先对下载产物执行版本自检，不兼容产物不能替换原程序。
 
-安装阶段需要系统已有的 POSIX `sh`、`curl`、`tar`、`awk`、`mktemp`，以及
-`sha256sum`、`shasum` 或 `openssl` 之一。Linux 进程身份检查使用 `/proc` 与 `readlink`，macOS 使用系统 `lsof`；安装后的 `zc` 不需要这些工具。
+归档和校验格式保持不变：`zc-v<version>-<os>-<arch>.tar.gz`、同名 `.tar.gz.sha256`，归档内同名目录包含 `zc`、README、LICENSE 和 THIRD_PARTY_NOTICES。Homebrew 消费同样的四种归档。
 
-## Homebrew Tap
+安装器先将 `latest` 解析为不可变 tag，再下载版本化归档及 SHA-256 文件。校验文件缺失、摘要不匹配、异常归档或 `zc --version` 自检失败都会保留旧程序并非零退出。替换使用目标目录内的临时文件、单安装器锁、旧二进制备份和原子 rename；发布后检查失败会恢复备份。
 
-macOS 或 Linux 的 amd64/arm64 用户可以从项目 Tap 安装当前发布版本：
+对通过 `zc service` 注册、且已确认属于当前安装路径及 HOME/runtime 的运行服务，独立安装器自动通过管理器停止、发布并恢复原冻结调用；这是冷升级，现有连接可能中断。首次安装或原本停止的服务保持停止。
+
+手动启动或归属未知的运行实例需要先用原方式停止；安装器保留旧程序并拒绝自动停止或覆盖。安装目标是符号链接、注册或快照损坏、存在其他 runtime 的遗留进程，或无法检查进程身份时，同样拒绝替换。即使 `zc status` 报告 stopped，旧 inode 的遗留进程仍会阻止替换。无法追踪的实例须先核对 PID、路径和端口，再显式停止。异常断电留下的 `.zc.install.lock` 只能在确认其 owner PID 和安装进程均已不存在后手动删除。
+
+安装阶段需要 POSIX sh、`/bin/bash`（检查进程组与内嵌发布器）、curl、tar、awk、mktemp 和 sha256sum/shasum/openssl 之一。Linux 进程检查需要 `/proc` 和 readlink，macOS 需要 lsof；这些不是安装后代理运行时的依赖。
+
+## Homebrew
 
 ```bash
 brew install ekil1100/tap/zc
 zc --version
 ```
 
-升级时使用同一个 fully qualified formula，避免与其他 Tap 的同名 formula 混淆。版本之间可能迁移 runtime 路径，因此必须先用当前（旧）二进制停止 daemon，确认停止后再替换：
+升级前必须用旧二进制停止 daemon，确认状态后再替换；由 supervisor 管理时通过 supervisor 停止与恢复：
 
 ```bash
 zc stop
-zc status --json  # must report data.state == "stopped"
+zc status --json                    # Must report data.state == "stopped".
 brew upgrade ekil1100/tap/zc
-zc start          # only if it was running before the upgrade
 ```
 
-如果 daemon 由 systemd 或其他 supervisor 管理，应通过 supervisor 先停止、升级，再启动；不要在替换后才调用新二进制的 `restart`。从 `v1.0.0` 升级后，daemon 未携带显式 `--port` 时固定监听 `7899`；配置文件中的其他 `mixed-port` 数值不会保留为运行端口。升级前应确认 `7899` 可用；需要保留原端口时，在启动命令或 supervisor 中显式传入 `--port <原端口>`。
+保留原配置、显式端口、override 和 supervisor 参数，再决定是否恢复运行。默认端口行为见相关运行文档；需要保留配置中的非默认端口时，应显式传入 `--port`。
 
-发布工作流会为 macOS arm64/amd64 和 Linux arm64/amd64 生成二进制归档；Linux
-归档必须通过 static linkage gate。GitHub Release 成功后会更新
-`ekil1100/homebrew-tap` 中的 formula。
+## 可选的本地安装
 
-## Local install flow
-
-The shortest local install flow is:
+候选版本完成验收前不要覆盖生产安装。确需在明确授权的隔离环境试装时：
 
 ```bash
-just install
+just install --target-dir /tmp/zc-candidate/bin
+/tmp/zc-candidate/bin/zc --version
 ```
 
-This builds `zig-out/bin/zc` with `-Doptimize=ReleaseFast` and installs it to `~/.local/bin/zc` through `scripts/install/local-dev-install.sh`. `just install` binds lifecycle checks to the exact target `$HOME/.local/bin/zc`: it detects a running daemon with that old binary, verifies the tracked process was launched from that exact target path, stops it before replacement, verifies it stopped, then starts it with the new target binary. Success requires a changed PID and an executable device/inode matching the newly installed target, so `already_running` cannot accept a respawned old inode. If replacement or startup verification fails, an EXIT rollback restores the retained old binary and attempts to restart it. Automatic restart is limited to the default managed prepared invocation; foreground, explicit source, CLI port, and one-shot override invocations must be preserved manually through their supervisor. The lower-level `local-dev-install.sh` only replaces the binary. It rejects symlink targets and any visible process whose executable identity is the exact logical or physical install target, including an untracked process executing an older unlinked inode. It scans both before and after publication and restores the retained target if final verification fails; it must not be used directly while a daemon is running.
+`just install` 先执行 `just release`，再调用本地安装脚本。安装器把候选复制到目标目录内的私有临时文件，执行版本、冻结状态兼容检查，macOS Mach-O 还检查签名；全部成功后才考虑停止服务。构建、候选检查失败保持旧二进制与运行实例。
 
-The underlying maintained install workflow is script-based:
+无参数目标为 `$HOME/.local/bin/zc`；候选试用仍应显式指定独立 HOME、runtime 和安装目录。首次安装保持停止；停止态升级保持停止。对通过 `zc service` 注册、且安装路径/HOME/runtime 与调用环境一致的运行实例，安装器通过服务管理器停止，使用已有 staging/rename 发布，再恢复原冻结调用。保留自启动偏好、认证配置、端口、runtime 和已应用节点选择，不使用 plain `zc start` 或当前 active profile 恢复。
 
-```bash
-# Install a local shim/marker into a target directory
-bash scripts/install/oc-run.sh install --target-dir /tmp/zc-install
+发布或启动失败时尝试恢复旧二进制与精确旧调用。恢复成功仍非零退出并报 `SERVICE_INSTALL_ROLLED_BACK`；恢复失败报 `SERVICE_RECOVERY_FAILED`，保留目标目录的 `.zc.recovery.*` 和服务状态供核查。若原本停止，恢复过程也保持停止。目录中的 `.zc.install.guard/.zc.binary.lock` 为稳定锁，正常安装后保留；临时候选及成功事务的备份会清理。异常中断或恢复失败需要先核对状态和保留工件，再决定恢复，勿盲删状态或直接用默认配置启动。
 
-# Verify installed files
-bash scripts/install/oc-run.sh verify --target-dir /tmp/zc-install
+### 安装中断与恢复
 
-# Upgrade requires an explicit version
-bash scripts/install/oc-run.sh upgrade --target-dir /tmp/zc-install --version v1.0.1
+本地安装入口单独处理 SIGINT（Ctrl-C）和 SIGTERM，其他 CLI 命令的信号行为保持原样。接收中断后暂停推进升级，终止正在执行的管理器/检查/发布命令进程组，等待直接子进程退出并回收，再执行恢复；恢复期间继续等待收尾。每次外部命令最多 15 秒，清理的直接子进程回收另限 1 秒，readiness 最多 10 秒；这不是整个安装事务的总期限。
 
-# Optional rollback cleanup
-bash scripts/install/oc-run.sh rollback --target-dir /tmp/zc-install
-```
+中断仍非零退出：进入事务前可报 `SERVICE_INSTALL_INTERRUPTED`；恢复成功报 `SERVICE_INSTALL_ROLLED_BACK`，原因明确含 `SERVICE_INSTALL_INTERRUPTED`；恢复失败报 `SERVICE_RECOVERY_FAILED` 并保留工件。停止前中断且原实例身份仍一致时保持其 PID；已停止才恢复原调用。若新实例已经出现，但管理器结果丢失、尚未捕获本次启动 PID，安装器保留备份并报恢复失败，不通过猜测停止该实例。先检查服务和管理器，再决定显式 stop/restart。命令组终止或直接子进程回收本身失败时，保留恢复工件并停止后续自动发布/恢复，先处理遗留命令进程。
 
-Expected behavior:
+命令组清理覆盖同用户、留在该进程组的发布脚本与辅助进程；受信任的自定义发布钩子应前台完成，保持用户身份和进程组。自行 `setsid`/后台脱离或提权的钩子不在此保证内。管理器启动的 daemon 由管理器独立托管，其停止仍走服务身份核对。
 
-- every command prints machine-readable `INSTALL_*` fields;
-- failures include `INSTALL_FAILED_STEP` and `INSTALL_NEXT_STEP`;
-- rollback removes the install marker/version/shim produced by the local scripts.
+**SIGKILL、断电及进程崩溃需要人工核查**，进程无法自行执行恢复；SIGKILL 还可能留下独立发布进程组。不要立即重跑安装或仅凭锁已释放就覆盖目标：
 
-## Runtime directory
+1. 保留安装目录里的 `.zc.recovery.*`、`.zc.candidate.*`、`zc.tmp.*`、`zc.backup.*`，以及完整服务目录和 runtime；稳定 `.zc.install.guard/.zc.binary.lock` 保持原 inode。
+2. 用 `ps -axo pid,ppid,pgid,command` 核对本次安装及发布脚本的实际路径、参数和进程组；确认并结束遗留发布组，等待其退出，再检查目标。只操作已核对的本次安装进程，勿按名称批量终止。
+3. 使用原 HOME/runtime 和注册安装路径检查 `zc service status --json`，同时检查用户管理器的 PID/状态；若 binary 无法执行，先保留文件并由管理器核对、停止明确属于此注册的任务。身份不符或状态损坏时保留现场，先解决证据缺口。
+4. 对照升级前记录/备份确认正确的 `.zc.recovery.*` 二进制及完整冻结状态。在已确认服务和发布进程都停止、没有并发安装后，以同目录 staging/rename 恢复已验证旧二进制；恢复完整状态时遵守下方格式兼容约束。最后显式 `zc service start` 使用冻结调用，检查端口、选择和自启动偏好，再清理已确认无用的工件。
 
-直接运行时，已设置的 `XDG_RUNTIME_DIR` 必须是绝对、规范化路径，由当前 euid 所有且权限为 `0700`。未设置时 zc 使用规范化 `$HOME/.local/state/zc/runtime`；`HOME` 必须由当前 euid 所有且不得由 group/other 写入，zc 创建的后续目录收敛为 owner-only。zc 不再使用共享 `/tmp/zc.pid`、`/tmp/zc.lock` 或 `/tmp/zc.log`。
+这些工件提供恢复输入，未提供自动 SIGKILL 恢复日志或通用一键回退。必要输入缺失、格式不兼容或无法证明进程归属时，继续保留现场而非按 active/default 配置启动。
 
-仓库中的 systemd unit 使用 `RuntimeDirectory=zc`、`RuntimeDirectoryMode=0700` 与 `XDG_RUNTIME_DIR=/run/zc`。自定义 unit 必须保持等价约束；不要把多个 OS 用户指向同一个 runtime directory。
+手动启动的目标维持安全拒绝，并提示显式迁移：先确认原 namespace 和调用参数，用原方式停止，再运行 `zc service start -c <config> --port <port>`。符号链接/外来目标、坏注册/快照、其他 runtime 的遗留进程、竞争中的新实例或无法检查进程时同样拒绝替换。安装器不会自动停止这些实例。
 
-## Regression gates
+这是**自动保持状态的冷升级**，连接可能关闭，不提供热升级承诺。`just install` 与独立 Release 安装器使用同一套服务升级事务；Homebrew 仍由包管理器管理，不属于该自动服务升级入口。用户服务定义和命令见 [CLI](../cli/spec.md#当前用户服务)。
 
-Run these before changing install behavior:
+额外参数原样传给 `scripts/install/local-dev-install.sh`。脚本默认源是 `target/release/zc`，可用 `--source <path>` 显式指定；自定义 Cargo 输出位置时也须指定对应产物。试用时应使用独立 HOME 和显式安装目标。
 
-```bash
-bash scripts/install/verify-install-flow.sh
-bash scripts/install/verify-install-env.sh
-bash scripts/install/verify-install-path-matrix.sh
-bash scripts/install/verify-rollback-flow.sh
-bash scripts/install/run-all-regression.sh
-bash scripts/install/test-oneline-installer.sh
-```
+安装来源须为当前用户所有、最多 256 MiB 的普通文件；允许 Cargo 构建产物这类已有多个硬链接的来源。安装器通过安全文件句柄有界捕获字节，读取前验证所有权和至少一个链接，读取期间的链接数、所有者、权限、长度或修改/变更时间变化均导致拒绝。捕获后在目标目录独立创建私有候选，再验证与发布；来源及其硬链接别名保持原字节，安装结果为独立、单链接文件。此许可仅适用于安装来源，既有安装目标、恢复备份及私有状态继续要求单链接。
 
-常规 install regression 应以 `INSTALL_ALL_RESULT=PASS` 结束。One-line installer E2E 只在
-pull request、ordinary `main` push 或显式本地执行时运行，并以
-`INSTALLER_E2E_RESULT=PASS` 结束。
+独立 Release 安装器先完成下载、校验和版本自检，再确认候选支持 `zc-release-install-v1`。版本与安装契约检查各限 15 秒；检查期间收到 SIGINT/SIGTERM 时取消检查，终止检查进程组并回收直接子进程后退出，保持旧目标且不进入发布。该清理覆盖留在检查进程组中的子进程；自行脱离进程组的程序以及 SIGKILL、断电仍需人工核查。支持的候选使用与 `just install` 相同的服务升级事务：保留运行/停止状态、登录自启、配置、端口和已应用选择；中断时等待恢复完成后再清理下载文件。不支持该契约的旧版候选在停止或替换前拒绝，并提示显式停止、备份完整状态后手动回退。不支持的候选不会退回旧的强制覆盖流程。
 
-## Release validation
+## 状态兼容与回退
 
-The full project gate includes install regression:
+升级前停止旧实例并备份完整状态，在独立 HOME/runtime 中验证后再安排正式切换。既有 catalog、revision 或运行快照损坏、缺字段或格式未知时会拒绝读取；不要删除状态目录、手工删字段或重建空 catalog 来绕过检查。
 
-```bash
-bash scripts/run-full-validation.sh
-```
+托管 profile 持久生成自动 controller secret 后，旧 Rust 程序可能拒绝读取新增字段；采用自动 secret 的运行快照也使用旧程序不支持的 schema 2。**只替换回旧二进制不等于完成回退。** 必须先安全停止实例，再恢复与旧程序匹配的完整旧状态备份，包括 catalog、revisions 与相应运行状态；`meta.json` 镜像不能代替完整备份。
 
-Expected output:
+默认 `restart` 继续使用冻结运行快照，不会为旧快照自动补 secret。已有 controller 的托管 profile 要启用自动值，须显式运行 `zc restart -c <profile>`；完整行为见 [CLI](../cli/spec.md#托管-profile-的自动-controller-secret)。
 
-```text
-VALIDATION_RESULT=PASS
-```
+## 运行目录
 
-## Other packaging channels
+`XDG_RUNTIME_DIR` 必须为绝对、规范化路径，由当前 euid 所有且权限为 `0700`。未设置时使用规范化 `$HOME/.local/state/zc/runtime`；HOME 必须由当前 euid 所有且不得由 group/other 写入。隔离试用时应使用独立 HOME 和 runtime，避免读写生产状态。
 
-Standalone `install.sh` 是 Linux/macOS 的首选入口，Homebrew Tap 是可选入口。Debian
-package 仍处于发布链路验证阶段，不作为当前推荐安装方式。
+`zc service` 使用登录用户的管理器，注册时固定 zc 的 HOME/runtime，并在生成的定义中显式传入；Linux 管理器自身的 bus 路径独立于该 runtime。无需 `/run/zc`、系统级 `RuntimeDirectory`、sudo 或 linger。自定义 supervisor 须保持等价的文件权限和单实例约束，不要让多个 OS 用户共用 runtime 目录。
 
-过时的历史打包说明位于 `docs/archive/install/`，不属于当前用户指南。
+## 其他渠道
 
-## No TUI in v1.0
-
-Do not use or document the removed TUI command for v1.0. Related historical docs are archived.
+Debian 打包不是推荐安装入口。项目不提供 TUI。

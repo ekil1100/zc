@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Correctness suite: zig build + zig build test (baseline cpu).
+# Correctness suite: cargo build + cargo test.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd -P)"
@@ -19,8 +19,8 @@ while [[ $# -gt 0 ]]; do
 Usage: bash scripts/eval/suites/correctness.sh --run-dir <dir>
 
 Runs:
-  zig build -Dcpu=baseline
-  zig build test -Dcpu=baseline
+  cargo build --locked
+  cargo test --locked
 
 Exit: 0 pass, 1 fail, 2 error
 HELP
@@ -38,8 +38,8 @@ if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR" ]]; then
   exit 2
 fi
 
-if ! command -v zig >/dev/null 2>&1; then
-  printf 'correctness: zig not found on PATH\n' >&2
+if ! command -v cargo >/dev/null 2>&1; then
+  printf 'correctness: cargo not found on PATH\n' >&2
   exit 2
 fi
 
@@ -62,8 +62,8 @@ run_step() {
 
 build_rc=0
 test_rc=0
-run_step build zig build -Dcpu=baseline || build_rc=$?
-run_step test zig build test -Dcpu=baseline || test_rc=$?
+run_step build cargo build --locked || build_rc=$?
+run_step test cargo test --locked || test_rc=$?
 
 steps_json='[]'
 failed_json='[]'
