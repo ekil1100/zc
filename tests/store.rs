@@ -518,8 +518,12 @@ fn fresh_publication_respects_zig_legacy_cutover_lock() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("state");
     let store = Store::open_with_timeout(&root, Duration::from_millis(30)).unwrap();
-    let initial = store.load().unwrap();
     let dir = zc::fsutil::SecureDir::open(&root).unwrap();
+    // Keep cold durability work outside the 30ms contention budget.
+    for name in ["state-v2.lock", "legacy-cutover.lock"] {
+        dir.write_new(name, b"").unwrap();
+    }
+    let initial = store.load().unwrap();
     let _legacy_writer = dir
         .lock("legacy-cutover.lock", Duration::from_millis(30))
         .unwrap();

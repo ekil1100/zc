@@ -16,6 +16,8 @@ fn atomic_private_bounded_files_and_lock() {
     assert!(dir.read("state", 2).is_err());
     dir.atomic_write("state", b"new").unwrap();
     assert_eq!(dir.read("state", 3).unwrap(), b"new");
+    // Prepare durable storage before exercising short contention deadlines.
+    dir.write_new("lock", b"").unwrap();
     let lock = dir.lock("lock", Duration::from_millis(50)).unwrap();
     assert!(dir.lock("lock", Duration::from_millis(20)).is_err());
     drop(lock);

@@ -451,9 +451,13 @@ fn takeover_freezes_cooperative_writers_and_does_not_overwrite_new_legacy_state(
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("state");
     let store = Store::open_with_timeout(&root, Duration::from_millis(30)).unwrap();
+    let dir = zc::fsutil::SecureDir::open(&root).unwrap();
+    // The short budget tests contention, not first-file durability sync.
+    for name in ["state-v2.lock", "legacy-cutover.lock"] {
+        dir.write_new(name, b"").unwrap();
+    }
     let missing = store.load().unwrap();
     fixture(&root);
-    let dir = zc::fsutil::SecureDir::open(&root).unwrap();
     let guard = dir
         .lock("legacy-cutover.lock", Duration::from_millis(30))
         .unwrap();
@@ -475,6 +479,17 @@ fn takeover_freezes_cooperative_writers_and_does_not_overwrite_new_legacy_state(
             .is_err()
     );
     assert!(!root.join("state-v2.json").exists());
+    assert!(!root.join("profiles").exists());
+    // Prepare the publication lock only after checking that blocked takeover
+    // and stale publication left profiles and authority untouched.
+    dir.child("profiles", true)
+        .unwrap()
+        .child(&zc::store::storage_id("home"), true)
+        .unwrap()
+        .child("revisions", true)
+        .unwrap()
+        .write_new(".publish.lock", b"")
+        .unwrap();
     assert_eq!(store.load().unwrap().catalog.profiles[0].head, ZIG_HEAD);
 }
 

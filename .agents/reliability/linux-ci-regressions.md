@@ -115,6 +115,12 @@
 
 原注入矩阵增加 diagnostic writer 路径：75ms 同步确定性红绿，包含超时、文件/目录 EIO、锁争用、symlink/hardlink/权限拒绝和原热锁约束，共 20 个子场景。本机 observability 11 项、定向 Clippy 与格式通过。证据：`target/linux-ci-fixes/pre-observer-init-{red,green}.log`、`c588213-linux-arm64.log`。完整 Linux 矩阵待最终复核。
 
+### 短锁竞争用例的持久化准备
+
+同一 `c588213` 完整 CI 中，x64 仅 `takeover_freezes_cooperative_writers_and_does_not_overwrite_new_legacy_state` 在最后成功接管时失败：首次创建 revision `.publish.lock` 的文件/目录同步被计入 30ms 竞争预算。提前持久化测试锁文件，保留全部 30ms/50ms/20ms 期限；revision 锁仅在原“阻塞时无 profiles、旧 token 不发布 authority”断言之后准备，另加强旧 token 失败后 profiles 仍不存在的断言。
+
+按同类证据检查了测试中 `Store::open_with_timeout` 的两个调用及全部短预算 `.lock` 调用，一并准备 fresh publication 与基础文件锁测试的冷锁文件；FIFO 拒绝、真实锁竞争、首次锁初始化/同步失败的注入测试保持。产品 Store/锁实现不变。本机 Store/legacy 41 项通过；失败证据 `target/linux-ci-fixes/c588213-linux-x64.log`，回归 `store-contention-fixture-green.log`。
+
 ## 验证边界
 
 - 格式、严格 Clippy、本机定向回归及独立 OpenSSL record-shape 检查通过。
