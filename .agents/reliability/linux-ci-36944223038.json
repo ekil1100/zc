@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "repository": "ekil1100/zc",
+  "source_commit": "f6d68cbd784eba735ef78d1a66b32e9320dcf82f",
+  "run_url": "https://github.com/ekil1100/zc/actions/runs/36944223038",
+  "scope": "Linux delivery jobs only; no macOS, performance, soak, or official AnyTLS gate claim",
+  "jobs": [
+    {
+      "id": 110642454693,
+      "name": "delivery / rust-delivery (ubuntu-24.04-arm, aarch64-unknown-linux-musl)",
+      "url": "https://github.com/ekil1100/zc/actions/runs/36944223038/job/110642454693",
+      "conclusion": "success",
+      "completed_at": "2026-10-02T00:30:01Z",
+      "checks": {
+        "Format and lint": "success",
+        "Test public interfaces": "success",
+        "Validate delivery contracts": "success",
+        "Validate beta gate contract": "success",
+        "Independent core and TCP interoperability": "success",
+        "Isolated installer regression": "success",
+        "Build production artifact": "success",
+        "Verify default runtime port in isolated CI": "success"
+      }
+    },
+    {
+      "id": 110642454932,
+      "name": "delivery / rust-delivery (ubuntu-latest, x86_64-unknown-linux-musl)",
+      "url": "https://github.com/ekil1100/zc/actions/runs/36944223038/job/110642454932",
+      "conclusion": "success",
+      "completed_at": "2026-10-02T00:30:38Z",
+      "checks": {
+        "Format and lint": "success",
+        "Test public interfaces": "success",
+        "Validate delivery contracts": "success",
+        "Validate beta gate contract": "success",
+        "Independent core and TCP interoperability": "success",
+        "Isolated installer regression": "success",
+        "Build production artifact": "success",
+        "Verify default runtime port in isolated CI": "success"
+      }
+    }
+  ]
+}

@@ -1,4 +1,21 @@
-# Linux CI：日志锁初始化与 AnyTLS 收尾
+# Linux CI 修复与双架构交付验收
+
+## 最终验收
+
+**2026-10-02：`f6d68cb` 的 Linux x64 / arm64 完整交付任务均通过。** [CI 36944223038](https://github.com/ekil1100/zc/actions/runs/36944223038)；[固定提交与逐项结果](linux-ci-36944223038.json)。以下保留各阶段的诊断记录，当前 Linux 结论以本节为准。
+
+| 检查 | Linux x64 | Linux arm64 |
+| --- | --- | --- |
+| 格式、严格 Clippy、默认 Rust 测试套件 | 通过 | 通过 |
+| 交付契约、beta 门禁契约 | 通过 | 通过 |
+| 独立 core/TCP 互操作 | 通过 | 通过 |
+| 隔离安装与服务冷升级回归 | 通过 | 通过 |
+| musl 生产产物构建、core/TCP 互操作与安装复验 | 通过 | 通过 |
+| 生产产物默认运行端口验证（独占 CI） | 通过 | 通过 |
+
+原始完整日志：`target/linux-ci-fixes/f6d68cb-linux-{x64,arm64}.log`；GitHub job 元数据快照与各检查结论另存上述 JSON，保留精确源码提交和 job 链接。现有显式 ignored 用例保持；本次结果限定为 Linux 交付任务，不代替 macOS 系统信任、官方 AnyTLS 互操作、性能或 24/72 小时长稳验收。归档时三个 macOS 任务仍在执行，整条 workflow 尚未结束。
+
+全部修复已推送 `origin/to-rust`；未合并 main、未安装生产二进制或操作真实用户服务管理器。仅独占 CI 验证默认端口，本地测试继续避开生产 7899。
 
 ## 范围与基线
 
