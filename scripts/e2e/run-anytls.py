@@ -13,6 +13,7 @@ import platform
 import socket
 import ssl
 import struct
+import subprocess
 import tempfile
 
 # Reuse CLI/socket lifecycle utilities, not a protocol implementation or oracle.
@@ -50,6 +51,11 @@ def denied(mixed, origin, kind="socks"):
 
 def wire_shapes(zc, work):
     """OpenSSL recv preserves TLS records, unlike tokio-rustls' coalescing reader."""
+    name, version = subprocess.check_output(
+        [str(zc), "--version"], timeout=harness.WAIT
+    ).split()
+    assert name == b"zc", "unexpected candidate version output"
+    client = name + b"/" + version
     update = b"stop=3\n0=9-9\n1=200-200\n2=20-20,40-40\n"
     md5s = [b"75cff2ad89aadf5e257059ee571ebe11", b"8d29f7a84b60406b4144b7461f63b0fb"]
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -91,7 +97,7 @@ def wire_shapes(zc, work):
                     assert [f[:2] for f in opened[:3]] == [(4, 0), (1, 1), (2, 1)]
                     assert (
                         opened[0][2]
-                        == b"v=2\nclient=zc/1.0.1\npadding-md5=" + md5s[index]
+                        == b"v=2\nclient=" + client + b"\npadding-md5=" + md5s[index]
                     )
                     assert opened[2][2] == b"\x03\x0bexample.com\x01\xbb"
                     assert all(f[0:2] == (0, 0) for f in opened[3:])

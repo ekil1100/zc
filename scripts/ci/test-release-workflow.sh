@@ -63,10 +63,16 @@ reject_text "$CI_WORKFLOW" "if: github.event_name == 'pull_request'"
 expect_text "$RELEASE_WORKFLOW" "Verify successful main CI"
 expect_text "$RELEASE_WORKFLOW" "actions/workflows/ci.yml/runs"
 expect_text "$RELEASE_WORKFLOW" "fail-fast: false"
-expect_text "$RELEASE_WORKFLOW" "x86_64-unknown-linux-musl"
-expect_text "$RELEASE_WORKFLOW" "aarch64-unknown-linux-musl"
-expect_text "$RELEASE_WORKFLOW" "x86_64-apple-darwin"
-expect_text "$RELEASE_WORKFLOW" "aarch64-apple-darwin"
+expect_text "$RELEASE_WORKFLOW" 'matrix: ${{ steps.ci.outputs.matrix }}'
+expect_text "$RELEASE_WORKFLOW" 'matrix: ${{ fromJSON(needs.validate-release.outputs.matrix) }}'
+expect_text "$RELEASE_WORKFLOW" 'python3 scripts/ci/release-policy.py --tag "$RELEASE_TAG" --sha "$TAGGED_SHA"'
+expect_text "$RELEASE_WORKFLOW" '--run ci-run.json --jobs ci-jobs.json >> "$GITHUB_OUTPUT"'
+expect_text "$RELEASE_WORKFLOW" 'if: ${{ !contains(github.ref_name, '\''-'\'') }}'
+expect_text "$RELEASE_WORKFLOW" 'make_latest: ${{ contains(github.ref_name, '\''-'\'') && '\''false'\'' || '\''true'\'' }}'
+for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
+  expect_text scripts/ci/release-policy.py "$target"
+done
+python3 scripts/ci/test-release-policy.py
 expect_text "$RELEASE_WORKFLOW" "THIRD_PARTY_NOTICES.md"
 expect_text "$THIRD_PARTY_NOTICES" "Copyright (c) Zig contributors"
 expect_text "$THIRD_PARTY_NOTICES" "The MIT License (Expat)"

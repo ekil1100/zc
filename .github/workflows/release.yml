@@ -13,6 +13,8 @@ jobs:
   validate-release:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.ci.outputs.matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -37,26 +39,28 @@ jobs:
             exit 1
           fi
 
-      - name: Verify successful main CI
+      - name: Verify successful main CI for release scope
+        id: ci
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAGGED_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          CI_RUN_ID=$(gh api --method GET \
+          gh api --method GET \
             "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
             -f head_sha="$TAGGED_SHA" \
             -f event=push \
             -f branch=main \
-            -f status=success \
             -f per_page=1 \
-            --jq '.workflow_runs[0].id // empty')
-          if [[ -z "$CI_RUN_ID" ]]; then
-            echo "No successful main CI run found for tagged commit $TAGGED_SHA" >&2
-            exit 1
-          fi
-          echo "Verified main CI run $CI_RUN_ID for $TAGGED_SHA"
+            --jq '.workflow_runs[0]' > ci-run.json
+          CI_RUN_ID=$(jq -er '.id | select(type == "number")' ci-run.json)
+          gh api --paginate --slurp \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/jobs?filter=latest&per_page=100" \
+            > ci-jobs.json
+          python3 scripts/ci/release-policy.py --tag "$RELEASE_TAG" --sha "$TAGGED_SHA" \
+            --run ci-run.json --jobs ci-jobs.json >> "$GITHUB_OUTPUT"
 
   release:
     env:
@@ -65,24 +69,7 @@ jobs:
     needs: validate-release
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target_os: linux
-            target_arch: amd64
-            rust_target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target_os: linux
-            target_arch: arm64
-            rust_target: aarch64-unknown-linux-musl
-          - os: macos-latest
-            target_os: macos
-            target_arch: arm64
-            rust_target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target_os: macos
-            target_arch: amd64
-            rust_target: x86_64-apple-darwin
+      matrix: ${{ fromJSON(needs.validate-release.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -215,6 +202,7 @@ jobs:
           body_path: dist/release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
           fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
@@ -222,6 +210,7 @@ jobs:
             dist/install.sh
 
   update-tap:
+    if: ${{ !contains(github.ref_name, '-') }}
     needs: publish
     runs-on: ubuntu-latest
     concurrency:

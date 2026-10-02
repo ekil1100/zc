@@ -10,7 +10,7 @@
 
 ## Rust 候选版本
 
-当前开发与交付入口使用 Rust `1.0.1`：完整 CLI、托管 revision、daemon、minimal API、mixed TCP 与受限 UDP 已接入。**实现覆盖不等于迁移验收完成**；当前候选尚未完成正式发布验证，不作四平台、性能或长稳保证。使用方式与支持边界请从[文档目录](docs/README.md)查看。默认构建与运行不依赖 Zig。
+当前开发与交付入口使用 Rust `1.1.0-rc1`：完整 CLI、托管 revision、daemon、minimal API、mixed TCP 与受限 UDP 已接入。**本次预发布仅提供 Linux x64 / arm64 产物**，供隔离试用；macOS、性能、长稳及当前候选的官方 AnyTLS 互操作补验仍待完成。预发布不替换 GitHub Latest 稳定版本，也不更新 Homebrew。使用方式与支持边界请从[文档目录](docs/README.md)查看。默认构建与运行不依赖 Zig。
 
 ```bash
 just build                   # target/debug/zc

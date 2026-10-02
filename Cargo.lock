@@ -2825,7 +2825,7 @@ dependencies = [
 
 [[package]]
 name = "zc"
-version = "1.0.1"
+version = "1.1.0-rc1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

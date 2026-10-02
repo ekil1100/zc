@@ -2,7 +2,20 @@
 
 ## Rust 候选版本状态
 
-当前 Cargo 包版本为 `1.0.1`。**当前 Rust 候选尚未完成正式发布验证，请勿覆盖生产安装。** 版本号、构建成功或单项测试通过不代表可以发布；四平台、性能、长期稳定性和完整兼容性尚不能据此保证。
+当前 Cargo 包版本为 `1.1.0-rc1`，发布范围为 **Linux x64 / arm64 预发布版**。请使用独立目录与测试配置试用，保留生产安装。该候选仅在同一提交的 main CI 中 Python 检查及两个 Linux 完整交付任务通过后发布；macOS、当前候选的官方 AnyTLS 互操作补验、性能和 24/72 小时长稳仍待验收。
+
+本次预发布提供 Linux 静态 musl 归档、SHA-256 校验文件与安装脚本；不提供 macOS 归档、不更新 Homebrew，也不替换 GitHub Latest 稳定版本。此范围仅适用于 `v1.1.0-rc1`，其他候选与正式版本仍要求完整 main CI 和四平台发布流程。
+
+发布后可在 Linux 上显式安装到独立目录：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/ekil1100/zc/releases/download/v1.1.0-rc1/install.sh \
+  | ZC_VERSION=v1.1.0-rc1 ZC_INSTALL_DIR="$HOME/.local/opt/zc-rc/bin" sh
+"$HOME/.local/opt/zc-rc/bin/zc" --version
+```
+
+运行试用实例时仍需隔离 HOME/runtime，并显式使用非生产端口；独立二进制目录本身不隔离运行状态。
 
 默认构建使用 Rust，不调用 Zig 编译器或 Zig 运行时回退。
 

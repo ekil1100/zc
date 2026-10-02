@@ -2,7 +2,22 @@
 
 ## [Unreleased]
 
+## [1.1.0-rc1] - 2026-10-02
+
+### 发布范围
+- 本次为 **Linux x64 / arm64 预发布版**，提供静态 musl 二进制和 SHA-256 校验文件；建议使用独立安装目录与测试配置试用。
+- 发布要求同一提交的 main CI 中 Python 检查及两个 Linux 完整交付任务通过，包括 Rust 测试、独立 core/TCP 互操作、安装回滚和生产产物复验。
+- 本次不提供 macOS 归档、不更新 Homebrew、不替换 GitHub Latest 稳定版本。macOS 系统信任与首次使用、当前候选的官方 AnyTLS 互操作补验、性能及 24/72 小时长稳仍待验收。
+
+### Added
+- 原生 Rust AnyTLS TLS/TCP 出站；每条出站独占会话，支持有界关闭与故障留痕，暂不提供连接复用或 AnyTLS UDP。
+- 带鉴权的连接列表与按 ID 断开、实际代理路径验证、持久化 controller secret，以及分层故障日志和 CPU/RSS 趋势观测。
+- 用户服务管理与可恢复冷升级：冻结启动配置，安装失败回滚，保留状态损坏和恢复失败证据。
+
 ### Changed
+- **破坏性变更**：默认构建、测试和交付改用 Cargo/Rust；CLI/API 契约以当前文档为准。保留旧配置与状态的验证读取，损坏或未知格式拒绝迁移；Zig 源码仅供历史对照。
+- 修复 Linux 冷日志锁初始化、Shadowsocks UDP 拒绝事件处理及稳定硬链接安装来源；AnyTLS 正常关闭排空传输后确认完成，保持有界资源与超时。
+
 - **破坏性变更（Rust 候选）**：最低 macOS 提升到 15（Sequoia），不再支持 11–14。通过 Apple linker 延迟 Security/SystemConfiguration/CoreFoundation 初始化，保留原生证书信任与 DNS API；构建/发布检查部署版本、强延迟标记、签名及冷启动，Homebrew 声明最低系统版本。性能和长稳仍须独立验收。
 
 ### Added
