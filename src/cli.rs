@@ -1142,6 +1142,47 @@ fn refresh_mirror(store: &Store) -> Result<()> {
     Ok(())
 }
 
+fn generated_config_name() -> Result<String> {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut name = String::with_capacity(8);
+    while name.len() < 8 {
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+        for byte in bytes {
+            // Match Zig's unbiased base-62 sampling.
+            if byte < 248 {
+                name.push(CHARSET[usize::from(byte) % CHARSET.len()] as char);
+                if name.len() == 8 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(name)
+}
+
+fn subscription_metadata(url: &str) -> Metadata {
+    // Preserve Zig's raw query values (including percent escapes and '+').
+    let mut params = BTreeMap::new();
+    if let Some((_, query)) = url.split_once('?') {
+        for pair in query.split('&') {
+            if let Some((key, value)) = pair.split_once('=')
+                && !key.is_empty()
+            {
+                params.insert(key.to_owned(), value.to_owned());
+            }
+        }
+    }
+    Metadata {
+        url: Some(url.into()),
+        filename: params.remove("filename"),
+        params: params
+            .into_iter()
+            .map(|(key, value)| store::Param { key, value })
+            .collect(),
+    }
+}
+
 async fn download(url: &str, command: &str) -> Result<Vec<u8>> {
     let prefix = command.replace(' ', "_").to_uppercase();
     let parsed =
@@ -1258,13 +1299,14 @@ async fn config_command(args: &Args) -> Result<Output> {
             )
         }
         "config download" => {
-            let generated = format!(
-                "config-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs()
-            );
-            let name = service::validate_name(args.value("-n").unwrap_or(&generated))?;
+            let generated;
+            let name = service::validate_name(match args.value("-n") {
+                Some(name) => name,
+                None => {
+                    generated = generated_config_name()?;
+                    &generated
+                }
+            })?;
             // Validate the name and current authority before any network activity.
             let existing = service::existing_store()?;
             if let Some(store) = &existing {
@@ -1297,11 +1339,7 @@ async fn config_command(args: &Args) -> Result<Output> {
                 name,
                 None,
                 &bundle,
-                Metadata {
-                    url: Some(args.positionals[0].clone()),
-                    filename: Some(name.into()),
-                    ..Default::default()
-                },
+                subscription_metadata(&args.positionals[0]),
                 activate,
             )?;
             let health = health_data(&store, Some(&receipt));

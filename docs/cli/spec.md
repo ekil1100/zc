@@ -44,6 +44,8 @@
 
 `config download/update` 的订阅 HTTP(S) 请求发送 `User-Agent: zc/<版本>`，避免服务端拒绝缺失客户端标识的请求；不冒充 Clash 或浏览器，不增加 curl 回退。仍保持 TLS 校验、直连（不读取环境代理）、30 秒超时、最多 5 次重定向和 16 MiB 响应上限。服务端返回非成功状态时保留 `CONFIG_DOWNLOAD_FAILED` / `CONFIG_UPDATE_FAILED` 错误码，消息明确给出 HTTP 状态码并提示检查订阅是否开启、有效、可访问；不回显订阅 URL 或响应正文，也不发布失败响应。
 
+`config download` 沿用 Zig 命名规则：省略 `-n` 时生成 8 位随机字母数字 ID（`A–Z`、`a–z`、`0–9`），兼容镜像文件为 `configs/<ID>.yaml`；显式 `-n` 剥除一个尾部 `.yaml` 后作为 ID。显示名称取订阅 URL 的 `filename` 查询参数，缺省时显示 ID；其余有效 `key=value` 查询参数保留为订阅元数据。参数保留原始值（不解码百分号转义或 `+`），重复参数取最后一个值。更新订阅保留已有 ID 与名称元数据，已有配置不会自动重命名。
+
 `config list` 文本示例：`* Flower_SS.yaml (ID: BlWdYKsc)`。显示名称可能重复，操作时使用 ID，例如 `zc config use BlWdYKsc`；这只是已有 profile key 的展示，不引入新的身份字段，也不修改配置状态。
 
 `start/restart`、配置加载类诊断及 `config dump` 的一次性 override 使用 `--override-script <path>`、可重复 `--override-arg <k=v>`、`--override-timeout-ms <1..60000>`；适用与安全边界见 [override](../config/override.md)。

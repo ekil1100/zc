@@ -256,6 +256,72 @@ fn usage_errors_share_json_codes_and_never_create_state() {
     assert!(!home.join(".config").exists());
 }
 
+#[test]
+fn config_download_restores_zig_random_ids() {
+    let _serial = cli_fixture::serial();
+    let home = tempfile::tempdir().unwrap();
+    let http = HttpSource::new(b"rules: ['MATCH,DIRECT']\n");
+    let mut names = std::collections::BTreeSet::new();
+    for _ in 0..4 {
+        let result = ok(home.path(), &["config", "download", &http.url, "--json"]);
+        let name = result["data"]["name"].as_str().unwrap();
+        assert_eq!(name.len(), 8, "{name}");
+        assert!(name.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert!(names.insert(name.to_owned()));
+        assert!(
+            home.path()
+                .join(format!(".config/zc/configs/{name}.yaml"))
+                .is_file()
+        );
+    }
+    let list = ok(home.path(), &["config", "list", "--json"]);
+    for entry in list["data"]["configs"].as_array().unwrap() {
+        assert_eq!(entry["display"], entry["name"]);
+    }
+}
+
+#[test]
+fn config_download_restores_zig_filename_metadata() {
+    let _serial = cli_fixture::serial();
+    let home = tempfile::tempdir().unwrap();
+    let http = HttpSource::new(b"rules: ['MATCH,DIRECT']\n");
+    let url = format!(
+        "{}&filename=old.yaml&filename=Flower_SS.yaml&token=a%2Bb+c&flag&=ignored",
+        http.url
+    );
+    let downloaded = ok(
+        home.path(),
+        &["config", "download", &url, "-n", "custom.yaml", "--json"],
+    );
+    assert_eq!(downloaded["data"]["name"], "custom");
+    for update in [false, true] {
+        if update {
+            ok(home.path(), &["config", "update", "custom.yaml", "--json"]);
+        }
+        let list = ok(home.path(), &["config", "list", "--json"]);
+        assert_eq!(
+            list["data"]["configs"],
+            json!([{"name":"custom", "display":"Flower_SS.yaml", "active":true}])
+        );
+        let mirror: Value = serde_json::from_slice(
+            &std::fs::read(home.path().join(".config/zc/meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mirror["configs"]["custom"]["filename"], "Flower_SS.yaml");
+        assert_eq!(
+            mirror["configs"]["custom"]["params"],
+            json!({"token":"a%2Bb+c"})
+        );
+    }
+    ok(home.path(), &["config", "use", "custom.yaml", "--json"]);
+    let text = run(home.path(), &["config", "list"]);
+    assert!(
+        String::from_utf8(text.stdout)
+            .unwrap()
+            .contains("Flower_SS.yaml (ID: custom)")
+    );
+}
+
 struct HttpSource {
     url: String,
     body: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
