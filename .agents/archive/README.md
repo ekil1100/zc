@@ -1,10 +1,10 @@
 # Archived documentation
 
-This directory contains historical drafts and stale planning documents kept only for traceability.
+This directory preserves historical validation reports, metrics, and the criteria needed to interpret them.
 
 Archived files may mention old project names, TUI plans, GA-ready conclusions, old install URLs, or API plans that are no longer current.
 
-The archived `api/openapi.yaml` file is a historical full API v1 draft. It is not implemented by the current v1.0 runtime and must not be used as the active API contract.
+Superseded API, TUI, installation, and implementation drafts have been removed. The active API contract is documented in [`../../docs/api/README.md`](../../docs/api/README.md).
 
 They are **not** v1.0 commitments.
 

@@ -138,4 +138,4 @@ SS UDP helper 的 socket、地址编码和 SOCKS 探针由独立 Rust 测试程�
 
 ## 其他渠道
 
-Debian 打包仍不是推荐入口，历史说明位于 `.agents/archive/install/`。项目不提供 TUI。
+推荐安装入口见 [安装指南](../docs/install/README.md)；Debian 打包仅保留为历史渠道。项目不提供 TUI。
