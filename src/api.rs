@@ -1,4 +1,4 @@
-//! Bounded, single-request loopback control API.
+//! Bounded, single-request control API with authentication for wildcard listeners.
 use crate::{config::Config, connection::ConnectionRegistry};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
@@ -47,9 +47,11 @@ impl Server {
             return Ok(None);
         };
         ensure!(
-            address.ip() == std::net::Ipv4Addr::LOCALHOST && address.port() != 0,
-            "START_CONTROLLER_INVALID: controller must be explicit 127.0.0.1:<port>"
+            matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST)
+                && address.port() != 0,
+            "START_CONTROLLER_INVALID: controller must be explicit 127.0.0.1:<port> or 0.0.0.0:<port>"
         );
+        config.validate_controller_auth()?;
         let listener = TcpListener::bind(address).await.map_err(|error| {
             anyhow::anyhow!("START_CONTROLLER_PORT_IN_USE: cannot bind {address}: {error}")
         })?;
@@ -268,7 +270,9 @@ impl State {
         if connection_request && self.config.secret().is_empty() {
             return Err(HttpError(403, "Connection secret required"));
         }
-        if (request.method == "PUT" || connection_request) && !self.config.secret().is_empty() {
+        if self.config.controller_requires_auth()
+            || ((request.method == "PUT" || connection_request) && !self.config.secret().is_empty())
+        {
             let authorization = request.authorization.as_deref().unwrap_or_default();
             if authorization.len() < 7
                 || !authorization[..7].eq_ignore_ascii_case(b"Bearer ")

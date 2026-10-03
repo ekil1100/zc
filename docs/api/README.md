@@ -4,7 +4,7 @@
 
 ## 启用与鉴权
 
-配置 `external-controller` 时启动，只接受精确 `127.0.0.1:<port>`；端口占用即启动失败，不换端口、不静默关闭。示例仅定义 controller，开发启动另传 `--port 17890`，避免生产默认 7899：
+配置 `external-controller` 时启动，接受精确 `127.0.0.1:<port>` 或 `0.0.0.0:<port>`，端口 1–65535；端口占用即启动失败，不换端口、不静默关闭。其他 IPv4 地址、域名、IPv6 和 HTTPS controller 暂不支持。示例仅定义 controller，开发启动另传 `--port 17890`，避免生产默认 7899：
 
 ```yaml
 external-controller: 127.0.0.1:19090
@@ -13,7 +13,9 @@ rules:
   - MATCH,DIRECT
 ```
 
-非空 `secret` 使所有 PUT 要求 `Authorization: Bearer <secret>`，缺失/错误返回 401；原有只读端点仍不要求 Bearer。连接详情敏感，`GET /connections`、`DELETE /connections/<id>` 及下述 `/connections/probes` 诊断票据端点 **必须具有非空运行时 secret 并使用 Bearer**：未配置返回 403，缺失或错误 Bearer 返回 401。loopback 不是多用户授权边界；非托管配置应始终配置随机 secret，不要把原有只读接口视为私密信息通道。
+`127.0.0.1` 保持既有规则：非空 `secret` 使所有 PUT 要求 `Authorization: Bearer <secret>`，缺失/错误返回 401；原有只读端点仍不要求 Bearer。连接详情敏感，`GET /connections`、`DELETE /connections/<id>` 及下述 `/connections/probes` 诊断票据端点 **必须具有非空运行时 secret 并使用 Bearer**：未配置返回 403，缺失或错误 Bearer 返回 401。loopback 不是多用户授权边界；非托管配置应始终配置随机 secret，不要把原有只读接口视为私密信息通道。
+
+`0.0.0.0` 在所有 IPv4 网卡监听：启动前必须具备非空运行时 secret，**全部管理路由**（含 `/`、`/version`、`/status` 等 GET）要求 Bearer。缺失或错误认证统一返回 401；认证先于路由内容和实例校验，不披露状态或实例头。本机访问同一 listener 也须认证。托管 profile 自动 secret 的规则同下；非托管文件缺少 secret 时在启动/注册前返回 `START_CONTROLLER_SECRET_REQUIRED`。controller 是 HTTP 接口，不提供 TLS。本机 CLI 始终连接 `127.0.0.1`，使用运行实例冻结的凭据，通配监听不改变代理入口的绑定或端口。
 
 托管 profile 在首次实际运行准备时，若已有 controller 而 secret 缺失/为空，会自动生成并持久保存 64 位小写 hex secret；显式非空 secret 优先，自动值保留供以后复用。CLI connection/selection 从认证运行快照取实际值，无需用户复制 key；订阅更新、override、选择和重命名不轮换。key 不进入普通 dump、日志或兼容镜像；非托管 `-c` 文件仍须手工配置。
 

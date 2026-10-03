@@ -296,14 +296,12 @@ fn basic(doc: &Value, report: &mut Diagnostics) {
         );
     }
     if let Some(endpoint) = doc["external-controller"].as_str()
-        && endpoint
-            .strip_prefix("127.0.0.1:")
-            .is_none_or(|p| parse_port(p).is_err())
+        && super::parse_controller_endpoint(endpoint).is_err()
     {
         // Endpoint values may contain URL credentials; never echo them.
         error!(
             report,
-            "Invalid external-controller (expected 127.0.0.1:PORT)"
+            "Invalid external-controller (expected 127.0.0.1:PORT or 0.0.0.0:PORT)"
         );
     }
     if let Some(secret) = doc["secret"].as_str()

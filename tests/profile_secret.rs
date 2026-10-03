@@ -1,4 +1,4 @@
-//! Managed CLI and authenticated runtime boundaries; only temporary HOME/loopback.
+//! Managed CLI and authenticated runtime boundaries; only temporary HOME and ports.
 #[path = "support/cli_fixture.rs"]
 mod cli_fixture;
 use serde_json::{Value, json};
@@ -106,6 +106,51 @@ fn authorized(controller: u16, secret: &str) -> bool {
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response.starts_with("HTTP/1.1 200")
+}
+
+#[test]
+fn wildcard_legacy_profile_migrates_and_cli_uses_frozen_authentication() {
+    let f = Fixture::new();
+    let controller = free_port();
+    let root = f.home.path().join(".config/zc");
+    fs::create_dir_all(root.join("configs")).unwrap();
+    let legacy = source(controller, "").replace("127.0.0.1:", "0.0.0.0:");
+    fs::write(root.join("configs/legacy.yaml"), &legacy).unwrap();
+    fs::write(
+        root.join("meta.json"),
+        r#"{"active":"legacy","configs":{"legacy":{}}}"#,
+    )
+    .unwrap();
+    f.ok(&["config", "list", "--json"]);
+    assert!(f.auto("legacy").is_null());
+    assert_eq!(
+        fs::read_to_string(root.join("configs/legacy.yaml")).unwrap(),
+        legacy
+    );
+    let check = f.run(&["--service-check"]);
+    assert!(check.status.success(), "{check:?}");
+    f.start();
+    let secret = f.auto("legacy");
+    assert!(authorized(controller, secret.as_str().unwrap()));
+    let status = f.ok(&["status", "--json"]);
+    assert_eq!(status["data"]["runtime_state_available"], true);
+    assert_eq!(status["data"]["selected_proxies"][0]["proxy"], "DIRECT");
+    f.ok(&["connection", "list", "--json"]);
+    let selection = f.ok(&["proxy", "select", "-g", "pick", "-p", "REJECT", "--json"]);
+    assert_eq!(selection["data"]["applied"], true, "{selection}");
+    // A different active profile must never supply the running controller's key.
+    f.load("other", &source(free_port(), "different-secret"));
+    f.ok(&["config", "use", "other", "--json"]);
+    let status = f.ok(&["status", "--json"]);
+    assert_eq!(status["data"]["runtime_state_available"], true);
+    assert_eq!(status["data"]["selected_proxies"][0]["proxy"], "REJECT");
+    f.ok(&["restart", "--json"]);
+    assert_eq!(f.auto("legacy"), secret);
+    let status = f.ok(&["status", "--json"]);
+    assert_eq!(status["data"]["runtime_state_available"], true);
+    assert_eq!(status["data"]["selected_proxies"][0]["proxy"], "REJECT");
+    f.ok(&["connection", "list", "--json"]);
+    f.ok(&["stop", "--json"]);
 }
 
 struct Process(Option<Child>);

@@ -149,6 +149,8 @@ just install --target-dir /tmp/zc-candidate/bin
 
 升级前停止旧实例并备份完整状态，在独立 HOME/runtime 中验证后再安排正式切换。既有 catalog、revision 或运行快照损坏、缺字段或格式未知时会拒绝读取；不要删除状态目录、手工删字段或重建空 catalog 来绕过检查。
 
+首次从仅有 `meta.json/configs` 的旧版升级时，安装器不会自动迁移配置库。先备份完整配置目录，再使用新构建的 `target/release/zc config list` 显式执行旧格式迁移，成功后重试 `just install`。迁移会验证全部保存的配置；任一不兼容项仍会阻塞迁移。当前支持原样导入 `external-controller: 0.0.0.0:<port>`，无需改成 loopback；托管 profile 在实际运行准备时生成或复用 secret。若此前已使用新版 catalog、后来丢失 `state-v2.json`，应恢复备份，不能把缺失状态当作首次迁移。其他运行实例与手动 daemon 的安装边界保持不变。
+
 托管 profile 持久生成自动 controller secret 后，旧 Rust 程序可能拒绝读取新增字段；采用自动 secret 的运行快照也使用旧程序不支持的 schema 2。**只替换回旧二进制不等于完成回退。** 必须先安全停止实例，再恢复与旧程序匹配的完整旧状态备份，包括 catalog、revisions 与相应运行状态；`meta.json` 镜像不能代替完整备份。
 
 默认 `restart` 继续使用冻结运行快照，不会为旧快照自动补 secret。已有 controller 的托管 profile 要启用自动值，须显式运行 `zc restart -c <profile>`；完整行为见 [CLI](../cli/spec.md#托管-profile-的自动-controller-secret)。

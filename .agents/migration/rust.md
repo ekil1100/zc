@@ -21,7 +21,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 | `src/service.rs` | 解析配置身份，准备 provider/override/selection，冻结启动输入 |
 | `src/user_service.rs` | 用户服务注册与管理器适配、冻结调用、本地冷发布和失败恢复 |
 | `src/daemon.rs` | PID/lock/nonce 身份、认证快照、readiness、stop/restart/回滚、live selection |
-| `src/api.rs` | 有界 loopback minimal HTTP API、Bearer 与 managed generation 校验 |
+| `src/api.rs` | 有界 minimal HTTP API、loopback/通配监听鉴权与 managed generation 校验 |
 | `src/config.rs`、`src/config_provider.rs` | 有界 YAML、规则展开、select 索引与路由 |
 | `src/override_script.rs` | Lua/可执行脚本、canonical materialization、只用于运行时的兼容字段投影 |
 | `src/runtime.rs`、`src/connection.rs` | mixed HTTP/SOCKS5、转发、UDP association 生命周期，以及实例内有界连接索引与管理取消 |
@@ -34,7 +34,7 @@ Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C
 
 - 完整命令树：`help/version`、`start/up`、`stop/down`、`restart/reload/status/log/test/doctor`、`config load/list/download/update/use/delete/dump/override`、`proxy/profile list/select/test`、`connection list/close <id>`、`diag doctor`。详见 [CLI 契约](../../docs/cli/spec.md)。
 - 托管 profile 的 immutable source、本地 provider assets、metadata、冻结 override 与 desired selections；先提交 durable desired，再尝试 exact revision 的 live apply。
-- 后台或 supervised foreground daemon；监听器绑定和 desired reconciliation 完成后才发布 ready 并开放数据面。控制面只有显式 `127.0.0.1:<port>`，占用即失败。
+- 后台或 supervised foreground daemon；监听器绑定和 desired reconciliation 完成后才发布 ready 并开放数据面。控制面接受显式 `127.0.0.1:<port>` 和 `0.0.0.0:<port>`，占用即失败；通配监听要求非空 secret 和全路由 Bearer，本机 CLI 始终连接 loopback。
 - 内置 DIRECT/REJECT、classic AEAD SS、原生 TLS Trojan / AnyTLS TCP；SS 的内建 simple-obfs HTTP；`udp:true` SS/Trojan 经 mixed SOCKS5 UDP ASSOCIATE。
 - select 默认首成员、嵌套组、持久选择、循环/未知引用拒绝；first-match 规则、本地和 unmanaged HTTP rule-provider 展开。
 - minimal API：`/`、`/version`、`/proxies`、`/rules`、`/status`、`PUT /proxies/<group>`、需强制鉴权的 `GET /connections` 与 `DELETE /connections/<id>`，详见 [API](../../docs/api/README.md)。
@@ -250,3 +250,7 @@ cargo clippy --offline --locked --lib --test provider_cache --test service --tes
 仅服务实例在 descriptor 末尾写可选 `service_id`，与注册、管理器 PID、nonce、认证快照及实例锁共同校验。普通手动实例省略该字段，原 descriptor canonical bytes 保持；旧严格 reader 可能拒绝新服务 descriptor。自动恢复适用于已经接受原注册/快照格式的旧服务二进制，不把它扩写为任意历史版本的数据格式回退。恢复兼容边界与完整状态备份要求保持。
 
 本机新服务测试使用独立管理器替身和真实隔离 daemon/二进制发布；没有真实用户服务变更或生产安装。首轮累计去重 227 项定向回归通过、3 项历史二进制忽略，以及未解决的 override_spawn 失败分别记录。后续服务恢复修复的当前定向验证为 185 passed / 3 ignored，含 27 项用户服务测试、36 个中断/超时子场景；本轮未运行 override_spawn。详细红绿、人工恢复边界及原生 Linux 待验证项见上述验证文档；构建/Clippy 通过不代替原生平台、性能、四平台或长稳证据。
+
+## 通配 controller 兼容与鉴权
+
+用户确认支持旧配置的 `0.0.0.0:<port>`：保留 source、catalog 与 snapshot 格式，本机 descriptor endpoint 仍为 loopback；托管自动 secret 在实际准备时生成，非托管缺少 secret 在启动/服务注册前拒绝。内部 status 和服务选择捕获使用冻结凭据。217 项相关回归通过、3 项历史二进制忽略；Release 经本机两类网卡验证 401/200。未安装或改动真实配置，完整证据与边界见 [验证记录](../reliability/controller-wildcard.md)。

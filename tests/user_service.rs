@@ -445,6 +445,96 @@ fn cli(binary: &std::path::Path, args: &[&str]) -> serde_json::Value {
 }
 
 #[test]
+fn wildcard_service_without_secret_is_rejected_before_registration() {
+    if !isolated("wildcard_service_without_secret_is_rejected_before_registration") {
+        return;
+    }
+    runtime().block_on(async {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let source = home.join("source.yaml");
+        std::fs::write(
+            &source,
+            format!(
+                "external-controller: 0.0.0.0:{}\nrules: ['MATCH,DIRECT']\n",
+                port()
+            ),
+        )
+        .unwrap();
+        let runner = support::FakeManager::new(platform());
+        let error = zc::user_service::execute(
+            "enable",
+            zc::service::PrepareOptions {
+                config: Some(source.to_str().unwrap().into()),
+                port: Some(port()),
+                ..Default::default()
+            },
+            std::path::Path::new(env!("CARGO_BIN_EXE_zc")),
+            &runner,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("START_CONTROLLER_SECRET_REQUIRED"),
+            "{error:#}"
+        );
+        assert!(
+            !home.join(".local/state/zc/service").exists(),
+            "invalid frozen input created service state"
+        );
+        assert!(!home.join("Library/LaunchAgents/org.zc.user.plist").exists());
+        assert!(!home.join(".config/systemd/user/zc-user.service").exists());
+    });
+}
+
+#[test]
+fn wildcard_service_preserves_authenticated_live_selection_across_stop_restart_and_install() {
+    if !isolated(
+        "wildcard_service_preserves_authenticated_live_selection_across_stop_restart_and_install",
+    ) {
+        return;
+    }
+    runtime().block_on(async {
+        use zc::user_service::{execute, install};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        std::fs::copy(env!("CARGO_BIN_EXE_zc"), &binary).unwrap();
+        let source = home.join("source.yaml");
+        let controller = port();
+        std::fs::write(&source, format!("external-controller: 0.0.0.0:{controller}\nsecret: test-secret\nproxy-groups: [{{name: pick, type: select, proxies: [DIRECT, REJECT]}}]\nrules: ['MATCH,pick']\n")).unwrap();
+        let runner = support::FakeManager::new(platform());
+        execute("enable", zc::service::PrepareOptions {
+            config: Some(source.to_str().unwrap().into()), port: Some(port()), ..Default::default()
+        }, &binary, &runner).await.unwrap();
+        execute("start", Default::default(), &binary, &runner).await.unwrap();
+        let response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .put(format!("http://127.0.0.1:{controller}/proxies/pick"))
+            .bearer_auth("test-secret")
+            .json(&serde_json::json!({"name":"REJECT"}))
+            .send().await.unwrap();
+        assert!(response.status().is_success());
+        // Stop must authenticate its state capture before freezing transient selection.
+        execute("stop", Default::default(), &binary, &runner).await.unwrap();
+        std::fs::remove_file(&source).unwrap();
+        execute("start", Default::default(), &binary, &runner).await.unwrap();
+        execute("restart", Default::default(), &binary, &runner).await.unwrap();
+        let state = cli(&binary, &["status"]);
+        assert_eq!(state["data"]["runtime_state_available"], true);
+        assert_eq!(state["data"]["selected_proxies"][0]["proxy"], "REJECT");
+        let publisher = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install/local-dev-install.sh");
+        install(std::path::Path::new(env!("CARGO_BIN_EXE_zc")), &bin, &publisher, &runner).await.unwrap();
+        let state = cli(&binary, &["status"]);
+        assert_eq!(state["data"]["runtime_state_available"], true);
+        assert_eq!(state["data"]["selected_proxies"][0]["proxy"], "REJECT");
+        let state = execute("status", Default::default(), &binary, &runner).await.unwrap();
+        assert_eq!(state["running"], true);
+        assert_eq!(state["enabled"], true);
+        execute("stop", Default::default(), &binary, &runner).await.unwrap();
+    });
+}
+
+#[test]
 fn native_service_commands_reject_temporary_home_before_any_mutation() {
     let home = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_zc"))

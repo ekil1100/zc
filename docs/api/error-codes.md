@@ -61,9 +61,10 @@
 | `START_CONFIG_NOT_SELECTED` | no active config is selected | run `zc config list`, then `zc config use <name>` |
 | `START_PORT_IN_USE` | requested start port is already in use | retry with `zc start --port <free-port>` |
 | `START_CONTROLLER_PORT_IN_USE` | configured controller port is already in use | free the exact `external-controller` port or update the config |
+| `START_CONTROLLER_SECRET_REQUIRED` | `0.0.0.0` controller 缺少非空运行时 secret | 显式配置 secret，或导入托管 profile 后由实际运行准备生成自动值；启动/服务注册前拒绝 |
 | `START_PORT_CONFLICT` | requested start port conflicts with another runtime listener | change the port or fix the conflicting runtime config |
 | `START_BIND_ADDRESS_INVALID` | invalid bind address for start preflight | fix `bind-address` in config and retry |
-| `START_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | use an explicit loopback endpoint such as `127.0.0.1:9090` |
+| `START_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | 使用 `127.0.0.1:<port>` 或 `0.0.0.0:<port>`，端口 1–65535 |
 | `START_PREFLIGHT_FAILED` | failed to validate daemon start ports | check config and retry |
 | `STOP_FAILED` | failed to stop daemon | verify process permissions and retry `zc stop` |
 | `STOP_TIMEOUT` | daemon did not acknowledge the stop request within 5 seconds | inspect `zc status` and the daemon log before retrying |
@@ -77,9 +78,10 @@
 | `RESTART_CONFIG_NOT_SELECTED` | no active config is selected for restart | run `zc config list`, then `zc config use <name>` |
 | `RESTART_PORT_IN_USE` | restart target port is already in use | free the occupied port, then retry `zc restart` |
 | `RESTART_CONTROLLER_PORT_IN_USE` | restart controller port is already in use | free the exact `external-controller` port before retrying `zc restart` |
+| `RESTART_CONTROLLER_SECRET_REQUIRED` | 新的 `0.0.0.0` controller 输入缺少非空 secret | 修复 secret 或使用托管 profile 后重试；保留旧实例运行 |
 | `RESTART_PORT_CONFLICT` | restart target port conflicts with another runtime listener | fix the conflicting runtime config before retrying `zc restart` |
 | `RESTART_BIND_ADDRESS_INVALID` | invalid bind address for restart preflight | fix `bind-address` in config and retry `zc restart` |
-| `RESTART_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | use an explicit loopback endpoint such as `127.0.0.1:9090` |
+| `RESTART_EXTERNAL_CONTROLLER_INVALID` | invalid `external-controller` address in config | 使用 `127.0.0.1:<port>` 或 `0.0.0.0:<port>`，端口 1–65535 |
 | `RESTART_PREFLIGHT_FAILED` | failed to validate daemon restart ports | check config and retry `zc restart` |
 | `RELOAD_FAILED` | daemon is not running | start it first with `zc start` |
 | `RELOAD_ARGUMENT_INVALID` | unknown or unexpected argument for `reload` | use `zc reload [--json]` |
@@ -115,7 +117,7 @@
 
 除明确列出的用法错误外均 exit 1，文本/JSON 同码。错误不回显 secret、目标或控制器响应正文。CLI 的 DELETE 成功仅为 `close_requested:true`，不能自动重试为“已回收”；仍在 closing 的条目可重复请求，消失后 404。
 
-API 保持 `{"error":"…"}`，不发 CLI 信封或上述 code：非空 secret 缺失 403，缺失/错误 Bearer 401，格式错误 400，实例不符 409，条目不存在 404，完整编码超限 500。旧 GET/PUT 鉴权规则不变。协议与元数据详见 [API](README.md)。
+API 保持 `{"error":"…"}`，不发 CLI 信封或上述 code：连接接口非空 secret 缺失 403，缺失/错误 Bearer 401，格式错误 400，实例不符 409，条目不存在 404，完整编码超限 500。`127.0.0.1` 的旧 GET/PUT 鉴权规则不变；`0.0.0.0` 启动前要求非空 secret，所有管理路由均要求 Bearer。协议与元数据详见 [API](README.md)。
 
 ### B3. service 与本地冷升级
 

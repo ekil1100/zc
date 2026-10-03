@@ -66,12 +66,29 @@ fn controller_modes_and_api_views_preserve_baseline_metadata() {
     for endpoint in [
         "localhost:19432",
         "127.0.0.2:19432",
-        "0.0.0.0:19432",
+        "192.168.1.2:19432",
+        "0.0.0.0:0",
+        "0.0.0.0:65536",
+        "0.0.0.0:+123",
+        "0.0.0.0:19432/path",
         "[::1]:19432",
         "127.0.0.1:0",
         "127.0.0.1:+123",
     ] {
         assert!(Config::parse(&format!("external-controller: '{endpoint}'")).is_err());
+    }
+    for secret in ["", "secret: test-secret\n"] {
+        let config =
+            Config::parse(&format!("external-controller: 0.0.0.0:19432\n{secret}")).unwrap();
+        assert_eq!(
+            config.controller_endpoint().unwrap().to_string(),
+            "0.0.0.0:19432"
+        );
+        assert_eq!(config.document()["external-controller"], "0.0.0.0:19432");
+        assert!(
+            config.bind_address().is_loopback(),
+            "controller must not change mixed binding"
+        );
     }
 }
 

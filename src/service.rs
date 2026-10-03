@@ -293,7 +293,7 @@ pub async fn prepare_loaded(loaded: Loaded, options: PrepareOptions) -> Result<P
             config::sync_http_assets(&runtime_source, root, policy, &assets, source_file.as_ref())
                 .await?;
     }
-    let config = Config::parse_with_assets(&runtime_source, &assets)?;
+    let mut config = Config::parse_with_assets(&runtime_source, &assets)?;
     let selections = reconcile_selections(&config, &loaded.desired.selections);
     config.set_selections(
         &selections
@@ -359,6 +359,12 @@ pub async fn prepare_loaded(loaded: Loaded, options: PrepareOptions) -> Result<P
         } else {
             None
         };
+    if actual_run {
+        if let Some(secret) = &controller_secret {
+            config.set_runtime_controller_secret(secret);
+        }
+        config.validate_controller_auth()?;
+    }
     let source_path = loaded.source_path;
     Ok(Prepared {
         source,

@@ -64,6 +64,56 @@ fn free_port() -> u16 {
         .unwrap()
         .port()
 }
+
+#[test]
+fn wildcard_without_secret_rejects_start_and_restart_without_stopping_the_old_instance() {
+    let f = Fixture::new();
+    let invalid = f.home.join("wildcard.yaml");
+    let controller = free_port();
+    fs::write(
+        &invalid,
+        format!("external-controller: 0.0.0.0:{controller}\nrules: ['MATCH,DIRECT']\n"),
+    )
+    .unwrap();
+    let port = free_port().to_string();
+    let out = f.command(&[
+        "start",
+        "-c",
+        invalid.to_str().unwrap(),
+        "--port",
+        &port,
+        "--json",
+    ]);
+    assert!(!out.status.success());
+    let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        error["error"]["code"], "START_CONTROLLER_SECRET_REQUIRED",
+        "{error}"
+    );
+    assert_eq!(f.json(&["status", "--json"])["data"]["state"], "stopped");
+    let original = f.json(&[
+        "start",
+        "-c",
+        f.config.to_str().unwrap(),
+        "--port",
+        &port,
+        "--json",
+    ]);
+    let out = f.command(&["restart", "-c", invalid.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        error["error"]["code"], "RESTART_CONTROLLER_SECRET_REQUIRED",
+        "{error}"
+    );
+    let status = f.json(&["status", "--json"]);
+    assert_eq!(status["data"]["state"], "running");
+    assert_eq!(status["data"]["pid"], original["data"]["pid"]);
+    assert!(
+        std::net::TcpListener::bind(("0.0.0.0", controller)).is_ok(),
+        "rejected controller bound a listener"
+    );
+}
 fn log_events(f: &Fixture) -> Vec<Value> {
     let out = f.command(&["log", "--json", "--no-follow", "-n", "50"]);
     assert!(out.status.success(), "{out:?}");
@@ -706,10 +756,16 @@ fn unsafe_runtime_paths_are_rejected_and_logs_are_bounded() {
         "--json",
     ]);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while !log_events(&f)
-        .iter()
-        .any(|e| e["event"] == "runtime_summary" && e["phase"] == "initial")
-    {
+    loop {
+        let events = log_events(&f);
+        // Both startup records must reach disk before replacing the log fixture.
+        if events.iter().any(|e| e["event"] == "daemon_ready")
+            && events
+                .iter()
+                .any(|e| e["event"] == "runtime_summary" && e["phase"] == "initial")
+        {
+            break;
+        }
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(25));
     }

@@ -35,6 +35,114 @@ async fn request(address: std::net::SocketAddr, bytes: &[u8]) -> String {
     }
     String::from_utf8(response).unwrap()
 }
+
+#[tokio::test]
+async fn wildcard_controller_authenticates_every_route_before_disclosing_state() {
+    let reservation = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let config = Config::parse(&format!(
+        "external-controller: 0.0.0.0:{port}\nsecret: test-secret\nproxy-groups: [{{name: pick, type: select, proxies: [DIRECT, REJECT]}}]\nrules: ['MATCH,pick']"
+    )).unwrap();
+    let server = Server::bind(
+        Arc::new(config),
+        None,
+        zc::connection::ConnectionRegistry::new().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(server.local_addr().unwrap().ip().to_string(), "0.0.0.0");
+    let address = ([127, 0, 0, 1], port).into();
+    let task = tokio::spawn(server.run(std::future::pending()));
+    for (method, path, body) in [
+        ("GET", "/", ""),
+        ("GET", "/version", ""),
+        ("GET", "/status", ""),
+        ("GET", "/proxies", ""),
+        ("GET", "/rules", ""),
+        ("GET", "/connections", ""),
+        ("GET", "/unknown", ""),
+        ("POST", "/status", ""),
+        ("PUT", "/proxies/pick", r#"{"name":"REJECT"}"#),
+        ("DELETE", "/connections/invalid", ""),
+    ] {
+        for auth in ["", "Authorization: Bearer wrong\r\n"] {
+            let wire = format!(
+                "{method} {path} HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let response = request(address, wire.as_bytes()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 401"),
+                "{method} {path}: {response}"
+            );
+            assert!(!response.to_lowercase().contains("x-zc-instance-nonce:"));
+            assert!(!response.contains("DIRECT") && !response.contains("test-secret"));
+        }
+    }
+    for path in [
+        "/",
+        "/version",
+        "/status",
+        "/proxies",
+        "/rules",
+        "/connections",
+    ] {
+        let wire = format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n");
+        let response = request(address, wire.as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+    }
+    let response = request(address, b"PUT /proxies/pick HTTP/1.1\r\nAuthorization: Bearer test-secret\r\nContent-Length: 17\r\n\r\n{\"name\":\"REJECT\"}").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let response = request(
+        address,
+        b"GET /status HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n",
+    )
+    .await;
+    assert!(response.contains("REJECT"), "{response}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn wildcard_controller_requires_secret_and_never_changes_an_occupied_port() {
+    let reserved = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    let config = Config::parse(&format!(
+        "external-controller: 0.0.0.0:{port}\nrules: ['MATCH,DIRECT']"
+    ))
+    .unwrap();
+    let result = Server::bind(
+        Arc::new(config),
+        None,
+        zc::connection::ConnectionRegistry::new().unwrap(),
+    )
+    .await;
+    let error = result
+        .err()
+        .expect("wildcard without secret must be rejected");
+    assert!(
+        format!("{error:#}").contains("START_CONTROLLER_SECRET_REQUIRED"),
+        "{error:#}"
+    );
+    let config = Config::parse(&format!(
+        "external-controller: 0.0.0.0:{port}\nsecret: test-secret\nrules: ['MATCH,DIRECT']"
+    ))
+    .unwrap();
+    let result = Server::bind(
+        Arc::new(config),
+        None,
+        zc::connection::ConnectionRegistry::new().unwrap(),
+    )
+    .await;
+    let error = result
+        .err()
+        .expect("occupied wildcard port must be rejected");
+    assert!(
+        format!("{error:#}").contains("START_CONTROLLER_PORT_IN_USE"),
+        "{error:#}"
+    );
+}
 #[tokio::test]
 async fn public_reads_and_authenticated_unmanaged_selection() {
     let (address, task) = server().await;

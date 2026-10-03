@@ -52,7 +52,11 @@
 
 生产 mixed 默认端口固定 **7899**，只有 CLI `--port` 能覆盖。配置/profile/override 的 `mixed-port` 数值（包括来源声明 0）仅兼容解析，准备时规范化；CLI 端口 0 非法。与 mixed 声明共存的 `port/socks-port` 忽略，不创建额外 listener；没有 mixed 声明的独立入口仍在 bind 前拒绝。开发必须显式选非生产端口；端口占用拒绝启动，不自动换端口。
 
-`external-controller` 只接受显式 `127.0.0.1:<port>`，精确绑定失败返回 `START_CONTROLLER_PORT_IN_USE` / `RESTART_CONTROLLER_PORT_IN_USE`，不得漂移或静默关闭。mixed 非 loopback 暴露需要 `allow-lan:true`；当前入站不提供用户认证，不应暴露到不可信网络。
+`external-controller` 接受显式 `127.0.0.1:<port>` 或 `0.0.0.0:<port>`（端口 1–65535），精确绑定失败返回 `START_CONTROLLER_PORT_IN_USE` / `RESTART_CONTROLLER_PORT_IN_USE`，不得漂移或静默关闭。暂不接受其他 IPv4 地址、域名、IPv6 或 HTTPS controller。mixed 非 loopback 暴露需要 `allow-lan:true`；当前入站不提供用户认证，不应暴露到不可信网络。
+
+`0.0.0.0` 表示在所有 IPv4 网卡监听管理接口，独立于 mixed 的 `allow-lan/bind-address`。启动、重启及服务注册前要求非空运行时 secret，所有管理 API 路由均要求 Bearer，缺失或错误返回 401。托管 profile 复用下述自动 secret；非托管文件须显式配置 secret，否则返回 `START_CONTROLLER_SECRET_REQUIRED`（restart 为 `RESTART_CONTROLLER_SECRET_REQUIRED`），不停止旧实例、不创建新服务注册。本机 CLI 始终通过 `127.0.0.1` 连接，status、切组和服务停止/升级时使用已认证冻结输入中的凭据，不读取其他 active profile 的 key。监听地址保留在冻结配置中，descriptor 的 endpoint 表示本机连接地址，schema 不变。`127.0.0.1` 的既有鉴权规则保持，详见 [API](../api/README.md#启用与鉴权)。
+
+旧版配置可原样保留 `external-controller: 0.0.0.0:<port>`。首次升级先备份完整配置目录，再用新构建的二进制执行 `target/release/zc config list` 完成既有旧格式迁移，然后执行 `just install`；安装检查本身不会迁移或从兼容镜像重建状态。迁移遇到其他不支持的配置仍拒绝，不能通过删除新版 catalog 绕过。
 
 ### readiness 与安全停止
 

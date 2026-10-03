@@ -33,6 +33,16 @@ async fn diagnose(source: &str) -> Value {
 }
 
 #[tokio::test]
+async fn doctor_accepts_wildcard_controller_without_rewriting_the_source() {
+    let data = diagnose(
+        "external-controller: 0.0.0.0:19091\nsecret: test-secret\nrules: ['MATCH,DIRECT']\n",
+    )
+    .await;
+    assert_eq!(data["config_ok"], true, "{data}");
+    assert_eq!(data["config_errors"], json!([]));
+}
+
+#[tokio::test]
 async fn doctor_accumulates_errors_and_original_supported_warnings() {
     let data = diagnose("mode: invalid\nlog-level: noisy\nbind-address: 127.0.0.2\nidle-session-timeout: 5\nproxies:\n  - {name: edge, type: trojan, server: localhost, port: 443, password: PRIVATE_MARKER, skip-cert-verify: true}\nrules: ['MATCH,missing']\n").await;
     assert_eq!(data["config_ok"], false);

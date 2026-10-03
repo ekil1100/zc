@@ -7,7 +7,8 @@
 - 一个 mixed HTTP/SOCKS5 listener，默认 loopback。生产默认端口 **7899**；只有 CLI `--port` 控制实际端口。来源 `mixed-port`（含 0）只作兼容声明，准备时规范化；开发显式使用其他端口。
 - 同文件存在 mixed 声明时，`port/socks-port` 是 ignored compatibility declarations；没有 mixed 的 standalone 入口拒绝。`redir-port/tproxy-port` 不创建 listener，TUN 不支持。
 - `allow-lan:false` 的规范运行时投影绑定 loopback；`allow-lan:true` 才允许 LAN。没有入站认证，不应暴露给不可信客户端。
-- `external-controller` 仅接受 `127.0.0.1:<port>`；必须精确绑定，不漂移、不静默关闭。托管 profile 仅在已有 controller 且无非空显式 secret 的实际运行准备时，生成并持久复用自动 secret；显式值优先且不抹掉旧自动值。不会添加 controller/默认控制端口，非托管文件保持手工配置。
+- `external-controller` 接受 `127.0.0.1:<port>` 和 `0.0.0.0:<port>`；端口 1–65535，必须精确绑定，不漂移、不静默关闭。`0.0.0.0` 在所有 IPv4 网卡监听，要求非空运行时 secret，并对所有管理路由做 Bearer 鉴权；本机 CLI 仍通过 `127.0.0.1` 访问。此选项不改变 mixed 的 `allow-lan/bind-address`。其他 IPv4 地址、域名、IPv6 和 HTTPS controller 暂不支持。
+- 托管 profile 仅在已有 controller 且无非空显式 secret 的实际运行准备时，生成并持久复用自动 secret；显式值优先且不抹掉旧自动值。导入/旧格式迁移保留原 controller 地址和 source，不生成凭据；非托管通配监听须手工配置非空 secret，启动和服务注册前拒绝缺失值。不会添加 controller/默认控制端口。`127.0.0.1` 的原有鉴权行为保持。
 - `mode/log-level` 接受合法兼容声明；不要据此宣称完整 mihomo 模式调度或动态日志级别。当前路由由规则决定。
 - `dns`（含 fake-ip、enhanced-mode、nameserver-policy）、`hosts`、`sniffer`、`profile`、`experimental`、`unified-delay`、`clash-for-android` 接受但不执行，见下方清单；`proxy-providers` 仍拒绝。`external-ui` 等兼容元数据不代表托管 dashboard。
 - 运行时只使用已经校验的兼容字段；原始配置和规范化配置的字节及内容摘要不会被运行时投影改写。

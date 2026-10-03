@@ -402,6 +402,7 @@ fn parse_config(prepared: &Prepared) -> Result<Config> {
     let mut config = Config::parse_with_assets(&runtime_source, &assets)
         .context("START_CONFIG_INVALID: invalid prepared configuration")?;
     crate::service::apply_controller_secret(prepared, &mut config)?;
+    config.validate_controller_auth()?;
     config.set_selections(&selection_map(&prepared.selections)?)?;
     ensure!(
         config
@@ -752,7 +753,7 @@ fn prepared_for(runtime: &Directory, d: &Descriptor) -> Result<Prepared> {
         prepared.identity == d.identity
             && prepared.generation == d.generation
             && parse_config(&prepared)?
-                .controller_endpoint()
+                .controller_client_endpoint()
                 .map(|a| a.to_string())
                 == d.endpoint,
         "RUNTIME_SNAPSHOT_INVALID: snapshot identity mismatch"
@@ -797,7 +798,7 @@ pub async fn capture_restart() -> Result<RestartCapture> {
             .is_some_and(|p| p.ends_with(".yaml"))
     {
         if let Some(endpoint) = &d.endpoint {
-            let state = get_runtime_status(endpoint).await?;
+            let state = get_runtime_status(endpoint, prepared).await?;
             ensure!(
                 state["config_key"].as_str() == d.identity.as_ref().map(|i| i.key.as_str()),
                 "RUNTIME_SNAPSHOT_INVALID: controller identity mismatch"
@@ -1312,7 +1313,7 @@ async fn run_instance_inner(
         schema_version: 2,
         pid: std::process::id(),
         nonce: nonce.into(),
-        endpoint: config.controller_endpoint().map(|a| a.to_string()),
+        endpoint: config.controller_client_endpoint().map(|a| a.to_string()),
         identity: prepared.identity.clone(),
         generation: prepared.generation,
         ready: false,
@@ -1632,7 +1633,7 @@ pub async fn status() -> Result<Value> {
     );
     result["runtime_state_available"] = json!(false);
     if let Some(endpoint) = &d.endpoint
-        && let Ok(response) = get_runtime_status(endpoint).await
+        && let Ok(response) = get_runtime_status(endpoint, &prepared).await
         && observe(&runtime)?.as_ref() == Some(&d)
     {
         result["runtime_state_available"] = json!(true);
@@ -1650,12 +1651,13 @@ fn client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(2))
         .build()?)
 }
-async fn get_runtime_status(endpoint: &str) -> Result<Value> {
-    let mut response = client()?
-        .get(format!("http://{endpoint}/status"))
-        .send()
-        .await?
-        .error_for_status()?;
+async fn get_runtime_status(endpoint: &str, prepared: &Prepared) -> Result<Value> {
+    let config = parse_config(prepared)?;
+    let mut request = client()?.get(format!("http://{endpoint}/status"));
+    if config.controller_requires_auth() {
+        request = request.bearer_auth(config.secret());
+    }
+    let mut response = request.send().await?.error_for_status()?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         ensure!(
@@ -2056,7 +2058,7 @@ pub(crate) async fn capture_service(id: &str, selections: bool) -> Result<Servic
         && p.identity.is_none()
         && d.endpoint.is_some()
     {
-        let data = get_runtime_status(d.endpoint.as_deref().expect("endpoint")).await?;
+        let data = get_runtime_status(d.endpoint.as_deref().expect("endpoint"), p).await?;
         let entries = data["selected_proxies"]
             .as_array()
             .context("SERVICE_STATE_INVALID: runtime selections unavailable")?;

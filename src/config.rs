@@ -12,6 +12,18 @@ use crate::{dns::Dns, target::Target};
 
 pub mod diagnostics;
 
+pub(crate) fn parse_controller_endpoint(endpoint: &str) -> Result<SocketAddr> {
+    let (host, port) = endpoint.split_once(':').ok_or_else(|| {
+        anyhow!("external-controller must be explicit 127.0.0.1:<port> or 0.0.0.0:<port>")
+    })?;
+    let address = match host {
+        "127.0.0.1" => [127, 0, 0, 1],
+        "0.0.0.0" => [0, 0, 0, 0],
+        _ => bail!("external-controller must be explicit 127.0.0.1:<port> or 0.0.0.0:<port>"),
+    };
+    Ok(SocketAddr::from((address, parse_port(port)?)))
+}
+
 #[path = "config_provider.rs"]
 mod provider;
 pub(crate) use provider::{MAX_DOCUMENT_DEPTH, on_document_stack};
@@ -714,12 +726,7 @@ impl Config {
         let controller = raw
             .external_controller
             .as_deref()
-            .map(|endpoint| {
-                let port = endpoint.strip_prefix("127.0.0.1:").ok_or_else(|| {
-                    anyhow!("external-controller must be explicit 127.0.0.1:<port>")
-                })?;
-                Ok::<_, anyhow::Error>(SocketAddr::from(([127, 0, 0, 1], parse_port(port)?)))
-            })
+            .map(parse_controller_endpoint)
             .transpose()?;
         if raw.log_level.as_deref().is_some_and(|level| {
             !matches!(level, "silent" | "error" | "warning" | "info" | "debug")
@@ -801,6 +808,26 @@ impl Config {
 
     pub fn controller_endpoint(&self) -> Option<SocketAddr> {
         self.controller
+    }
+
+    /// Local control clients never connect to an unspecified bind address.
+    pub(crate) fn controller_client_endpoint(&self) -> Option<SocketAddr> {
+        self.controller
+            .map(|address| SocketAddr::from(([127, 0, 0, 1], address.port())))
+    }
+
+    pub(crate) fn controller_requires_auth(&self) -> bool {
+        self.controller
+            .is_some_and(|address| address.ip().is_unspecified())
+    }
+
+    pub(crate) fn validate_controller_auth(&self) -> Result<()> {
+        if self.controller_requires_auth() && self.secret.is_empty() {
+            bail!(
+                "START_CONTROLLER_SECRET_REQUIRED: 0.0.0.0 controller requires a nonempty secret; configure secret or load a managed profile for automatic authentication"
+            );
+        }
+        Ok(())
     }
 
     /// Does not change the parsed document or canonical materialization.
