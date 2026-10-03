@@ -155,6 +155,8 @@ fn error_index(error: &anyhow::Error) -> usize {
         _ => 0,
     }
 }
+// `try_update` requires Rust 1.95; keep `fetch_update` for the Rust 1.91 MSRV.
+#[allow(deprecated)]
 fn increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(1))
