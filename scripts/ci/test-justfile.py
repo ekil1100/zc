@@ -305,7 +305,10 @@ class JustfileContract(unittest.TestCase):
             "macos-15-intel",
         ]:
             self.assertIn(platform, ci)
-        self.assertIn("RUSTUP_TOOLCHAIN: 1.98.1", ci)
+        for workflow in ["ci.yml", "release.yml", "platform-diagnostics.yml"]:
+            contents = (ROOT / ".github/workflows" / workflow).read_text()
+            self.assertIn("RUSTUP_TOOLCHAIN: 1.99.0", contents)
+            self.assertIn("rustup toolchain install 1.99.0 --profile minimal", contents)
         self.assertIn("actions/setup-node@", ci)
         self.assertNotIn("Setup Zig", ci)
         self.assertNotIn("zig build", ci)

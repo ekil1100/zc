@@ -29,7 +29,7 @@ just run testdata/config/rust-tcp.yaml 17890
 
 构建不安装、不替换已有二进制、不接管 daemon。开发运行必须显式使用非生产端口，不使用 `7899`。生产程序只有 `zc`；`examples/` 下的三个程序仅用于测试，不打包、不安装。
 
-CI 固定 Rust `1.98.1`，需要 rustfmt、Clippy、C/C++ 编译工具、CMake、Python 3、just。E2E 另需 Node.js 24、curl、tar、unzip、file、SHA-256 工具以及可用的 IPv4/IPv6 loopback、非 loopback IPv4 接口和 DNS。静态 fixture 下载需要访问 GitHub；原 core harness 还使用 `127-0-0-1.sslip.io`。Linux 构建安装 `musl-tools`，在对应 CPU 的原生 runner 上用 `musl-gcc`，不通过 Zig 或架构回退编译。
+CI 固定 Rust `1.99.0`，需要 rustfmt、Clippy、C/C++ 编译工具、CMake、Python 3、just。E2E 另需 Node.js 24、curl、tar、unzip、file、SHA-256 工具以及可用的 IPv4/IPv6 loopback、非 loopback IPv4 接口和 DNS。静态 fixture 下载需要访问 GitHub；原 core harness 还使用 `127-0-0-1.sslip.io`。Linux 构建安装 `musl-tools`，在对应 CPU 的原生 runner 上用 `musl-gcc`，不通过 Zig 或架构回退编译。
 
 发布矩阵配置为：
 

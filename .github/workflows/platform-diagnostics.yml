@@ -41,7 +41,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 45
     env:
-      RUSTUP_TOOLCHAIN: 1.98.1
+      RUSTUP_TOOLCHAIN: 1.99.0
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@v7
@@ -51,7 +51,7 @@ jobs:
         run: |
           test -d "$DEVELOPER_DIR"
           xcodebuild -version
-          rustup toolchain install 1.98.1 --profile minimal
+          rustup toolchain install 1.99.0 --profile minimal
       - name: Setup independent crypto oracle
         uses: actions/setup-node@v6
         with:

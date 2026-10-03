@@ -20,7 +20,7 @@ zc 以 mihomo/clash 为基线，优先做好这几件事：
 
 ## 技术约束
 
-- Rust 最低版本 `1.91`（以 `Cargo.toml` 为准）；CI 固定 `1.98.1`，本地优先同版本
+- Rust 最低版本 `1.91`（以 `Cargo.toml` 为准）；CI 固定 `1.99.0`，本地优先同版本
 - 默认构建、测试与交付使用 Cargo / just；依赖使用已提交的 `Cargo.lock`
 - 原生依赖需要 C/C++ 工具链与 CMake；E2E 需要 Python 3、Node.js 与 just
 - 生产目标为 Linux/macOS × x64/arm64，不支持 Windows

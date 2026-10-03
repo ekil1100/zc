@@ -12,7 +12,7 @@
 
 ## 工程与模块
 
-Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.98.1`。原生依赖需要 C/C++ 工具链与 CMake；E2E 使用 Python 3、Node.js、just。生产目标仅 Linux/macOS × x64/arm64；Windows 不支持。Zig `0.16.0` 仅为迁移期历史对照工具链。
+Rust 最低 `1.91`（Cargo 声明），CI 固定 `1.99.0`。原生依赖需要 C/C++ 工具链与 CMake；E2E 使用 Python 3、Node.js、just。生产目标仅 Linux/macOS × x64/arm64；Windows 不支持。Zig `0.16.0` 仅为迁移期历史对照工具链。
 
 | 模块 | 职责 |
 | --- | --- |

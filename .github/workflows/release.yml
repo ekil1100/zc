@@ -64,7 +64,7 @@ jobs:
 
   release:
     env:
-      RUSTUP_TOOLCHAIN: 1.98.1
+      RUSTUP_TOOLCHAIN: 1.99.0
       BINARY: target/${{ matrix.rust_target }}/release/zc
     needs: validate-release
     strategy:
@@ -90,7 +90,7 @@ jobs:
           xcrun --show-sdk-version
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --target ${{ matrix.rust_target }}
+        run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.rust_target }}
 
       - name: Install native musl build tools
         if: runner.os == 'Linux'

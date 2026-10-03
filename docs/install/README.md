@@ -38,7 +38,7 @@ just run testdata/config/rust-tcp.yaml 17890
 
 构建不安装、不替换已有二进制、不接管 daemon。开发运行必须显式使用非生产端口，不使用 `7899`。安装的程序为 `zc`，不包含测试辅助程序。
 
-Rust 最低版本为 `1.91`，推荐使用项目 CI 固定的 `1.98.1`；需要 C/C++ 编译工具、CMake 和 just。Linux musl 构建还需要 `musl-tools` 与 `musl-gcc`，在对应 CPU 架构上原生构建。
+Rust 最低版本为 `1.91`，推荐使用项目 CI 固定的 `1.99.0`；需要 C/C++ 编译工具、CMake 和 just。Linux musl 构建还需要 `musl-tools` 与 `musl-gcc`，在对应 CPU 架构上原生构建。
 
 生产目标为 Linux/macOS × x64/arm64，不支持 Windows：
 
