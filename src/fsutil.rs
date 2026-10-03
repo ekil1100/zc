@@ -701,6 +701,10 @@ impl SecureDir {
     pub fn file_metadata(&self, name: &str) -> io::Result<std::fs::Metadata> {
         self.open_file(name, false, false)?.metadata()
     }
+    /// Pin an existing private file without creating or locking it.
+    pub(crate) fn hold_private_file(&self, name: &str) -> io::Result<File> {
+        self.open_file(name, false, false)
+    }
     pub fn append_bounded(&self, name: &str, bytes: &[u8], limit: usize) -> io::Result<()> {
         if bytes.len() > limit {
             return Err(invalid("log record exceeds limit"));

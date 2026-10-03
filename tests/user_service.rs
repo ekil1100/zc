@@ -87,6 +87,8 @@ fn login_preference_is_independent_of_loading_and_running() {
     });
 }
 
+#[path = "support/early_stop_manager.rs"]
+mod early_stop;
 #[path = "support/service_runner.rs"]
 mod support;
 
@@ -120,7 +122,7 @@ fn real_service_lifecycle_preserves_login_preference_and_frozen_config() {
         let bin_dir = home.join(if platform() == zc::user_service::Platform::Launchd {
             "bin}valid with 'quotes' \"double\" \\ & $dollars %percent"
         } else {
-            "bin with spaces & $dollars %percent"
+            "bin} ;x with spaces & $dollars %percent"
         });
         std::fs::create_dir(&bin_dir).unwrap();
         let binary = bin_dir.join("zc");
@@ -383,6 +385,427 @@ fn install_restores_only_previously_running_service_and_rolls_back_failed_activa
                 .await
                 .unwrap();
         });
+}
+
+#[test]
+fn asynchronous_manager_stop_preserves_install_and_service_lifecycle() {
+    if !isolated("asynchronous_manager_stop_preserves_install_and_service_lifecycle") {
+        return;
+    }
+    runtime().block_on(async {
+        use zc::user_service::{execute, install};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        let source = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+        std::fs::copy(source, &binary).unwrap();
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let runner = early_stop::EarlyStopManager::new(platform());
+        let mixed = port();
+        execute(
+            "enable",
+            zc::service::PrepareOptions {
+                config: Some(config.to_str().unwrap().into()),
+                port: Some(mixed),
+                ..Default::default()
+            },
+            &binary,
+            &runner,
+        )
+        .await
+        .unwrap();
+        let original = execute("start", Default::default(), &binary, &runner)
+            .await
+            .unwrap();
+        std::fs::remove_file(config).unwrap();
+        let publisher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/install/local-dev-install.sh");
+        for action in ["install", "interrupted-install", "restart", "stop"] {
+            let accepted = runner.defer_stop();
+            let operation = async {
+                if action == "install" {
+                    install(source, &bin, &publisher, &runner).await
+                } else if action == "interrupted-install" {
+                    zc::user_service::install_with_signals(source, &bin, &publisher, &runner).await
+                } else {
+                    execute(action, Default::default(), &binary, &runner)
+                        .await
+                        .map(|_| ())
+                }
+            };
+            let completion = async {
+                let pid = accepted.await.unwrap();
+                // This runs only after the operation yields following stop's
+                // successful acknowledgement. No sleep guesses the exit race.
+                if action == "interrupted-install" {
+                    rustix::process::kill_process(
+                        rustix::process::getpid(),
+                        rustix::process::Signal::INT,
+                    )
+                    .unwrap();
+                }
+                rustix::process::kill_process(
+                    rustix::process::Pid::from_raw(pid as i32).unwrap(),
+                    rustix::process::Signal::TERM,
+                )
+                .unwrap();
+            };
+            let (result, ()) = tokio::join!(operation, completion);
+            if action == "interrupted-install" {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains("ROLLED_BACK") && error.contains("INTERRUPTED"),
+                    "{error}"
+                );
+            } else {
+                result.unwrap_or_else(|error| panic!("{action}: {error:#}"));
+            }
+            let status = execute("status", Default::default(), &binary, &runner)
+                .await
+                .unwrap();
+            assert_eq!(status["running"], action != "stop");
+            assert_eq!(status["enabled"], true);
+            assert_eq!(status["configured_port"], mixed);
+            if action != "stop" {
+                assert_ne!(status["pid"], original["pid"]);
+            }
+        }
+    });
+}
+
+#[test]
+fn acknowledged_stop_timeout_preserves_recovery_evidence_without_claiming_restoration() {
+    if isolated(
+        "acknowledged_stop_timeout_preserves_recovery_evidence_without_claiming_restoration",
+    ) {
+        uncertain_stop_keeps_evidence(false);
+    }
+}
+
+#[test]
+fn lost_stop_reply_does_not_claim_restoration_before_late_manager_completion() {
+    if isolated("lost_stop_reply_does_not_claim_restoration_before_late_manager_completion") {
+        uncertain_stop_keeps_evidence(true);
+    }
+}
+
+fn uncertain_stop_keeps_evidence(lose_ack: bool) {
+    runtime().block_on(async {
+        use zc::user_service::{execute, install};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        let source = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+        std::fs::copy(source, &binary).unwrap();
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let runner = early_stop::EarlyStopManager::new(platform());
+        execute(
+            "start",
+            zc::service::PrepareOptions {
+                config: Some(config.to_str().unwrap().into()),
+                port: Some(port()),
+                ..Default::default()
+            },
+            &binary,
+            &runner,
+        )
+        .await
+        .unwrap();
+        let registration = home.join(".local/state/zc/service/registration.json");
+        let original = std::fs::read(&registration).unwrap();
+        let publisher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/install/local-dev-install.sh");
+        let accepted = if lose_ack {
+            runner.lose_stop_acknowledgement()
+        } else {
+            runner.defer_stop()
+        };
+        let result = install(source, &bin, &publisher, &runner).await;
+        let pid = accepted.await.unwrap();
+        // The independently accepted stop may complete even after the caller
+        // returns. Never call an instantaneous old PID observation a rollback.
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid as i32).unwrap(),
+            rustix::process::Signal::TERM,
+        )
+        .unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("SERVICE_RECOVERY_FAILED"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(registration).unwrap(), original);
+        assert!(std::fs::read_dir(&bin).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zc.recovery.")
+        }));
+        assert_eq!(
+            std::fs::read(binary).unwrap(),
+            std::fs::read(source).unwrap()
+        );
+    });
+}
+
+#[test]
+fn stopped_install_accepts_unchanged_state_left_by_an_exited_service() {
+    if !isolated("stopped_install_accepts_unchanged_state_left_by_an_exited_service") {
+        return;
+    }
+    runtime().block_on(async {
+        use std::time::Duration;
+        use zc::user_service::{execute, install};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        let source = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+        std::fs::copy(source, &binary).unwrap();
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let runner = support::FakeManager::new(platform());
+        let original = execute(
+            "start",
+            zc::service::PrepareOptions {
+                config: Some(config.to_str().unwrap().into()),
+                port: Some(port()),
+                ..Default::default()
+            },
+            &binary,
+            &runner,
+        )
+        .await
+        .unwrap();
+        let runtime_path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let descriptor = std::fs::read(runtime_path.join("zc.daemon.json")).unwrap();
+        let pid = rustix::process::Pid::from_raw(original["pid"].as_u64().unwrap() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while rustix::process::test_kill_process(pid).is_ok() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let publisher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/install/local-dev-install.sh");
+        install(source, &bin, &publisher, &runner).await.unwrap();
+        assert_eq!(
+            execute("status", Default::default(), &binary, &runner)
+                .await
+                .unwrap()["running"],
+            false
+        );
+        assert_eq!(
+            std::fs::read(runtime_path.join("zc.daemon.json")).unwrap(),
+            descriptor
+        );
+    });
+}
+
+#[test]
+fn readiness_deadline_bounds_manager_work_and_joins_its_helpers() {
+    if !isolated("readiness_deadline_bounds_manager_work_and_joins_its_helpers") {
+        return;
+    }
+    runtime().block_on(async {
+        use std::time::Duration;
+        use zc::user_service::{execute, install};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        let source = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+        std::fs::copy(source, &binary).unwrap();
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let runner = support::FakeManager::new(platform());
+        execute(
+            "start",
+            zc::service::PrepareOptions {
+                config: Some(config.to_str().unwrap().into()),
+                port: Some(port()),
+                ..Default::default()
+            },
+            &binary,
+            &runner,
+        )
+        .await
+        .unwrap();
+        std::fs::write(home.join("pause-readiness-ready"), "").unwrap();
+        let publisher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/install/local-dev-install.sh");
+        let entered = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !home.join("entered").exists() {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            std::time::Instant::now()
+        };
+        let (result, began) = tokio::join!(install(source, &bin, &publisher, &runner), entered);
+        let elapsed = began.elapsed();
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("TIMEOUT"), "{error:#}");
+        std::fs::write(home.join("release"), "").unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !home.join("late-publication").exists(),
+            "readiness timeout left a command helper alive"
+        );
+        assert!(
+            elapsed < Duration::from_secs(12),
+            "readiness command exceeded its shared budget: {elapsed:?}"
+        );
+    });
+}
+
+#[test]
+fn asynchronous_stop_rejects_replaced_runtime_owners_before_publication() {
+    if !isolated("asynchronous_stop_rejects_replaced_runtime_owners_before_publication") {
+        return;
+    }
+    runtime().block_on(async {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use zc::user_service::{execute, install};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let runtime_path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        let source = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+        std::fs::copy(source, &binary).unwrap();
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let publisher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/install/local-dev-install.sh");
+        for change in ["cleanup", "nonce", "service_id", "pid", "lock", "directory"] {
+            let runner = early_stop::EarlyStopManager::new(platform());
+            execute(
+                "start",
+                zc::service::PrepareOptions {
+                    config: Some(config.to_str().unwrap().into()),
+                    port: Some(port()),
+                    ..Default::default()
+                },
+                &binary,
+                &runner,
+            )
+            .await
+            .unwrap();
+            let inode = binary.metadata().unwrap().ino();
+            let original = std::fs::read_to_string(runtime_path.join("zc.daemon.json")).unwrap();
+            let descriptor: serde_json::Value = serde_json::from_str(&original).unwrap();
+            let saved = home.join("saved-runtime-owner");
+            let accepted = runner.defer_stop();
+            let mutation = async {
+                accepted.await.unwrap();
+                match change {
+                    "cleanup" => {
+                        let dir = zc::fsutil::SecureDir::open(&runtime_path).unwrap();
+                        let guard = dir
+                            .lock("zc.daemon.lock", std::time::Duration::from_secs(1))
+                            .unwrap();
+                        dir.remove_file("zc.daemon.json").unwrap();
+                        dir.remove_file("zc.pid").unwrap();
+                        drop(guard);
+                        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                        assert_eq!(
+                            binary.metadata().unwrap().ino(),
+                            inode,
+                            "published before instance lock release"
+                        );
+                        let _guard = dir
+                            .lock("zc.daemon.lock", std::time::Duration::from_secs(1))
+                            .unwrap();
+                        dir.atomic_write("zc.daemon.json", original.as_bytes())
+                            .unwrap();
+                        dir.atomic_write("zc.pid", format!("{}\n", descriptor["pid"]).as_bytes())
+                            .unwrap();
+                        rustix::process::kill_process(
+                            rustix::process::Pid::from_raw(
+                                descriptor["pid"].as_u64().unwrap() as i32
+                            )
+                            .unwrap(),
+                            rustix::process::Signal::TERM,
+                        )
+                        .unwrap();
+                    }
+                    "lock" => {
+                        std::fs::rename(runtime_path.join("zc.lock"), &saved).unwrap();
+                        std::fs::write(runtime_path.join("zc.lock"), "").unwrap();
+                        std::fs::set_permissions(
+                            runtime_path.join("zc.lock"),
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .unwrap();
+                    }
+                    "directory" => {
+                        std::fs::rename(&runtime_path, &saved).unwrap();
+                        std::fs::create_dir(&runtime_path).unwrap();
+                        std::fs::set_permissions(
+                            &runtime_path,
+                            std::fs::Permissions::from_mode(0o700),
+                        )
+                        .unwrap();
+                    }
+                    field => {
+                        let old = serde_json::to_string(&descriptor[field]).unwrap();
+                        let new = if field == "pid" {
+                            "1".into()
+                        } else {
+                            format!("\"{}\"", "0".repeat(32))
+                        };
+                        let changed = original
+                            .replace(&format!("\"{field}\":{old}"), &format!("\"{field}\":{new}"));
+                        let dir = zc::fsutil::SecureDir::open(&runtime_path).unwrap();
+                        let _guard = dir
+                            .lock("zc.daemon.lock", std::time::Duration::from_secs(1))
+                            .unwrap();
+                        dir.atomic_write("zc.daemon.json", changed.as_bytes())
+                            .unwrap();
+                    }
+                }
+            };
+            let (result, ()) = tokio::join!(install(source, &bin, &publisher, &runner), mutation);
+            if change == "cleanup" {
+                result.unwrap();
+                assert_eq!(
+                    execute("status", Default::default(), &binary, &runner)
+                        .await
+                        .unwrap()["running"],
+                    true
+                );
+                continue;
+            }
+            // Restore only this isolated fixture so its real process can clean up.
+            match change {
+                "lock" => {
+                    std::fs::rename(&saved, runtime_path.join("zc.lock")).unwrap();
+                }
+                "directory" => {
+                    std::fs::remove_dir_all(&runtime_path).unwrap();
+                    std::fs::rename(&saved, &runtime_path).unwrap();
+                }
+                _ => {
+                    std::fs::write(runtime_path.join("zc.daemon.json"), original).unwrap();
+                }
+            }
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("SERVICE_RECOVERY_FAILED"),
+                "{change}: {error:#}"
+            );
+            assert_eq!(
+                binary.metadata().unwrap().ino(),
+                inode,
+                "{change}: target was republished"
+            );
+        }
+    });
 }
 
 fn isolated(name: &str) -> bool {
@@ -1402,7 +1825,8 @@ fn bounded_command_timeout_and_cancellation_kill_publisher_descendants() {
             let script = r#"import os, pathlib, time, sys
 root = pathlib.Path(sys.argv[1])
 if os.fork() == 0:
-    (root / 'child').write_text(str(os.getpid()))
+    (root / 'child.tmp').write_text(str(os.getpid()))
+    (root / 'child.tmp').replace(root / 'child')
     while not (root / 'release').exists(): time.sleep(.01)
     (root / 'late-publication').write_text('unsafe')
     os._exit(0)
@@ -1717,13 +2141,21 @@ if [ "$phase" = post-publish ]; then pause; fi
                     .await
                     .unwrap();
                 assert_eq!(state["enabled"], true, "{phase}: {message}");
-                assert_eq!(state["running"], true, "{phase}: {message}");
-                assert_eq!(state["mixed_port"], mixed);
-                if phase == "readiness-ready" {
-                    // The manager command's result was lost: the new process is
-                    // not a captured startup PID, so recovery must not stop it.
+                assert_eq!(state["running"], phase != "post-stop", "{phase}: {message}");
+                assert_eq!(state["configured_port"], mixed);
+                let uncertain = matches!(phase, "pre-stop" | "post-stop" | "readiness-ready");
+                if uncertain {
+                    // A killed client does not prove its native stop request was
+                    // revoked. An uncaptured startup PID is equally uncertain.
                     assert!(message.contains("RECOVERY_FAILED"), "{message}");
-                    assert_ne!(state["pid"], old["pid"]);
+                    if phase == "readiness-ready" {
+                        assert_ne!(state["pid"], old["pid"]);
+                    } else {
+                        assert_eq!(std::fs::read(&record_path).unwrap(), old_record);
+                        if phase == "pre-stop" {
+                            assert_eq!(state["pid"], old["pid"]);
+                        }
+                    }
                     assert!(std::fs::read_dir(&bin).unwrap().any(|e| {
                         e.unwrap()
                             .file_name()
@@ -1733,10 +2165,6 @@ if [ "$phase" = post-publish ]; then pause; fi
                     }));
                 } else {
                     assert!(message.contains("ROLLED_BACK"), "{phase}: {message}");
-                    if phase == "pre-stop" {
-                        assert_eq!(state["pid"], old["pid"]);
-                        assert_eq!(std::fs::read(&record_path).unwrap(), old_record);
-                    }
                 }
                 if phase != "readiness-ready" {
                     assert_eq!(
@@ -1762,7 +2190,7 @@ if [ "$phase" = post-publish ]; then pause; fi
                 );
                 println!(
                     "boundary={phase} signal={signal:?} recovery={} late_publication=false",
-                    if phase == "readiness-ready" {
+                    if uncertain {
                         "uncertain-retained"
                     } else {
                         "restored"
@@ -2397,6 +2825,55 @@ fn stopped_registered_reload_reports_service_ownership() {
     if isolated("stopped_registered_reload_reports_service_ownership") {
         stopped_registration_rejects_manual_preparation("reload");
     }
+}
+
+#[test]
+fn systemd_path_delimiters_do_not_hide_additional_commands_or_arguments() {
+    if !isolated("systemd_path_delimiters_do_not_hide_additional_commands_or_arguments")
+        || platform() != zc::user_service::Platform::Systemd
+    {
+        return;
+    }
+    runtime().block_on(async {
+        use std::{future::Future, path::Path, pin::Pin};
+        use zc::user_service::{CommandOutput, CommandRunner, Platform, execute};
+        struct ExtraExec<'a> { inner: &'a support::FakeManager, extra_command: bool }
+        impl CommandRunner for ExtraExec<'_> {
+            fn platform(&self) -> Platform { Platform::Systemd }
+            fn authorize<'a>(&'a self, home: &'a Path) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> { self.inner.authorize(home) }
+            fn run<'a>(&'a self, program: &'a str, args: &'a [String]) -> Pin<Box<dyn Future<Output = anyhow::Result<CommandOutput>> + 'a>> {
+                Box::pin(async move {
+                    let mut output = self.inner.run(program, args).await?;
+                    if args.iter().any(|arg| arg == "show") {
+                        output.stdout = if self.extra_command {
+                            output.stdout.replace("status=0 }", "status=0 } ; { path=/foreign/zc ; argv[]=/foreign/zc ; ignore_errors=no ; status=0 }")
+                        } else {
+                            output.stdout.replace(" ; ignore_errors=no ;", " --extra ; ignore_errors=no ;")
+                        };
+                    }
+                    Ok(output)
+                })
+            }
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = home.join("bin} ;valid");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        std::fs::copy(env!("CARGO_BIN_EXE_zc"), &binary).unwrap();
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let runner = support::FakeManager::new(Platform::Systemd);
+        let original = execute("start", zc::service::PrepareOptions {
+            config: Some(config.to_str().unwrap().into()), port: Some(port()), ..Default::default()
+        }, &binary, &runner).await.unwrap();
+        for extra_command in [true, false] {
+            let reply = ExtraExec { inner: &runner, extra_command };
+            let error = execute("status", Default::default(), &binary, &reply).await.unwrap_err();
+            assert!(error.to_string().contains("SERVICE_FOREIGN"), "{error:#}");
+        }
+        assert_eq!(execute("status", Default::default(), &binary, &runner).await.unwrap()["pid"], original["pid"]);
+        execute("stop", Default::default(), &binary, &runner).await.unwrap();
+    });
 }
 
 #[test]

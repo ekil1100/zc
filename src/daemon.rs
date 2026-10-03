@@ -2014,7 +2014,13 @@ pub(crate) fn service_launch_lock() -> Result<FileLock> {
 }
 
 pub(crate) struct ServiceCapture {
+    runtime: Directory,
+    lock_file: File,
     descriptor: Option<Descriptor>,
+    // An already exited process can leave valid public files behind. Preserve
+    // that stopped baseline without treating it as a running owner or deleting it.
+    inactive_descriptor: Option<Descriptor>,
+    inactive_pid: Option<u32>,
     pub prepared: Option<Prepared>,
 }
 impl ServiceCapture {
@@ -2024,13 +2030,79 @@ impl ServiceCapture {
     pub fn ready(&self) -> bool {
         self.descriptor.as_ref().is_some_and(|d| d.ready)
     }
-    pub fn verify(&self) -> Result<()> {
-        let runtime = runtime_dir(false)?.context("runtime missing")?;
+    fn verify_runtime(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        self.runtime.dir.validate_path(&self.runtime.path)?;
+        let expected = self.lock_file.metadata()?;
+        let current = self.runtime.dir.file_metadata("zc.lock")?;
         ensure!(
-            observe(&runtime)? == self.descriptor,
-            "SERVICE_CONTENDED: captured runtime changed"
+            expected.dev() == current.dev() && expected.ino() == current.ino(),
+            "SERVICE_CONTENDED: captured instance lock changed"
         );
         Ok(())
+    }
+    pub fn verify(&self) -> Result<()> {
+        self.verify_runtime()?;
+        ensure!(
+            observe(&self.runtime)? == self.descriptor,
+            "SERVICE_CONTENDED: captured runtime changed"
+        );
+        if self.descriptor.is_none() {
+            ensure!(
+                read_descriptor(&self.runtime.dir)? == self.inactive_descriptor
+                    && pid(&self.runtime.dir)? == self.inactive_pid,
+                "SERVICE_CONTENDED: captured stopped state changed"
+            );
+        }
+        self.verify_runtime()
+    }
+    /// Observe only the captured owner's exit. Descriptor cleanup and selection
+    /// publication share this short critical section; no lock spans an await.
+    pub fn stopped(&self) -> Result<bool> {
+        self.verify_runtime()?;
+        let guard = match self
+            .runtime
+            .dir
+            .lock("zc.daemon.lock", Duration::from_millis(1))
+        {
+            Ok(guard) => guard,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(current) = read_descriptor(&self.runtime.dir)? {
+            ensure!(
+                self.descriptor
+                    .as_ref()
+                    .or(self.inactive_descriptor.as_ref())
+                    .is_some_and(|expected| current.pid == expected.pid
+                        && current.nonce == expected.nonce
+                        && current.service_id == expected.service_id),
+                "SERVICE_CONTENDED: runtime instance changed while stopping"
+            );
+        }
+        if let Some(current) = pid(&self.runtime.dir)? {
+            ensure!(
+                Some(current) == self.pid().or(self.inactive_pid),
+                "SERVICE_CONTENDED: runtime PID changed while stopping"
+            );
+        }
+        // Probe the pinned file, never recreate a missing/replaced lock. An exit
+        // can remove both public files before its final owner releases this lock.
+        let held = match self.lock_file.try_lock() {
+            Ok(()) => {
+                self.lock_file.unlock()?;
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        };
+        ensure!(
+            !held || self.descriptor.is_some(),
+            "SERVICE_CONTENDED: instance appeared while stopping"
+        );
+        guard.validate(&self.runtime.dir, "zc.daemon.lock")?;
+        self.verify_runtime()?;
+        Ok(!held)
     }
 }
 pub(crate) async fn capture_service(id: &str, selections: bool) -> Result<ServiceCapture> {
@@ -2047,6 +2119,12 @@ pub(crate) async fn capture_service(id: &str, selections: bool) -> Result<Servic
             "SERVICE_CONTENDED: instance startup is in progress"
         );
     }
+    let lock_file = runtime.dir.hold_private_file("zc.lock")?;
+    let (inactive_descriptor, inactive_pid) = if descriptor.is_none() {
+        (read_descriptor(&runtime.dir)?, pid(&runtime.dir)?)
+    } else {
+        (None, None)
+    };
     let mut prepared = descriptor
         .as_ref()
         .map(|d| prepared_for(&runtime, d))
@@ -2078,7 +2156,11 @@ pub(crate) async fn capture_service(id: &str, selections: bool) -> Result<Servic
         parse_config(p)?;
     }
     let captured = ServiceCapture {
+        runtime,
+        lock_file,
         descriptor,
+        inactive_descriptor,
+        inactive_pid,
         prepared,
     };
     captured.verify()?;

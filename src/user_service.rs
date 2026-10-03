@@ -35,8 +35,10 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 /// Implementations must bound execution/output, join command cleanup before
-/// returning errors, and never echo manager output. Privilege-changing or
-/// detached command helpers are unsupported (manager-owned daemons are separate).
+/// returning errors, and never echo manager output. Use `run_bounded` for
+/// external commands so lifecycle scopes share their remaining time budget.
+/// Privilege-changing or detached command helpers are unsupported
+/// (manager-owned daemons are separate).
 pub trait CommandRunner {
     fn platform(&self) -> Platform;
     fn authorize<'a>(&'a self, home: &'a Path) -> CommandFuture<'a, ()>;
@@ -112,6 +114,9 @@ tokio::task_local! {
     // Scoped to the installer only. Recovery deliberately uses an uncancelled
     // scope and is awaited to completion, even after repeated OS signals.
     static INSTALL_CANCEL: tokio::sync::watch::Receiver<bool>;
+    // Limits command work inside readiness/stop confirmation. Cleanup is still
+    // awaited by run_bounded; an outer timeout must never drop that future.
+    static COMMAND_DEADLINE: tokio::time::Instant;
 }
 fn check_install_interruption() -> Result<()> {
     ensure!(
@@ -227,6 +232,14 @@ impl Drop for CommandGroup {
 pub async fn run_bounded(program: &str, args: &[String]) -> Result<CommandOutput> {
     use std::process::Stdio;
     check_install_interruption()?;
+    let command_limit = tokio::time::Instant::now() + WAIT;
+    let deadline = COMMAND_DEADLINE
+        .try_with(|deadline| command_limit.min(*deadline))
+        .unwrap_or(command_limit);
+    ensure!(
+        tokio::time::Instant::now() < deadline,
+        "SERVICE_MANAGER_TIMEOUT: command deadline exceeded"
+    );
     let mut command = Command::new(program);
     if program == "/usr/bin/systemctl" {
         let runtime = format!("/run/user/{}", rustix::process::geteuid().as_raw());
@@ -272,7 +285,7 @@ pub async fn run_bounded(program: &str, args: &[String]) -> Result<CommandOutput
     let result = tokio::select! {
         biased;
         _ = install_interrupted() => Err(anyhow::anyhow!("SERVICE_INSTALL_INTERRUPTED: installation interrupted")),
-        result = tokio::time::timeout(WAIT, async {
+        result = tokio::time::timeout_at(deadline, async {
             let ((), stdout, stderr) = tokio::try_join!(group.exited(), read(stdout), read(stderr))?;
             Ok::<_, anyhow::Error>((stdout, stderr))
         }) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("SERVICE_MANAGER_TIMEOUT: command deadline exceeded"))),
@@ -649,7 +662,10 @@ impl Manager<'_> {
                     .get("ExecStart")
                     .context("SERVICE_FOREIGN: loaded invocation unavailable")?;
                 ensure!(
-                    exec.starts_with(&expected) && !exec.contains("} ;"),
+                    // The exact registered path may itself contain "} ;".
+                    // Only the remaining manager metadata can delimit another command.
+                    exec.strip_prefix(&expected)
+                        .is_some_and(|rest| !rest.contains("} ;")),
                     "SERVICE_FOREIGN: loaded invocation differs from registration"
                 );
                 let pid: u32 = properties
@@ -882,7 +898,9 @@ pub async fn execute(
                         .inspect(Some(&record), verify_definitions(&dir, &record)?)
                         .await?;
                     verify_recovery_owner(&record, &current, started_pid, None).await?;
+                    let stopping = daemon::capture_service(&record.id, false).await?;
                     manager.stop(&record, &current).await?;
+                    wait_stopped(&manager, &dir, &record, &stopping).await?;
                     write_record(&dir, &previous)?;
                     drop(launch);
                     if captured.ready() {
@@ -923,6 +941,47 @@ pub async fn execute(
     )
 }
 
+// A successful manager command acknowledges stop, not daemon exit. Keep the
+// captured owner and startup gate until cleanup releases its original lock.
+async fn wait_stopped(
+    manager: &Manager<'_>,
+    dir: &SecureDir,
+    record: &Registration,
+    captured: &daemon::ServiceCapture,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    COMMAND_DEADLINE
+        .scope(deadline, async {
+            loop {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "SERVICE_STOP_FAILED: daemon stop deadline exceeded"
+                );
+                if captured.stopped()? {
+                    let current = manager
+                        .inspect(Some(record), verify_definitions(dir, record)?)
+                        .await?;
+                    ensure!(
+                        current.pid.is_none() || current.pid == captured.pid(),
+                        "SERVICE_CONTENDED: manager instance changed while stopping"
+                    );
+                    if current.pid.is_none() {
+                        ensure!(
+                            tokio::time::Instant::now() < deadline,
+                            "SERVICE_STOP_FAILED: daemon stop deadline exceeded"
+                        );
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(25)),
+                )
+                .await;
+            }
+        })
+        .await
+}
+
 // A stop failure may mean either no effect or a completed stop. Restore only
 // our registration; never repeat the stop or adopt a process to infer success.
 async fn stop_registered(
@@ -937,18 +996,7 @@ async fn stop_registered(
     let result = async {
         write_record(dir, &gated)?;
         manager.stop(original, current).await?;
-        let after = manager
-            .inspect(Some(original), verify_definitions(dir, original)?)
-            .await?;
-        ensure!(
-            after.pid.is_none()
-                && daemon::capture_service(&original.id, false)
-                    .await?
-                    .pid()
-                    .is_none(),
-            "SERVICE_STOP_FAILED: daemon is still present"
-        );
-        Ok::<_, anyhow::Error>(())
+        wait_stopped(manager, dir, original, captured).await
     }
     .await;
     if let Err(error) = result {
@@ -1029,32 +1077,47 @@ async fn start_ready(
     }
     manager.start(record, current.loaded).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let current = manager
-            .inspect(Some(record), verify_definitions(dir, record)?)
-            .await?;
-        if let Some(pid) = current.pid {
-            ensure!(
-                started_pid.is_none_or(|expected| expected == pid),
-                "SERVICE_CONTENDED: manager process changed during startup"
-            );
-            *started_pid = Some(pid);
-        }
-        if let Ok(observed) = daemon::capture_service(&record.id, false).await {
-            ensure!(
-                observed.pid().is_none() || observed.pid() == current.pid,
-                "SERVICE_INSTANCE_MISMATCH: readiness belongs to another process"
-            );
-            if observed.ready() {
-                return Ok(());
+    COMMAND_DEADLINE
+        .scope(deadline, async {
+            loop {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "SERVICE_START_FAILED: manager success did not produce a ready daemon"
+                );
+                let current = manager
+                    .inspect(Some(record), verify_definitions(dir, record)?)
+                    .await?;
+                if let Some(pid) = current.pid {
+                    ensure!(
+                        started_pid.is_none_or(|expected| expected == pid),
+                        "SERVICE_CONTENDED: manager process changed during startup"
+                    );
+                    *started_pid = Some(pid);
+                }
+                if let Ok(observed) = daemon::capture_service(&record.id, false).await {
+                    ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "SERVICE_START_FAILED: manager success did not produce a ready daemon"
+                    );
+                    ensure!(
+                        observed.pid().is_none() || observed.pid() == current.pid,
+                        "SERVICE_INSTANCE_MISMATCH: readiness belongs to another process"
+                    );
+                    if observed.ready() {
+                        return Ok(());
+                    }
+                }
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "SERVICE_START_FAILED: manager success did not produce a ready daemon"
+                );
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(50)),
+                )
+                .await;
             }
-        }
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "SERVICE_START_FAILED: manager success did not produce a ready daemon"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        })
+        .await
 }
 /// Foreground manager entry. The registration and random identity, never an
 /// environment flag, authorize this invocation; launch ownership closes races.
@@ -1168,6 +1231,14 @@ async fn publish(source: &Path, target_dir: &Path, publisher: &Path) -> Result<(
     );
     Ok(())
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallStop {
+    NotRequested,
+    Unconfirmed,
+    Acknowledged,
+    Complete,
+}
+
 /// Cold activation transaction. No manager calls are made for a first install.
 /// The caller must await completion; the CLI uses `install_with_signals` rather
 /// than dropping this future, so command cleanup and rollback retain their locks.
@@ -1309,6 +1380,7 @@ pub async fn install(
         None
     };
     let mut publication_attempted = false;
+    let mut stop_progress = InstallStop::NotRequested;
     let result = async {
         check_install_interruption()?;
     if record.is_some() {
@@ -1335,14 +1407,11 @@ pub async fn install(
             );
             record.allowed = false;
             write_record(dir, record)?;
+            stop_progress = InstallStop::Unconfirmed;
             manager.stop(record, &current).await?;
-            ensure!(
-                daemon::capture_service(&record.id, false)
-                    .await?
-                    .pid()
-                    .is_none(),
-                "SERVICE_STOP_FAILED: service is still running"
-            );
+            stop_progress = InstallStop::Acknowledged;
+            wait_stopped(&manager, dir, record, &capture).await?;
+            stop_progress = InstallStop::Complete;
         }
         let lease = target_fd
             .lock(".zc.binary.lock", Duration::from_secs(1))
@@ -1396,6 +1465,17 @@ pub async fn install(
                 let launch = daemon::service_launch_lock()?;
                 if let Some(record) = &mut record {
                     let dir = &state.as_ref().expect("registered state").1;
+                    if matches!(stop_progress, InstallStop::Unconfirmed | InstallStop::Acknowledged) {
+                        // Reaping a command client cannot revoke an accepted
+                        // native-manager request. Keep the original registration
+                        // and backup when its outcome is still uncertain.
+                        write_record(dir, original_registration.as_ref().context("original registration missing")?)?;
+                        ensure!(stop_progress == InstallStop::Acknowledged,
+                            "SERVICE_RECOVERY_FAILED: stop acknowledgement was lost; original registration retained, running state is uncertain; inspect the manager before retrying");
+                        ensure!(original_capture.as_ref().context("original capture missing")?.stopped()?
+                            && manager.inspect(Some(record), verify_definitions(dir, record)?).await?.pid.is_none(),
+                            "SERVICE_RECOVERY_FAILED: stop completion is uncertain; original registration retained; inspect the manager before retrying");
+                    }
                     record.allowed = false;
                     write_record(dir, record)?;
                     let current = manager
@@ -1412,7 +1492,9 @@ pub async fn install(
                         write_record(dir, original)?;
                         return Ok(());
                     }
+                    let stopping = daemon::capture_service(&record.id, false).await?;
                     manager.stop(record, &current).await?;
+                    wait_stopped(&manager, dir, record, &stopping).await?;
                 }
                 if let Some(backup) = &backup {
                     let original = fsutil::read_regular(backup, 256 * 1024 * 1024)?;

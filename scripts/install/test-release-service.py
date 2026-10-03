@@ -180,8 +180,11 @@ for platform in ("launchd", "systemd"):
         after = assert_state(True, True)
         assert after["pid"] != before["pid"]
         print(f"ROOT_SERVICE_ACTIVATION_ROLLBACK={platform} PASS")
-        # Signals at the handoff's real manager stop, including recovery overlap.
+        # Killing the command client does not revoke an accepted manager stop.
+        # A lost acknowledgement retains evidence and requires explicit recovery.
         for sig in (signal.SIGINT, signal.SIGTERM):
+            registration = home / ".local/state/zc/service/registration.json"
+            old_registration = registration.read_bytes()
             (home / "pause-post-stop").touch()
             for name in ("entered", "release", "late-publication"):
                 (home / name).unlink(missing_ok=True)
@@ -212,16 +215,19 @@ for platform in ("launchd", "systemd"):
                         child.kill()
                         child.wait()
             message = (home / "output").read_text()
-            assert "INTERRUPTED" in message and "ROLLED_BACK" in message, message
+            assert "INTERRUPTED" in message and "RECOVERY_FAILED" in message, message
             assert binary.read_bytes() == old_bytes
-            assert_state(True, True)
+            assert registration.read_bytes() == old_registration
+            assert list(bin_dir.glob(".zc.recovery.*"))
+            assert_state(False, True)
             assert not (bin_dir / ".zc.install.lock").exists()
             (home / "release").touch()
             time.sleep(0.2)
             assert not (home / "late-publication").exists()
             print(
-                f"ROOT_SERVICE_SIGNAL={platform} {sig.name} recovered/no-late-publication PASS"
+                f"ROOT_SERVICE_SIGNAL={platform} {sig.name} uncertain-retained/no-late-publication PASS"
             )
+            service("start")
         service("stop")
     finally:
         subprocess.run(
