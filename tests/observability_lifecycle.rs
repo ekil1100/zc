@@ -335,6 +335,11 @@ fn failed_bind_has_final_evidence_and_does_not_claim_an_unclean_exit() {
         .unwrap();
     assert_eq!(failed["phase"], "mixed_bind");
     assert_eq!(failed["error_kind"], "AddrInUse");
+    assert_eq!(failed["component"], "mixed_listener");
+    assert_eq!(failed["operation"], "initialize_and_bind");
+    assert_eq!(failed["cause"], "io");
+    assert_eq!(failed["os_errno"], libc::EADDRINUSE);
+    let retained = failed.clone();
     assert!(
         events
             .iter()
@@ -346,13 +351,56 @@ fn failed_bind_has_final_evidence_and_does_not_claim_an_unclean_exit() {
     // The collision socket must be released before testing successful recovery.
     // Two sequential ephemeral allocations are allowed to return the same port.
     drop(listener);
+    // Force startup rotation with real fatal evidence at the tail of the old log.
+    let old = fs::read(f.runtime.join("zc.log")).unwrap();
+    let mut full = vec![b'\n'; 8 * 1024 * 1024 - old.len()];
+    full.extend_from_slice(&old);
+    fs::write(f.runtime.join("zc.log"), full).unwrap();
     f.start();
     f.json(&["stop", "--json"]);
+    assert!(f.runtime.join("zc.log.1").exists());
+    assert!(
+        f.events().contains(&retained),
+        "restart erased fatal evidence"
+    );
     assert!(
         !f.events()
             .iter()
             .any(|e| e["event"] == "previous_exit_unknown")
     );
+}
+
+#[test]
+fn controller_bind_failure_retains_typed_os_cause() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    assert_ne!(address.port(), 7899);
+    fs::write(&f.config, format!(
+        "external-controller: {address}\nsecret: private-controller-secret\nrules: ['MATCH,DIRECT']\n"
+    )).unwrap();
+    let output = f.output(&[
+        "start",
+        "--foreground",
+        "-c",
+        f.config.to_str().unwrap(),
+        "--port",
+        &f.port.to_string(),
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let events = f.events();
+    let failed = events
+        .iter()
+        .find(|e| e["event"] == "daemon_failed")
+        .unwrap();
+    assert_eq!(failed["phase"], "controller_bind");
+    assert_eq!(failed["component"], "controller");
+    assert_eq!(failed["operation"], "bind");
+    assert_eq!(failed["cause"], "io");
+    assert_eq!(failed["error_kind"], "AddrInUse");
+    assert_eq!(failed["os_errno"], libc::EADDRINUSE);
+    assert!(!format!("{events:?}").contains("private-controller-secret"));
 }
 
 #[test]

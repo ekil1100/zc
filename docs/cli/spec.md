@@ -262,11 +262,11 @@ doctor 最多保留 256 条 errors/warnings 合计、每条 512 rendered bytes�
 
 ### 稳定性日志
 
-后台与前台实例均记录结构化生命周期、连接故障和资源摘要，详见[稳定性观测](../reliability/observability.md)。事件带 `timestamp_ms`、`level`、`event`、`pid` 和 `instance`；生命周期额外包含 `phase` 与有限 `error_kind`。ready 发布后的日志失败不撤销启动，最终证据尽力写入，不用缺少错误日志证明健康。
+后台与前台实例均记录结构化生命周期、连接故障和资源摘要，详见[稳定性观测](../reliability/observability.md)。事件带 `timestamp_ms`、`level`、`event`、`pid` 和 `instance`；生命周期额外包含 `phase` 与有限 `error_kind`；`daemon_failed` 还提供安全的组件、操作、类型化原因和 OS errno。ready 发布后的日志失败不撤销启动，最终证据尽力写入，不用缺少错误日志证明健康。
 
 连接故障按 `ingress/dns/connect/tls/transfer/udp` 分类，首次记录后每 30 秒合并同类错误，退出补汇总；正常断连和策略拒绝不刷故障。独立线程记录初始、30 秒周期及最终 CPU/RSS 与连接计数；采样不可用时为 null，不阻止转发。新事件不包含原始错误、目标、请求内容或凭据。
 
-panic 记录不含 payload/位置；未完成的退出标记在下次启动报告 `previous_exit_unknown`，不猜测强杀、断电等根因。损坏标记保留，不据此接管或停止进程。实例流程之前的配置准备、快照认证等失败并非全部写入 daemon 日志，仍以 CLI 错误输出为准。
+panic 记录省略 payload，首个样本保留有界源码文件名、行列与函数栈；重启沿用日志与一代归档，保留窗口受既有轮转规则约束。未完成的退出标记在下次启动报告 `previous_exit_unknown`，不猜测强杀、断电等根因。损坏标记保留，不据此接管或停止进程。实例流程之前的配置准备、快照认证等失败并非全部写入 daemon 日志，仍以 CLI 错误输出为准。
 
 `zc log --json` 保持既有 `{"line":"…"}` 包装；旧纯文本行与新 JSON 事件可共存。单个新事件最多 4 KiB，保留当前日志与一代归档，均保持 owner-only。这些能力不提供自动重启或长稳通过保证。
 

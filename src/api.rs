@@ -1,6 +1,6 @@
 //! Bounded, single-request control API with authentication for wildcard listeners.
 use crate::{config::Config, connection::ConnectionRegistry};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -52,9 +52,9 @@ impl Server {
             "START_CONTROLLER_INVALID: controller must be explicit 127.0.0.1:<port> or 0.0.0.0:<port>"
         );
         config.validate_controller_auth()?;
-        let listener = TcpListener::bind(address).await.map_err(|error| {
-            anyhow::anyhow!("START_CONTROLLER_PORT_IN_USE: cannot bind {address}: {error}")
-        })?;
+        let listener = TcpListener::bind(address)
+            .await
+            .with_context(|| format!("START_CONTROLLER_PORT_IN_USE: cannot bind {address}"))?;
         Ok(Some(Self {
             listener,
             state: Arc::new(State {

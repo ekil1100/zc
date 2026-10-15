@@ -1208,6 +1208,17 @@ impl InstanceScope {
             tasks: tokio::task::JoinSet::new(),
         }
     }
+    fn spawn(
+        &mut self,
+        future: impl std::future::Future<Output = Result<()>> + Send + 'static,
+        operation: observability::FatalOperation,
+    ) {
+        self.tasks.spawn(async move {
+            observability::catch_instance_panic(future)
+                .await
+                .context(operation)
+        });
+    }
     async fn drain(&mut self) -> Result<()> {
         if let Some(control) = &self.control {
             control.stopped.store(true, Ordering::Release);
@@ -1387,8 +1398,8 @@ async fn run_instance_inner(
             eprintln!("Runtime listening on {address} (foreground)");
         }
         scope.phase = "runtime";
-        scope.tasks.spawn(proxy.run(wait_shutdown(scope.shutdown.subscribe())));
-        if let Some(controller) = controller { scope.tasks.spawn(controller.run(wait_shutdown(scope.shutdown.subscribe()))); }
+        scope.spawn(proxy.run(wait_shutdown(scope.shutdown.subscribe())), observability::FatalOperation::MixedRun);
+        if let Some(controller) = controller { scope.spawn(controller.run(wait_shutdown(scope.shutdown.subscribe())), observability::FatalOperation::ControllerRun); }
         loop {
             tokio::select! {
                 _ = terminate.recv() => { scope.phase = "sigterm"; break Ok(()); },
@@ -1399,7 +1410,7 @@ async fn run_instance_inner(
                         runtime.dir.validate_path(&runtime.path)?; lock.validate(&runtime.dir, "zc.lock")?;
                         let (guardian, guardian_lock) = scope.guardian.as_ref().expect("lifecycle owner acquired");
                         guardian_lock.validate(&guardian.dir, "zc.lifecycle.lock")?;
-                        ensure!(!control.stopped.load(Ordering::Acquire), "RUNTIME_FAILED: selection publication failed");
+                        ensure!(!control.stopped.load(Ordering::Acquire), observability::RuntimeFault::SelectionPublicationFailed);
                         let stop_name = format!("zc.stop.{nonce}");
                         if !runtime.dir.exists(&stop_name)? { return Ok(false); }
                         let request = runtime.dir.read(&stop_name, 33)?;
@@ -2201,6 +2212,54 @@ mod lifecycle_tests {
     use super::*;
     use std::fs;
     use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn listener_failure_keeps_component_and_errno_through_drain() {
+        if std::env::var_os("ZC_EVIDENCE_HARNESS").is_some() {
+            let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let dir = SecureDir::open(&path).unwrap();
+            let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
+            for operation in [
+                observability::FatalOperation::MixedRun,
+                observability::FatalOperation::ControllerRun,
+            ] {
+                let evidence =
+                    Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock.clone())
+                        .unwrap();
+                let mut scope = InstanceScope::new();
+                scope.spawn(
+                    async { Err(io::Error::from_raw_os_error(libc::EMFILE).into()) },
+                    operation,
+                );
+                let result = scope.drain().await;
+                assert!(result.is_err());
+                evidence.finish("shutdown", result.as_ref().err()).await;
+            }
+            return;
+        }
+        let (home, output) = observability::tests::harness(
+            "daemon::lifecycle_tests::listener_failure_keeps_component_and_errno_through_drain",
+            "listener-failure",
+        );
+        assert!(output.status.success(), "{output:?}");
+        let text = fs::read_to_string(home.path().join("runtime/zc.log")).unwrap();
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "daemon_failed")
+            .collect();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["component"], "mixed_listener");
+        assert_eq!(failures[1]["component"], "controller");
+        for failed in failures {
+            assert_eq!(failed["operation"], "run_listener");
+            assert_eq!(failed["cause"], "io");
+            assert_eq!(failed["os_errno"], libc::EMFILE);
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn instance_panic_retains_owners_until_late_udp_drop_panic_is_joined() {

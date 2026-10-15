@@ -9,8 +9,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -155,6 +155,79 @@ fn error_index(error: &anyhow::Error) -> usize {
         _ => 0,
     }
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FatalOperation {
+    MixedRun,
+    ControllerRun,
+}
+impl FatalOperation {
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::MixedRun => ("mixed_listener", "run_listener"),
+            Self::ControllerRun => ("controller", "run_listener"),
+        }
+    }
+}
+impl fmt::Display for FatalOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::MixedRun => "RUNTIME_FAILED: mixed listener failed",
+            Self::ControllerRun => "RUNTIME_FAILED: controller listener failed",
+        })
+    }
+}
+impl std::error::Error for FatalOperation {}
+
+// Fatal diagnostics are a safe projection, not a redacted Display/error chain.
+// Unknown application errors keep an explicit unclassified cause and operation.
+#[derive(Serialize)]
+struct FatalDiagnostic {
+    component: &'static str,
+    operation: &'static str,
+    cause: &'static str,
+    error_kind: &'static str,
+    os_errno: Option<i32>,
+}
+impl FatalDiagnostic {
+    fn capture(phase: &'static str, error: &anyhow::Error) -> Self {
+        let (mut component, mut operation) = match phase {
+            "lifecycle_lock" => ("runtime_owner", "acquire_lifecycle_lock"),
+            "config" => ("configuration", "parse_snapshot"),
+            "mixed_bind" => ("mixed_listener", "initialize_and_bind"),
+            "controller_bind" => ("controller", "bind"),
+            "readiness" => ("daemon", "publish_readiness"),
+            "runtime_guard" => ("runtime_owner", "validate_and_check_stop"),
+            "shutdown" => ("daemon", "drain_tasks"),
+            "observability" => ("observability", "spawn_reporter"),
+            _ => ("daemon", "run_instance"),
+        };
+        let io = error.chain().find_map(|e| e.downcast_ref::<io::Error>());
+        let fault = error.downcast_ref::<RuntimeFault>();
+        if let Some(context) = error.downcast_ref::<FatalOperation>() {
+            (component, operation) = context.labels();
+        }
+        if matches!(fault, Some(RuntimeFault::SelectionPublicationFailed)) {
+            (component, operation) = ("controller", "publish_selection");
+        }
+        Self {
+            component,
+            operation,
+            cause: fault.map(|f| f.cause()).unwrap_or(if io.is_some() {
+                "io"
+            } else {
+                "unclassified"
+            }),
+            error_kind: match fault {
+                Some(RuntimeFault::TaskCancelled) => "Cancelled",
+                Some(RuntimeFault::SelectionPublicationFailed) => "StateInvariant",
+                Some(_) => "Panic",
+                None => KINDS[error_index(error)],
+            },
+            os_errno: io.and_then(io::Error::raw_os_error),
+        }
+    }
+}
+
 fn increment(counter: &AtomicU64) {
     let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(1))
@@ -165,6 +238,8 @@ pub(crate) struct Observer {
     total: AtomicU64,
     rejected: AtomicU64,
     panics: AtomicU64,
+    panic_claimed: AtomicBool,
+    first_panic: OnceLock<PanicDiagnostic>,
     failures: [[[AtomicU64; KINDS.len()]; SOURCES.len()]; STAGES.len()],
 }
 impl Observer {
@@ -174,6 +249,8 @@ impl Observer {
             total: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             panics: AtomicU64::new(0),
+            panic_claimed: AtomicBool::new(false),
+            first_panic: OnceLock::new(),
             failures: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
             }),
@@ -391,23 +468,149 @@ impl EventLog {
         &self,
         event: &'static str,
         phase: &'static str,
-        error_kind: Option<&'static str>,
+        failure: Option<&FatalDiagnostic>,
     ) -> Result<()> {
-        self.event(
-            json!({"level": if error_kind.is_some() {"error"} else {"info"},
-            "event": event, "phase": phase, "error_kind": error_kind}),
-        )
+        let mut value = json!({"level": if failure.is_some() {"error"} else {"info"},
+            "event": event, "phase": phase, "error_kind": null});
+        if let Some(failure) = failure {
+            // Only our closed diagnostic fields enter the event.
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(serde_json::to_value(failure)?.as_object().unwrap().clone());
+        }
+        self.event(value)
     }
 }
+// Rust backtrace formatting has no stable frame iterator. Stream its output
+// through a bounded line buffer and retain only numeric frame + symbol lines.
+// Never persist source paths, arbitrary formatter output, or panic payloads.
+#[derive(Default)]
+struct TraceSymbols {
+    line: String,
+    frames: Vec<String>,
+    bytes: usize,
+    truncated: bool,
+}
+impl TraceSymbols {
+    fn end_line(&mut self) -> fmt::Result {
+        let line = self.line.trim();
+        if let Some((index, symbol)) = line.split_once(": ")
+            && !index.is_empty()
+            && index.bytes().all(|b| b.is_ascii_digit())
+        {
+            if symbol.is_empty()
+                || !symbol
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_:<> ,{}[]()&;*!+-.#".contains(&b))
+            {
+                self.truncated = true;
+            } else {
+                if self.frames.len() == 16 || self.bytes + line.len() > 2048 {
+                    self.truncated = true;
+                    return Err(fmt::Error);
+                }
+                self.bytes += line.len();
+                self.frames.push(line.to_owned());
+            }
+        }
+        self.line.clear();
+        Ok(())
+    }
+}
+impl fmt::Write for TraceSymbols {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        for ch in value.chars() {
+            if ch == '\n' {
+                self.end_line()?;
+            } else {
+                if self.line.len() + ch.len_utf8() > 512 {
+                    self.truncated = true;
+                    return Err(fmt::Error);
+                }
+                self.line.push(ch);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct CrashLocation {
+    file: String,
+    line: u32,
+    column: u32,
+}
+#[derive(Serialize)]
+struct PanicDiagnostic {
+    location: Option<CrashLocation>,
+    payload_policy: &'static str,
+    backtrace_status: &'static str,
+    backtrace: Vec<String>,
+    backtrace_truncated: bool,
+}
+impl PanicDiagnostic {
+    fn capture(info: &std::panic::PanicHookInfo<'_>) -> Self {
+        use std::backtrace::{Backtrace, BacktraceStatus};
+        use std::fmt::Write;
+        let location = info.location().map(|location| {
+            let basename = location.file().rsplit(['/', '\\']).next().unwrap_or("");
+            let file = if !basename.is_empty()
+                && basename.len() <= 96
+                && basename
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            {
+                basename
+            } else {
+                "omitted"
+            };
+            CrashLocation {
+                file: file.into(),
+                line: location.line(),
+                column: location.column(),
+            }
+        });
+        // Capture the panicking thread, not the later reporter thread. This is
+        // cold-path work, once per instance, independent of RUST_BACKTRACE.
+        let trace = Backtrace::force_capture();
+        let status = match trace.status() {
+            BacktraceStatus::Captured => "captured",
+            BacktraceStatus::Disabled => "disabled",
+            _ => "unsupported",
+        };
+        let mut symbols = TraceSymbols::default();
+        if trace.status() == BacktraceStatus::Captured {
+            if write!(&mut symbols, "{trace}").is_err() {
+                symbols.truncated = true;
+            } else {
+                let _ = symbols.end_line();
+            }
+        }
+        Self {
+            location,
+            payload_policy: "omitted",
+            backtrace_status: status,
+            backtrace: symbols.frames,
+            backtrace_truncated: symbols.truncated,
+        }
+    }
+}
+
 type Hook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
 struct PanicHook(Option<Hook>);
 impl PanicHook {
     fn install(observer: Arc<Observer>) -> Self {
         let previous = std::panic::take_hook();
-        // No allocation, formatting, filesystem operation, mutex, or user data.
-        // Deliberately do not chain the default hook: it prints payload/location.
-        std::panic::set_hook(Box::new(move |_| {
-            observer.panics.fetch_add(1, Ordering::Relaxed);
+        // Do not chain the default hook: it prints arbitrary payloads and paths.
+        // No log writes or application mutex on the panicking thread. Standard
+        // library symbolization may read debug info. The first sample owns
+        // bounded output; later panics only increment the counter.
+        std::panic::set_hook(Box::new(move |info| {
+            increment(&observer.panics);
+            if !observer.panic_claimed.swap(true, Ordering::Relaxed) {
+                let _ = observer.first_panic.set(PanicDiagnostic::capture(info));
+            }
         }));
         Self(Some(previous))
     }
@@ -423,13 +626,45 @@ impl Drop for PanicHook {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RuntimeFault {
+    SelectionPublicationFailed,
+    TaskPanic,
+    TaskCancelled,
+    InstancePanic,
+    InstanceDropPanic,
+}
+impl RuntimeFault {
+    fn cause(self) -> &'static str {
+        match self {
+            Self::SelectionPublicationFailed => "selection_publication_failed",
+            Self::TaskPanic => "task_panic",
+            Self::TaskCancelled => "task_cancelled",
+            Self::InstancePanic => "instance_panic",
+            Self::InstanceDropPanic => "instance_drop_panic",
+        }
+    }
+}
+impl fmt::Display for RuntimeFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SelectionPublicationFailed => "RUNTIME_FAILED: selection publication failed",
+            Self::TaskPanic => "RUNTIME_FAILED: task panicked",
+            Self::TaskCancelled => "RUNTIME_FAILED: task cancelled",
+            Self::InstancePanic => "RUNTIME_FAILED: instance future panicked",
+            Self::InstanceDropPanic => "RUNTIME_FAILED: instance future drop panicked",
+        })
+    }
+}
+impl std::error::Error for RuntimeFault {}
+
 pub(crate) fn task_error(error: tokio::task::JoinError) -> anyhow::Error {
     // JoinError's Display and source retain the private panic payload. Do not
     // attach it as a cause, even when callers request the full error chain.
-    anyhow::anyhow!(if error.is_panic() {
-        "RUNTIME_FAILED: task panicked"
+    anyhow::Error::new(if error.is_panic() {
+        RuntimeFault::TaskPanic
     } else {
-        "RUNTIME_FAILED: task cancelled"
+        RuntimeFault::TaskCancelled
     })
 }
 
@@ -445,23 +680,19 @@ pub(crate) async fn catch_instance_panic(
         // the installed hook has already counted this panic without formatting it.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
             Ok(poll) => poll,
-            Err(_) => std::task::Poll::Ready(Err(anyhow::anyhow!(
-                "RUNTIME_FAILED: instance future panicked"
-            ))),
+            Err(_) => std::task::Poll::Ready(Err(RuntimeFault::InstancePanic.into())),
         }
     })
     .await;
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(future))) {
         Ok(()) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "RUNTIME_FAILED: instance future drop panicked"
-        )),
+        Err(_) => Err(RuntimeFault::InstanceDropPanic.into()),
     }
 }
 
 struct Finish {
     phase: &'static str,
-    error_kind: Option<&'static str>,
+    failure: Option<FatalDiagnostic>,
 }
 
 /// The reporter owns a lock reference until its final write. Disk/ps work never
@@ -509,7 +740,7 @@ impl Evidence {
                 .lifecycle(
                     "daemon_failed",
                     "observability",
-                    Some(KINDS[error_index(&error)]),
+                    Some(&FatalDiagnostic::capture("observability", &error)),
                 )
                 .is_ok()
             {
@@ -534,7 +765,7 @@ impl Evidence {
     pub(crate) async fn finish(self, phase: &'static str, error: Option<&anyhow::Error>) {
         let _ = self.finish.try_send(Finish {
             phase,
-            error_kind: error.map(|e| KINDS[error_index(e)]),
+            failure: error.map(|e| FatalDiagnostic::capture(phase, e)),
         });
         let _ = tokio::time::timeout(Duration::from_secs(2), self.done).await;
     }
@@ -575,13 +806,13 @@ impl Reporter {
                     if self
                         .log
                         .lifecycle(
-                            if finish.error_kind.is_some() {
+                            if finish.failure.is_some() {
                                 "daemon_failed"
                             } else {
                                 "daemon_stopped"
                             },
                             finish.phase,
-                            finish.error_kind,
+                            finish.failure.as_ref(),
                         )
                         .is_ok()
                     {
@@ -611,12 +842,18 @@ impl Reporter {
         }
     }
     fn panic(&mut self) {
-        let count = self.observer.panics.load(Ordering::Relaxed);
-        if count > 0 && !self.panic_reported {
-            self.panic_reported = true;
-            let _ = self
-                .log
-                .event(json!({"level":"error", "event":"runtime_panic", "count":count}));
+        if !self.panic_reported
+            && let Some(sample) = self.observer.first_panic.get()
+        {
+            // Acquiring the published sample precedes the count read, so the
+            // hook's increment is visible even when publication races this poll.
+            let count = self.observer.panics.load(Ordering::Relaxed);
+            let mut event = json!(sample);
+            event["level"] = json!("error");
+            event["event"] = json!("runtime_panic");
+            event["count"] = json!(count);
+            event["version"] = json!(env!("CARGO_PKG_VERSION"));
+            self.panic_reported = self.log.event(event).is_ok();
         }
     }
     fn failures(&mut self, final_report: bool) {
@@ -928,7 +1165,76 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn spawned_task_errors_never_serialize_panic_payload_or_location() {
+    async fn fatal_errors_keep_only_typed_context_even_when_display_is_unsafe() {
+        if std::env::var_os("ZC_EVIDENCE_HARNESS").is_some() {
+            #[derive(Debug)]
+            struct PrivateError;
+            impl fmt::Display for PrivateError {
+                fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    panic!(
+                        "error Display must never run: https://user:password@private.example/token"
+                    );
+                }
+            }
+            impl std::error::Error for PrivateError {}
+            let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let dir = SecureDir::open(&path).unwrap();
+            let lock = Arc::new(dir.lock("zc.lock", Duration::from_secs(1)).unwrap());
+            let errors = [
+                anyhow::Error::new(PrivateError)
+                    .context("https://user:password@private.example/token"),
+                anyhow::Error::new(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    PrivateError,
+                ))
+                .context("credential=private-context"),
+                anyhow::Error::new(RuntimeFault::SelectionPublicationFailed),
+            ];
+            for error in errors {
+                let evidence =
+                    Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock.clone())
+                        .unwrap();
+                evidence.finish("runtime_guard", Some(&error)).await;
+            }
+            return;
+        }
+        let (home, output) = harness(
+            "observability::tests::fatal_errors_keep_only_typed_context_even_when_display_is_unsafe",
+            "typed-errors",
+        );
+        assert!(output.status.success(), "{output:?}");
+        let text = std::fs::read_to_string(home.path().join("runtime/zc.log")).unwrap();
+        for private in [
+            "password",
+            "private.example",
+            "private-context",
+            "PrivateError",
+        ] {
+            assert!(!text.contains(private));
+        }
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "daemon_failed")
+            .collect();
+        assert_eq!(failures.len(), 3);
+        assert_eq!(failures[0]["cause"], "unclassified");
+        assert_eq!(failures[0]["operation"], "validate_and_check_stop");
+        assert_eq!(failures[1]["cause"], "io");
+        assert_eq!(failures[1]["error_kind"], "PermissionDenied");
+        assert!(failures[1]["os_errno"].is_null());
+        assert_eq!(failures[2]["cause"], "selection_publication_failed");
+        assert_eq!(failures[2]["component"], "controller");
+        assert_eq!(failures[2]["operation"], "publish_selection");
+        assert_eq!(failures[2]["error_kind"], "StateInvariant");
+        assert!(!events.iter().any(|e| e["event"] == "runtime_panic"));
+    }
+
+    #[tokio::test]
+    async fn spawned_task_errors_keep_payload_and_source_paths_out_of_cli() {
         if std::env::var_os("ZC_EVIDENCE_HARNESS").is_some() {
             let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
             let dir = SecureDir::open(&path).unwrap();
@@ -961,7 +1267,7 @@ pub(crate) mod tests {
             return;
         }
         let (home, output) = harness(
-            "observability::tests::spawned_task_errors_never_serialize_panic_payload_or_location",
+            "observability::tests::spawned_task_errors_keep_payload_and_source_paths_out_of_cli",
             "task",
         );
         assert!(output.status.success(), "{output:?}");
@@ -981,7 +1287,7 @@ pub(crate) mod tests {
             );
             assert!(
                 !text.contains("observability.rs:"),
-                "panic location escaped"
+                "unstructured panic location escaped"
             );
         }
         assert_eq!(startup, "RUNTIME_FAILED: task panicked");
@@ -1056,7 +1362,8 @@ pub(crate) mod tests {
         let last = events.last().unwrap();
         assert_eq!(last["event"], "daemon_failed");
         assert_eq!(last["phase"], "runtime");
-        assert_eq!(last["error_kind"], "Other");
+        assert_eq!(last["error_kind"], "Panic");
+        assert_eq!(last["cause"], "instance_panic");
         assert!(!events.iter().any(|e| e["event"] == "daemon_stopped"));
     }
 
@@ -1436,13 +1743,19 @@ pub(crate) mod tests {
                 count.fetch_add(1, Ordering::Relaxed);
             }));
             let evidence =
-                Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock).unwrap();
-            for _ in 0..20 {
-                assert!(
-                    std::thread::spawn(|| panic!("credential=never-serialize-this-panic"))
-                        .join()
-                        .is_err()
-                );
+                Evidence::start(&path, "0123456789abcdef0123456789abcdef", lock.clone()).unwrap();
+            // Arbitrary payloads are omitted, never truncated or formatted.
+            struct PrivatePayload;
+            for index in 0..20 {
+                assert!(std::thread::spawn(move || {
+                    if index == 0 {
+                        let payload = "credential=never-serialize-this-panic https://user:pass@private.example/token\n秘密".repeat(16384);
+                        println!("panic_line={}", line!() + 1);
+                        std::panic::panic_any(payload);
+                    } else {
+                        std::panic::panic_any(PrivatePayload);
+                    }
+                }).join().is_err());
             }
             evidence.finish("stop_request", None).await;
             assert_eq!(restored.load(Ordering::Relaxed), 0);
@@ -1453,10 +1766,20 @@ pub(crate) mod tests {
             );
             assert_eq!(restored.load(Ordering::Relaxed), 1);
             std::panic::set_hook(original);
+            let previous = dir.read("zc.log", LOG_LIMIT).unwrap();
+            let evidence =
+                Evidence::start(&path, "fedcba9876543210fedcba9876543210", lock).unwrap();
+            evidence.ready().unwrap();
+            evidence.finish("stop_request", None).await;
+            assert!(
+                dir.read("zc.log", LOG_LIMIT)
+                    .unwrap()
+                    .starts_with(&previous)
+            );
             crate::daemon::log(1000, false, true).await.unwrap();
             return;
         }
-        let (_, output) = harness(
+        let (home, output) = harness(
             "observability::tests::panic_evidence_is_private_bounded_and_restores_the_hook_in_a_subprocess",
             "hook",
         );
@@ -1465,6 +1788,17 @@ pub(crate) mod tests {
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(!stdout.contains("never-serialize-this-panic"));
         assert!(!stderr.contains("never-serialize-this-panic"));
+        assert!(!stdout.contains("private.example"));
+        assert!(!stdout.contains("秘密"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(home.path().join("runtime/zc.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let events: Vec<Value> = stdout
             .lines()
             .filter_map(|line| {
@@ -1477,8 +1811,34 @@ pub(crate) mod tests {
             .filter(|e| e["event"] == "runtime_panic")
             .collect();
         assert_eq!(panics.len(), 1, "{events:?}");
-        assert!(!panics[0].as_object().unwrap().contains_key("location"));
+        assert!(panics[0]["count"].as_u64().unwrap() >= 1);
+        assert_eq!(panics[0]["location"]["file"], "observability.rs");
+        let expected_line: u64 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("panic_line="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(panics[0]["location"]["line"], expected_line);
+        assert_eq!(panics[0]["instance"], "0123456789abcdef0123456789abcdef");
+        assert!(panics[0]["location"]["column"].as_u64().unwrap() > 0);
+        assert_eq!(panics[0]["payload_policy"], "omitted");
         assert!(!panics[0].as_object().unwrap().contains_key("payload"));
+        assert_eq!(panics[0]["backtrace_status"], "captured");
+        let frames = panics[0]["backtrace"].as_array().unwrap();
+        assert!(!frames.is_empty());
+        assert!(frames.len() <= 16);
+        assert!(
+            frames.iter().any(|v| v.as_str().unwrap().contains(
+                "panic_evidence_is_private_bounded_and_restores_the_hook_in_a_subprocess"
+            )),
+            "{frames:?}"
+        );
+        assert!(frames.iter().all(|v| !v.as_str().unwrap().contains('/')));
+        for event in &events {
+            assert!(serde_json::to_vec(event).unwrap().len() < RECORD_LIMIT);
+        }
+        assert!(!stdout.contains(env!("CARGO_MANIFEST_DIR")));
         let summary = events
             .iter()
             .find(|e| e["event"] == "runtime_summary" && e["phase"] == "final")
