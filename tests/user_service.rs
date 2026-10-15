@@ -149,6 +149,18 @@ fn real_service_lifecycle_preserves_login_preference_and_frozen_config() {
         };
         let first = execute("start", options, &binary, &runner).await.unwrap();
         let private = home.join(".local/state/zc/service");
+        let definition = std::fs::read_to_string(private.join(if platform() == Platform::Launchd {
+            "org.zc.user.plist"
+        } else {
+            "zc-user.service"
+        })).unwrap();
+        if platform() == Platform::Launchd {
+            assert!(definition.contains("<key>KeepAlive</key><true/>"));
+            assert!(definition.contains("<key>ThrottleInterval</key><integer>10</integer>"));
+        } else {
+            assert!(definition.contains("Restart=always\nRestartSec=10\n"));
+        }
+
         if cfg!(target_os = "macos") && platform() == Platform::Launchd {
             let out = Command::new("/usr/bin/plutil").arg("-lint").arg(private.join("org.zc.user.plist")).output().unwrap();
             assert!(out.status.success(), "native plist parse: {out:?}");
@@ -343,9 +355,26 @@ fn install_restores_only_previously_running_service_and_rolls_back_failed_activa
             )
             .await
             .unwrap();
+            // Binary publication must retain the legacy definition: recovery may
+            // need an old binary that only recognizes that exact template.
+            let private_definition = home.join(".local/state/zc/service/org.zc.user.plist");
+            let login_definition = home.join("Library/LaunchAgents/org.zc.user.plist");
+            let legacy = std::fs::read_to_string(&private_definition)
+                .unwrap()
+                .replace(
+                    "<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>10</integer>",
+                    "<key>KeepAlive</key><false/>",
+                );
+            std::fs::write(&private_definition, &legacy).unwrap();
+            std::fs::write(&login_definition, &legacy).unwrap();
             install(source, &bin_dir, &publisher, &runner)
                 .await
                 .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&private_definition).unwrap(),
+                legacy
+            );
+            assert_eq!(std::fs::read_to_string(&login_definition).unwrap(), legacy);
             assert_eq!(
                 execute("status", Default::default(), &binary, &runner)
                     .await
@@ -2944,5 +2973,167 @@ fn launchd_arguments_require_complete_exact_registered_invocation() {
         }
         assert_eq!(execute("status", Default::default(), &binary, &runner).await.unwrap()["pid"], started["pid"]);
         execute("stop", Default::default(), &binary, &runner).await.unwrap();
+    });
+}
+
+#[test]
+fn legacy_service_definitions_remain_usable_and_upgrade_on_cold_start() {
+    if !isolated("legacy_service_definitions_remain_usable_and_upgrade_on_cold_start") {
+        return;
+    }
+    runtime().block_on(async {
+        use zc::user_service::{Platform, execute};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let binary = std::path::Path::new(env!("CARGO_BIN_EXE_zc"));
+        let runner = support::FakeManager::new(platform());
+        execute(
+            "enable",
+            zc::service::PrepareOptions {
+                config: Some(config.to_str().unwrap().into()),
+                port: Some(port()),
+                ..Default::default()
+            },
+            binary,
+            &runner,
+        )
+        .await
+        .unwrap();
+        let (name, login) = if platform() == Platform::Launchd {
+            ("org.zc.user.plist", home.join("Library/LaunchAgents"))
+        } else {
+            ("zc-user.service", home.join(".config/systemd/user"))
+        };
+        let private = home.join(".local/state/zc/service");
+        let current = std::fs::read_to_string(private.join(name)).unwrap();
+        let legacy = current
+            .replace(
+                "<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>10</integer>",
+                "<key>KeepAlive</key><false/>",
+            )
+            .replace("Restart=always\nRestartSec=10\n", "Restart=no\n");
+        assert_ne!(legacy, current);
+        for path in [private.join(name), login.join(name)] {
+            std::fs::write(path, &legacy).unwrap();
+        }
+        let registration = std::fs::read(private.join("registration.json")).unwrap();
+        let status = execute("status", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        assert_eq!(status["registered"], true);
+        assert_eq!(status["running"], false);
+        assert_eq!(
+            std::fs::read(private.join("registration.json")).unwrap(),
+            registration
+        );
+        assert_eq!(std::fs::read_to_string(private.join(name)).unwrap(), legacy);
+        execute("disable", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        execute("enable", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        // A partial definition update is valid only when both files match an exact
+        // supported template. Arbitrary policy edits remain foreign state.
+        std::fs::write(login.join(name), &current).unwrap();
+        std::fs::remove_file(config).unwrap();
+        let started = execute("start", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        assert_eq!(started["running"], true);
+        assert_eq!(started["enabled"], true);
+        assert_eq!(
+            std::fs::read_to_string(private.join(name)).unwrap(),
+            current
+        );
+        assert_eq!(std::fs::read_to_string(login.join(name)).unwrap(), current);
+        execute("stop", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        let stopped = execute("status", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        assert_eq!(stopped["running"], false);
+        assert_eq!(stopped["enabled"], true);
+        if platform() == Platform::Launchd {
+            assert_eq!(stopped["loaded"], false);
+        }
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|args| args.iter().any(|a| a
+                    == if platform() == Platform::Launchd {
+                        "bootout"
+                    } else {
+                        "stop"
+                    }))
+        );
+        // Model an already-loaded old registration (for example, after replacing
+        // only the binary). A repeated start is read-only for its restart policy.
+        for path in [private.join(name), login.join(name)] {
+            std::fs::write(path, &legacy).unwrap();
+        }
+        use zc::user_service::CommandRunner;
+        let (program, args) = if platform() == Platform::Launchd {
+            (
+                "/bin/launchctl",
+                vec![
+                    "bootstrap".into(),
+                    format!("gui/{}", rustix::process::geteuid().as_raw()),
+                    private.join(name).to_str().unwrap().into(),
+                ],
+            )
+        } else {
+            (
+                "/usr/bin/systemctl",
+                vec![
+                    "--user".into(),
+                    "--no-pager".into(),
+                    "start".into(),
+                    name.into(),
+                ],
+            )
+        };
+        assert_eq!(runner.run(program, &args).await.unwrap().code, 0);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(status) = execute("status", Default::default(), binary, &runner).await
+                && status["running"] == true
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        execute("start", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(private.join(name)).unwrap(), legacy);
+        let restarted = execute("restart", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        assert_eq!(restarted["running"], true);
+        assert_eq!(restarted["enabled"], true);
+        assert_eq!(
+            std::fs::read_to_string(private.join(name)).unwrap(),
+            current
+        );
+        assert_eq!(std::fs::read_to_string(login.join(name)).unwrap(), current);
+        execute("stop", Default::default(), binary, &runner)
+            .await
+            .unwrap();
+        let corrupt = format!("{legacy}\n# foreign edit\n");
+        std::fs::write(private.join(name), &corrupt).unwrap();
+        let error = execute("start", Default::default(), binary, &runner)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("SERVICE_FOREIGN"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(private.join(name)).unwrap(),
+            corrupt
+        );
     });
 }

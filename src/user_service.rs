@@ -485,7 +485,7 @@ fn definition(record: &Registration) -> Result<String> {
     let args = [binary.to_owned(), "--service-run".into(), record.id.clone()];
     Ok(match record.platform {
         Platform::Launchd => format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array>{}</array>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>XDG_RUNTIME_DIR</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><false/>\n<key>ExitTimeOut</key><integer>10</integer>\n<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>\n</dict></plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array>{}</array>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>XDG_RUNTIME_DIR</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>ExitTimeOut</key><integer>10</integer>\n<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>\n</dict></plist>\n",
             args.iter()
                 .map(|s| format!("<string>{}</string>", xml(s)))
                 .collect::<String>(),
@@ -493,7 +493,7 @@ fn definition(record: &Registration) -> Result<String> {
             xml(runtime)
         ),
         Platform::Systemd => format!(
-            "# Owned by zc; validated against its private registration.\n[Unit]\nDescription=zc user proxy\n[Service]\nType=exec\nExecStart=:{}\nEnvironment={} {}\nRestart=no\nKillMode=control-group\nTimeoutStopSec=10\nStandardOutput=null\nStandardError=null\n[Install]\nWantedBy=default.target\n",
+            "# Owned by zc; validated against its private registration.\n[Unit]\nDescription=zc user proxy\n[Service]\nType=exec\nExecStart=:{}\nEnvironment={} {}\nRestart=always\nRestartSec=10\nKillMode=control-group\nTimeoutStopSec=10\nStandardOutput=null\nStandardError=null\n[Install]\nWantedBy=default.target\n",
             args.iter()
                 .map(|s| unit_quote(s))
                 .collect::<Vec<_>>()
@@ -503,18 +503,34 @@ fn definition(record: &Registration) -> Result<String> {
         ),
     })
 }
+// The original schema-1 registration did not encode a restart policy. Accept
+// only its exact generated definition as well as the current template, including
+// mixed copies after an interrupted cold-start upgrade. Never repair foreign data.
+fn supported_definition(bytes: &[u8], record: &Registration) -> Result<bool> {
+    let current = definition(record)?;
+    let legacy = current
+        .replace(
+            "<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>10</integer>",
+            "<key>KeepAlive</key><false/>",
+        )
+        .replace("Restart=always\nRestartSec=10\n", "Restart=no\n");
+    Ok(bytes == current.as_bytes() || bytes == legacy.as_bytes())
+}
+
 fn verify_definitions(dir: &SecureDir, record: &Registration) -> Result<bool> {
     dir.validate_path(&home()?.join(".local/state/zc/service"))?;
-    let expected = definition(record)?;
     ensure!(
-        dir.read(definition_name(record.platform), LIMIT)? == expected.as_bytes(),
+        supported_definition(&dir.read(definition_name(record.platform), LIMIT)?, record)?,
         "SERVICE_FOREIGN: private service definition differs; retain and inspect it"
     );
     let (_, login) = login_dir(record.platform, false)?;
     let exists = login.exists(definition_name(record.platform))?;
     if exists {
         ensure!(
-            login.read(definition_name(record.platform), LIMIT)? == expected.as_bytes(),
+            supported_definition(
+                &login.read(definition_name(record.platform), LIMIT)?,
+                record
+            )?,
             "SERVICE_FOREIGN: login service definition differs; retain and inspect it"
         );
     }
@@ -693,12 +709,18 @@ impl Manager<'_> {
                 if enabled {
                     self.launch(&["enable".into(), self.target()]).await?;
                     if !login.exists(name)? {
-                        login.write_new(name, definition(record)?.as_bytes())?;
+                        let (_, private) = state(false)?;
+                        let bytes = private.read(name, LIMIT)?;
+                        ensure!(
+                            supported_definition(&bytes, record)?,
+                            "SERVICE_FOREIGN: private definition changed before enable"
+                        );
+                        login.write_new(name, &bytes)?;
                         login.sync()?;
                     }
                 } else if login.exists(name)? {
                     ensure!(
-                        login.read(name, LIMIT)? == definition(record)?.as_bytes(),
+                        supported_definition(&login.read(name, LIMIT)?, record)?,
                         "SERVICE_FOREIGN: login definition changed before removal"
                     );
                     login.remove_file(name)?;
@@ -886,7 +908,7 @@ pub async fn execute(
             write_record(&dir, &record)?;
             drop(launch);
             let mut started_pid = None;
-            if start_ready(&manager, &record, &dir, &mut started_pid)
+            if start_ready(&manager, &record, &dir, &mut started_pid, true)
                 .await
                 .is_err()
             {
@@ -904,7 +926,7 @@ pub async fn execute(
                     write_record(&dir, &previous)?;
                     drop(launch);
                     if captured.ready() {
-                        start_ready(&manager, &previous, &dir, &mut None).await?;
+                        start_ready(&manager, &previous, &dir, &mut None, false).await?;
                     }
                     Ok::<_, anyhow::Error>(())
                 }
@@ -1061,6 +1083,7 @@ async fn start_ready(
     record: &Registration,
     dir: &SecureDir,
     started_pid: &mut Option<u32>,
+    upgrade_policy: bool,
 ) -> Result<()> {
     let current = manager
         .inspect(Some(record), verify_definitions(dir, record)?)
@@ -1075,7 +1098,41 @@ async fn start_ready(
     {
         manager.enable(record, false).await?;
     }
-    manager.start(record, current.loaded).await?;
+    // Installation retains the old policy so rollback can still launch an old
+    // binary that only accepts the original definition. Explicit CLI activation
+    // upgrades it; recovery uses the already-published definitions.
+    if upgrade_policy {
+        // Reload only on a cold activation. Status and already-running start leave
+        // the manager and old registrations untouched. Explicit manager stop/bootout
+        // suppresses automatic restart; login enablement remains independent.
+        if record.platform == Platform::Launchd {
+            manager.stop(record, &current).await?;
+        }
+        let login_exists = verify_definitions(dir, record)?;
+        let (_, login) = login_dir(record.platform, false)?;
+        let name = definition_name(record.platform);
+        let definition = definition(record)?;
+        for destination in std::iter::once(dir).chain(login_exists.then_some(&login)) {
+            if destination.read(name, LIMIT)? != definition.as_bytes() {
+                let receipt = destination.atomic_write(name, definition.as_bytes())?;
+                ensure!(
+                    receipt.durability_error.is_none(),
+                    "SERVICE_STATE_INVALID: definition durability uncertain; retain state and retry inspection"
+                );
+            }
+        }
+        if record.platform == Platform::Systemd {
+            // Also reload when files already match: a prior attempt may have written
+            // both files and failed before the manager accepted the new policy.
+            manager.system(&["daemon-reload".into()]).await?;
+        }
+    }
+    manager
+        .start(
+            record,
+            current.loaded && !(upgrade_policy && record.platform == Platform::Launchd),
+        )
+        .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     COMMAND_DEADLINE
         .scope(deadline, async {
@@ -1434,7 +1491,7 @@ pub async fn install(
             record.allowed = true;
             let dir = &state.as_ref().expect("registered state").1;
             match write_record(dir, record) {
-                Ok(()) => start_ready(&manager, record, dir, &mut started_pid).await,
+                Ok(()) => start_ready(&manager, record, dir, &mut started_pid, false).await,
                 Err(e) => Err(e),
             }
         }
@@ -1518,7 +1575,7 @@ pub async fn install(
                     let dir = &state.as_ref().expect("registered state").1;
                     write_record(dir, record)?;
                     if was_running {
-                        start_ready(&manager, record, dir, &mut None).await?;
+                        start_ready(&manager, record, dir, &mut None, false).await?;
                     }
                 }
                 Ok::<_, anyhow::Error>(())

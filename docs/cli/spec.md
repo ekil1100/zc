@@ -80,7 +80,9 @@
 
 ## 当前用户服务
 
-支持 macOS 登录 LaunchAgent 和 Linux `systemd --user`；用户登录后运行，不提供登录前启动、root/system-wide 服务或自动 linger。macOS 需要当前用户的 GUI 登录域，Linux 需要可访问的 user manager。服务进程保持前台，当前无崩溃自动重启承诺。
+支持 macOS 登录 LaunchAgent 和 Linux `systemd --user`；用户登录后运行，不提供登录前启动、root/system-wide 服务或自动 linger。macOS 需要当前用户的 GUI 登录域，Linux 需要可访问的 user manager。服务进程保持前台，默认由管理器自动重启退出的进程：macOS 使用 `KeepAlive=true` 和 `ThrottleInterval=10` 秒；Linux 使用 `Restart=always` 和 `RestartSec=10` 秒（仍受管理器启动频率限制）。这也覆盖非显式停止导致的正常退出。重启复用注册的冻结输入；持续配置、权限或端口故障仍须修复，重启策略不保证恢复就绪。
+
+显式 `zc service stop` 使用 macOS `bootout` 或 Linux `systemctl --user stop`，管理器不会因上述策略立即拉起进程。停止保留登录自启动偏好；已 enable 的服务仍可在后续登录启动。`disable` 只控制登录自启动，运行中的服务继续受重启策略管理。
 
 ```bash
 zc service start -c <profile-or-file> --port 17890
@@ -99,6 +101,10 @@ Linux 服务的**可执行文件路径**接受空格、`$`、`%`，按 systemd �
 注册快照保留注册或上次捕获的选择；启动不会偷偷切到新的 active/head。离线 profile 选择或来源变更要明确应用时，使用 `zc service restart -c <profile>`。运行态 stop/restart/安装升级在停止前捕获已应用的选择；托管 profile 的自动 controller secret 沿用既有生成与冻结规则，enable 的首次配置准备也可能生成该私有值。定义文件、argv、环境和管理器错误输出均不包含它。
 
 注册位于 `$HOME/.local/state/zc/service/registration.json`，认证快照和私有定义在同一私有目录。macOS 登录副本为 `~/Library/LaunchAgents/org.zc.user.plist`；Linux 定义为 `~/.config/systemd/user/zc-user.service`。只接受与注册逐字节一致的定义，拒绝外来内容、drop-ins、错误的已加载调用、缺失或损坏状态，保留现场。不要手工编辑定义或删除注册来绕过检查。服务和安装检查只验证既有 schema-2 catalog，缺失时不从兼容镜像重建；有效旧格式应先通过原配置命令明确完成既有迁移流程。
+
+旧注册兼容：原 `KeepAlive=false` / `Restart=no` 定义按原模板逐字节验证，注册 schema 和认证快照不变。`status`、`stop`、`enable/disable`、已运行时重复 `start` 及本地安装升级保留旧策略。升级二进制后，显式执行 `zc service restart`，或在停止态执行 `zc service start`，即可采用新策略；无需重读来源、删除注册或重新导入 profile。macOS 重新加载任务，Linux 更新定义并执行 `daemon-reload`。该操作为冷切换，保留登录自启动偏好。
+
+定义更新中断时，新旧两个精确模板的混合副本仍可检查，下次冷启动会完成更新；任意其他内容、损坏注册或快照继续拒绝并保留现场。本地安装事务保留原策略，使旧二进制的失败恢复仍可使用原定义；显式采用新策略后，仅接受旧模板的历史二进制需要配套的完整旧状态备份才能回退。
 
 stop/restart 和安装在管理器确认停止请求后，共用 5 秒停止确认预算：等待捕获的实例完成清理并释放原实例锁，再确认管理器 PID 为空。退出期间 descriptor/PID 文件消失属于正常过渡；runtime 目录、实例锁、PID/nonce 或服务身份被替换时仍拒绝。停止观察不重读退出中的配置快照。
 

@@ -72,7 +72,9 @@ def start():
         job = plistlib.loads(path.read_bytes())
         argv = job["ProgramArguments"]
         env = dict(os.environ, **job["EnvironmentVariables"])
-        assert not job["KeepAlive"] and job["RunAtLoad"]
+        assert job["RunAtLoad"]
+        if job["KeepAlive"]:
+            assert job["ThrottleInterval"] == 10
     else:
         lines = dict(
             line.split("=", 1) for line in path.read_text().splitlines() if "=" in line
@@ -87,7 +89,9 @@ def start():
             v.split("=", 1)
             for v in shlex.split(lines["Environment"].replace("%%", "%"))
         )
-        assert lines["Restart"] == "no"
+        assert lines["Restart"] in ("no", "always")
+        if lines["Restart"] == "always":
+            assert lines["RestartSec"] == "10"
     child = subprocess.Popen(
         argv,
         env=env,
