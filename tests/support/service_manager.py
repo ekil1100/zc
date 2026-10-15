@@ -17,7 +17,14 @@ state = json.loads(state_path.read_text()) if state_path.exists() else {}
 
 
 def save():
-    state_path.write_text(json.dumps(state))
+    # A bounded manager command can be terminated during any write. Keep the
+    # previous state readable by recovery until the complete replacement exists.
+    pending = state_path.with_name(f".{state_path.name}.{os.getpid()}.tmp")
+    try:
+        pending.write_text(json.dumps(state))
+        os.replace(pending, state_path)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def barrier(phase):

@@ -1,10 +1,13 @@
 """Check process-disappearance races without signalling real processes."""
 
 import ast
+import json
+import os
 import pathlib
+import tempfile
 import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 class ManagerProcessLiveness(unittest.TestCase):
@@ -54,6 +57,62 @@ class ManagerProcessLiveness(unittest.TestCase):
         self.kill.side_effect = PermissionError(1, "access denied")
         with self.assertRaises(PermissionError):
             self.alive()
+
+
+class ManagerStatePublication(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = pathlib.Path(self.directory.name) / "fake-manager.json"
+        self.previous = {"pid": 12345, "loaded": True}
+        self.updated = {"pid": 0, "loaded": False}
+        self.path.write_text(json.dumps(self.previous))
+        source = pathlib.Path(__file__).with_name("service_manager.py")
+        tree = ast.parse(source.read_text())
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "save"
+        )
+        namespace = {
+            "state_path": self.path,
+            "state": self.updated,
+            "json": json,
+            "os": os,
+        }
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), source, "exec"),
+            namespace,
+        )
+        self.save = namespace["save"]
+
+    def test_interrupted_write_keeps_previous_complete_state(self):
+        write_text = pathlib.Path.write_text
+
+        def interrupted(path, text, *args, **kwargs):
+            write_text(path, text[:1], *args, **kwargs)
+            raise InterruptedError("manager killed during state write")
+
+        with patch.object(pathlib.Path, "write_text", interrupted):
+            with self.assertRaises(InterruptedError):
+                self.save()
+        self.assertEqual(json.loads(self.path.read_text()), self.previous)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_reader_never_sees_partial_state_before_publication(self):
+        write_text = pathlib.Path.write_text
+        observed = []
+
+        def partial(path, text, *args, **kwargs):
+            write_text(path, text[:1], *args, **kwargs)
+            observed.append(self.path.read_text())
+            return write_text(path, text, *args, **kwargs)
+
+        with patch.object(pathlib.Path, "write_text", partial):
+            self.save()
+        self.assertEqual([json.loads(text) for text in observed], [self.previous])
+        self.assertEqual(json.loads(self.path.read_text()), self.updated)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
 
 if __name__ == "__main__":
