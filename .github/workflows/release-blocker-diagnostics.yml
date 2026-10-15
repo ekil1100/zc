@@ -26,7 +26,16 @@ jobs:
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Build isolated service tests
         run: cargo test --locked --test user_service --no-run --message-format=json > build.jsonl
+      - name: Run complete user-service regression
+        id: suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -n 8192
+          mkdir -p target/release-blockers
+          cargo test --locked --test user_service -- --nocapture > target/release-blockers/full-suite.log 2>&1
       - name: Exercise recovery serially and under contention
+        if: ${{ success() || steps.suite.outcome == 'failure' }}
         shell: bash
         run: |
           set -euo pipefail
