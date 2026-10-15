@@ -1138,6 +1138,137 @@ fn managed_namespace_frozen_identity_secret_and_selected_node_survive_upgrade() 
 }
 
 #[test]
+fn install_waits_for_original_daemon_after_manager_accepts_stop() {
+    if !isolated("install_waits_for_original_daemon_after_manager_accepts_stop") {
+        return;
+    }
+    struct AsyncStopManager {
+        inner: support::FakeManager,
+        delayed: std::cell::Cell<bool>,
+        accepted: tokio::sync::Notify,
+        release: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>>,
+        calls_before_release: std::cell::Cell<usize>,
+        worker: std::cell::RefCell<Option<std::thread::JoinHandle<std::process::Output>>>,
+    }
+    impl zc::user_service::CommandRunner for AsyncStopManager {
+        fn platform(&self) -> zc::user_service::Platform {
+            self.inner.platform()
+        }
+        fn authorize<'a>(
+            &'a self,
+            home: &'a std::path::Path,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+            self.inner.authorize(home)
+        }
+        fn run<'a>(
+            &'a self,
+            program: &'a str,
+            args: &'a [String],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<zc::user_service::CommandOutput>>
+                    + 'a,
+            >,
+        > {
+            if self.release.borrow().is_some() {
+                self.calls_before_release
+                    .set(self.calls_before_release.get() + 1);
+            }
+            if args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "bootout" | "stop"))
+                && self.delayed.replace(false)
+            {
+                let mut command = Command::new("/usr/bin/python3");
+                command
+                    .args([
+                        format!(
+                            "{}/tests/support/service_manager.py",
+                            env!("CARGO_MANIFEST_DIR")
+                        ),
+                        std::env::var("HOME").unwrap(),
+                        std::env::var("ZC_SERVICE_TEST_CHILD").unwrap(),
+                        program.to_owned(),
+                    ])
+                    .args(args);
+                let (release, released) = std::sync::mpsc::channel();
+                *self.release.borrow_mut() = Some(release);
+                *self.worker.borrow_mut() = Some(std::thread::spawn(move || {
+                    // Keep the original daemon alive until the installer yields
+                    // after acknowledging stop, independent of scheduler speed.
+                    released.recv().unwrap();
+                    command.output().unwrap()
+                }));
+                self.accepted.notify_one();
+                return Box::pin(async {
+                    Ok(zc::user_service::CommandOutput {
+                        code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                });
+            }
+            self.inner.run(program, args)
+        }
+    }
+    impl Drop for AsyncStopManager {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.get_mut().take() {
+                let _ = release.send(());
+            }
+            if let Some(worker) = self.worker.get_mut().take() {
+                let _ = worker.join();
+            }
+        }
+    }
+    runtime().block_on(async {
+        use zc::user_service::{execute, install};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("zc");
+        std::fs::copy(env!("CARGO_BIN_EXE_zc"), &binary).unwrap();
+        let config = home.join("source.yaml");
+        std::fs::write(&config, "rules: ['MATCH,DIRECT']\n").unwrap();
+        let runner = AsyncStopManager {
+            inner: support::FakeManager::new(platform()),
+            delayed: std::cell::Cell::new(false),
+            accepted: tokio::sync::Notify::new(),
+            release: std::cell::RefCell::new(None),
+            calls_before_release: std::cell::Cell::new(0),
+            worker: std::cell::RefCell::new(None),
+        };
+        let first = execute("start", zc::service::PrepareOptions {
+            config: Some(config.to_str().unwrap().into()),
+            port: Some(port()),
+            ..Default::default()
+        }, &binary, &runner).await.unwrap();
+        runner.delayed.set(true);
+        let publisher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/install/local-dev-install.sh");
+        let installation = install(std::path::Path::new(env!("CARGO_BIN_EXE_zc")), &bin, &publisher, &runner);
+        tokio::pin!(installation);
+        tokio::select! {
+            biased;
+            result = &mut installation => panic!("installation returned before stop completed: {result:?}"),
+            _ = runner.accepted.notified() => (),
+        }
+        assert_eq!(runner.calls_before_release.get(), 0, "installer entered recovery instead of waiting for exit");
+        runner.release.borrow_mut().take().unwrap().send(()).unwrap();
+        let result = installation.await;
+        let output = runner.worker.borrow_mut().take().unwrap().join().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        result.unwrap();
+        let after = execute("status", Default::default(), &binary, &runner).await.unwrap();
+        assert_eq!(after["running"], true);
+        assert_ne!(after["pid"], first["pid"]);
+        assert_eq!(after["mixed_port"], first["mixed_port"]);
+        assert_eq!(after["enabled"], first["enabled"]);
+        execute("stop", Default::default(), &binary, &runner).await.unwrap();
+    });
+}
+
+#[test]
 fn manager_success_without_ready_daemon_is_failure_and_keeps_registration() {
     if !isolated("manager_success_without_ready_daemon_is_failure_and_keeps_registration") {
         return;

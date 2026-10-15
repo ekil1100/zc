@@ -2214,6 +2214,63 @@ mod lifecycle_tests {
     use tokio::net::TcpStream;
 
     #[tokio::test]
+    async fn service_stop_wait_rejects_replacement_and_requires_lock_release() {
+        if std::env::var_os("ZC_EVIDENCE_HARNESS").is_none() {
+            let (_home, output) = observability::tests::harness(
+                "daemon::lifecycle_tests::service_stop_wait_rejects_replacement_and_requires_lock_release",
+                "service-stop-wait",
+            );
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let runtime = runtime_dir(false).unwrap().unwrap();
+        let lock = runtime.dir.lock("zc.lock", Duration::from_secs(1)).unwrap();
+        drop(
+            runtime
+                .dir
+                .lock("zc.daemon.lock", Duration::from_secs(1))
+                .unwrap(),
+        );
+        let expected: Descriptor = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/daemon_zig_descriptor.json"
+        ))
+        .unwrap();
+        let capture = ServiceCapture {
+            lock_file: runtime.dir.hold_private_file("zc.lock").unwrap(),
+            runtime,
+            descriptor: Some(expected.clone()),
+            inactive_descriptor: None,
+            inactive_pid: None,
+            prepared: None,
+        };
+        for replace_pid in [true, false] {
+            let mut replacement = expected.clone();
+            if replace_pid {
+                replacement.pid += 1;
+            } else {
+                replacement.nonce = fsutil::nonce().unwrap();
+            }
+            publish(&capture.runtime.dir, &replacement).unwrap();
+            let error = capture.stopped().unwrap_err();
+            assert!(
+                error.to_string().contains("runtime instance changed"),
+                "{error:#}"
+            );
+            assert_eq!(
+                read_descriptor(&capture.runtime.dir).unwrap(),
+                Some(replacement)
+            );
+        }
+        // Cleanup can remove the descriptor before releasing the instance lock.
+        // Its absence alone must not authorize publication.
+        capture.runtime.dir.remove_file(DESCRIPTOR).unwrap();
+        assert!(!capture.stopped().unwrap());
+        assert!(lock_held(&capture.runtime.dir).unwrap());
+        drop(lock);
+        assert!(capture.stopped().unwrap());
+    }
+
+    #[tokio::test]
     async fn listener_failure_keeps_component_and_errno_through_drain() {
         if std::env::var_os("ZC_EVIDENCE_HARNESS").is_some() {
             let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());

@@ -127,7 +127,7 @@ JSON 的四个布尔字段含义：
 
 ### 所有权与手动迁移
 
-服务管理操作和本地安装串行，停止前复查捕获的实例；发布使用独占二进制锁，运行实例持有共享锁。安装目录中的 `.zc.install.guard/.zc.binary.lock` 为稳定锁文件，保留其 inode。运行 root-owned 分发版本的普通 daemon 不需要写入其安装目录；当前用户安装目录须可写以建立锁。
+服务管理操作和本地安装串行，停止前复查捕获的实例；本地安装在管理器确认停止请求后，有界等待原 PID/nonce 对应实例释放实例锁，允许正常退出清理，拒绝替换实例。发布使用独占二进制锁，运行实例持有共享锁。安装目录中的 `.zc.install.guard/.zc.binary.lock` 为稳定锁文件，保留其 inode。运行 root-owned 分发版本的普通 daemon 不需要写入其安装目录；当前用户安装目录须可写以建立锁。
 
 普通 `zc start/stop/restart/reload` 保留手动实例语义；注册 runtime 的生命周期由 `zc service` 管理，普通入口返回 `SERVICE_OWNED`，避免绕过管理器或误恢复默认配置。服务命令也拒绝接管手动实例。迁移顺序：确认原 HOME/runtime、配置和端口 → 用原来的 `zc stop` 或 supervisor 停止 → 显式 `zc service start -c <config> --port <port>`。迁移需要重新准备输入，来源不可用时保留手动安装并先恢复来源，不自动停止它。
 
