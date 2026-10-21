@@ -1,5 +1,9 @@
 # macOS User TrustSettings 授权边界
 
+## 当前发布决策
+
+用户已批准将 macOS 原生系统信任/首次使用测试移出必过发布门禁，保留可选手动验证。以下授权研究及未验证事实仍有效；缺少该证据不再阻塞发布。详见 [开发优先级](../development-priorities.md)。
+
 ## 结论
 
 普通 User trust setter 没有接收调用方密码或 AuthorizationRef 的公开参数。当前 GitHub macOS runner 上，setter 等待系统认证并超过 30 秒期限；完整九项原生验收仍未通过。只读源码与模拟测试不构成授权修复。

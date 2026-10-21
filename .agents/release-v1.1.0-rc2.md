@@ -2,7 +2,7 @@
 
 ## 状态
 
-用户已确认目标为 `v1.1.0-rc2`，保留四平台完整发布门禁。当前仍未更新 Cargo 版本、创建 tag 或发布 Release。修复与诊断位于 `fix/release-rc2-ci`；main 和已有 rc1 保持原样。
+用户已确认目标为 `v1.1.0-rc2`，保留四平台发布检查；随后明确批准移除 macOS 原生系统信任/首次使用必过要求，保留可选手动测试和未验证边界。当前仍未更新 Cargo 版本、创建 tag 或发布 Release。修复与诊断位于 `fix/release-rc2-ci`；main 和已有 rc1 保持原样。
 
 ## Linux 测试状态发布
 
@@ -25,10 +25,10 @@
 
 本机另通过管理器夹具 7 项、用户服务 48 项及 Ruff/格式检查。
 
-## macOS 仍受阻
+## macOS 系统信任：已豁免发布阻塞，验证仍未完成
 
 本轮核对 arm64/Intel 日志，User trust setter 均等待系统认证并超过 30 秒；严格清理仍报告 item-not-found。保留全部九项原生场景及 User deny 优先于 Admin trust，不以 Admin-only、无认证配置或仅模拟测试代替。
 
 补充 runner 合约测试后 26 项通过；诊断合约 20 项通过。源码与凭据探索的结论见 [macOS 原生记录](reliability/macos-native.md) 和 [授权边界](reliability/macos-trust-auth.md)。探索工件留在 `target/`，尚无已验证的非交互 User setter 修复。
 
-继续完整发布需要能完成正常系统认证的独占、可销毁 macOS 环境及九项原生通过证据；当前发布仍受阻，Linux-only 范围未被批准用于 rc2。
+用户已批准将这九项原生系统信任/首次使用场景移出必过发布门禁；默认 CI 移除对应执行步骤，脚本与隔离合约测试保留。后续手动验证仍要求能完成正常系统认证的独占、可销毁 macOS 环境和严格清理。当前缺失证据不再单独阻塞发布，也不记为验收通过。四平台范围及其他检查保持不变；未批准 Linux-only 发布。
