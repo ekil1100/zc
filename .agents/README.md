@@ -17,6 +17,7 @@
 
 - 协议研究：`research/`；AnyTLS 复用设计：`anytls/`。
 - 故障定位和平台测试：`reliability/`；观测闭环记录：[observability-validation](observability-validation.md)；[TCP 代理 DNS 错地址修复](reliability/dns-routing-fix.md)；[Linux CI 修复与双架构交付验收](reliability/linux-ci-regressions.md)。
+- 发布记录：[v1.1.0-rc1](release-v1.1.0-rc1.md)；[v1.1.0-rc2 阻塞修复与证据](release-v1.1.0-rc2.md)。
 - 协议与配置历史验证：[compat-validation](compat-validation.md)。
 - 通配 controller 支持与全路由鉴权：[验证记录](reliability/controller-wildcard.md)。
 - 已批准用户服务与冷升级：[验收契约](service-upgrade-contract.md)、[本轮验证](service-upgrade-validation.md)、[安装异步停止修复](install-stop-validation.md)。
