@@ -30,7 +30,7 @@ class JustfileContract(unittest.TestCase):
             "sys.exit(int(os.environ.get('ZC_JUST_TEST_EXIT', '0')))\n"
         )
         recorder.chmod(0o755)
-        for tool in ["cargo", "zig"]:
+        for tool in ["cargo"]:
             (tools / tool).symlink_to(recorder)
         self.env = dict(
             os.environ,
@@ -60,6 +60,35 @@ class JustfileContract(unittest.TestCase):
         if not self.log.exists():
             return []
         return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def test_clean_removes_local_caches_and_preserves_project_files(self):
+        caches = [
+            "target",
+            ".cache",
+            "scripts/__pycache__",
+        ]
+        for name in caches:
+            directory = self.work / name / "nested"
+            directory.mkdir(parents=True)
+            (directory / "artifact").write_text("cache")
+        readonly = self.work / "target" / "nested"
+        readonly.chmod(0o555)
+        preserved = [
+            "src/main.rs",
+            ".git/marker",
+            ".worktrees/example/__pycache__/marker",
+        ]
+        for name in preserved:
+            path = self.work / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("keep")
+        for _ in range(2):
+            result = self.just("clean")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in caches:
+                self.assertFalse((self.work / name).exists(), name)
+            for name in preserved:
+                self.assertEqual((self.work / name).read_text(), "keep")
 
     def test_build_defaults_to_locked_rust(self):
         result = self.just("build")
@@ -238,17 +267,12 @@ class JustfileContract(unittest.TestCase):
             self.assertIn("reserved for production", result.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_zig_commands_are_explicit_and_retired_entries_are_removed(self):
-        for recipe, arguments in [
-            ("zig-build", ["build", "-Dcpu=baseline"]),
-            ("zig-test", ["build", "test", "-Dcpu=baseline"]),
-            ("zig-e2e", ["build", "e2e", "--summary", "all"]),
-        ]:
-            self.log.write_text("")
-            result = self.just(recipe)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(self.calls(), [["zig", *arguments]])
+    def test_retired_entries_are_removed(self):
         for recipe in [
+            "zig-build",
+            "zig-test",
+            "zig-e2e",
+            "zig-install-test",
             "rust-build",
             "rust-test",
             "rust-check",

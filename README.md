@@ -30,6 +30,7 @@ Rust 最低 `1.95`，CI 固定 `1.99.0`；原生依赖需要 C/C++ 工具链与 
 ```bash
 just build
 just release                 # target/release/zc; no installation
+just clean                   # Remove local Rust build artifacts and Python caches
 just check                   # Formatting check + Clippy
 just test
 just delivery-test

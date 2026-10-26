@@ -32,6 +32,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 ```bash
 just build                         # target/debug/zc
 just release                       # cargo build --locked --release
+just clean                         # 清理项目内 Rust 构建产物和 Python 缓存
 ./target/release/zc --version
 just run testdata/config/rust-tcp.yaml 17890
 ```

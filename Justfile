@@ -5,6 +5,18 @@ set positional-arguments
 default:
     @just --list
 
+# Remove project-local build artifacts and caches, including read-only Go fixtures.
+clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for directory in target .cache; do
+        if [[ -d "$directory" && ! -L "$directory" ]]; then
+            find "$directory" -type d -exec chmod u+w {} +
+        fi
+        rm -rf -- "$directory"
+    done
+    find . -type d \( -name .git -o -name .worktrees \) -prune -o -type d -name __pycache__ -prune -exec rm -rf -- {} +
+
 # Build the Rust development binary.
 build *args:
     cargo build --locked "$@"
@@ -86,20 +98,8 @@ install-test: build e2e-helpers
     bash scripts/install/run-all-regression.sh
     bash scripts/install/test-oneline-installer.sh "$PWD/target/debug/zc" "$PWD/target/debug/examples/e2e_origin"
 
-# Run complete Rust delivery checks; no Zig runtime or compiler fallback.
+# Run complete Rust delivery checks.
 validate: check test delivery-test e2e install-test release
-
-# Build the Zig reference binary (Zig 0.16.0).
-zig-build:
-    zig build -Dcpu=baseline
-
-# Run the Zig reference tests.
-zig-test:
-    zig build test -Dcpu=baseline
-
-# Run the Zig reference end-to-end tests.
-zig-e2e:
-    zig build e2e --summary all
 
 # Run a Rust eval suite: correctness, contract, interop, perf, or all.
 eval suite *args:
@@ -112,7 +112,3 @@ eval-selfcheck *args:
 # Run the independent configuration-migrator regressions.
 migrator-test:
     bash tools/config-migrator/run-all.sh
-
-# Run installer regressions in temporary HOME; requires a built Rust candidate for local publication.
-zig-install-test:
-    bash scripts/install/run-all-regression.sh
