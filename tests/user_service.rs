@@ -854,6 +854,42 @@ fn isolated(name: &str) -> bool {
             .env("XDG_RUNTIME_DIR", runtime.canonicalize().unwrap())
             .output()
             .unwrap();
+        if std::env::var("ZC_SERVICE_STOP_DIAGNOSTICS").as_deref() == Ok("1") {
+            let log = std::fs::read_to_string(home.path().join("manager-stop-diagnostics.jsonl"))
+                .unwrap_or_default();
+            // Preserve bounded evidence before the isolated HOME is removed,
+            // including successful samples for comparison with a failed stop.
+            for line in log
+                .lines()
+                .rev()
+                .take(60)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                eprintln!("FIXTURE_STOP_DIAGNOSTIC {line}");
+            }
+        }
+        if !out.status.success()
+            || std::env::var("ZC_SERVICE_STOP_DIAGNOSTICS").as_deref() == Ok("1")
+        {
+            let log = std::fs::read_to_string(runtime.join("zc.log")).unwrap_or_default();
+            let events: Vec<_> = log
+                .lines()
+                .rev()
+                .filter_map(|line| {
+                    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+                    Some(serde_json::json!({
+                        "event": event["event"], "pid": event["pid"],
+                        "timestamp_ms": event["timestamp_ms"], "phase": event["phase"],
+                        "error_kind": event["error_kind"], "cause": event["cause"],
+                        "os_errno": event["os_errno"],
+                    }))
+                })
+                .take(30)
+                .collect();
+            eprintln!("Fixture lifecycle evidence (newest first): {events:?}");
+        }
         assert!(
             out.status.success(),
             "{platform}: {out:?}; fixture traceback: {}",

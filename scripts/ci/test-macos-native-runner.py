@@ -187,6 +187,81 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(calls[-1], [runner.SECURITY, "list-keychains", "-d", "user"])
         self.assertTrue(preserved)
 
+    def test_user_authorization_timeout_never_retries_or_runs_trusted_cases(self):
+        with mock.patch.object(runner.time, "monotonic", return_value=100):
+            message, output, calls, preserved, _ = self.exercise(
+                {
+                    "add-trusted-cert": (None, ""),
+                    "remove-trusted-cert": (
+                        1,
+                        "The specified item could not be found in the keychain.",
+                    ),
+                }
+            )
+        self.assertIn("PRIMARY: user owned certificate add-trusted-cert", message)
+        self.assertIn("parent watchdog expired after 30s", message)
+        self.assertIn("CLEANUP: user owned certificate remove-trusted-cert", message)
+        self.assertEqual(output.count("PASS native "), 1)
+        self.assertIn("PASS native baseline-untrusted", output)
+        self.assertEqual(sum(Path(call[0]).name == "fixture-test" for call in calls), 1)
+        setters = [call for call in calls if "add-trusted-cert" in call]
+        self.assertEqual(len(setters), 1)
+        self.assertEqual(
+            setters[0][:4], [runner.SECURITY, "add-trusted-cert", "-r", "trustRoot"]
+        )
+        self.assertFalse(any("-d" in call for call in setters))
+        self.assertEqual(sum("remove-trusted-cert" in call for call in calls), 1)
+        self.assertTrue(any("delete-keychain" in call for call in calls))
+        self.assertEqual(calls[-1], [runner.SECURITY, "list-keychains", "-d", "user"])
+        self.assertTrue(preserved)
+        self.assertNotIn("PASS cleanup", output)
+
+    def test_success_preserves_user_admin_domains_and_all_native_cases(self):
+        message, output, calls, preserved, _ = self.exercise({})
+        self.assertEqual(message, "")
+        self.assertFalse(preserved)
+        self.assertIn("PASS cleanup", output)
+        self.assertEqual(output.count("PASS native "), 9)
+        for case in (
+            "baseline-untrusted",
+            "security-first",
+            "dns-first",
+            "wrong-sni",
+            "concurrent-independent",
+            "concurrent-shared",
+            "user-deny",
+            "admin-trust",
+            "user-deny-admin-trust",
+        ):
+            self.assertEqual(output.count(f"PASS native {case} ("), 1)
+        mutations = [
+            call
+            for call in calls
+            if "add-trusted-cert" in call or "remove-trusted-cert" in call
+        ]
+        # User mutations must stay with the test identity. Admin positive control
+        # cannot substitute for User trust or for User-deny-over-Admin priority.
+        expected = [
+            ("user", "add-trusted-cert", "trustRoot"),
+            ("user", "remove-trusted-cert", None),
+            ("user", "add-trusted-cert", "deny"),
+            ("user", "remove-trusted-cert", None),
+            ("admin", "add-trusted-cert", "trustRoot"),
+            ("user", "add-trusted-cert", "deny"),
+            ("user", "remove-trusted-cert", None),
+            ("admin", "remove-trusted-cert", None),
+        ]
+        self.assertEqual(len(mutations), len(expected))
+        for call, (domain, operation, result) in zip(mutations, expected):
+            with self.subTest(domain=domain, operation=operation, result=result):
+                prefix = ["/usr/bin/sudo", "-n"] if domain == "admin" else []
+                command = prefix + [runner.SECURITY, operation]
+                if domain == "admin":
+                    command.append("-d")
+                if result is not None:
+                    command += ["-r", result, "-k", call[-2]]
+                self.assertEqual(call, command + [call[-1]])
+
     def test_primary_failure_with_successful_cleanup_still_fails(self):
         message, output, _, preserved, _ = self.exercise(
             {"add-trusted-cert": (23, "failed")}

@@ -49,6 +49,8 @@ HTTP CONNECT 的请求目标必须包含显式端口（例如 `CONNECT example.c
 
 HTTP request header 最多 16 KiB，request body 最多 16 MiB；chunk framing/trailer 也有计数/字节上界。response 按流转发，不应把 request body 上界误称 response 总大小上界。mixed 最多 1024 connection tasks，入站握手 10 秒，路由与出站准备另有 10 秒 deadline，TCP 转发空闲期限 15 分钟。退出取消并回收任务，不承诺 drain 完全部存量流量。
 
+macOS 自定义 User/Admin 系统信任、用户拒绝优先级及相关首次使用/并发场景尚未完成原生验收，作为已知验证边界保留；这组测试不作为发布必过项。默认的证书链和服务端身份校验保持启用。
+
 TLS 使用 rustls / tokio-rustls、系统信任根、安全默认 TLS 1.2/1.3；不继承 Zig TLS 派生实现的 poll/partial-record/KeyUpdate 限制说明。Trojan / AnyTLS server 必须是合法 IP 或 RFC hostname，DNS server 尾点在派生身份时去除；显式 SNI 必须是无尾点的 DNS hostname，不接受 IP/wildcard/控制字符。验证证书的 IP server 须显式 SNI。仅 `skip-cert-verify:true` 关闭链和身份校验，握手签名仍验证；这是安全降级，不是默认行为。uTLS/Reality/mTLS/任意 ALPN 配置不在支持范围。
 
 ### AnyTLS：单流原生 TLS/TCP

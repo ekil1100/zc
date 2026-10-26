@@ -1,0 +1,73 @@
+name: Release blocker diagnostics (not acceptance)
+
+on:
+  push:
+    branches: [ fix/release-rc2-ci ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-stop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Build isolated service tests
+        run: cargo test --locked --test user_service --no-run --message-format=json > build.jsonl
+      - name: Run complete user-service regression
+        id: suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -n 8192
+          mkdir -p target/release-blockers
+          cargo test --locked --test user_service -- --nocapture > target/release-blockers/full-suite.log 2>&1
+      - name: Exercise recovery serially and under contention
+        if: ${{ success() || steps.suite.outcome == 'failure' }}
+        env:
+          ZC_SERVICE_STOP_DIAGNOSTICS: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -n 8192
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import pathlib
+          import subprocess
+          messages = [json.loads(line) for line in pathlib.Path('build.jsonl').read_text().splitlines()]
+          binary = next(m['executable'] for m in messages if m.get('reason') == 'compiler-artifact' and m['target']['name'] == 'user_service' and m.get('executable'))
+          root = pathlib.Path('target/release-blockers')
+          root.mkdir(parents=True, exist_ok=True)
+          case = 'failed_new_binary_and_publication_restore_real_old_binary_and_invocation'
+          def sample(index):
+              with (root / f'recovery-{index}.log').open('wb') as log:
+                  result = subprocess.run([binary, '--exact', case, '--nocapture'], stdout=log, stderr=subprocess.STDOUT, timeout=180)
+              print(f'RECOVERY_SAMPLE={index} EXIT={result.returncode}', flush=True)
+              return result.returncode
+          outcomes = [sample(0)]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+              outcomes.extend(pool.map(sample, range(1, 13)))
+          (root / 'results.json').write_text(json.dumps(outcomes))
+          raise SystemExit(any(outcomes))
+          PY
+      - name: Preserve all samples
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-blockers-${{ matrix.os }}
+          path: target/release-blockers/
+          if-no-files-found: warn
+          retention-days: 7

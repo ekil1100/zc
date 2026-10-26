@@ -41,7 +41,9 @@ expect_text "$CI_WORKFLOW" "musl-tools"
 expect_text "$CI_WORKFLOW" 'bash scripts/e2e/run-core.sh "$PWD/$BINARY"'
 expect_text "$CI_WORKFLOW" 'python3 scripts/e2e/run-rust-tcp.py "$BINARY"'
 expect_text "$CI_WORKFLOW" 'os: macos-15'
-expect_text "$CI_WORKFLOW" 'python3 scripts/ci/test-macos-native.py --ephemeral-runner --target'
+# System trust mutation is an optional manual diagnostic, not a release gate.
+reject_text "$CI_WORKFLOW" 'scripts/ci/test-macos-native.py'
+[[ -f scripts/ci/test-macos-native.py ]] || fail "missing optional macOS native diagnostic"
 for workflow in "$CI_WORKFLOW" "$RELEASE_WORKFLOW"; do
   expect_text "$workflow" '/Applications/Xcode_26.3.app/Contents/Developer'
   expect_text "$workflow" 'python3 scripts/ci/verify-macos-artifact.py "$BINARY"'
