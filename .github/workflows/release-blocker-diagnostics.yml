@@ -36,6 +36,8 @@ jobs:
           cargo test --locked --test user_service -- --nocapture > target/release-blockers/full-suite.log 2>&1
       - name: Exercise recovery serially and under contention
         if: ${{ success() || steps.suite.outcome == 'failure' }}
+        env:
+          ZC_SERVICE_STOP_DIAGNOSTICS: '1'
         shell: bash
         run: |
           set -euo pipefail

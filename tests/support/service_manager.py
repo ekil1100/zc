@@ -14,6 +14,8 @@ root, platform, program, *args = sys.argv[1:]
 root = pathlib.Path(root)
 state_path = root / "fake-manager.json"
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
+diagnostics = os.environ.get("ZC_SERVICE_STOP_DIAGNOSTICS") == "1"
+last_probe = None
 
 
 def save():
@@ -47,16 +49,82 @@ def barrier(phase):
 
 
 def alive():
+    global last_probe
     pid = state.get("pid", 0)
-    if not pid:
-        return False
+    probe = {"pid": pid}
+    if diagnostics:
+        probe.update(monotonic=time.monotonic(), timestamp_ns=time.time_ns())
     try:
-        os.kill(pid, 0)
+        if not pid:
+            probe["alive"] = False
+            return False
+        try:
+            os.kill(pid, 0)
+            probe["kill_errno"] = 0
+        except OSError as error:
+            probe["kill_errno"] = error.errno
+            raise
         proc = pathlib.Path(f"/proc/{pid}/stat")
-        return not (proc.exists() and proc.read_text().split(") ", 1)[1][0] == "Z")
-    except (ProcessLookupError, FileNotFoundError):
+        probe["proc_exists"] = proc.exists()
+        if probe["proc_exists"]:
+            probe["stat"] = proc.read_text()
+            # Keep the original decision while diagnosing it. The raw stat also
+            # preserves starttime and allows independent parsing of comm/state.
+            probe["parsed_state"] = probe["stat"].split(") ", 1)[1][0]
+        probe["alive"] = probe.get("parsed_state") != "Z"
+        return probe["alive"]
+    except (ProcessLookupError, FileNotFoundError) as error:
         # Linux may reap the process between the procfs existence check and read.
+        probe.update(alive=False, errno=error.errno)
         return False
+    finally:
+        if diagnostics:
+            probe["finished_monotonic"] = time.monotonic()
+            last_probe = probe
+
+
+def record_diagnostic(phase, deadline=None):
+    if not diagnostics:
+        return
+    event = {
+        "phase": phase,
+        "platform": platform,
+        "operation": (
+            "cleanup"
+            if program == "test-cleanup"
+            else args[0]
+            if platform == "launchd"
+            else args[2]
+        ),
+        "manager_pid": os.getpid(),
+        "monotonic": time.monotonic(),
+        "timestamp_ns": time.time_ns(),
+        "deadline": deadline,
+        "probe": last_probe,
+    }
+    if phase == "timeout":
+        # Read only the owned test process. Do not collect cmdline or environ.
+        task = pathlib.Path(f"/proc/{state['pid']}/task")
+        try:
+            threads = list(task.iterdir())
+            event["thread_count"] = len(threads)
+            event["threads"] = []
+            for thread in sorted(threads)[:32]:
+                entry = {"tid": thread.name}
+                for field in ("stat", "wchan", "stack"):
+                    try:
+                        entry[field] = (thread / field).read_text()[:4096]
+                    except OSError as error:
+                        entry[field + "_errno"] = error.errno
+                event["threads"].append(entry)
+        except OSError as error:
+            event["threads_errno"] = error.errno
+    try:
+        with (root / "manager-stop-diagnostics.jsonl").open("a") as output:
+            output.write(json.dumps(event) + "\n")
+    except OSError:
+        # Optional evidence must not replace the original stop result.
+        pass
 
 
 def start():
@@ -128,9 +196,12 @@ def stop():
     if alive():
         os.kill(state["pid"], signal.SIGTERM)
         deadline = time.monotonic() + 5
+        record_diagnostic("sigterm", deadline)
         while alive() and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert not alive(), "test daemon failed to stop"
+        still_alive = alive()
+        record_diagnostic("timeout" if still_alive else "stopped", deadline)
+        assert not still_alive, "test daemon failed to stop"
     state["pid"] = 0
     save()
     barrier("post-stop")
@@ -228,4 +299,5 @@ else:
         stop()
     else:
         raise AssertionError(args)
+record_diagnostic("command-end")
 save()
