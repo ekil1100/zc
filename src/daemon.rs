@@ -1859,43 +1859,92 @@ pub async fn connections(id: Option<&str>) -> Result<Value> {
     Ok(value)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionApply {
+    Applied,
+    NotRunning,
+    IdentityMismatch,
+    GenerationConflict,
+    ControllerRequired,
+    ControllerUnavailable,
+    Unauthorized,
+    ControllerRejected,
+    InstanceChanged,
+    RuntimeUnverifiable,
+}
+impl SelectionApply {
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Applied => "Selection applied to the running daemon.",
+            Self::NotRunning => {
+                "Start the saved profile with `zc start -c <profile>` (or `zc service start -c <profile>` for a stopped registered service)."
+            }
+            Self::IdentityMismatch => {
+                "The running profile/revision differs from the selected profile. Check `zc status --json` and `zc config list --json`; use -c <running-profile> when its revision matches, or explicitly apply the saved profile with `zc restart -c <profile>` / `zc service restart -c <profile>` (supervised foreground: restart through its supervisor)."
+            }
+            Self::GenerationConflict => {
+                "The runtime selection generation changed. Check `zc status` and retry the selection."
+            }
+            Self::ControllerRequired => {
+                "The running snapshot has no controller. Configure external-controller, then explicitly prepare the profile with `zc restart -c <profile>` / `zc service restart -c <profile>` (supervised foreground: use its supervisor)."
+            }
+            Self::ControllerUnavailable => {
+                "The controller request failed. Check `zc status` and `zc log --no-follow`, then retry."
+            }
+            Self::Unauthorized => {
+                "The controller rejected the frozen credentials. Check the running instance and its controller authentication before retrying."
+            }
+            Self::ControllerRejected => {
+                "The controller rejected the selection. Check `zc status` and `zc log --no-follow`; verify the daemon version and profile revision before retrying."
+            }
+            Self::InstanceChanged => {
+                "The running instance changed during apply. Check `zc status` before retrying."
+            }
+            Self::RuntimeUnverifiable => {
+                "The runtime identity or authenticated snapshot could not be verified. Check `zc status` and `zc log --no-follow`; preserve existing state for diagnosis."
+            }
+        }
+    }
+}
+
 pub async fn apply_selection(
     identity: &ActiveIdentity,
     generation: u64,
     selections: &[Selection],
-) -> Result<bool> {
-    // Durable desired state is already committed. An unverifiable runtime only
-    // disables live apply; it must never turn that commit into a reported failure.
-    Ok(apply_selection_checked(identity, generation, selections)
+) -> SelectionApply {
+    // Desired state is already committed. Preserve that success, but expose why
+    // live apply was not confirmed without leaking raw errors or credentials.
+    apply_selection_checked(identity, generation, selections)
         .await
-        .unwrap_or(false))
+        .unwrap_or(SelectionApply::RuntimeUnverifiable)
 }
 async fn apply_selection_checked(
     identity: &ActiveIdentity,
     generation: u64,
     selections: &[Selection],
-) -> Result<bool> {
+) -> Result<SelectionApply> {
     let Some(runtime) = runtime_dir(false)? else {
-        return Ok(false);
+        return Ok(SelectionApply::NotRunning);
     };
     let Some(d) = observe(&runtime)?.filter(|d| d.ready) else {
-        return Ok(false);
+        return Ok(SelectionApply::NotRunning);
     };
-    if d.identity.as_ref() != Some(identity) || generation <= d.generation {
-        return Ok(false);
+    if d.identity.as_ref() != Some(identity) {
+        return Ok(SelectionApply::IdentityMismatch);
+    }
+    if generation <= d.generation {
+        return Ok(SelectionApply::GenerationConflict);
     }
     let Some(endpoint) = &d.endpoint else {
-        return Ok(false);
+        return Ok(SelectionApply::ControllerRequired);
     };
-    let Some(selection) = selections.first() else {
-        return Ok(false);
-    };
+    let selection = selections.first().context("selection snapshot is empty")?;
     let prepared = prepared_for(&runtime, &d)?;
     let config = parse_config(&prepared)?;
-    ensure!(
-        observe(&runtime)?.as_ref() == Some(&d),
-        "RUNTIME_IDENTITY_CHANGED: daemon changed before apply"
-    );
+    if observe(&runtime)?.as_ref() != Some(&d) {
+        return Ok(SelectionApply::InstanceChanged);
+    }
     let group: String = selection
         .group
         .bytes()
@@ -1909,17 +1958,29 @@ async fn apply_selection_checked(
         .collect();
     let response = client()?.put(format!("http://{endpoint}/proxies/{group}")).bearer_auth(config.secret()).json(&json!({"name":selection.proxy,"instance_nonce":d.nonce,"identity_key":identity.key,"identity_revision":identity.revision,"generation":generation})).send().await;
     let Ok(response) = response else {
-        return Ok(false);
+        return Ok(SelectionApply::ControllerUnavailable);
     };
     if !response.status().is_success() {
-        return Ok(false);
+        return Ok(match response.status().as_u16() {
+            401 | 403 => SelectionApply::Unauthorized,
+            _ => SelectionApply::ControllerRejected,
+        });
     }
-    Ok(observe(&runtime)?.is_some_and(|current| {
-        current.pid == d.pid
-            && current.nonce == d.nonce
-            && current.identity == d.identity
-            && current.generation == generation
-    }))
+    let Some(current) = observe(&runtime)? else {
+        return Ok(SelectionApply::InstanceChanged);
+    };
+    if current.pid != d.pid
+        || current.nonce != d.nonce
+        || current.identity != d.identity
+        || current.endpoint != d.endpoint
+    {
+        return Ok(SelectionApply::InstanceChanged);
+    }
+    Ok(if current.generation == generation {
+        SelectionApply::Applied
+    } else {
+        SelectionApply::GenerationConflict
+    })
 }
 pub async fn log(lines: usize, follow: bool, json_output: bool) -> Result<()> {
     use std::os::unix::fs::MetadataExt;

@@ -833,6 +833,210 @@ fn status_text_shows_live_selections_for_each_proxy_group() {
 }
 
 #[test]
+fn interactive_selection_searches_pages_and_applies_without_escaping_unicode() {
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let _guard = DaemonGuard(home.into());
+    let names: Vec<_> = (1..=30)
+        .map(|i| {
+            if i == 27 {
+                "🇯🇵 日本".to_owned()
+            } else {
+                format!("Node {i}")
+            }
+        })
+        .collect();
+    let source = home.join("interactive.yaml");
+    std::fs::write(&source, json!({
+        "external-controller": format!("127.0.0.1:{}", free_port()),
+        "proxies": names.iter().map(|name| json!({"name":name,"type":"direct"})).collect::<Vec<_>>(),
+        "proxy-groups": [{"name":"Proxies","type":"select","proxies":names}],
+        "rules": ["MATCH,Proxies"]
+    }).to_string()).unwrap();
+    ok(
+        home,
+        &["config", "load", source.to_str().unwrap(), "--json"],
+    );
+    ok(
+        home,
+        &["start", "--port", &free_port().to_string(), "--json"],
+    );
+    let catalog = home.join(".config/zc/state-v2.json");
+    let before = std::fs::read(&catalog).unwrap();
+    let interact = |input: &str| {
+        let output = Command::new("python3").args(["-c", r#"
+import os, pty, subprocess, sys
+master, slave = pty.openpty()
+try:
+    child = subprocess.Popen([sys.argv[1], 'profile', 'select', '--no-color'], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        os.write(master, sys.argv[2].encode())
+        out, err = child.communicate(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+    sys.stdout.buffer.write(out)
+    sys.stderr.buffer.write(err)
+    sys.exit(child.returncode)
+finally:
+    os.close(master)
+    os.close(slave)
+"#, env!("CARGO_BIN_EXE_zc"), input])
+            .env("HOME", home.canonicalize().unwrap())
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env_remove("XDG_RUNTIME_DIR")
+            .env("NO_COLOR", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output
+    };
+    let cancelled = interact("q\n");
+    assert!(cancelled.stdout.is_empty());
+    let menu = String::from_utf8(cancelled.stderr).unwrap();
+    assert!(
+        menu.contains("Profile: interactive\nGroup: Proxies\n"),
+        "{menu}"
+    );
+    assert!(menu.contains("* 1: Node 1"), "{menu}");
+    assert!(menu.contains("Page 1/2 (30 matches)"), "{menu}");
+    assert!(!menu.contains("🇯🇵 日本"), "{menu}");
+    assert_eq!(std::fs::read(&catalog).unwrap(), before);
+    let selected = interact("n\n/日本\n27\n");
+    let menu = String::from_utf8(selected.stderr).unwrap();
+    assert!(menu.contains("Page 2/2 (30 matches)"), "{menu}");
+    assert!(
+        menu.contains("Page 1/1 (1 matches)\n  27: 🇯🇵 日本"),
+        "{menu}"
+    );
+    assert!(!menu.contains('\u{1b}'), "{menu}");
+    assert_eq!(
+        String::from_utf8(selected.stdout).unwrap(),
+        "Applied: Proxies -> 🇯🇵 日本\n"
+    );
+    assert_eq!(
+        ok(home, &["status", "--json"])["data"]["selected_proxies"][0]["proxy"],
+        "🇯🇵 日本"
+    );
+}
+
+#[test]
+fn saved_only_selection_explains_why_runtime_did_not_change() {
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let _guard = DaemonGuard(home.into());
+    let source = home.join("selection.yaml");
+    let yaml = "proxies: [{name: '🇯🇵 日本', type: direct}]\nproxy-groups: [{name: Proxies, type: select, proxies: [DIRECT, '🇯🇵 日本']}]\nrules: ['MATCH,Proxies']\n";
+    std::fs::write(&source, yaml).unwrap();
+    ok(
+        home,
+        &["config", "load", source.to_str().unwrap(), "--json"],
+    );
+    let select = ["proxy", "select", "-p", "🇯🇵 日本", "--json"];
+    let saved = ok(home, &select);
+    assert_eq!(saved["data"]["applied"], false);
+    assert_eq!(saved["data"]["apply_reason"], "not_running");
+    assert!(
+        saved["data"]["apply_hint"]
+            .as_str()
+            .unwrap()
+            .contains("start")
+    );
+
+    ok(
+        home,
+        &["start", "--port", &free_port().to_string(), "--json"],
+    );
+    let saved = ok(home, &select);
+    assert_eq!(saved["data"]["apply_reason"], "controller_required");
+    ok(home, &["stop", "--json"]);
+
+    let source = home.join("controlled.yaml");
+    std::fs::write(
+        &source,
+        format!("external-controller: 127.0.0.1:{}\n{yaml}", free_port()),
+    )
+    .unwrap();
+    ok(
+        home,
+        &["config", "load", source.to_str().unwrap(), "--json"],
+    );
+    ok(
+        home,
+        &["start", "--port", &free_port().to_string(), "--json"],
+    );
+    let other = home.join("other.yaml");
+    std::fs::write(&other, yaml).unwrap();
+    ok(home, &["config", "load", other.to_str().unwrap(), "--json"]);
+    let saved = ok(home, &select);
+    assert_eq!(saved["data"]["applied"], false);
+    assert_eq!(saved["data"]["apply_reason"], "identity_mismatch");
+    let status = ok(home, &["status", "--json"]);
+    assert_eq!(status["data"]["selected_proxies"][0]["proxy"], "DIRECT");
+    let output = run(home, &["profile", "select", "-p", "🇯🇵 日本"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Saved: Proxies -> 🇯🇵 日本"), "{text}");
+    assert!(
+        text.contains("Live apply: not confirmed (identity_mismatch)"),
+        "{text}"
+    );
+    assert!(!text.contains("\\ud83c"), "{text}");
+}
+
+#[test]
+fn repeated_live_selection_with_multiple_saved_groups_updates_status() {
+    let _serial = cli_fixture::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let _guard = DaemonGuard(home.into());
+    let source = home.join("selection.yaml");
+    std::fs::write(&source, format!("external-controller: 0.0.0.0:{}\nproxies: [{{name: '🇯🇵 日本', type: direct}}, {{name: '🇸🇬 新加坡', type: reject}}]\nproxy-groups: [{{name: Proxies, type: select, proxies: ['🇯🇵 日本', '🇸🇬 新加坡']}}, {{name: Other, type: select, proxies: [DIRECT, REJECT]}}]\nrules: ['MATCH,Proxies']\n", free_port())).unwrap();
+    ok(
+        home,
+        &["config", "load", source.to_str().unwrap(), "--json"],
+    );
+    ok(
+        home,
+        &["start", "--port", &free_port().to_string(), "--json"],
+    );
+    for (group, proxy) in [
+        ("Proxies", "🇸🇬 新加坡"),
+        ("Other", "REJECT"),
+        ("Proxies", "🇯🇵 日本"),
+        ("Proxies", "🇸🇬 新加坡"),
+    ] {
+        let selected = ok(
+            home,
+            &["proxy", "select", "-g", group, "-p", proxy, "--json"],
+        );
+        assert_eq!(selected["data"]["applied"], true, "{selected}");
+        let status = ok(home, &["status", "--json"]);
+        let current = status["data"]["selected_proxies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["group"] == group)
+            .unwrap();
+        assert_eq!(current["proxy"], proxy, "{status}");
+        assert!(selected["data"].get("apply_reason").is_none());
+    }
+    let output = run(home, &["proxy", "select", "-p", "🇯🇵 日本"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Applied: Proxies -> 🇯🇵 日本\n"
+    );
+    assert_eq!(
+        ok(home, &["status", "--json"])["data"]["selected_proxies"][0]["proxy"],
+        "🇯🇵 日本"
+    );
+}
+
+#[test]
 fn managed_live_selection_reload_and_immutable_local_provider_work_end_to_end() {
     let _serial = cli_fixture::serial();
     let dir = tempfile::tempdir().unwrap();
@@ -1246,9 +1450,14 @@ fn selection_persists_when_the_runtime_descriptor_is_corrupt() {
         &["proxy", "select", "-g", "Pick", "-p", "REJECT", "--json"],
     );
     assert_eq!(selected["data"]["applied"], false);
+    assert_eq!(selected["data"]["apply_reason"], "runtime_unverifiable");
     assert_eq!(
         ok(home, &["proxy", "list", "--json"])["data"]["groups"][0]["now"],
         "REJECT"
+    );
+    assert_eq!(
+        std::fs::read(runtime.join("zc.daemon.json")).unwrap(),
+        b"corrupt"
     );
 }
 

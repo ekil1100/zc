@@ -145,6 +145,37 @@ selection 先以 state token（format/sequence/digest）CAS 提交，绑定 exac
 
 无持久选择时 select 默认首成员；嵌套组、DIRECT/REJECT 字面量有效，未知引用/循环拒绝。文本交互只在 stdin 为 TTY 时进入；非 TTY 且无 `-p` 返回 `PROXY_SELECT_NOT_INTERACTIVE`，JSON 无 `-p` 只读。
 
+### 交互选择与应用结果
+
+`proxy select` 与 `profile select` 共用逐行 CLI 交互，不使用全屏 TUI 或终端 raw mode：
+
+- 显示目标 profile、组名，以及该 profile 的已保存选择或默认首成员；用 `*` 标记。此标记不代表运行实例的实际选择，实际状态用 `zc status` 查看。
+- 省略 `-g` 仍选第一个 select 组；有多个组时提示使用 `-g <group>`，可用 `zc proxy list` 查看组名。
+- 每页最多 15 项，编号始终沿用原列表。输入当前页显示的编号并回车确认；`n` / `p` 翻页。
+- 输入 `/日本` 等 `/关键词` 搜索全部成员，采用 Unicode 小写转换后的子串匹配；单独 `/` 清除搜索。搜索后回到第一页，编号保持不变。
+- 空行、`q`、Escape 后回车或 EOF 取消，取消不提交选择。非法输入、不可见编号和无匹配允许继续输入。
+- 菜单和提示写 stderr，最终结果写 stdout。中文和 Emoji 原样显示，控制字符和不安全方向字符转义；不发送 ANSI 控制序列。
+
+文本结果区分 `Applied: <group> -> <proxy>` 与 `Saved: <group> -> <proxy>`。前者表示已确认运行实例应用；后者追加 `Live apply: not confirmed (<reason>)` 和操作提示，不把持久保存等同于实时切换。持久性不确定或兼容镜像不同步另行显示警告。
+
+JSON 保留 `state:"selected"`、`applied` 和持久性字段。`applied:false` 时新增 `apply_reason`、`apply_hint`；`applied:true` 时省略这两个字段。保存成功仍 exit 0，不因实时应用未确认而撤销 desired selection。请求超时或事后验证失败时，运行实例可能已经应用，须重新检查 `zc status`。
+
+| `apply_reason` | 直接证据与操作 |
+| --- | --- |
+| `not_running` | 没有可验证的 ready 实例；启动目标 profile，已注册服务使用服务命令 |
+| `identity_mismatch` | 运行实例的 profile/revision 与选择目标不同；核对 `status --json` 和 `config list --json`。用 `-c` 指向相同 revision 的运行 profile，或显式 `restart -c <profile>` / `service restart -c <profile>` 应用目标；前台实例通过 supervisor 处理 |
+| `generation_conflict` | 请求 generation 未领先，或响应后的 generation 与请求不一致；检查实际选择后重试 |
+| `controller_required` | 运行快照没有 controller；显式配置后，带 `-c` 重新准备并重启，默认 restart 仍复用冻结输入 |
+| `controller_unavailable` | controller 请求失败或超时；检查状态和日志后重试，不推断是否已应用 |
+| `unauthorized` | controller 返回 HTTP 401/403；核对运行实例与冻结认证 |
+| `controller_rejected` | controller 返回其他非成功状态，包括 409；核对 daemon 版本、profile revision 与日志，不仅凭 409 推断具体冲突原因 |
+| `instance_changed` | 请求前后实例身份发生变化；重新检查状态再操作 |
+| `runtime_unverifiable` | runtime 或认证快照验证失败；保留现场，检查状态和日志 |
+
+这些提示不自动重启实例、不选择其他 profile、不绕过 exact revision/generation 校验，也不创建 controller 或默认控制端口。
+
+### 运行状态
+
 `status` 文本在 daemon/PID/端口之后显示 `Selected proxies:`，按运行配置中代理组的声明顺序，以 `代理组 -> 所选节点或组成员` 逐行列出实际运行选择（多个组可能选择不同成员，不虚构全局唯一节点）。运行状态不可读时显示 `(unavailable)`；已停止或没有代理组选择时显示 `(none)`。名称中的中文、国旗及组合 Emoji 原样输出 UTF-8；仅控制字符和不安全的方向控制符做终端安全转义，Emoji 的具体显示效果取决于终端与字体。JSON 结构保持不变，`selected_proxies` 数组同样按运行配置的组声明顺序排列；需运行新版 daemon 才会生成新的顺序。
 
 `status` 的 `active_config/selected_proxies` 是实际运行状态，不是当前 catalog active 的替身；通过匹配 descriptor 的 controller 查询。controller 不可用时保留实例 identity、选择为空、`runtime_state_available:false`，不能猜 endpoint。来源标记为 `persisted/transient/default`。停止时保留显式 `mixed_port:null`，运行时为实际端口；该字段不受通用 null 过滤影响，公开 CLI 回归已覆盖。

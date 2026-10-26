@@ -1,5 +1,6 @@
 //! Public command contract. State and runtime authority remain in store/daemon.
 mod probes;
+mod selection;
 use crate::{
     config::{self, Config},
     daemon,
@@ -12,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{IsTerminal, Write},
+    io::IsTerminal,
     path::Path,
     time::Duration,
 };
@@ -848,6 +849,38 @@ fn render_text(command: &str, data: &Value) {
                         }
                     }
                 }
+            }
+        }
+        "proxy select" | "profile select" => {
+            println!(
+                "{}: {} -> {}",
+                if data["applied"] == true {
+                    "Applied"
+                } else {
+                    "Saved"
+                },
+                safe_text(data["group"].as_str().unwrap_or("")),
+                safe_text(data["proxy"].as_str().unwrap_or(""))
+            );
+            if data["applied"] != true {
+                println!(
+                    "Live apply: not confirmed ({})",
+                    data["apply_reason"]
+                        .as_str()
+                        .unwrap_or("runtime_unverifiable")
+                );
+                println!(
+                    "Hint: {}",
+                    safe_text(data["apply_hint"].as_str().unwrap_or(""))
+                );
+            }
+            if data["durability_uncertain"] == true {
+                println!("Warning: selection is visible, but crash durability is uncertain.");
+            }
+            if data["mirror_out_of_sync"] == true {
+                println!(
+                    "Warning: compatibility mirror is out of sync; the catalog remains authoritative."
+                );
             }
         }
         "status" => {
@@ -1744,24 +1777,24 @@ async fn proxy_command(args: &Args) -> Result<Output> {
                 2,
             ));
         }
-        for (i, choice) in choices.iter().enumerate() {
-            eprintln!("{}: {}", i + 1, safe_text(choice.as_str().unwrap_or("")));
+        if let Some(identity) = &prepared.identity {
+            eprintln!("Profile: {}", safe_text(&identity.key));
         }
-        eprint!("Select a number (q to cancel): ");
-        std::io::stderr().flush()?;
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        if matches!(line.trim(), "" | "q" | "\u{1b}") {
+        if args.value("-g").is_none() && groups.len() > 1 {
+            eprintln!("Use -g <group> to select another group; `zc proxy list` lists groups.");
+        }
+        let selected = config.selected();
+        let names: Vec<_> = choices.iter().filter_map(Value::as_str).collect();
+        proxy = selection::choose(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stderr().lock(),
+            name,
+            &names,
+            selected.get(name).map(String::as_str),
+        )?;
+        if proxy.is_none() {
             return Ok(Output::Silent);
         }
-        proxy = line
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .and_then(|i| i.checked_sub(1))
-            .and_then(|i| choices.get(i))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
     }
     let proxy = proxy.context("PROXY_NOT_FOUND: proxy not found in group")?;
     ensure!(
@@ -1789,19 +1822,11 @@ async fn proxy_command(args: &Args) -> Result<Output> {
         profile.desired.generation,
         selections.clone(),
     )?;
-    let applied =
-        match daemon::apply_selection(&identity, profile.desired.generation + 1, &selections).await
-        {
-            Ok(applied) => applied,
-            Err(_) => {
-                eprintln!(
-                    "Selection saved only; the daemon identity or controller could not be verified"
-                );
-                false
-            }
-        };
+    let outcome =
+        daemon::apply_selection(&identity, profile.desired.generation + 1, &selections).await;
+    let applied = outcome == daemon::SelectionApply::Applied;
     Ok(Output::Data(extend(
-        json!({"action":"proxy_select","group":name,"proxy":proxy,"state":"selected","applied":applied}),
+        json!({"action":"proxy_select","group":name,"proxy":proxy,"state":"selected","applied":applied,"apply_reason":(!applied).then_some(outcome),"apply_hint":(!applied).then_some(outcome.hint())}),
         health_data(&store, Some(&receipt)),
     )))
 }
