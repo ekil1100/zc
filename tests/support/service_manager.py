@@ -89,13 +89,7 @@ def record_diagnostic(phase, deadline=None):
     event = {
         "phase": phase,
         "platform": platform,
-        "operation": (
-            "cleanup"
-            if program == "test-cleanup"
-            else args[0]
-            if platform == "launchd"
-            else args[2]
-        ),
+        "operation": "cleanup" if program == "test-cleanup" else command,
         "manager_pid": os.getpid(),
         "monotonic": time.monotonic(),
         "timestamp_ns": time.time_ns(),

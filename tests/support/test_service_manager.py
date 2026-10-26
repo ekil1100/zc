@@ -4,6 +4,7 @@ import ast
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import time
@@ -85,6 +86,7 @@ class ManagerStopDiagnostics(unittest.TestCase):
             "program": "/bin/launchctl",
             "platform": "launchd",
             "args": ["bootout", "gui/501/org.zc.user"],
+            "command": "bootout",
             "os": types.SimpleNamespace(kill=self.kill, getpid=lambda: 999),
             "pathlib": types.SimpleNamespace(Path=Mock(return_value=self.proc)),
             "time": types.SimpleNamespace(
@@ -114,6 +116,25 @@ class ManagerStopDiagnostics(unittest.TestCase):
             .read_text()
             .splitlines()
         ]
+
+    def test_systemd_cli_records_operation_after_argument_dispatch(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(pathlib.Path(__file__).with_name("service_manager.py")),
+                str(self.root),
+                "systemd",
+                "/usr/bin/systemctl",
+                "--user",
+                "--no-pager",
+                "daemon-reload",
+            ],
+            env=dict(os.environ, ZC_SERVICE_STOP_DIAGNOSTICS="1"),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events()[-1]["operation"], "daemon-reload")
 
     def test_timeout_preserves_actual_probe_and_original_failure(self):
         with self.assertRaisesRegex(AssertionError, "test daemon failed to stop"):
